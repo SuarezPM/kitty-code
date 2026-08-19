@@ -23,20 +23,42 @@ pub struct ContextBudget {
     consecutive_compactions: usize,
     /// Maximum consecutive compactions before hard-stopping.
     max_consecutive_compactions: usize,
+    compact_threshold: f32,
 }
 
 impl ContextBudget {
     /// Default compaction threshold (80%).
     pub const DEFAULT_THRESHOLD: f32 = 0.8;
 
-    /// Create a new budget with a given max token limit.
+    /// Create a new budget with a given max token limit (uses default threshold 0.8).
     pub fn new(max_tokens: usize) -> Self {
+        Self::new_with_threshold(max_tokens, Self::DEFAULT_THRESHOLD)
+    }
+
+    /// Create a new budget with explicit compaction threshold.
+    pub fn new_with_threshold(max_tokens: usize, threshold: f32) -> Self {
         Self {
             max_tokens,
             used_tokens: 0,
             consecutive_compactions: 0,
             max_consecutive_compactions: 3,
+            compact_threshold: threshold.clamp(0.1, 0.95),
         }
+    }
+
+    /// Update the compaction threshold (0.1–0.95, clamped).
+    pub fn set_threshold(&mut self, threshold: f32) {
+        self.compact_threshold = threshold.clamp(0.1, 0.95);
+    }
+
+    /// Update max tokens (e.g. when CLI overrides profile).
+    pub fn set_max(&mut self, max: usize) {
+        self.max_tokens = max;
+    }
+
+    /// Current threshold.
+    pub fn threshold(&self) -> f32 {
+        self.compact_threshold
     }
 
     /// Current token usage.
@@ -64,9 +86,9 @@ impl ContextBudget {
         self.ratio() >= threshold
     }
 
-    /// Whether compaction should trigger (at or above 80%).
+    /// Whether compaction should trigger (at or above threshold, default 80%).
     pub fn should_compact(&self) -> bool {
-        self.is_near_limit(Self::DEFAULT_THRESHOLD)
+        self.is_near_limit(self.compact_threshold)
     }
 
     /// Whether we should hard-stop (too many failed compactions).

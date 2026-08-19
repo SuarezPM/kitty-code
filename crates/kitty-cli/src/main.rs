@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kitty_harness::agent::{Agent, AgentConfig};
 use kitty_harness::tools::standard_tool_definitions;
+use kitty_harness::ModelProfile;
 use kitty_memory::{Episode, EpisodeStore};
 use kitty_runtime::OllamaClient;
 use std::path::PathBuf;
@@ -58,6 +59,10 @@ pub struct Cli {
     /// Bash command timeout in seconds (default: 60)
     #[arg(long, default_value = "60")]
     pub bash_timeout: u64,
+
+    /// Model profile preset: tiny|medium|large (default: medium)
+    #[arg(long, global = true, default_value = "medium", value_parser = clap::builder::PossibleValuesParser::new(["tiny", "medium", "large"]))]
+    pub profile: String,
 }
 
 #[derive(Subcommand)]
@@ -115,17 +120,28 @@ async fn main() -> Result<()> {
             } else {
                 Some(default_db_path())
             };
-            let config = AgentConfig {
+            let base_config = AgentConfig {
                 model: cli.model.clone(),
-                max_thinking_tokens: Some(cli.thinking_budget),
-                max_iterations: cli.max_iterations,
-                context_window: cli.context_window,
                 enable_knowledge: cli.knowledge,
-                bash_timeout_secs: cli.bash_timeout,
                 memory_db_path,
                 ..Default::default()
-            };
-            let mut agent = Agent::new(client, config);
+            }
+            .with_profile(&cli.profile);
+            let mut agent = Agent::new(client, base_config);
+            // Overlay explicit CLI overrides after profile sync (profile wins by default,
+            // but explicit CLI flags should survive). We check against clap defaults.
+            if cli.context_window != 16384 {
+                agent.config_mut().context_window = cli.context_window;
+            }
+            if cli.max_iterations != 20 {
+                agent.config_mut().max_iterations = cli.max_iterations;
+            }
+            if cli.thinking_budget != 2048 {
+                agent.config_mut().max_thinking_tokens = Some(cli.thinking_budget);
+            }
+            if cli.bash_timeout != 60 {
+                agent.config_mut().bash_timeout_secs = cli.bash_timeout;
+            }
 
             println!("Model: {}", cli.model);
             println!("Prompt: {}", prompt);
@@ -195,6 +211,7 @@ async fn main() -> Result<()> {
                 context_window: cli.context_window,
                 max_iterations: bench_max_iterations,
                 bash_timeout: cli.bash_timeout,
+                profile: ModelProfile::from_cli(&cli.profile),
             };
 
             println!("Kitty Code Benchmark");
@@ -422,6 +439,7 @@ fn file_contains(dir: &str, filename: &str, pattern: &str) -> bool {
 }
 
 /// Shared benchmark configuration.
+#[allow(dead_code)]
 struct BenchConfig {
     client: OllamaClient,
     model: String,
@@ -431,6 +449,7 @@ struct BenchConfig {
     context_window: usize,
     max_iterations: usize,
     bash_timeout: u64,
+    profile: &'static ModelProfile,
 }
 
 /// Shared benchmark driver used by every exercise set.
@@ -468,15 +487,30 @@ async fn run_bench(
         );
 
         let start = Instant::now();
-        let config = AgentConfig {
+        let base_config = AgentConfig {
             model: cfg.model.clone(),
-            max_thinking_tokens: Some(cfg.thinking_budget),
-            context_window: cfg.context_window,
-            max_iterations: cfg.max_iterations,
-            bash_timeout_secs: cfg.bash_timeout,
+            profile: cfg.profile,
             ..Default::default()
         };
-        let mut agent = Agent::new(cfg.client.clone(), config);
+        let mut agent = Agent::new(cfg.client.clone(), base_config);
+        // Bench smoke override: bench uses 5 iterations even for medium (20) to stay <20s.
+        // Agent::new syncs profile fields, so patch explicit bench overrides here.
+        // Copy Run overlay logic to preserve profile tiny/medium/large unless CLI explicitly differs.
+        agent.config_mut().max_iterations = cfg.max_iterations;
+        if cfg.context_window != 16384 {
+            agent.config_mut().context_window = cfg.context_window;
+            agent.budget_mut().set_max(cfg.context_window);
+        }
+        if cfg.thinking_budget != 2048 {
+            agent.config_mut().max_thinking_tokens = Some(cfg.thinking_budget);
+        }
+        if cfg.bash_timeout != 60 {
+            agent.config_mut().bash_timeout_secs = cfg.bash_timeout;
+        }
+        // Ensure compact threshold follows profile (tiny 0.7, medium 0.8, large 0.8)
+        agent.config_mut().compact_threshold = cfg.profile.compact_threshold;
+        // Re-sync budget threshold from profile (ensures tiny 0.7 vs medium 0.8)
+        agent.budget_mut().set_threshold(cfg.profile.compact_threshold);
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             agent.run(&prompt),

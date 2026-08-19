@@ -23,7 +23,7 @@ pub enum ToolError {
     #[error("Write blocked on existing file: {path} — use Edit instead")]
     WriteBlocked { path: String },
 
-    #[error("Edit blocked: file not read this session: {0}")]
+    #[error("File not loaded: {0} — must Read before Edit")]
     EditBlocked(String),
 
     #[error("Bash command blocked: {0}")]
@@ -186,8 +186,8 @@ impl ToolRegistry {
 
         let path_buf = PathBuf::from(path);
 
-        // Read-before-edit guard
-        if !self.read_files.contains(&path_buf) {
+        // Read-before-edit guard — scoped to session via snapshot
+        if self.hashline.get_snapshot(&path_buf).is_none() {
             return Err(ToolError::EditBlocked(path.to_string()));
         }
 
@@ -307,8 +307,17 @@ impl ToolRegistry {
 
         let path_buf = PathBuf::from(path);
 
-        // Write guard: refuse Write on existing files
+        // Write guard: refuse Write on existing files (force Edit)
+        // Layer 1: spec-required check — existing file not in written_files → block
         if path_buf.exists() && !self.written_files.contains(&path_buf) {
+            return Err(ToolError::WriteBlocked {
+                path: path.to_string(),
+            });
+        }
+        // Layer 2: strict invariant — even files we created via Write in this
+        // session must be edited via Edit, not overwritten via Write again.
+        // This enforces "Primera vez en tmpdir fresco permite, segunda bloquea".
+        if path_buf.exists() {
             return Err(ToolError::WriteBlocked {
                 path: path.to_string(),
             });
@@ -321,9 +330,11 @@ impl ToolRegistry {
 
         std::fs::write(&path_buf, content)?;
 
-        // Update read_files so the file can be edited afterwards
+        // Update session state so the file can be edited afterwards without extra Read
         self.read_files.insert(path_buf.clone());
-        self.written_files.insert(path_buf);
+        self.written_files.insert(path_buf.clone());
+        // Populate hashline snapshot for read-before-edit invariant
+        let _ = self.hashline.read_file(&path_buf);
 
         Ok(ToolResult {
             success: true,
@@ -844,5 +855,112 @@ mod tests {
             "should NOT find target/build.rs, got: {}",
             result.output
         );
+    }
+
+    #[test]
+    fn edit_blocked_message_mentions_must_read() {
+        let f = temp_file("line1\nline2");
+        let mut registry = ToolRegistry::new();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "hash": "deadbeef",
+            "new": "replaced"
+        });
+        let err = registry.execute_edit(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("File not loaded"), "got: {msg}");
+        assert!(msg.contains("must Read before Edit"), "got: {msg}");
+    }
+
+    #[test]
+    fn edit_after_read_succeeds() {
+        let f = temp_file("hello\nworld");
+        let mut registry = ToolRegistry::new();
+        // First read
+        let read_args = serde_json::json!({"path": f.path().to_str().unwrap()});
+        let read_res = registry.execute_read(&read_args).unwrap();
+        assert!(read_res.success);
+        // Extract hash from first line
+        let first_line = read_res.output.lines().next().unwrap();
+        // Format is "1:HASH|content"
+        let hash = first_line.split(':').nth(1).unwrap().split('|').next().unwrap();
+        let edit_args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "hash": hash,
+            "new": "HELLO"
+        });
+        let edit_res = registry.execute_edit(&edit_args).unwrap();
+        assert!(edit_res.success);
+    }
+
+    #[test]
+    fn write_blocks_existing_file_message_mentions_edit() {
+        let f = temp_file("existing");
+        let mut registry = ToolRegistry::new();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "content": "new"
+        });
+        let err = registry.execute_write(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("use Edit instead"), "got: {msg}");
+    }
+
+    #[test]
+    fn write_then_edit_without_extra_read_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        let mut registry = ToolRegistry::new();
+        let write_args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "content": "line1\nline2"
+        });
+        registry.execute_write(&write_args).unwrap();
+        // Now edit without explicit Read — should succeed because Write populated snapshot
+        let read_args = serde_json::json!({"path": path.to_str().unwrap()});
+        let read_res = registry.execute_read(&read_args).unwrap();
+        let hash = read_res.output.lines().next().unwrap().split(':').nth(1).unwrap().split('|').next().unwrap();
+        let edit_args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "hash": hash,
+            "new": "LINE1"
+        });
+        let edit_res = registry.execute_edit(&edit_args).unwrap();
+        assert!(edit_res.success);
+    }
+
+    #[tokio::test]
+    async fn bash_blocks_redirect_write() {
+        let registry = ToolRegistry::new();
+        let args = serde_json::json!({"command": "cat > /tmp/evil.txt"});
+        let err = registry.execute_bash(&args).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("do not redirect") || msg.contains("Write"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn bash_allows_redirect_to_dev_null() {
+        let registry = ToolRegistry::new();
+        let args = serde_json::json!({"command": "echo hi > /dev/null"});
+        let result = registry.execute_bash(&args).await.unwrap();
+        assert!(result.success || !result.output.contains("blocked"), "should allow /dev/null, got: {:?}", result);
+        // If it blocks, it's a failure — but /dev/null should be allowed
+        // Verify no BashBlocked error was thrown
+    }
+
+    #[tokio::test]
+    async fn bash_blocks_tee_write() {
+        let registry = ToolRegistry::new();
+        let args = serde_json::json!({"command": "echo x | tee file.log"});
+        let err = registry.execute_bash(&args).await.unwrap_err();
+        assert!(matches!(err, ToolError::BashBlocked(_)));
+    }
+
+    #[tokio::test]
+    async fn bash_allows_tee_without_file() {
+        let registry = ToolRegistry::new();
+        let args = serde_json::json!({"command": "echo hi | tee"});
+        let result = registry.execute_bash(&args).await.unwrap();
+        assert!(result.success);
     }
 }

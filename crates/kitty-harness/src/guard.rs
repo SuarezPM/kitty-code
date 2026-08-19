@@ -1,6 +1,9 @@
 //! Safety guards for the agent loop.
 //!
 //! Provides permission gates for shell commands and chain analysis.
+//! Port of little-coder `_shared/shell-write.ts` for shell-redirect write detection.
+
+use std::collections::HashSet;
 
 /// Patterns that indicate destructive or dangerous shell commands.
 const BLOCKED_PATTERNS: &[&str] = &[
@@ -35,10 +38,14 @@ const BLOCKED_PATTERNS: &[&str] = &[
 /// their arguments. Anything Turing-complete or with an execute flag (awk's
 /// `system()`, sed's `e` command, shells, script interpreters) is intentionally
 /// excluded and handled by `INTERPRETERS` below.
+///
+/// `tee` deliberately NOT included — `tee file` writes to `file` via shell
+/// and must be detected as a write (see `detect_write_targets`). `tee` without
+/// args is still Allow via redirect detection (no targets).
 const SAFE_OUTPUT_COMMANDS: &[&str] = &[
     "echo", "cat", "grep", "printf", "read",
     "test", "[", "true", "false", "head", "tail", "wc",
-    "sort", "uniq", "cut", "tr", "tee",
+    "sort", "uniq", "cut", "tr",
 ];
 
 /// Interpreters / shells: their arguments are *executed*, not just data.
@@ -60,6 +67,26 @@ const INTERPRETERS: &[&str] = &[
 /// legitimate use inside a coding agent, and any payload it wraps is
 /// unanalyzable by a pattern guard. Hard-blocked by decision (F1.1).
 const ALWAYS_BLOCKED_COMMANDS: &[&str] = &["eval"];
+
+/// Targets that are character devices and destroy no real file.
+///
+/// Redirecting to these is benign (`2>/dev/null` discards output,
+/// `>/dev/stdout` re-plumbs a stream) and must not be treated as a file write.
+/// Matched case-sensitively. Windows `nul` intentionally NOT exempted.
+const NON_DESTRUCTIVE_TARGETS: &[&str] = &[
+    "/dev/null",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/stdin",
+    "/dev/tty",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+];
+
+/// Chain operators that split a shell command chain into independent commands.
+const CHAIN_OPERATORS: &[&str] = &["&&", "||", ";", "|", "\n"];
 
 /// Get the command name (first word) from a command string.
 fn command_name(cmd: &str) -> &str {
@@ -145,26 +172,655 @@ fn has_command_substitution(cmd: &str) -> bool {
     cmd.contains("$(") || cmd.contains('`') || cmd.contains("<(") || cmd.contains(">(")
 }
 
+// ---------------------------------------------------------------------------
+// Shell-write detection (port of _shared/shell-write.ts)
+// ---------------------------------------------------------------------------
+
+/// True for a redirect target that can't destroy a real file.
+///
+/// Covers `/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/stdin`, `/dev/tty`,
+/// `/dev/zero`, etc. plus `/dev/fd/N`. Also treats fd duplication plumbing
+/// (`&1`, `&2`, `1`, `2`) as non-destructive. Case-sensitive.
+/// See little-coder `_shared/shell-write.ts` `isNonDestructiveTarget`.
+pub fn is_non_destructive_target(s: &str) -> bool {
+    // Trim surrounding whitespace
+    let t = s.trim();
+    if NON_DESTRUCTIVE_TARGETS.contains(&t) {
+        return true;
+    }
+    // /dev/fd/N — fd plumbing by another spelling
+    if let Some(rest) = t.strip_prefix("/dev/fd/") {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    // fd duplication targets like &1, &2, and bare fd numbers 1,2
+    // Also handles "2>", "&>", ">&" forms mentioned in spec — if the target
+    // string itself is one of those, treat as non-destructive.
+    if t == "1" || t == "2" || t.starts_with('&') {
+        return true;
+    }
+    if t == "2>" || t == "&>" || t == ">&" || t == "2>&1" || t == ">&2" || t == "&>>" {
+        return true;
+    }
+    false
+}
+
+/// Helper: is target an fd target (starts with &)? e.g. &1, &2
+fn is_fd_target(target: &str) -> bool {
+    target.starts_with('&')
+}
+
+/// Remove heredoc bodies, leaving the command line that opened them.
+///
+/// A heredoc body is data, not shell syntax, and analyzing it produces noise:
+/// a `>` in the payload (`if a > b:`) looks like a redirect, and an apostrophe
+/// (`don't`) leaves the quote scanner stuck. The redirect we care about —
+/// `cat > main.py << 'EOF'` — sits on the opening line, so dropping the body
+/// loses nothing.
+///
+/// Portable port of `stripHeredocBodies` from `_shared/shell-write.ts`.
+pub fn strip_heredoc_bodies(cmd: &str) -> String {
+    let mut out = cmd.to_string();
+    let mut search_from: usize = 0;
+
+    // One pass per heredoc; a command can open several (guard 32)
+    for _ in 0..32 {
+        if search_from >= out.len() {
+            break;
+        }
+        let rest = &out[search_from..];
+        // Find "<<"
+        let Some(rel_pos) = rest.find("<<") else {
+            break;
+        };
+        let at = search_from + rel_pos;
+
+        // Guard: "<<<" here-string — nothing to strip, keep scanning past it
+        if out.as_bytes().get(at + 2) == Some(&b'<') {
+            search_from = at + 3;
+            continue;
+        }
+
+        // Parse delimiter after "<<"
+        let mut idx = at + 2;
+        let bytes = out.as_bytes();
+        // Optional '-' for <<-
+        if bytes.get(idx) == Some(&b'-') {
+            idx += 1;
+        }
+        // Skip spaces/tabs
+        while idx < bytes.len() && (bytes[idx] == b' ' || bytes[idx] == b'\t') {
+            idx += 1;
+        }
+        if idx >= bytes.len() {
+            search_from = at + 2;
+            continue;
+        }
+
+        let delim: String;
+        let delim_end: usize;
+        if bytes[idx] == b'\'' || bytes[idx] == b'"' {
+            let quote = bytes[idx];
+            idx += 1;
+            let start = idx;
+            while idx < bytes.len() && bytes[idx] != quote {
+                idx += 1;
+            }
+            if idx >= bytes.len() {
+                // Unterminated quote — not a valid heredoc
+                search_from = at + 2;
+                continue;
+            }
+            delim = out[start..idx].to_string();
+            delim_end = idx + 1; // after closing quote
+        } else {
+            // Unquoted delimiter: [A-Za-z_][A-Za-z0-9_]*
+            let start = idx;
+            if start < bytes.len() && (bytes[start].is_ascii_alphabetic() || bytes[start] == b'_') {
+                idx += 1;
+                while idx < bytes.len() && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_') {
+                    idx += 1;
+                }
+                delim = out[start..idx].to_string();
+                delim_end = idx;
+            } else {
+                search_from = at + 2;
+                continue;
+            }
+        }
+
+        if delim.is_empty() {
+            search_from = delim_end;
+            continue;
+        }
+
+        // Body starts after newline following delimiter
+        let Some(nl_pos) = out[delim_end..].find('\n') else {
+            // No newline — single-line command, nothing to strip
+            search_from = delim_end;
+            continue;
+        };
+        let body_start = delim_end + nl_pos + 1; // after '\n'
+
+        // Scan lines after body_start for terminator
+        let remaining = &out[body_start..];
+        let lines: Vec<&str> = remaining.split('\n').collect();
+        let mut consumed: usize = 0;
+        let mut closed = false;
+        for line in &lines {
+            // consumed includes line length + 1 for '\n' except maybe last
+            // For simplicity, track as we iterate
+            if line.trim() == delim {
+                // "<<-" allows indented terminator with tabs — trim covers it
+                closed = true;
+                consumed += line.len() + 1; // include newline for this line
+                break;
+            }
+            consumed += line.len() + 1;
+        }
+
+        let body_end = if closed {
+            // body_start + consumed, but clamp
+            let end = body_start + consumed;
+            end.min(out.len())
+        } else {
+            // Unterminated heredoc: rest of string is body
+            out.len()
+        };
+
+        // Remove from `at` to `body_end`, but keep opening line prefix before `<<`
+        // Actually JS does: out = out.slice(0, at) + out.slice(bodyEnd)
+        // That removes the heredoc operator and body, leaving "cat > f "
+        // For detection we want to keep the "> file" part before "<<"
+        // So slicing from `at` is correct — it preserves prefix.
+        out = format!("{}{}", &out[..at], &out[body_end..]);
+        search_from = at;
+    }
+
+    out
+}
+
+/// Walk `cmd` tracking quote state and invoke `visit` for each char outside
+/// handling. Used to keep every consumer from firing on text that merely
+/// looks like shell syntax (`grep "a > b"` writes nothing).
+#[allow(dead_code)]
+fn scan_with_quotes<F>(cmd: &str, mut visit: F)
+where
+    F: FnMut(char, usize, bool),
+{
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut quote: Option<char> = None;
+    let mut i = 0usize;
+    // We need byte index for visit; track byte offset in parallel
+    let mut byte_idx = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        let ch_len = ch.len_utf8();
+        if quote.is_none() && ch == '\\' {
+            // Backslash escapes next char entirely (outside single quotes)
+            // Skip both
+            i += 1;
+            if i < chars.len() {
+                byte_idx += ch_len + chars[i].len_utf8();
+                i += 1;
+            } else {
+                byte_idx += ch_len;
+            }
+            continue;
+        }
+        if quote == Some('\'') && ch == '\\' {
+            // Backslash literal inside single quotes — no escaping
+            visit(ch, byte_idx, true);
+            byte_idx += ch_len;
+            i += 1;
+            continue;
+        }
+        if quote.is_none() && (ch == '"' || ch == '\'') {
+            quote = Some(ch);
+            byte_idx += ch_len;
+            i += 1;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+                byte_idx += ch_len;
+                i += 1;
+                continue;
+            }
+        }
+        let quoted = quote.is_some();
+        visit(ch, byte_idx, quoted);
+        byte_idx += ch_len;
+        i += 1;
+    }
+}
+
+/// Split a command line into individual commands on unquoted `&&`, `||`, `;`,
+/// `|`, `\n`. Heredoc bodies are stripped first so their contents are never
+/// mistaken for commands.
+///
+/// Port of `splitCommandChain` from `_shared/shell-write.ts`.
+pub fn split_command_chain(raw: &str) -> Vec<String> {
+    let cmd = strip_heredoc_bodies(raw);
+    let mut cuts: Vec<(usize, usize)> = Vec::new(); // (at byte idx, len)
+
+    // Need to scan with quote tracking to find operators
+    // We'll build a byte-indexed view for starts_with checks.
+    // Use scan_with_quotes but need to check operators at each position.
+    // Simpler: iterate byte indices with quote state.
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < len {
+        let b = bytes[i];
+        // Handle escapes
+        if quote.is_none() && b == b'\\' {
+            // Skip next byte
+            if i + 1 < len {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if quote == Some(b'\'') && b == b'\\' {
+            i += 1;
+            continue;
+        }
+        if quote.is_none() && (b == b'"' || b == b'\'') {
+            quote = Some(b);
+            i += 1;
+            continue;
+        }
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        // Not quoted — check for chain operators
+        let quoted = false;
+        if !quoted {
+            let mut matched: Option<usize> = None;
+            for op in CHAIN_OPERATORS {
+                let op_bytes = op.as_bytes();
+                if i + op_bytes.len() <= len && &bytes[i..i + op_bytes.len()] == op_bytes {
+                    // For "&&" and "||" ensure we don't double-count;
+                    // also check we aren't inside already-recorded operator
+                    if let Some(last) = cuts.last() {
+                        if i < last.0 + last.1 {
+                            matched = None;
+                            break;
+                        }
+                    }
+                    // Prefer longest match: check && and || before & and |
+                    // Since we iterate in order ["&&","||",";","|","\n"] this is fine,
+                    // but need to ensure "&&" matched before "&" — but we only have "&&", not single "&"
+                    // So longest is covered.
+                    matched = Some(op_bytes.len());
+                    break;
+                }
+            }
+            if let Some(op_len) = matched {
+                cuts.push((i, op_len));
+                i += op_len;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    let mut segments: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    for (at, op_len) in &cuts {
+        let seg = cmd[start..*at].trim().to_string();
+        if !seg.is_empty() {
+            segments.push(seg);
+        }
+        start = at + op_len;
+    }
+    let last_seg = cmd[start..].trim().to_string();
+    if !last_seg.is_empty() {
+        segments.push(last_seg);
+    }
+    segments
+}
+
+/// Tokenize helper — split on unquoted whitespace, keeping quoted runs together.
+/// Also treats unquoted `>` and `<` as word boundaries (so `cat>f` is two words).
+pub fn tokenize(s: &str) -> Vec<String> {
+    split_words(s)
+}
+
+/// Split on unquoted whitespace, keeping quoted runs together.
+/// Port of `splitWords` from `_shared/shell-write.ts`.
+pub fn split_words(s: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+
+    while i < len {
+        let b = bytes[i];
+        if quote.is_none() && b == b'\\' {
+            // Escape next char outside single quotes
+            cur.push(b as char);
+            if i + 1 < len {
+                cur.push(bytes[i + 1] as char);
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if quote.is_none() && (b == b'"' || b == b'\'') {
+            quote = Some(b);
+            cur.push(b as char);
+            i += 1;
+            continue;
+        }
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+                cur.push(b as char);
+                i += 1;
+                continue;
+            }
+        }
+        if quote.is_none() && (b == b' ' || b == b'\t' || b == b'\n' || b == b'\r') {
+            if !cur.is_empty() {
+                words.push(cur.clone());
+                cur.clear();
+            }
+            i += 1;
+            continue;
+        }
+        // Unquoted redirect ends current word (`cat>f` is two words)
+        if quote.is_none() && (b == b'>' || b == b'<' ) {
+            if !cur.is_empty() {
+                words.push(cur.clone());
+                cur.clear();
+            }
+            // Do not push redirect itself as word; just split
+            i += 1;
+            continue;
+        }
+        cur.push(b as char);
+        i += 1;
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+/// The first whitespace-delimited word of `s`, honoring quotes.
+fn first_word(s: &str) -> String {
+    split_words(s).into_iter().next().unwrap_or_default()
+}
+
+/// Unquote a word: strip matching outer quotes or unescape backslashes.
+fn unquote(word: &str) -> String {
+    let bytes = word.as_bytes();
+    if word.len() >= 2
+        && (bytes[0] == b'"' || bytes[0] == b'\'')
+        && bytes[word.len() - 1] == bytes[0]
+    {
+        return word[1..word.len() - 1].to_string();
+    }
+    // Replace \X with X
+    let mut out = String::with_capacity(word.len());
+    let mut chars = word.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Extract redirect targets (`>`/`>>`) from a single segment, outside quotes.
+/// Returns paths after `>`/`>>`, filtered for non-destructive and deduped internally.
+pub fn extract_redirect_targets(segment: &str) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    let bytes = segment.as_bytes();
+    let len = bytes.len();
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+
+    // Track positions of '>' outside quotes
+    let mut redirects: Vec<(usize, bool)> = Vec::new(); // (at after >, is_append)
+
+    while i < len {
+        let b = bytes[i];
+        if quote.is_none() && b == b'\\' {
+            if i + 1 < len { i += 2; } else { i += 1; }
+            continue;
+        }
+        if quote == Some(b'\'') && b == b'\\' {
+            i += 1;
+            continue;
+        }
+        if quote.is_none() && (b == b'"' || b == b'\'') {
+            quote = Some(b);
+            i += 1;
+            continue;
+        }
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        // Not quoted
+        if b == b'>' {
+            // Don't record second '>' of ">>" twice
+            if i > 0 && bytes[i - 1] == b'>' {
+                i += 1;
+                continue;
+            }
+            let is_append = i + 1 < len && bytes[i + 1] == b'>';
+            let at = i + if is_append { 2 } else { 1 };
+            redirects.push((at, is_append));
+        }
+        i += 1;
+    }
+
+    for (at, _is_append) in redirects {
+        if at >= segment.len() {
+            continue;
+        }
+        let rest = &segment[at..];
+        // Process substitution `>(cmd)` is not a file target
+        if rest.trim_start().starts_with('(') {
+            continue;
+        }
+        let target = first_word(rest);
+        if target.is_empty() || is_fd_target(&target) {
+            continue;
+        }
+        let unquoted = unquote(&target);
+        if unquoted.is_empty() || is_non_destructive_target(&unquoted) {
+            continue;
+        }
+        targets.push(unquoted);
+    }
+
+    // Dedup within this segment (preserve first)
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for t in targets {
+        if seen.contains(&t) {
+            continue;
+        }
+        seen.insert(t.clone());
+        deduped.push(t);
+    }
+    deduped
+}
+
+/// Extract `tee` file targets from a segment.
+/// `tee [-a] FILE...` writes every non-flag argument.
+pub fn extract_tee_targets(segment: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for seg in split_command_chain(segment) {
+        let words = split_words(&seg);
+        if words.is_empty() {
+            continue;
+        }
+        // Check if first word is exactly "tee" (case-sensitive)
+        if words[0] != "tee" {
+            continue;
+        }
+        for w in words.iter().skip(1) {
+            if w.starts_with('-') {
+                continue;
+            }
+            let u = unquote(w);
+            if u.is_empty() || is_non_destructive_target(&u) {
+                continue;
+            }
+            out.push(u);
+        }
+    }
+    // Also handle segment without chain splitting (if caller already segmented)
+    // But split_command_chain already handles single segment, so this covers it.
+    // For direct segment that's a single command, the loop above already works.
+    // Dedup
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for t in out {
+        if seen.contains(&t) { continue; }
+        seen.insert(t.clone());
+        deduped.push(t);
+    }
+    deduped
+}
+
+/// Extract `dd of=PATH` targets.
+pub fn extract_dd_targets(segment: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for seg in split_command_chain(segment) {
+        let words = split_words(&seg);
+        if words.is_empty() || words[0] != "dd" {
+            continue;
+        }
+        for w in words.iter().skip(1) {
+            if let Some(path) = w.strip_prefix("of=") {
+                let u = unquote(path);
+                if u.is_empty() || is_non_destructive_target(&u) {
+                    continue;
+                }
+                out.push(u);
+            } else if *w == "of" {
+                // Handle `dd of = file` with spaces (unlikely but cover)
+                // Look ahead — but split_words already splits on whitespace,
+                // so "of" alone would be separate; next word might be "="?
+                // Skip for now.
+                continue;
+            }
+        }
+    }
+    // Dedup
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for t in out {
+        if seen.contains(&t) { continue; }
+        seen.insert(t.clone());
+        deduped.push(t);
+    }
+    deduped
+}
+
+/// Every path `cmd` writes to via shell redirection or write-by-design tools.
+///
+/// Covers `>`, `>>`, `tee`, and `dd of=`. Ignores fd duplication
+/// (`2>&1`, `>&2`), process substitution (`>(…)`), here-strings/heredocs
+/// (`<<`, `<<<`), and anything inside quotes.
+///
+/// Port of `detectWriteTargets` from `_shared/shell-write.ts`.
+pub fn detect_write_targets(cmd: &str) -> Vec<String> {
+    let stripped = strip_heredoc_bodies(cmd);
+    let mut writes: Vec<String> = Vec::new();
+
+    // Redirects: scan whole stripped command for > outside quotes
+    // We need to handle redirects that may appear in any segment, but scanning
+    // whole stripped command once is sufficient (like JS).
+    // However to mirror JS, we scan redirects on whole cmd, not per segment.
+    writes.extend(extract_redirect_targets(&stripped));
+
+    // For tee and dd, use chain splitting
+    for segment in split_command_chain(&stripped) {
+        // For tee/dd we already use split inside, but to avoid double splitting,
+        // handle per segment directly without re-splitting:
+        // Use direct word parsing for this segment only
+        let words = split_words(&segment);
+        if words.is_empty() {
+            continue;
+        }
+        if words[0] == "tee" {
+            for w in words.iter().skip(1) {
+                if w.starts_with('-') {
+                    continue;
+                }
+                let u = unquote(w);
+                if u.is_empty() || is_non_destructive_target(&u) {
+                    continue;
+                }
+                writes.push(u);
+            }
+        }
+        if words[0] == "dd" {
+            for w in words.iter().skip(1) {
+                if let Some(path) = w.strip_prefix("of=") {
+                    let u = unquote(path);
+                    if u.is_empty() || is_non_destructive_target(&u) {
+                        continue;
+                    }
+                    writes.push(u);
+                }
+            }
+        }
+    }
+
+    // De-duplicate by path, keeping first kind, and filter non-destructive
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for w in writes {
+        if w.is_empty() || seen.contains(&w) || is_non_destructive_target(&w) {
+            continue;
+        }
+        seen.insert(w.clone());
+        deduped.push(w);
+    }
+    deduped
+}
+
+/// True when the command writes to the filesystem through the shell.
+pub fn is_write_via_redirect(cmd: &str) -> bool {
+    !detect_write_targets(cmd).is_empty()
+}
+
 /// Safety guard that analyzes shell commands.
 pub struct Guard;
 
 impl Guard {
     /// Analyze a single shell command for safety.
     ///
-    /// Four layers, in order:
-    /// 0. Raw pre-scan for command substitution (`$()`, backticks, process
-    ///    substitution). If present, the arguments ARE executed even for
-    ///    "safe" commands, so we scan the **raw** command.
-    /// 1. Always-blocked commands (`eval`) — never allowed, no exceptions.
-    /// 2. Safe output commands (echo, cat, grep, ...) — their arguments are
-    ///    just data, never executed (guaranteed by layer 0: any substitution
-    ///    already diverted to the raw scan).
-    /// 3. Interpreters (sh, bash, python, awk, ...) — their arguments ARE
-    ///    executed. We scan the **raw** command (quotes included) so the
-    ///    dangerous payload inside `-c`/`BEGIN{system()}` cannot be hidden by
-    ///    quoting.
-    /// 4. Everything else — scan the quote-stripped command to avoid false
-    ///    positives from dangerous-looking literal strings passed as data.
+    /// Layers in order: 0 raw pre-scan, 1 always-blocked, 1b shell-redirect
+    /// write detection, 2 safe output, 3 interpreters, 4 general scan.
+    #[allow(clippy::doc_markdown)]
     pub fn check_command(cmd: &str) -> GuardVerdict {
         let name = command_name(cmd).to_lowercase();
 
@@ -178,6 +834,16 @@ impl Guard {
         if ALWAYS_BLOCKED_COMMANDS.contains(&name.as_str()) {
             return GuardVerdict::Block(format!(
                 "Blocked: '{name}' is always blocked (arbitrary code execution)"
+            ));
+        }
+
+        // Layer 1b: shell-redirect write detection (port of _shared/shell-write.ts)
+        // Must run BEFORE safe-output allow, because `cat`/`echo` with `>` is a write.
+        let targets = detect_write_targets(cmd);
+        if !targets.is_empty() {
+            return GuardVerdict::Block(format!(
+                "use Write for new file / Edit for existing — do not redirect (writes to {})",
+                targets.join(", ")
             ));
         }
 
@@ -200,6 +866,20 @@ impl Guard {
         let lowered = cmd.to_lowercase();
 
         for pattern in BLOCKED_PATTERNS {
+            // Refine `dd if=` to not block benign cases:
+            // - dd if=/dev/null (reading from null is safe)
+            // - dd ... of=/dev/null etc. (writing to null device is safe, not a file)
+            if *pattern == "dd if="
+                && (lowered.contains("dd if=/dev/null")
+                    || lowered.contains("of=/dev/null")
+                    || lowered.contains("of=/dev/stdout")
+                    || lowered.contains("of=/dev/stderr")
+                    || lowered.contains("of=/dev/stdin")
+                    || lowered.contains("of=/dev/tty")
+                    || lowered.contains("of=/dev/zero"))
+            {
+                continue;
+            }
             if lowered.contains(&pattern.to_lowercase()) {
                 return GuardVerdict::Block(format!(
                     "Blocked: command contains dangerous pattern '{pattern}'"
@@ -221,9 +901,8 @@ impl Guard {
     /// Analyze a shell chain (commands separated by &&, ||, |, ;).
     /// Each command is judged independently.
     pub fn check_chain(chain: &str) -> Vec<GuardVerdict> {
-        // Split on shell operators, but preserve them as context
         let mut results = Vec::new();
-        for cmd in Self::split_chain(chain) {
+        for cmd in split_command_chain(chain) {
             let cmd = cmd.trim();
             if !cmd.is_empty() {
                 results.push(Self::check_command(cmd));
@@ -232,8 +911,14 @@ impl Guard {
         results
     }
 
-    /// Split a shell chain into individual commands.
+    /// Split a shell chain into individual commands (legacy, quote-unaware).
+    /// Kept for compatibility; new code should use `split_command_chain`.
+    #[allow(dead_code)]
     fn split_chain(chain: &str) -> Vec<&str> {
+        // Delegate to new quote-aware splitter and leak memory for &str compat
+        // For tests we just use old logic to avoid lifetime issues, but we
+        // keep it for external callers that rely on &str.
+        // Instead, implement as before but ensure it filters correctly.
         let mut parts = Vec::new();
         let mut current_start = 0;
         let chars: Vec<char> = chain.chars().collect();
@@ -269,7 +954,6 @@ impl Guard {
             parts.push(&chain[current_start..]);
         }
 
-        // Filter out empty strings from leading operators
         parts.into_iter().filter(|s| !s.trim().is_empty()).collect()
     }
 }
@@ -566,5 +1250,195 @@ mod tests {
             GuardVerdict::Block(_) => {}
             other => panic!("Expected Block for env-wrapped danger, got {other:?}"),
         }
+    }
+
+    // === P0c: shell-redirect write detection (port of _shared/shell-write.ts) ===
+
+    #[test]
+    fn redirect_cat_to_file_blocked() {
+        match Guard::check_command("cat > file.txt") {
+            GuardVerdict::Block(msg) => assert!(msg.contains("do not redirect") || msg.contains("Write")),
+            other => panic!("Expected Block for cat > file, got {other:?}"),
+        }
+        assert!(is_write_via_redirect("cat > file.txt"));
+        assert_eq!(detect_write_targets("cat > file.txt"), vec!["file.txt"]);
+    }
+
+    #[test]
+    fn redirect_echo_append_blocked() {
+        match Guard::check_command("echo hi >> file.txt") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block for echo >>, got {other:?}"),
+        }
+        assert!(is_write_via_redirect("echo hi >> file.txt"));
+    }
+
+    #[test]
+    fn redirect_no_space_blocked() {
+        assert_eq!(detect_write_targets("cat>main.py"), vec!["main.py"]);
+        match Guard::check_command("cat>main.py") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block for cat>main.py, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tee_with_file_blocked() {
+        match Guard::check_command("echo x | tee out.log") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block for tee out.log, got {other:?}"),
+        }
+        assert_eq!(detect_write_targets("echo x | tee -a out.log"), vec!["out.log"]);
+    }
+
+    #[test]
+    fn tee_without_args_allowed() {
+        assert_eq!(Guard::check_command("echo hi | tee"), GuardVerdict::Allow);
+        assert!(!is_write_via_redirect("echo hi | tee"));
+        assert_eq!(detect_write_targets("echo hi | tee"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tee_to_dev_null_allowed() {
+        assert_eq!(Guard::check_command("echo x | tee /dev/null"), GuardVerdict::Allow);
+        assert!(!is_write_via_redirect("echo x | tee /dev/null"));
+    }
+
+    #[test]
+    fn redirect_to_dev_null_allowed() {
+        assert_eq!(Guard::check_command("cat > /dev/null"), GuardVerdict::Allow);
+        assert_eq!(Guard::check_command("cmd > /dev/null 2>&1"), GuardVerdict::Allow);
+        assert!(!is_write_via_redirect("cat > /dev/null"));
+        assert!(!is_write_via_redirect("cmd > /dev/null 2>&1"));
+    }
+
+    #[test]
+    fn redirect_stderr_to_dev_null_allowed() {
+        assert_eq!(Guard::check_command("grep -ri \"x\" ~/.config/ 2>/dev/null"), GuardVerdict::Allow);
+        assert_eq!(Guard::check_command("make 2>/dev/null"), GuardVerdict::Allow);
+        assert!(!is_write_via_redirect("make 2>/dev/null"));
+    }
+
+    #[test]
+    fn redirect_to_dev_stdout_allowed() {
+        assert_eq!(Guard::check_command("cmd > /dev/stdout"), GuardVerdict::Allow);
+        assert_eq!(Guard::check_command("cmd 2> /dev/stderr"), GuardVerdict::Allow);
+        assert!(!is_write_via_redirect("cmd > /dev/stdout"));
+    }
+
+    #[test]
+    fn fd_duplication_not_flagged() {
+        assert_eq!(detect_write_targets("make 2>&1"), Vec::<String>::new());
+        assert_eq!(detect_write_targets("echo err >&2"), Vec::<String>::new());
+        assert_eq!(Guard::check_command("make 2>&1"), GuardVerdict::Allow);
+    }
+
+    #[test]
+    fn tar_czf_still_allowed() {
+        assert_eq!(Guard::check_command("tar -czf backup.tar.gz dir/"), GuardVerdict::Allow);
+        assert!(!is_write_via_redirect("tar -czf backup.tar.gz dir/"));
+    }
+
+    #[test]
+    fn heredoc_strip_preserves_redirect() {
+        let cmd = "cat > backend/main.py << 'ENDOFFILE'\nfrom fastapi import FastAPI\napp = FastAPI()\nENDOFFILE";
+        assert_eq!(detect_write_targets(cmd), vec!["backend/main.py"]);
+        match Guard::check_command(cmd) {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block for heredoc > file, got {other:?}"),
+        }
+        // Heredoc body with `>` should not be mistaken for redirect
+        let cmd2 = "cat > cmp.py << 'EOF'\nif a > b:\n    pass  # don't compare like this\nEOF";
+        assert_eq!(detect_write_targets(cmd2), vec!["cmp.py"]);
+    }
+
+    #[test]
+    fn heredoc_body_not_split_as_commands() {
+        assert_eq!(split_command_chain("cat > f.sh << 'EOF'\nrm -rf /\nEOF"), vec!["cat > f.sh"]);
+    }
+
+    #[test]
+    fn dedup_write_targets() {
+        let writes = detect_write_targets("echo a > one.txt && echo b >> one.txt");
+        assert_eq!(writes, vec!["one.txt"]);
+        let writes2 = detect_write_targets("echo a > one.txt && echo b >> two.txt");
+        assert_eq!(writes2, vec!["one.txt", "two.txt"]);
+    }
+
+    #[test]
+    fn dd_of_file_blocked() {
+        assert_eq!(detect_write_targets("dd if=/dev/zero of=disk.img bs=1M"), vec!["disk.img"]);
+        match Guard::check_command("dd if=/dev/zero of=disk.img bs=1M") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block for dd of=, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dd_of_dev_null_allowed() {
+        assert_eq!(detect_write_targets("dd if=big.img of=/dev/null"), Vec::<String>::new());
+        assert_eq!(Guard::check_command("dd if=big.img of=/dev/null"), GuardVerdict::Allow);
+    }
+
+    #[test]
+    fn dd_if_dev_null_not_blocked() {
+        // Refined dd if= : benign input should not be blocked
+        assert_eq!(Guard::check_command("dd if=/dev/null of=/dev/null"), GuardVerdict::Allow);
+        assert_eq!(Guard::check_command("dd if=/dev/null bs=1 count=1"), GuardVerdict::Allow);
+    }
+
+    #[test]
+    fn redirect_inside_quotes_not_flagged() {
+        assert_eq!(detect_write_targets("grep \"a > b\" file.txt"), Vec::<String>::new());
+        assert_eq!(detect_write_targets("echo 'x >> y'"), Vec::<String>::new());
+        assert_eq!(Guard::check_command("grep \"a > b\" file.txt"), GuardVerdict::Allow);
+    }
+
+    #[test]
+    fn input_redirect_not_flagged() {
+        assert_eq!(detect_write_targets("wc -l < input.txt"), Vec::<String>::new());
+        assert_eq!(detect_write_targets("grep foo <<< \"$var\""), Vec::<String>::new());
+        assert_eq!(Guard::check_command("wc -l < input.txt"), GuardVerdict::Allow);
+    }
+
+    #[test]
+    fn chain_each_segment_judged() {
+        // ls && rm -rf / should be refused on rm, not admitted on ls
+        let results = Guard::check_chain("ls && cat > evil.txt");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], GuardVerdict::Allow);
+        assert!(matches!(results[1], GuardVerdict::Block(_)));
+    }
+
+    #[test]
+    fn extract_redirect_targets_works() {
+        assert_eq!(extract_redirect_targets("cat > file.txt"), vec!["file.txt"]);
+        assert_eq!(extract_redirect_targets("echo hi >> file.txt"), vec!["file.txt"]);
+        assert_eq!(extract_redirect_targets("cmd > /dev/null"), Vec::<String>::new());
+        assert_eq!(extract_redirect_targets("cmd 2>&1"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn is_non_destructive_target_works() {
+        assert!(is_non_destructive_target("/dev/null"));
+        assert!(is_non_destructive_target("/dev/stdout"));
+        assert!(is_non_destructive_target("/dev/stderr"));
+        assert!(is_non_destructive_target("/dev/fd/2"));
+        assert!(!is_non_destructive_target("file.txt"));
+        assert!(!is_non_destructive_target("/dev/null.bak"));
+        assert!(is_non_destructive_target("&1"));
+    }
+
+    #[test]
+    fn split_command_chain_quote_aware() {
+        assert_eq!(split_command_chain("echo 'a && b' ; ls"), vec!["echo 'a && b'", "ls"]);
+        assert_eq!(split_command_chain("ls && rm -rf / ; echo done | wc -l"), vec!["ls", "rm -rf /", "echo done", "wc -l"]);
+    }
+
+    #[test]
+    fn strip_heredoc_bodies_works() {
+        assert_eq!(strip_heredoc_bodies("cat > f << 'EOF'\nbody\nEOF"), "cat > f ");
+        assert_eq!(strip_heredoc_bodies("cat > f << EOF\nbody without terminator"), "cat > f ");
+        assert_eq!(strip_heredoc_bodies("grep foo <<< \"bar\""), "grep foo <<< \"bar\"");
     }
 }

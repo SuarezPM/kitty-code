@@ -6,6 +6,6 @@ pub mod client;
 pub mod error;
 pub mod tools;
 
-pub use client::{ChatRequest, ChatResponse, Message, OllamaClient, ToolCall};
+pub use client::{ChatClient, ChatRequest, ChatResponse, Message, MockClient, OllamaClient, ToolCall};
 pub use error::{Result, RuntimeError};
 pub use tools::ToolDefinition;

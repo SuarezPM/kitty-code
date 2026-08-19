@@ -1,8 +1,37 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::error::{Result, RuntimeError};
 use crate::tools::ToolDefinition;
+
+// ---------------------------------------------------------------------------
+// ChatClient trait — abstraction for Agent (Lane A)
+// ---------------------------------------------------------------------------
+
+/// Abstraction over an LLM chat backend (Ollama, llama.cpp, mock).
+///
+/// `Agent` should depend on this trait, not on `OllamaClient` concretely,
+/// so that tests can inject a [`MockClient`] and future backends can be
+/// added without touching the harness.
+pub trait ChatClient: Send + Sync {
+    fn chat<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>>;
+
+    fn count_tokens<'a>(
+        &'a self,
+        model: &'a str,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>>;
+
+    fn health_check<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
 
 // ---------------------------------------------------------------------------
 // Wire types — Ollama chat API
@@ -103,7 +132,7 @@ pub struct RequestOptions {
 }
 
 /// Chat response from Ollama.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ChatResponse {
     pub model: String,
     pub message: Message,
@@ -269,8 +298,157 @@ impl OllamaClient {
     }
 }
 
+impl ChatClient for OllamaClient {
+    fn chat<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            OllamaClient::chat(self, model, messages, tools, None).await
+        })
+    }
+
+    fn count_tokens<'a>(
+        &'a self,
+        model: &'a str,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>> {
+        Box::pin(async move { OllamaClient::count_tokens(self, model, text).await })
+    }
+
+    fn health_check<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let ok = OllamaClient::health_check(self).await?;
+            if ok {
+                Ok(())
+            } else {
+                Err(RuntimeError::ConnectionRefused(
+                    "ollama server not reachable or returned non-2xx".into(),
+                ))
+            }
+        })
+    }
+}
+
+impl<T: ChatClient + ?Sized> ChatClient for Box<T> {
+    fn chat<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
+        (**self).chat(model, messages, tools)
+    }
+
+    fn count_tokens<'a>(
+        &'a self,
+        model: &'a str,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>> {
+        (**self).count_tokens(model, text)
+    }
+
+    fn health_check<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        (**self).health_check()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MockClient — test double for ChatClient (Lane A)
+// ---------------------------------------------------------------------------
+
+pub struct MockClient {
+    responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ChatResponse>>>,
+    health_ok: bool,
+}
+
+impl MockClient {
+    /// Create a mock with scripted responses in order.
+    pub fn new(responses: Vec<ChatResponse>) -> Self {
+        Self {
+            responses: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::from(responses),
+            )),
+            health_ok: true,
+        }
+    }
+
+    /// Create a mock with a single response.
+    pub fn with_response(resp: ChatResponse) -> Self {
+        Self::new(vec![resp])
+    }
+
+    /// Push a response to the back of the queue (thread-safe via Arc).
+    pub fn push_response(&self, resp: ChatResponse) {
+        self.responses.lock().unwrap().push_back(resp);
+    }
+
+    /// Returns true if no more scripted responses remain.
+    pub fn is_empty(&self) -> bool {
+        self.responses.lock().unwrap().is_empty()
+    }
+
+    /// Override health check result.
+    pub fn with_health(mut self, ok: bool) -> Self {
+        self.health_ok = ok;
+        self
+    }
+}
+
+impl Clone for MockClient {
+    fn clone(&self) -> Self {
+        Self {
+            responses: std::sync::Arc::clone(&self.responses),
+            health_ok: self.health_ok,
+        }
+    }
+}
+
+impl ChatClient for MockClient {
+    fn chat<'a>(
+        &'a self,
+        _model: &'a str,
+        _messages: Vec<Message>,
+        _tools: Option<Vec<ToolDefinition>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut guard = self.responses.lock().unwrap();
+            guard.pop_front().ok_or_else(|| RuntimeError::Api {
+                status: 500,
+                message: "MockClient: no more scripted responses".into(),
+            })
+        })
+    }
+
+    fn count_tokens<'a>(
+        &'a self,
+        _model: &'a str,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>> {
+        // Heuristic fallback similar to context.rs estimation.
+        let len = text.len();
+        Box::pin(async move { Ok(len.div_ceil(4)) })
+    }
+
+    fn health_check<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.health_ok {
+                Ok(())
+            } else {
+                Err(RuntimeError::ConnectionRefused(
+                    "mock health check failed".into(),
+                ))
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::error::RuntimeError;
+
     use super::*;
 
     #[test]
@@ -300,5 +478,78 @@ mod tests {
         let json = r#"{"tokens":[1,2,3,4]}"#;
         let parsed: TokenizeResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.tokens.len(), 4);
+    }
+
+    fn dummy_response(content: &str) -> ChatResponse {
+        ChatResponse {
+            model: "test-model".into(),
+            message: Message::assistant(content),
+            done: true,
+            eval_count: None,
+            eval_duration: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_client_returns_scripted_responses_in_order() {
+        let r1 = dummy_response("first");
+        let r2 = dummy_response("second");
+        let mock = MockClient::new(vec![r1.clone(), r2.clone()]);
+        let client: Box<dyn ChatClient> = Box::new(mock);
+
+        let resp1 = client
+            .chat("test-model", vec![Message::user("hi")], None)
+            .await
+            .unwrap();
+        assert_eq!(resp1.message.content.as_deref(), Some("first"));
+
+        let resp2 = client
+            .chat("test-model", vec![Message::user("hi again")], None)
+            .await
+            .unwrap();
+        assert_eq!(resp2.message.content.as_deref(), Some("second"));
+
+        // Exhausted queue should error
+        let err = client
+            .chat("test-model", vec![Message::user("hi")], None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Api { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn mock_client_count_tokens_and_health_check() {
+        let mock = MockClient::new(vec![dummy_response("ok")]);
+        let count = mock.count_tokens("test-model", "hello world").await.unwrap();
+        // "hello world" len 11 -> ceil(11/4)=3
+        assert_eq!(count, 3);
+        assert!(mock.health_check().await.is_ok());
+
+        let failing = MockClient::new(vec![]).with_health(false);
+        assert!(failing.health_check().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mock_client_is_object_safe_and_clone_shares_queue() {
+        let mock = MockClient::new(vec![dummy_response("shared")]);
+        let cloned = mock.clone();
+        let boxed: Box<dyn ChatClient> = Box::new(mock);
+        // cloned shares Arc, so consuming via boxed should affect clone
+        let resp = boxed.chat("m", vec![], None).await.unwrap();
+        assert_eq!(resp.message.content.as_deref(), Some("shared"));
+        assert!(cloned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ollama_client_implements_chat_client_trait() {
+        // Compile-time check that OllamaClient satisfies ChatClient.
+        fn assert_impl<T: ChatClient>() {}
+        assert_impl::<OllamaClient>();
+        // Also check MockClient
+        assert_impl::<MockClient>();
+
+        let client = OllamaClient::new("http://localhost:11434");
+        // Ensure we can coerce to Box<dyn ChatClient>
+        let _: Box<dyn ChatClient> = Box::new(client);
     }
 }
