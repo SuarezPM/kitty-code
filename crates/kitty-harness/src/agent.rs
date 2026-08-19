@@ -356,12 +356,20 @@ impl Agent {
         // No tool calls — extract text response
         let text = response.message.content.unwrap_or_default();
 
-        // Check for empty response
-        let violations = self.quality_monitor.check_response(Some(&text), &[]);
-        if violations.contains(&QualityViolation::EmptyResponse) {
-            warn!("Empty response detected, forcing retry");
-            self.force_response("Your response was empty. Please provide text content.")
-                .await?;
+        // Push the assistant's response (even if empty) so the model sees it
+        // in the conversation history and corrects on the next iteration.
+        self.push_message(Message {
+            role: "assistant".to_string(),
+            content: Some(text.clone()),
+            thinking: None,
+            tool_calls: None,
+        })
+        .await;
+
+        // Check for empty response — just continue the loop so the model
+        // sees its own empty response and retries.
+        if text.trim().is_empty() {
+            warn!("Empty response detected, continuing loop for retry");
             return Ok(());
         }
 
@@ -369,14 +377,6 @@ impl Agent {
         let parsed = self.parser.parse(&text);
         if !parsed.is_empty() {
             // There are tool calls in the text, process them
-            self.push_message(Message {
-                role: "assistant".to_string(),
-                content: Some(text.clone()),
-                thinking: None,
-                tool_calls: None,
-            })
-            .await;
-
             for tc in &parsed {
                 // F2.2: Handle tool errors gracefully
                 let result = match self.registry.execute(tc).await {
@@ -402,14 +402,7 @@ impl Agent {
         }
 
         // Pure text response — we're done
-        self.push_message(Message {
-            role: "assistant".to_string(),
-            content: Some(text.clone()),
-            thinking: None,
-            tool_calls: None,
-        })
-        .await;
-
+        // (Assistant message already pushed above before the empty check)
         // Save successful episode to memory
         self.save_episode(user_prompt, &text, true);
 
