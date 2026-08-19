@@ -1,6 +1,6 @@
 # AUDIT.md — Kitty Code Benchmark Results
 
-**Date:** 2026-08-18
+**Date:** 2026-08-19 (updated)
 **Model:** ornith:9b (Q4_K_M, 5.6 GB)
 **Hardware:** RTX 2060 Super 8GB, Ryzen 5 3600, 48GB RAM
 **Harness:** Kitty Code v0.1.0
@@ -16,6 +16,31 @@ This document reports results from **homemade benchmarks**, NOT official industr
 - **NOT Terminal-Bench 2.0.** "KittyShell-89" is an 89-task terminal quiz written by the Kitty Code team. No Docker containers, no Harbor framework, no official TB2 test harness. Results are **NOT comparable** to the official Terminal-Bench 2.0 benchmark.
 - **No official benchmarks have been run yet.** The official Aider Polyglot and TB2 targets are listed as future work.
 - The numbers below are real and reproducible, but they measure **Kitty Code's homemade quizzes**, not the official benchmarks they were named after.
+
+---
+
+## Harness Hardening (F0-F5, 2026-08-19)
+
+The Rust harness has been hardened with the following fixes since the baseline:
+
+| Phase | Fix | Impact |
+|-------|-----|--------|
+| F1 | Bash guard: command substitution pre-scan, eval hard-block | Security: echo $(rm -rf /) now blocked |
+| F1 | Bash timeout via tokio (kill_on_drop, configurable) | No more hanging on sleep 10000 |
+| F2.1 | Hashline prefix matching (8-char → full hash) | Edit tool works end-to-end |
+| F2.2 | Tool errors → failed results, never abort session | Agent survives tool failures |
+| F2.3 | push_message async, sole token accounting point | No more double-counting budget |
+| F2.4 | Quality monitor window persists across turns | Cross-turn tool loops detected |
+| F2.5 | Tool results before corrective user messages | Ollama message order respected |
+| F2.6 | retry_without_thinking continues loop | Thinking budget exceeded handled gracefully |
+| F3.1 | Read truncation cap (300 lines) | Large files don't blow up context |
+| F3.2 | Grep uses ignore crate | Respects .gitignore, skips target/ |
+| F4.3 | Dead code removed | AgentEvent, CompactionResult, ParseError, QualityError |
+| F4.4 | CLI flags: --knowledge, --context-window, --max-iterations, --bash-timeout | All knobs exposed |
+| F5 | JSON exercise loading (--exercises flag) | Harness runs exercises from JSON |
+| Bugfix | Empty response: push assistant msg, no orphaned LLM calls | Latency 87s→28s per exercise |
+
+**Tests:** 126 passing (was 104 at baseline). **Clippy:** clean.
 
 ---
 

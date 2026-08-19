@@ -31,8 +31,8 @@ context budget, knowledge injection, episodic memory) around a small local LLM.
    - context pressure → `trigger_compaction` (LLM summary of old turns).
 3. Final text returned; episode saved (best-effort).
 
-## Honesty Notes (verified 2026-08-18)
-- **104 tests pass** and `cargo clippy --all-targets` is clean.
+## Honesty Notes (verified 2026-08-19)
+- **126 tests pass** and `cargo clippy --all-targets` is clean.
 - Benchmarks are genuinely homemade (string-match) — documented honestly.
 - Memory recall is now **lexical Jaccard** (was substring `LIKE`); dense embeddings
   are a planned upgrade. `save_episode` records real completion status.
@@ -42,3 +42,9 @@ context budget, knowledge injection, episodic memory) around a small local LLM.
 - Token counting is now REAL via Ollama `/api/tokenize` (model's own tokenizer),
   with heuristic fallback only on server error. `README.md` created.
 - Architecture of 4 crates is the correct sweet spot — not refactored for its own sake.
+- **F0-F5 hardened**: guard (command substitution, eval block, timeout), hashline
+  prefix matching, tool error handling, budget single-point accounting, cross-turn
+  tool-loop detection, message ordering, thinking retry, Read truncation (300 lines),
+  Grep via ignore crate, dead code removal, CLI flags, JSON exercise loading.
+- **Empty response fix**: assistant msg pushed to history, no orphaned LLM round-trips.
+  Exercise latency dropped from ~87s to ~28s average.
