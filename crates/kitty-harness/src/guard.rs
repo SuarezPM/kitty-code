@@ -50,7 +50,16 @@ const INTERPRETERS: &[&str] = &[
     "sh", "bash", "dash", "ash", "zsh", "ksh", "csh", "tcsh", "fish",
     "python", "python3", "python2", "perl", "ruby", "node", "lua",
     "php", "pwsh", "powershell", "cmd", "awk",
+    // These guys also execute their arguments, so they get the raw scan too:
+    "source", ".", "env", "xargs", "timeout", "nohup",
 ];
+
+/// Commands that are *always* blocked, no matter the arguments.
+///
+/// `eval` re-parses and executes its argument as shell code — there is no
+/// legitimate use inside a coding agent, and any payload it wraps is
+/// unanalyzable by a pattern guard. Hard-blocked by decision (F1.1).
+const ALWAYS_BLOCKED_COMMANDS: &[&str] = &["eval"];
 
 /// Get the command name (first word) from a command string.
 fn command_name(cmd: &str) -> &str {
@@ -124,32 +133,65 @@ pub enum GuardVerdict {
     Warn(String),
 }
 
+/// Detect command substitution in the raw command string.
+///
+/// `$(` / backticks / process substitution `<(`/`>(` all make the shell
+/// **execute** whatever they wrap, even when the outer command is a "safe
+/// output" command like `echo` or `cat` (`echo $(rm -rf /)` really runs
+/// `rm -rf /`). Variable expansion (`$VAR`, `$5`, `${x}`) is NOT execution and
+/// must not trigger this path — only `$(` (which includes `${x:=$(cmd)}` and
+/// `$((...))` arithmetic forms that can contain commands) and backticks do.
+fn has_command_substitution(cmd: &str) -> bool {
+    cmd.contains("$(") || cmd.contains('`') || cmd.contains("<(") || cmd.contains(">(")
+}
+
 /// Safety guard that analyzes shell commands.
 pub struct Guard;
 
 impl Guard {
     /// Analyze a single shell command for safety.
     ///
-    /// Three layers, in order:
-    /// 1. Safe output commands (echo, cat, grep, ...) — their arguments are just
-    ///    data, never executed, so they are always allowed.
-    /// 2. Interpreters (sh, bash, python, awk, sed, ...) — their arguments ARE
-    ///    executed. We scan the **raw** command (quotes included) so the dangerous
-    ///    payload inside `-c`/`BEGIN{system()}` cannot be hidden by quoting.
-    /// 3. Everything else — scan the quote-stripped command to avoid false
+    /// Four layers, in order:
+    /// 0. Raw pre-scan for command substitution (`$()`, backticks, process
+    ///    substitution). If present, the arguments ARE executed even for
+    ///    "safe" commands, so we scan the **raw** command.
+    /// 1. Always-blocked commands (`eval`) — never allowed, no exceptions.
+    /// 2. Safe output commands (echo, cat, grep, ...) — their arguments are
+    ///    just data, never executed (guaranteed by layer 0: any substitution
+    ///    already diverted to the raw scan).
+    /// 3. Interpreters (sh, bash, python, awk, ...) — their arguments ARE
+    ///    executed. We scan the **raw** command (quotes included) so the
+    ///    dangerous payload inside `-c`/`BEGIN{system()}` cannot be hidden by
+    ///    quoting.
+    /// 4. Everything else — scan the quote-stripped command to avoid false
     ///    positives from dangerous-looking literal strings passed as data.
     pub fn check_command(cmd: &str) -> GuardVerdict {
         let name = command_name(cmd).to_lowercase();
 
+        // Layer 0: command substitution anywhere in the raw command means
+        // arguments get executed, no matter who the command is.
+        if has_command_substitution(cmd) {
+            return Self::scan(cmd);
+        }
+
+        // Layer 1: hard-blocked commands (eval).
+        if ALWAYS_BLOCKED_COMMANDS.contains(&name.as_str()) {
+            return GuardVerdict::Block(format!(
+                "Blocked: '{name}' is always blocked (arbitrary code execution)"
+            ));
+        }
+
+        // Layer 2: safe output commands.
         if SAFE_OUTPUT_COMMANDS.contains(&name.as_str()) {
             return GuardVerdict::Allow;
         }
 
+        // Layer 3: interpreters.
         if INTERPRETERS.contains(&name.as_str()) {
             return Self::scan(cmd);
         }
 
-        // General command: strip quotes (literal data args) then scan.
+        // Layer 4: general command — strip quotes (literal data args) then scan.
         Self::scan(&strip_quotes(cmd))
     }
 
@@ -404,5 +446,125 @@ mod tests {
         assert_eq!(command_name("rm -rf /"), "rm");
         assert_eq!(command_name("echo hello"), "echo");
         assert_eq!(command_name(""), "");
+    }
+
+    // === F1.1 regression: command substitution bypasses ===
+
+    #[test]
+    fn command_substitution_in_echo_blocked() {
+        // echo is a "safe output" command, but $(...) executes its payload.
+        match Guard::check_command("echo $(rm -rf /)") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_substitution_in_printf_blocked() {
+        match Guard::check_command("printf \"$(rm -rf /)\"") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_substitution_backticks_blocked() {
+        // Backticks are command substitution too.
+        match Guard::check_command("echo `rm -rf /`") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_substitution_blocked() {
+        match Guard::check_command("cat <(rm -rf /)") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_always_blocked() {
+        match Guard::check_command("eval \"rm -rf /\"") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block, got {other:?}"),
+        }
+        // Even benign-looking eval is blocked: it can execute anything.
+        match Guard::check_command("eval 'x=1'") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn substitution_inside_sh_c_blocked() {
+        // The shell executes $(...) inside its -c argument.
+        match Guard::check_command("sh -c 'echo $(rm -rf /)'") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn variable_expansion_not_blocked() {
+        // $VAR / $5 / ${x} are expansion, not execution.
+        assert_eq!(
+            Guard::check_command("echo \"cost: $5\""),
+            GuardVerdict::Allow
+        );
+        assert_eq!(
+            Guard::check_command("echo $HOME/path"),
+            GuardVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn literal_dangerous_text_not_blocked() {
+        // Plain literal text with no substitution is data, not execution.
+        assert_eq!(
+            Guard::check_command("echo 'rm -rf / is dangerous'"),
+            GuardVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn backup_tarball_allowed() {
+        // F1.1.3 regression (sh-backup false positive): tarball creation must
+        // not be blocked by the "rm -rf" / backup-content heuristics.
+        assert_eq!(
+            Guard::check_command("tar -czf backup.tar.gz dir/"),
+            GuardVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn find_exec_rm_documented_decision() {
+        // Decide explicitly: `find ... -exec rm {} \;` on a *named pattern*
+        // (e.g. '*.tmp') is a legitimate cleanup operation, not a recursive
+        // wipe. Documented Allow (matching the plan's "Allow o Warn
+        // documentado"). A recursive wipe of a root path would still hit the
+        // Risky `rm -r` pattern if present; here the target is a temp glob.
+        assert_eq!(
+            Guard::check_command("find . -name '*.tmp' -exec rm {} \\;"),
+            GuardVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn source_and_env_raw_scan() {
+        // source / . / env / xargs execute their arguments: raw scan applies.
+        match Guard::check_command("source backup.sh") {
+            GuardVerdict::Allow => {}
+            other => panic!("Expected Allow for benign source, got {other:?}"),
+        }
+        match Guard::check_command(". myscript.sh") {
+            GuardVerdict::Allow => {}
+            other => panic!("Expected Allow for benign dot-source, got {other:?}"),
+        }
+        match Guard::check_command("env VAR=1 sh -c 'rm -rf /'") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block for env-wrapped danger, got {other:?}"),
+        }
     }
 }

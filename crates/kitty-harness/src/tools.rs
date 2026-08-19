@@ -7,6 +7,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 use thiserror::Error;
 
 use crate::guard::{Guard, GuardVerdict};
@@ -60,24 +62,32 @@ pub struct ToolRegistry {
     written_files: HashSet<PathBuf>,
     /// The hashline editor for file operations.
     pub hashline: HashlineEditor,
+    /// Bash command timeout in seconds (F1.3). Default: 60.
+    bash_timeout_secs: u64,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
+        Self::with_timeout(60)
+    }
+
+    /// Create a registry with a custom bash timeout (seconds).
+    pub fn with_timeout(bash_timeout_secs: u64) -> Self {
         Self {
             read_files: HashSet::new(),
             written_files: HashSet::new(),
             hashline: HashlineEditor::new(),
+            bash_timeout_secs,
         }
     }
 
     /// Execute a parsed tool call.
-    pub fn execute(&mut self, tc: &ParsedToolCall) -> Result<ToolResult, ToolError> {
+    pub async fn execute(&mut self, tc: &ParsedToolCall) -> Result<ToolResult, ToolError> {
         match tc.name.as_str() {
             "Read" => self.execute_read(&tc.arguments),
             "Edit" => self.execute_edit(&tc.arguments),
             "Write" => self.execute_write(&tc.arguments),
-            "Bash" => self.execute_bash(&tc.arguments),
+            "Bash" => self.execute_bash(&tc.arguments).await,
             "Glob" => self.execute_glob(&tc.arguments),
             "Grep" => self.execute_grep(&tc.arguments),
             other => Err(ToolError::NotFound(other.to_string())),
@@ -263,7 +273,12 @@ impl ToolRegistry {
     }
 
     /// Execute a Bash tool call.
-    fn execute_bash(&self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    ///
+    /// The command runs under `sh -c` with a hard timeout (F1.3): a command
+    /// that outlives `bash_timeout_secs` is killed and reported as a failed
+    /// tool result (`success: false`), never as a fatal error propagating out
+    /// of the agent loop.
+    async fn execute_bash(&self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
@@ -289,11 +304,36 @@ impl ToolRegistry {
             }
         }
 
-        // Execute the command
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .output()?;
+        // Execute the command with a timeout. `kill_on_drop(true)` guarantees
+        // the child is killed if the future is cancelled by the timeout.
+        let timeout = Duration::from_secs(self.bash_timeout_secs);
+        let run = async {
+            let child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .kill_on_drop(true)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            child.wait_with_output().await
+        };
+
+        let output = match tokio::time::timeout(timeout, run).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_elapsed) => {
+                // Timed out: the child was killed by kill_on_drop when the
+                // future was dropped. Report as a failed tool result.
+                return Ok(ToolResult {
+                    success: false,
+                    output: format!(
+                        "command timed out after {}s (killed)",
+                        self.bash_timeout_secs
+                    ),
+                    retry: false,
+                });
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -610,21 +650,42 @@ mod tests {
         assert!(matches!(err, ToolError::EditBlocked(_)));
     }
 
-    #[test]
-    fn bash_blocks_dangerous_commands() {
+    #[tokio::test]
+    async fn bash_blocks_dangerous_commands() {
         let registry = ToolRegistry::new();
         let args = serde_json::json!({"command": "rm -rf /"});
-        let err = registry.execute_bash(&args).unwrap_err();
+        let err = registry.execute_bash(&args).await.unwrap_err();
         assert!(matches!(err, ToolError::BashBlocked(_)));
     }
 
-    #[test]
-    fn bash_allows_safe_commands() {
+    #[tokio::test]
+    async fn bash_allows_safe_commands() {
         let registry = ToolRegistry::new();
         let args = serde_json::json!({"command": "echo hello"});
-        let result = registry.execute_bash(&args).unwrap();
+        let result = registry.execute_bash(&args).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn bash_command_substitution_blocked() {
+        // F1.1 regression: `echo $(...)` must be blocked, not silently allowed.
+        let registry = ToolRegistry::new();
+        let args = serde_json::json!({"command": "echo $(rm -rf /)"});
+        let err = registry.execute_bash(&args).await.unwrap_err();
+        assert!(matches!(err, ToolError::BashBlocked(_)));
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_returns_failed_result() {
+        // F1.3 regression: a command that hangs must be killed and reported as
+        // a failed tool result — never hang forever, never abort the session.
+        let registry = ToolRegistry::with_timeout(1); // 1 second
+        let args = serde_json::json!({"command": "sleep 10"});
+        let result = registry.execute_bash(&args).await.unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("timed out"), "got: {}", result.output);
+        assert!(!result.retry);
     }
 
     #[test]
@@ -642,14 +703,14 @@ mod tests {
         assert!(!result.output.contains("b.txt"));
     }
 
-    #[test]
-    fn tool_not_found() {
+    #[tokio::test]
+    async fn tool_not_found() {
         let mut registry = ToolRegistry::new();
         let tc = ParsedToolCall {
             name: "Nonexistent".to_string(),
             arguments: serde_json::json!({}),
         };
-        let err = registry.execute(&tc).unwrap_err();
+        let err = registry.execute(&tc).await.unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
     }
 }

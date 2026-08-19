@@ -40,6 +40,8 @@ pub struct AgentConfig {
     pub workspace: std::path::PathBuf,
     /// Path to episodic memory database. None = memory disabled.
     pub memory_db_path: Option<String>,
+    /// Bash command timeout in seconds (F1.3). Default: 60.
+    pub bash_timeout_secs: u64,
 }
 
 impl Default for AgentConfig {
@@ -55,6 +57,7 @@ impl Default for AgentConfig {
             quality_config: QualityConfig::default(),
             workspace: std::path::PathBuf::from("."),
             memory_db_path: None,
+            bash_timeout_secs: 60,
         }
     }
 }
@@ -111,8 +114,27 @@ pub struct Agent {
 impl Agent {
     /// Create a new agent with the given config.
     pub fn new(client: OllamaClient, config: AgentConfig) -> Self {
-        let budget = ContextBudget::new(config.context_window);
         let tools = crate::tools::standard_tool_definitions();
+        Self::new_inner(client, config, tools)
+    }
+
+    /// Create with custom tool definitions.
+    pub fn with_tools(
+        client: OllamaClient,
+        config: AgentConfig,
+        tools: Vec<ToolDefinition>,
+    ) -> Self {
+        Self::new_inner(client, config, tools)
+    }
+
+    /// Shared constructor: wires budget, monitors, knowledge, bootstrap and
+    /// memory from `config` (F4.1 — single implementation, no duplication).
+    fn new_inner(
+        client: OllamaClient,
+        config: AgentConfig,
+        tools: Vec<ToolDefinition>,
+    ) -> Self {
+        let budget = ContextBudget::new(config.context_window);
         let tool_names: Vec<String> = tools.iter().map(|t| t.function.name.clone()).collect();
         let thinking_budget = ThinkingBudget::new(
             config.max_thinking_tokens,
@@ -127,6 +149,8 @@ impl Agent {
             }
             EpisodeStore::open(path).ok()
         });
+        // Read before moving `config` into the struct (no Copy).
+        let bash_timeout_secs = config.bash_timeout_secs;
 
         Self {
             client,
@@ -134,46 +158,7 @@ impl Agent {
             messages: Vec::new(),
             tools,
             budget,
-            registry: ToolRegistry::new(),
-            parser: ToolCallParser::new(),
-            thinking_budget,
-            quality_monitor,
-            knowledge_base,
-            bootstrap,
-            bootstrap_done: false,
-            memory_store,
-        }
-    }
-
-    /// Create with custom tool definitions.
-    pub fn with_tools(
-        client: OllamaClient,
-        config: AgentConfig,
-        tools: Vec<ToolDefinition>,
-    ) -> Self {
-        let budget = ContextBudget::new(config.context_window);
-        let tool_names: Vec<String> = tools.iter().map(|t| t.function.name.clone()).collect();
-        let thinking_budget = ThinkingBudget::new(
-            config.max_thinking_tokens,
-            None,
-        );
-        let quality_monitor = QualityMonitor::new(config.quality_config.clone(), tool_names);
-        let knowledge_base = KnowledgeBase::new(config.knowledge_config.clone());
-        let bootstrap = Bootstrap::new(&config.workspace);
-        let memory_store = config.memory_db_path.as_ref().and_then(|path| {
-            if let Some(dir) = std::path::Path::new(path).parent() {
-                std::fs::create_dir_all(dir).ok();
-            }
-            EpisodeStore::open(path).ok()
-        });
-
-        Self {
-            client,
-            config,
-            messages: Vec::new(),
-            tools,
-            budget,
-            registry: ToolRegistry::new(),
+            registry: ToolRegistry::with_timeout(bash_timeout_secs),
             parser: ToolCallParser::new(),
             thinking_budget,
             quality_monitor,
@@ -304,8 +289,7 @@ impl Agent {
                             continue;
                         }
 
-                        let result = self.registry.execute(tc)?;
-
+                        let result = self.registry.execute(tc).await?;
                         debug!(name = tc.name, success = result.success, "Tool executed");
 
                         // Add tool result as a message
@@ -365,7 +349,7 @@ impl Agent {
                 });
 
                 for tc in &parsed {
-                    let result = self.registry.execute(tc)?;
+                    let result = self.registry.execute(tc).await?;
                     self.push_message(Message {
                         role: "tool".to_string(),
                         content: Some(result.output.clone()),
