@@ -60,7 +60,7 @@ async function longContext() {
 }
 
 (async () => {
-  console.log(`=== STRESS Qwen3.8-27B (concurrency=${CONC}, iterations=${ITERS}) ===`);
+  console.log(`=== STRESS Kitty-Code (concurrency=${CONC}, iterations=${ITERS}) ===`);
   await single();
   await concurrent(2, 200, '2req');
   await concurrent(4, 200, '4req');
