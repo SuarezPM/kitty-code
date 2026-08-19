@@ -169,18 +169,12 @@ async fn main() -> Result<()> {
         } => {
             // Pre-bench CWD contamination guard (Gate 2 hardening):
             // leftover solution.py in CWD contaminates grading (agent may write to CWD
-            // instead of tmpdir). Warn and remove stale file if present.
-            if std::path::Path::new("./solution.py").exists() {
-                warn!("solution.py in CWD will contaminate bench tmpdir; removing stale file");
-                let _ = std::fs::remove_file("./solution.py");
-            }
-            if std::path::Path::new("./solution.js").exists() {
-                warn!("solution.js in CWD will contaminate bench tmpdir; removing stale file");
-                let _ = std::fs::remove_file("./solution.js");
-            }
-            if std::path::Path::new("./solution.sh").exists() {
-                warn!("solution.sh in CWD will contaminate bench tmpdir; removing stale file");
-                let _ = std::fs::remove_file("./solution.sh");
+            // instead of tmpdir). Warn and remove stale files if present.
+            for stale in ["./solution.py", "./solution.js", "./solution.sh"] {
+                if std::path::Path::new(stale).exists() {
+                    warn!("{stale} in CWD will contaminate bench tmpdir; removing stale file");
+                    let _ = std::fs::remove_file(stale);
+                }
             }
 
             // Ensure memory DB directory exists
@@ -308,9 +302,7 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
                 .and_then(|v| v.get("rate_pct").and_then(|r| r.as_f64()));
-            let exit_code = if rate < gate { 1 } else if let Some(b) = baseline_rate {
-                if rate < b { 1 } else if (rate - b).abs() < 2.0 { 2 } else { 0 }
-            } else { 0 };
+            let exit_code = bench_exit_code(rate, gate, baseline_rate);
             std::process::exit(exit_code);
         }
         Commands::Info => {
@@ -359,7 +351,6 @@ struct BenchResult {
 
 /// A benchmark exercise loaded from JSON.
 #[derive(Debug, Clone, serde::Deserialize)]
-#[allow(dead_code)] // Fields used for deserialization; not all checked in Rust.
 struct JsonExercise {
     id: String,
     #[serde(default)]
@@ -514,7 +505,6 @@ fn file_contains(dir: &str, filename: &str, pattern: &str) -> bool {
 }
 
 /// Shared benchmark configuration.
-#[allow(dead_code)]
 struct BenchConfig {
     client: OllamaClient,
     model: String,
@@ -686,4 +676,54 @@ fn list_files(dir: &str) -> Vec<String> {
         }
     }
     files
+}
+
+/// Pure helper for bench exit-code (P1b reproducibility spec).
+/// 0 = pass/improved, 1 = gate failed or baseline regression, 2 = noise (|delta|<2).
+fn bench_exit_code(rate: f64, gate: f64, baseline: Option<f64>) -> i32 {
+    if rate < gate {
+        1
+    } else if let Some(b) = baseline {
+        if rate < b {
+            1
+        } else if (rate - b).abs() < 2.0 {
+            2
+        } else {
+            0
+        }
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod bench_exit_tests {
+    use super::bench_exit_code;
+
+    #[test]
+    fn gate_failed_returns_1() {
+        assert_eq!(bench_exit_code(40.0, 50.0, None), 1);
+        assert_eq!(bench_exit_code(40.0, 50.0, Some(96.0)), 1);
+    }
+
+    #[test]
+    fn baseline_regression_returns_1() {
+        assert_eq!(bench_exit_code(90.0, 50.0, Some(96.44)), 1);
+    }
+
+    #[test]
+    fn noise_within_2pct_returns_2() {
+        assert_eq!(bench_exit_code(97.0, 50.0, Some(96.44)), 2);
+        assert_eq!(bench_exit_code(96.44, 50.0, Some(96.44)), 2);
+    }
+
+    #[test]
+    fn improved_returns_0() {
+        assert_eq!(bench_exit_code(99.0, 50.0, Some(96.44)), 0);
+    }
+
+    #[test]
+    fn no_baseline_pass_returns_0() {
+        assert_eq!(bench_exit_code(80.0, 50.0, None), 0);
+    }
 }

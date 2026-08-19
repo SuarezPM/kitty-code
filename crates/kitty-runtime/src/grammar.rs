@@ -30,10 +30,7 @@ impl GrammarConfig {
 
     /// Create from a tool set with `strict = true` (default for the spike).
     pub fn from_tools(tools: Vec<ToolDefinition>) -> Self {
-        Self {
-            tool_schemas: tools,
-            strict: true,
-        }
+        Self::new(tools, true)
     }
 
     /// Generate a GBNF grammar that restricts output to a valid tool-call.

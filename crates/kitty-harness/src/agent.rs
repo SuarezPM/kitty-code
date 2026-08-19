@@ -214,7 +214,6 @@ impl Agent {
         });
         // Read before moving `config` into the struct (no Copy).
         let bash_timeout_secs = config.bash_timeout_secs;
-        let _read_cap = config.profile.read_cap;
 
         Self {
             client,
@@ -1050,6 +1049,37 @@ mod tests {
         // also via with_tools
         let mock2 = MockClient::new(vec![dummy_response("hi")]);
         let _agent2 = Agent::with_tools(Box::new(mock2), AgentConfig::default(), vec![]);
+    }
+
+    #[test]
+    fn check_done_guard_blocks_pending_claim() {
+        let mut agent = dummy_agent();
+        let mut c = crate::contract::Contract::new("test-guard");
+        c.add_assertion(crate::contract::AssertionCheck::FileExists("a.rs".into()));
+        agent.set_contract(c);
+        // contract pending (a01 Pending), text looks like done → returns Some blocker
+        let nudge = agent.check_done_guard("All done");
+        assert!(nudge.is_some(), "should block pending contract on done claim");
+        assert!(nudge.unwrap().contains("a01"));
+    }
+
+    #[test]
+    fn check_done_guard_allows_when_done_or_no_claim() {
+        let mut agent = dummy_agent();
+        // no contract → None
+        assert!(agent.check_done_guard("All done").is_none());
+        // contract done → None even on done claim
+        let mut c = crate::contract::Contract::new("done");
+        let id = c.add_assertion(crate::contract::AssertionCheck::FileExists("a.rs".into()));
+        c.mark_passed(&id);
+        agent.set_contract(c);
+        assert!(agent.check_done_guard("All done").is_none(), "done contract should not block");
+        // pending contract but non-done text → None
+        let mut agent2 = dummy_agent();
+        let mut c2 = crate::contract::Contract::new("pending2");
+        c2.add_assertion(crate::contract::AssertionCheck::FileExists("b.rs".into()));
+        agent2.set_contract(c2);
+        assert!(agent2.check_done_guard("hello world").is_none());
     }
 
     // Gate3: additional smoke tests to keep count >=154 when guard is old baseline
