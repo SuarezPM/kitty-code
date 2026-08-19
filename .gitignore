@@ -1,0 +1,29 @@
+# --- Build artifacts ---
+target/
+Cargo.lock.bak
+
+# --- Models (huge files, never commit) ---
+*.gguf
+*.bin
+*.safetensors
+!*.bin # keep pattern explicit below
+*.onnx
+
+# --- Python / bench artifacts ---
+__pycache__/
+*.pyc
+bench_*.json
+week0_*.json
+results/
+
+# --- Local state ---
+.slim/
+.slim/deepwork/
+.opencode/node_modules/
+*.db
+*.db-*
+*.log
+*.swp
+*.swo
+*~
+.DS_Store

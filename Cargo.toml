@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kitty-runtime",
+    "crates/kitty-harness",
+    "crates/kitty-memory",
+    "crates/kitty-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/SuarezPM/kitty-code"
+readme = "README.md"
+description = "Local coding agent for ornith:9B on consumer GPUs"
+
+[workspace.dependencies]
+# Internal crates
+kitty-runtime = { path = "crates/kitty-runtime" }
+kitty-harness = { path = "crates/kitty-harness" }
+kitty-memory = { path = "crates/kitty-memory" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Hashing
+blake3 = "1"
+
+# SQLite
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Crypto (for blake3 hashing)
+hex = "0.4"
+
+# File globbing
+glob = "0.3"
+
+# Directory walking
+walkdir = "2"
+
+# Regex
+regex = "1"
+
+# Temp files for tests
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1

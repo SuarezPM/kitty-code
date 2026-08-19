@@ -1,0 +1,24 @@
+[package]
+name = "kitty-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agent loop, tools, hashline edits, parser, context budget for Kitty Code"
+
+[dependencies]
+kitty-runtime.workspace = true
+kitty-memory.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+hex.workspace = true
+glob.workspace = true
+walkdir.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
