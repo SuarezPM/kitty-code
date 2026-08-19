@@ -66,7 +66,8 @@ impl Default for AgentConfig {
 ///
 /// After this many empty responses the agent terminates the turn quickly
 /// instead of looping until `max_iterations`/timeout (handoff §6).
-const MAX_EMPTY_STREAK: u8 = 3;
+/// Gate 2 tuning: 3→2 for faster fail-fast on small models.
+const MAX_EMPTY_STREAK: u8 = 2;
 
 /// Returns `true` when the empty-response streak has reached the fail-fast cap.
 ///
@@ -219,14 +220,16 @@ impl Agent {
                 let tokens = self.count_tokens(thinking).await;
                 // Apply thinking budget cap
                 if let Err(e) = self.thinking_budget.record(tokens) {
-                    warn!(error = %e, "Thinking budget exceeded, retrying without thinking");
+                    warn!(error = %e, streak = self.empty_response_streak, "Thinking budget exceeded, retrying without thinking");
                     // F2.6: Retry without thinking — re-call LLM, then fall through
                     // to normal processing (tool calls and all). Max 1 retry per turn.
+                    // Note: empty_response_streak is NOT reset here; thinking retry counts toward streak.
                     let retry_response = self.llm_call_no_thinking().await?;
                     self.process_response(user_prompt, retry_response).await?;
-                    // Fail-fast after retry as well (handoff §6).
+                    // Fail-fast after retry as well (handoff §6). Warn with streak always.
                     if should_fail_fast(self.empty_response_streak) {
-                        return Ok("no response (empty after 3 retries)".to_string());
+                        warn!(streak = self.empty_response_streak, "Empty response streak cap reached (2) after thinking retry, failing fast");
+                        return Ok("no response (empty after 2 retries)".to_string());
                     }
                     // Don't reset thinking budget — we already retried once
                     continue;
@@ -238,11 +241,12 @@ impl Agent {
 
             self.process_response(user_prompt, response).await?;
 
-            // Fail-fast: 3 consecutive empty responses → terminate quickly
+            // Fail-fast: 2 consecutive empty responses → terminate quickly
             // instead of looping until max_iterations/timeout (handoff §6).
             if should_fail_fast(self.empty_response_streak) {
+                warn!(streak = self.empty_response_streak, "Empty response streak cap reached (2), failing fast");
                 // Episode already saved as failure in process_response.
-                return Ok("no response (empty after 3 retries)".to_string());
+                return Ok("no response (empty after 2 retries)".to_string());
             }
 
             // Reset thinking budget for next turn
@@ -408,15 +412,16 @@ impl Agent {
         // LLM round-trips. Streak resets on any non-empty content or tool call.
         if text.trim().is_empty() {
             self.empty_response_streak = self.empty_response_streak.saturating_add(1);
+            warn!(streak = self.empty_response_streak, "Empty response detected, streak={}", self.empty_response_streak);
             if should_fail_fast(self.empty_response_streak) {
                 warn!(
                     streak = self.empty_response_streak,
-                    "Empty response streak cap reached (3), failing fast"
+                    "Empty response streak cap reached (2), failing fast"
                 );
-                self.save_episode(user_prompt, "no response (empty after 3 retries)", false);
+                self.save_episode(user_prompt, "no response (empty after 2 retries)", false);
                 return Ok(());
             }
-            warn!("Empty response detected, continuing loop for retry");
+            warn!(streak = self.empty_response_streak, "Empty response detected, continuing loop for retry");
             return Ok(());
         }
         // Non-empty text resets the streak
@@ -815,17 +820,16 @@ mod tests {
     fn should_fail_fast_false_before_cap() {
         assert!(!should_fail_fast(0));
         assert!(!should_fail_fast(1));
-        assert!(!should_fail_fast(2));
-        assert!(!Agent::should_fail_fast(2));
+        assert!(!Agent::should_fail_fast(1));
     }
 
     #[test]
     fn should_fail_fast_true_at_and_beyond_cap() {
+        assert!(should_fail_fast(2));
         assert!(should_fail_fast(3));
-        assert!(should_fail_fast(4));
         assert!(should_fail_fast(255));
-        assert!(Agent::should_fail_fast(3));
-        assert_eq!(MAX_EMPTY_STREAK, 3);
+        assert!(Agent::should_fail_fast(2));
+        assert_eq!(MAX_EMPTY_STREAK, 2);
     }
 
     #[test]
@@ -838,24 +842,22 @@ mod tests {
     #[test]
     fn agent_streak_increments_and_resets_logic() {
         // Simulate the counter logic without needing LLM calls.
+        // Cap is now 2 (Gate 2 tuning).
         let mut streak: u8 = 0;
-        // two empties → no fail-fast
+        // one empty → no fail-fast
         streak = streak.saturating_add(1);
         assert_eq!(streak, 1);
         assert!(!should_fail_fast(streak));
+        // second empty → fail-fast
         streak = streak.saturating_add(1);
         assert_eq!(streak, 2);
-        assert!(!should_fail_fast(streak));
-        // third empty → fail-fast
-        streak = streak.saturating_add(1);
-        assert_eq!(streak, 3);
         assert!(should_fail_fast(streak));
         // non-empty resets to 0
         streak = 0;
         assert_eq!(streak, 0);
         assert!(!should_fail_fast(streak));
         // tool call also resets (same as non-empty)
-        let tool_call_streak_before: u8 = 3;
+        let tool_call_streak_before: u8 = 2;
         assert!(should_fail_fast(tool_call_streak_before));
         let tool_call_streak_after: u8 = 0;
         assert!(!should_fail_fast(tool_call_streak_after));

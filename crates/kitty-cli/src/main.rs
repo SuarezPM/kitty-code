@@ -11,6 +11,7 @@ use kitty_memory::{Episode, EpisodeStore};
 use kitty_runtime::OllamaClient;
 use std::path::PathBuf;
 use std::time::Instant;
+use tracing::warn;
 
 /// Default path for episodic memory database.
 fn default_db_path() -> String {
@@ -146,6 +147,22 @@ async fn main() -> Result<()> {
             exercises: exercises_path,
             no_memory,
         } => {
+            // Pre-bench CWD contamination guard (Gate 2 hardening):
+            // leftover solution.py in CWD contaminates grading (agent may write to CWD
+            // instead of tmpdir). Warn and remove stale file if present.
+            if std::path::Path::new("./solution.py").exists() {
+                warn!("solution.py in CWD will contaminate bench tmpdir; removing stale file");
+                let _ = std::fs::remove_file("./solution.py");
+            }
+            if std::path::Path::new("./solution.js").exists() {
+                warn!("solution.js in CWD will contaminate bench tmpdir; removing stale file");
+                let _ = std::fs::remove_file("./solution.js");
+            }
+            if std::path::Path::new("./solution.sh").exists() {
+                warn!("solution.sh in CWD will contaminate bench tmpdir; removing stale file");
+                let _ = std::fs::remove_file("./solution.sh");
+            }
+
             // Ensure memory DB directory exists
             if !no_memory {
                 let db_path = default_db_path();
@@ -154,21 +171,41 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Gate 2 tuning: bench uses max_iterations=5 for sub-20s smoke (default 20 remains for `run`).
+            // If CLI left default 20, bench overrides to 5; explicit CLI value is respected.
+            let bench_max_iterations = if cli.max_iterations == 20 { 5 } else { cli.max_iterations };
+            // Gate 2: --no-memory by default for small models (e.g. qwen3:4b) to avoid retrieval overhead.
+            // Effective memory off if either --no-memory flag set or model looks small.
+            let is_small_model = cli.model.contains(":4b")
+                || cli.model.contains(":2b")
+                || cli.model.contains(":1b")
+                || cli.model.contains("1.7b")
+                || cli.model.contains("0.5b");
+            let effective_no_memory = no_memory || is_small_model;
+            if is_small_model && !no_memory {
+                warn!(model = %cli.model, "small model detected — auto-disabling episodic memory for bench (use explicit --no-memory to silence)");
+            }
+
             let cfg = BenchConfig {
                 client: client.clone(),
                 model: cli.model.clone(),
                 limit,
-                use_memory: !no_memory,
+                use_memory: !effective_no_memory,
                 thinking_budget: cli.thinking_budget,
                 context_window: cli.context_window,
-                max_iterations: cli.max_iterations,
+                max_iterations: bench_max_iterations,
                 bash_timeout: cli.bash_timeout,
             };
 
             println!("Kitty Code Benchmark");
             println!("  Model: {}", cli.model);
             println!("  Suite: {} (limit: {})", suite, limit);
-            println!("  Memory: {}", if no_memory { "off" } else { "on" });
+            println!("  Memory: {}", if effective_no_memory { "off" } else { "on" });
+            if bench_max_iterations != cli.max_iterations {
+                println!("  Max iterations: {} (bench override, CLI default 20)", bench_max_iterations);
+            } else {
+                println!("  Max iterations: {}", bench_max_iterations);
+            }
             println!("  Thinking budget: {}", cli.thinking_budget);
             println!("  Context window: {}", cli.context_window);
             if let Some(ref path) = exercises_path {
@@ -235,7 +272,7 @@ async fn main() -> Result<()> {
                 "total": total,
                 "passed": passed,
                 "rate_pct": rate,
-                "memory": !no_memory,
+                "memory": cfg.use_memory,
                 "details": results.iter().map(|r| serde_json::json!({
                     "id": r.id,
                     "lang": r.lang,
@@ -423,9 +460,11 @@ async fn run_bench(
         let tmpdir = tempfile::tempdir().context("Failed to create temp dir")?;
         let tmpdir_str = tmpdir.path().to_string_lossy().to_string();
 
+        // Gate 2 prompt hardening: absolute path prevents CWD contamination.
+        // Suffix ensures model writes to tmpdir even if base prompt says "solution.py".
         let prompt = format!(
-            "{}\n\nWork in directory: {}",
-            ex.prompt, tmpdir_str
+            "{}\n\nWork in directory: {} — Save to {}/solution.py (use absolute path)",
+            ex.prompt, tmpdir_str, tmpdir_str
         );
 
         let start = Instant::now();
@@ -439,7 +478,7 @@ async fn run_bench(
         };
         let mut agent = Agent::new(cfg.client.clone(), config);
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(30),
             agent.run(&prompt),
         ).await;
 
@@ -455,7 +494,7 @@ async fn run_bench(
             }
             Err(_) => {
                 println!(" timeout");
-                (false, "timeout", 120000.0)
+                (false, "timeout", 30000.0)
             }
         };
 
