@@ -64,6 +64,8 @@ pub struct ToolRegistry {
     pub hashline: HashlineEditor,
     /// Bash command timeout in seconds (F1.3). Default: 60.
     bash_timeout_secs: u64,
+    /// Max lines for Read tool output (F3.1). Default: 300.
+    max_read_lines: usize,
 }
 
 impl ToolRegistry {
@@ -78,6 +80,18 @@ impl ToolRegistry {
             written_files: HashSet::new(),
             hashline: HashlineEditor::new(),
             bash_timeout_secs,
+            max_read_lines: 300,
+        }
+    }
+
+    /// Create a registry with a custom Read truncation limit (F3.1).
+    pub fn with_read_limit(max_read_lines: usize) -> Self {
+        Self {
+            read_files: HashSet::new(),
+            written_files: HashSet::new(),
+            hashline: HashlineEditor::new(),
+            bash_timeout_secs: 60,
+            max_read_lines,
         }
     }
 
@@ -124,9 +138,20 @@ impl ToolRegistry {
             })
             .collect();
 
+        let total_lines = tagged.len();
+        let capped = &tagged[..total_lines.min(self.max_read_lines)];
+
+        let mut output = capped.join("\n");
+        if total_lines > self.max_read_lines {
+            let omitted = total_lines - self.max_read_lines;
+            output.push_str(&format!(
+                "\n... ({omitted} lines omitted — use Grep to search specific content)"
+            ));
+        }
+
         Ok(ToolResult {
             success: true,
-            output: tagged.join("\n"),
+            output,
             retry: false,
         })
     }
@@ -450,12 +475,13 @@ impl ToolRegistry {
             .map_err(|e| ToolError::Grep(format!("Invalid regex: {e}")))?;
 
         let mut results = Vec::new();
-        let walker = walkdir::WalkDir::new(path)
-            .into_iter()
-            .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'));
+        let walker = ignore::WalkBuilder::new(path)
+            .hidden(false)
+            .git_ignore(true)
+            .build();
 
         for entry in walker.filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
             }
 
@@ -751,5 +777,72 @@ mod tests {
         };
         let err = registry.execute(&tc).await.unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[test]
+    fn read_truncates_large_file() {
+        // F3.1: Read output is capped at max_read_lines with a truncation message.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        let lines: Vec<String> = (1..=500).map(|i| format!("line {i}")).collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let mut registry = ToolRegistry::with_read_limit(300);
+        let args = serde_json::json!({"path": path.to_str().unwrap()});
+        let result = registry.execute_read(&args).unwrap();
+        assert!(result.success);
+        assert!(
+            result.output.contains("200 lines omitted"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("use Grep to search specific content"),
+            "got: {}",
+            result.output
+        );
+        // First line present
+        assert!(result.output.contains("1:"));
+        // Line 300 present (last included)
+        assert!(result.output.contains("300:"));
+        // Line 301 absent (truncated)
+        assert!(!result.output.contains("301:"));
+    }
+
+    #[test]
+    fn grep_respects_gitignore() {
+        // F3.2: Grep uses ignore crate — files in .gitignore'd dirs are excluded.
+        let dir = tempfile::tempdir().unwrap();
+        // Init a git repo so ignore crate picks up .gitignore
+        std::process::Command::new("git")
+            .args(["init", dir.path().to_str().unwrap()])
+            .output()
+            .unwrap();
+        // Create .gitignore excluding target/
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        // Create a file that SHOULD match (not gitignored)
+        std::fs::write(dir.path().join("src.rs"), "needle here").unwrap();
+        // Create a file in target/ that should NOT match
+        let target_dir = dir.path().join("target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("build.rs"), "needle here").unwrap();
+
+        let registry = ToolRegistry::new();
+        let args = serde_json::json!({
+            "pattern": "needle",
+            "path": dir.path().to_str().unwrap()
+        });
+        let result = registry.execute_grep(&args).unwrap();
+        assert!(result.success);
+        assert!(
+            result.output.contains("src.rs"),
+            "should find src.rs, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("target/build.rs"),
+            "should NOT find target/build.rs, got: {}",
+            result.output
+        );
     }
 }

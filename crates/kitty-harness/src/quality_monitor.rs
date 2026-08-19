@@ -8,15 +8,8 @@
 //! When detected, injects corrective messages or forces a text response.
 
 use std::collections::{HashMap, VecDeque};
-use thiserror::Error;
 
 use crate::parser::ParsedToolCall;
-
-#[derive(Error, Debug)]
-pub enum QualityError {
-    #[error("Quality violation: {violation:?}")]
-    Violation { violation: QualityViolation },
-}
 
 /// Types of quality violations.
 #[derive(Debug, Clone, PartialEq, Eq)]

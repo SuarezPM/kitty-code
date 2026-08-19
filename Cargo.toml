@@ -54,8 +54,8 @@ hex = "0.4"
 # File globbing
 glob = "0.3"
 
-# Directory walking
-walkdir = "2"
+# Gitignore-aware directory walking
+ignore = "0.4"
 
 # Regex
 regex = "1"

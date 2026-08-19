@@ -9,16 +9,6 @@
 //! Includes auto-repair for malformed tool calls.
 
 use serde_json::Value;
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum ParseError {
-    #[error("No tool calls found in output")]
-    NoToolCalls,
-
-    #[error("Malformed tool call: {0}")]
-    Malformed(String),
-}
 
 /// A parsed tool call with name and arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]

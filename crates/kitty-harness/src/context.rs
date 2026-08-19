@@ -15,17 +15,6 @@ pub enum ContextError {
     InsufficientCompaction { freed: usize, needed: usize },
 }
 
-/// Compaction result returned when the budget triggers compaction.
-#[derive(Debug, Clone)]
-pub struct CompactionResult {
-    /// How many tokens were freed.
-    pub freed: usize,
-    /// Whether compaction was sufficient to continue.
-    pub sufficient: bool,
-    /// The summary replacing old messages.
-    pub summary: String,
-}
-
 /// Context budget tracker.
 pub struct ContextBudget {
     max_tokens: usize,

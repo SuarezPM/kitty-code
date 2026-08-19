@@ -62,36 +62,6 @@ impl Default for AgentConfig {
     }
 }
 
-/// Events emitted by the agent loop for observability.
-#[derive(Debug, Clone)]
-pub enum AgentEvent {
-    /// LLM call started.
-    LlmCall { iteration: usize },
-    /// Tool call being executed.
-    ToolCall {
-        name: String,
-        arguments: String,
-    },
-    /// Tool execution result.
-    ToolResult {
-        name: String,
-        success: bool,
-        output_preview: String,
-    },
-    /// Context compaction triggered.
-    Compaction { freed: usize, summary_preview: String },
-    /// Iteration limit reached.
-    IterationLimit { iterations: usize },
-    /// Agent finished with a text response.
-    Done { response_preview: String },
-    /// Thinking budget exceeded, retrying without thinking.
-    ThinkingBudgetRetry { turn_tokens: usize },
-    /// Quality violation detected.
-    QualityViolation { violation: QualityViolation },
-    /// Bootstrap detection result.
-    Bootstrap { hint: String },
-}
-
 /// The core agent loop.
 pub struct Agent {
     client: OllamaClient,

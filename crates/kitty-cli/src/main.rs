@@ -37,6 +37,26 @@ pub struct Cli {
     /// Maximum thinking/reasoning tokens per turn (default: 2048)
     #[arg(long, default_value = "2048")]
     pub thinking_budget: usize,
+
+    /// Enable knowledge injection (cards from knowledge/ directory)
+    #[arg(long)]
+    pub knowledge: bool,
+
+    /// Directory containing knowledge cards (default: knowledge/)
+    #[arg(long, default_value = "knowledge")]
+    pub knowledge_dir: String,
+
+    /// Context window size in tokens (default: 16384)
+    #[arg(long, default_value = "16384")]
+    pub context_window: usize,
+
+    /// Maximum iterations before forcing text response (default: 20)
+    #[arg(long, default_value = "20")]
+    pub max_iterations: usize,
+
+    /// Bash command timeout in seconds (default: 60)
+    #[arg(long, default_value = "60")]
+    pub bash_timeout: u64,
 }
 
 #[derive(Subcommand)]
@@ -94,6 +114,10 @@ async fn main() -> Result<()> {
             let config = AgentConfig {
                 model: cli.model.clone(),
                 max_thinking_tokens: Some(cli.thinking_budget),
+                max_iterations: cli.max_iterations,
+                context_window: cli.context_window,
+                enable_knowledge: cli.knowledge,
+                bash_timeout_secs: cli.bash_timeout,
                 memory_db_path,
                 ..Default::default()
             };
@@ -131,11 +155,12 @@ async fn main() -> Result<()> {
             println!("  Suite: {} (limit: {})", suite, limit);
             println!("  Memory: {}", if no_memory { "off" } else { "on" });
             println!("  Thinking budget: {}", cli.thinking_budget);
+            println!("  Context window: {}", cli.context_window);
             println!();
 
             let results = match suite.as_str() {
-                "tb2" => run_tb2_bench(&client, &cli.model, limit, !no_memory, cli.thinking_budget).await?,
-                _ => run_polyglot_bench(&client, &cli.model, limit, !no_memory, cli.thinking_budget).await?,
+                "tb2" => run_tb2_bench(&client, &cli.model, limit, !no_memory, cli.thinking_budget, cli.context_window, cli.max_iterations, cli.bash_timeout).await?,
+                _ => run_polyglot_bench(&client, &cli.model, limit, !no_memory, cli.thinking_budget, cli.context_window, cli.max_iterations, cli.bash_timeout).await?,
             };
 
             let passed = results.iter().filter(|r| r.passed).count();
@@ -269,25 +294,33 @@ fn file_contains(dir: &str, filename: &str, pattern: &str) -> bool {
     }
 }
 
-/// Shared benchmark driver used by every exercise set.
-async fn run_bench(
-    items: &[BenchItem],
-    client: &OllamaClient,
-    model: &str,
+/// Shared benchmark configuration.
+struct BenchConfig {
+    client: OllamaClient,
+    model: String,
     limit: usize,
     use_memory: bool,
     thinking_budget: usize,
+    context_window: usize,
+    max_iterations: usize,
+    bash_timeout: u64,
+}
+
+/// Shared benchmark driver used by every exercise set.
+async fn run_bench(
+    items: &[BenchItem],
+    cfg: &BenchConfig,
 ) -> Result<Vec<BenchResult>> {
     let mut results = Vec::new();
 
-    let store = if use_memory {
+    let store = if cfg.use_memory {
         Some(EpisodeStore::open(&default_db_path())?)
     } else {
         None
     };
 
-    for (i, ex) in items.iter().take(limit).enumerate() {
-        print!("[{:2}/{:2}] {:20}...", i + 1, limit.min(items.len()), ex.id);
+    for (i, ex) in items.iter().take(cfg.limit).enumerate() {
+        print!("[{:2}/{:2}] {:20}...", i + 1, cfg.limit.min(items.len()), ex.id);
 
         // Recall similar past episodes
         if let Some(ref store) = store {
@@ -307,11 +340,14 @@ async fn run_bench(
 
         let start = Instant::now();
         let config = AgentConfig {
-            model: model.to_string(),
-            max_thinking_tokens: Some(thinking_budget),
+            model: cfg.model.clone(),
+            max_thinking_tokens: Some(cfg.thinking_budget),
+            context_window: cfg.context_window,
+            max_iterations: cfg.max_iterations,
+            bash_timeout_secs: cfg.bash_timeout,
             ..Default::default()
         };
-        let mut agent = Agent::new(client.clone(), config);
+        let mut agent = Agent::new(cfg.client.clone(), config);
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(120),
             agent.run(&prompt),
@@ -362,14 +398,28 @@ async fn run_bench(
     Ok(results)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_polyglot_bench(
     client: &OllamaClient,
     model: &str,
     limit: usize,
     use_memory: bool,
     thinking_budget: usize,
+    context_window: usize,
+    max_iterations: usize,
+    bash_timeout: u64,
 ) -> Result<Vec<BenchResult>> {
-    run_bench(&exercises(), client, model, limit, use_memory, thinking_budget).await
+    let cfg = BenchConfig {
+        client: client.clone(),
+        model: model.to_string(),
+        limit,
+        use_memory,
+        thinking_budget,
+        context_window,
+        max_iterations,
+        bash_timeout,
+    };
+    run_bench(&exercises(), &cfg).await
 }
 
 // ── TB2: Terminal-Bench 2.0 ──────────────────────────────────────────
@@ -463,12 +513,26 @@ fn list_files(dir: &str) -> Vec<String> {
     files
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tb2_bench(
     client: &OllamaClient,
     model: &str,
     limit: usize,
     use_memory: bool,
     thinking_budget: usize,
+    context_window: usize,
+    max_iterations: usize,
+    bash_timeout: u64,
 ) -> Result<Vec<BenchResult>> {
-    run_bench(&tb2_exercises(), client, model, limit, use_memory, thinking_budget).await
+    let cfg = BenchConfig {
+        client: client.clone(),
+        model: model.to_string(),
+        limit,
+        use_memory,
+        thinking_budget,
+        context_window,
+        max_iterations,
+        bash_timeout,
+    };
+    run_bench(&tb2_exercises(), &cfg).await
 }
