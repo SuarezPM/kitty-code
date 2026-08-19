@@ -3,6 +3,8 @@
 //! The core agent loop that orchestrates tool calls, manages context,
 //! and applies safety guards.
 
+pub mod contract;
+pub use contract::{Assertion, AssertionCheck, AssertionStatus, Contract, ContractState};
 pub mod agent;
 pub mod tools;
 pub mod hashline;

@@ -6,10 +6,11 @@
 
 use anyhow::{Context, Result};
 use kitty_memory::{Episode, EpisodeStore};
-use kitty_runtime::{ChatClient, ChatResponse, Message, ToolDefinition};
+use kitty_runtime::{ChatClient, ChatResponse, GrammarClient, GrammarConfig, Message, ToolDefinition};
 use tracing::{debug, info, warn};
 
 use crate::bootstrap::Bootstrap;
+use crate::contract::{contract_guard_enabled, looks_like_done_claim, Contract};
 use crate::context::{ContextBudget, ContextError};
 use crate::knowledge::{KnowledgeBase, KnowledgeConfig};
 use crate::model_profile::ModelProfile;
@@ -48,6 +49,9 @@ pub struct AgentConfig {
     pub profile: &'static ModelProfile,
     /// Whether to use 2-stage tool routing (router ready but gated behind this flag).
     pub use_routing: bool,
+    /// Whether grammar-constrained decoding is enabled (tiny profile / spike).
+    /// Default false; enabled via `--profile tiny` or future CLI flag.
+    pub enable_grammar: bool,
 }
 
 impl Default for AgentConfig {
@@ -66,6 +70,7 @@ impl Default for AgentConfig {
             bash_timeout_secs: 60,
             profile: ModelProfile::medium(),
             use_routing: false,
+            enable_grammar: false,
         }
     }
 }
@@ -80,6 +85,9 @@ impl AgentConfig {
         self.max_thinking_tokens = p.max_thinking_tokens;
         self.bash_timeout_secs = p.bash_timeout_secs;
         self.compact_threshold = p.compact_threshold;
+        if p.name == "tiny" {
+            self.enable_grammar = true;
+        }
         self
     }
 }
@@ -119,6 +127,7 @@ pub struct Agent {
     empty_response_streak: u8,
     /// 2-stage tool router (affirmation guard, stateful).
     router: ToolRouter,
+    contract: Option<Contract>,
 }
 
 impl Agent {
@@ -176,6 +185,17 @@ impl Agent {
                 tools
             }
         };
+        // Grammar enforcement: auto-enable for tiny profile (spike).
+        if config.profile.name == "tiny" {
+            config.enable_grammar = true;
+        }
+        // Grammar enforcement: wrap client if enabled (spike, default false).
+        let client: Box<dyn ChatClient> = if config.enable_grammar {
+            let grammar = GrammarConfig::from_tools(tools.clone());
+            Box::new(GrammarClient::new(client, grammar))
+        } else {
+            client
+        };
         let mut budget = ContextBudget::new(config.context_window);
         budget.set_threshold(config.compact_threshold);
         let tool_names: Vec<String> = tools.iter().map(|t| t.function.name.clone()).collect();
@@ -212,6 +232,7 @@ impl Agent {
             memory_store,
             empty_response_streak: 0,
             router: ToolRouter::new(),
+            contract: None,
         }
     }
 
@@ -569,6 +590,10 @@ impl Agent {
 
         // Pure text response — we're done
         // (Assistant message already pushed above before the empty check)
+        if let Some(nudge) = self.check_done_guard(&text) {
+            self.push_message(Message::user(nudge)).await;
+            return Ok(());
+        }
         // Save successful episode to memory
         self.save_episode(user_prompt, &text, true);
 
@@ -900,6 +925,29 @@ impl Agent {
     /// Associated helper mirroring the free `should_fail_fast` (for `Agent::` call sites).
     pub fn should_fail_fast(streak: u8) -> bool {
         should_fail_fast(streak)
+    }
+
+    pub fn set_contract(&mut self, c: Contract) {
+        self.contract = Some(c);
+    }
+    pub fn clear_contract(&mut self) {
+        self.contract = None;
+    }
+    pub fn contract(&self) -> Option<&Contract> {
+        self.contract.as_ref()
+    }
+    fn check_done_guard(&self, text: &str) -> Option<String> {
+        if !contract_guard_enabled() {
+            return None;
+        }
+        let c = self.contract.as_ref()?;
+        if c.is_done() {
+            return None;
+        }
+        if !looks_like_done_claim(text) {
+            return None;
+        }
+        Some(format!("[CONTRACT-GUARD] Blockers:\n{}", c.to_markdown()))
     }
 }
 

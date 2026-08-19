@@ -15,8 +15,8 @@ Comando: `cargo build --release` (34s) → `timeout 600 ./target/release/kitty-c
 
 | Modelo | Passed (15) | Rate | Latencia avg | Status | Estimado 225 |
 |--------|-------------|------|--------------|--------|--------------|
-| **smollm2:1.7b** | 8/15 | **53.3%** | 2.76s (344ms-5918ms) | ✅ GATE PASSED (≥45) pero borderline | 225×2.76s=10.3 min, pero extrapola a <50% en full (rust/go caen) |
-| **qwen3:4b** | 8/15 | **53.3%** | ~24s (20-30s, 5 timeouts 30s) | ✅ GATE PASSED (≥45) pero lento | 225×24s=90 min (>30 min target) |
+| **smollm2:1.7b** | 8/15 | **53.3%** | 2.76s (344ms-5918ms) | ✅ GATE PASSED (≥50) pero borderline | 225×2.76s=10.3 min, pero extrapola a <50% en full (rust/go caen) |
+| **qwen3:4b** | 8/15 | **53.3%** | ~24s (20-30s, 5 timeouts 30s) | ✅ GATE PASSED (≥50) pero lento | 225×24s=90 min (>30 min target) |
 | **ornith:9b ref** | 217/225 (run1/run2) | **96.44%** | 4.6s | ✅ | 1054s (17.6 min) |
 
 ### Detalle smoke limit 3 (post-tuning, --no-memory auto)
@@ -37,11 +37,11 @@ Comando: `cargo build --release` (34s) → `timeout 600 ./target/release/kitty-c
 
 - smollm2: hay evidencia 0% 8s avg limit 3 builtin (0/3), no full.
 - qwen3:4b TB2 smoke timeout (thinking 4200/2048 retry) — no full.
-- TB2 JSON loader `main.rs:322` no soporta `check_type: file_exists` → `--exercises benches/exercises_tb2.json` da 0 exercises, defer a P1.
+- TB2 JSON loader `main.rs:322` no soporta `check_type: file_exists` → `--exercises benches/exercises_tb2.json` da 0 exercises, defer a P1. **Fix P1b aplicado:** `json_to_bench_item` ahora soporta `check_type: file_exists/file_not_exists/file_executable/file_content_exact/always_pass` con `check_path`.
 
 ## Diagnóstico post-tuning
 
-**Tuning aplicado Gate2 (2 líneas → 69 líneas):** `MAX_EMPTY_STREAK 3→2` + warn streak, `max_iterations 20→5` bench override, `timeout 120s→30s`, prompt `Work in directory: {} — Save to {}/solution.py (absolute)`, guard contaminación CWD `remove solution.py/js/sh`, `--no-memory` auto para modelos pequeños, thinking 2048 (no cambiado, pendiente 512).
+**Tuning aplicado Gate2 (2 líneas → 69 líneas):** `MAX_EMPTY_STREAK 3→2` + warn streak, `max_iterations 20→5` bench override, `timeout 120s→30s`, prompt `Work in directory: {} — Save to {}/<check_file> (absolute, fix .py hardcode)`, guard contaminación CWD `remove solution.py/js/sh`, `--no-memory` auto para modelos pequeños, thinking 2048 (no cambiado, pendiente 512). Gate 50% + exit-code 0/1/2 (P1b).
 
 **Efecto:** smollm2 60s→4s avg (100% limit3, 53% limit15), qwen3 39s→28.5s avg limit3, 24s limit15. Sin tuning, floor 225 era 2.4-3.4h >1800. Con tuning, smollm2 10 min pero 53% borderline, qwen3 90 min >30 min target (aún lento).
 

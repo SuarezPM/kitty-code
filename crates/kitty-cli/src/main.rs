@@ -3,6 +3,8 @@
 #[cfg(feature = "tui")]
 mod tui;
 
+mod mcp;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kitty_harness::agent::{Agent, AgentConfig};
@@ -95,6 +97,8 @@ pub enum Commands {
     },
     /// Show model info and status
     Info,
+    /// Start MCP server over stdio (exposes Read/Edit/Write/Bash/Glob/Grep)
+    Mcp,
     /// Launch the TUI status display (requires `tui` feature)
     #[cfg(feature = "tui")]
     Tui,
@@ -274,7 +278,7 @@ async fn main() -> Result<()> {
                 println!("  {}: {}/{} ({:.0}%)", lang, p, t, 100.0 * *p as f64 / *t as f64);
             }
 
-            let gate = 45.0;
+            let gate = 50.0;
             if rate >= gate {
                 println!();
                 println!("GATE PASSED: {:.1}% >= {:.0}%", rate, gate);
@@ -299,7 +303,15 @@ async fn main() -> Result<()> {
             });
             std::fs::write(&out, serde_json::to_string_pretty(&output)?)?;
             println!("Results saved to {}", out.display());
-            Ok(())
+            // bench-reproducibility: exit-code 0=pass/improved, 1=gate failed, 2=noise (no significant change)
+            let baseline_rate: Option<f64> = std::fs::read_to_string("benches/baseline.json")
+                .ok()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                .and_then(|v| v.get("rate_pct").and_then(|r| r.as_f64()));
+            let exit_code = if rate < gate { 1 } else if let Some(b) = baseline_rate {
+                if rate < b { 1 } else if (rate - b).abs() < 2.0 { 2 } else { 0 }
+            } else { 0 };
+            std::process::exit(exit_code);
         }
         Commands::Info => {
             println!("Kitty Code v{}", env!("CARGO_PKG_VERSION"));
@@ -325,6 +337,7 @@ async fn main() -> Result<()> {
             println!("Bench: polyglot (code), tb2 (terminal)");
             Ok(())
         }
+        Commands::Mcp => mcp::run().await,
         #[cfg(feature = "tui")]
         Commands::Tui => {
             let context_window = AgentConfig::default().context_window;
@@ -372,16 +385,73 @@ struct JsonExercise {
     setup: String,
 }
 
-/// Convert a JsonExercise to BenchItem (for polyglot JSON format).
+/// Convert a JsonExercise to BenchItem (for polyglot + TB2 JSON formats).
 fn json_to_bench_item(ex: &JsonExercise) -> Option<BenchItem> {
     if !ex.check_str.is_empty() && !ex.check_file.is_empty() {
         let check_str = ex.check_str.clone();
         let check_file = ex.check_file.clone();
+        let cf = check_file.clone();
+        let cf_leaked = Box::leak(check_file.into_boxed_str());
         Some(BenchItem {
             id: Box::leak(ex.id.clone().into_boxed_str()),
             label: Box::leak(ex.lang.clone().into_boxed_str()),
             prompt: Box::leak(ex.prompt.clone().into_boxed_str()),
-            check: Box::new(move |d| file_contains(d, &check_file, &check_str)),
+            check: Box::new(move |d| file_contains(d, &cf, &check_str)),
+            check_file: cf_leaked,
+        })
+    } else if !ex.check_type.is_empty() {
+        let check_path = ex.check_path.clone();
+        let check_type = ex.check_type.clone();
+        let expected = ex.expected.clone();
+        let cf = check_path.clone();
+        let check_file_leaked: &'static str = if check_path.is_empty() {
+            "solution.py"
+        } else {
+            Box::leak(check_path.into_boxed_str())
+        };
+        let check: Box<dyn Fn(&str) -> bool> = match check_type.as_str() {
+            "file_exists" => {
+                let p = cf.clone();
+                Box::new(move |d| std::path::Path::new(d).join(&p).exists())
+            }
+            "file_not_exists" => {
+                let p = cf.clone();
+                Box::new(move |d| !std::path::Path::new(d).join(&p).exists())
+            }
+            "file_executable" => {
+                let p = cf.clone();
+                Box::new(move |d| file_is_executable(d, &p))
+            }
+            "file_content_exact" => {
+                let p = cf.clone();
+                let exp = expected.clone();
+                Box::new(move |d| {
+                    let path = std::path::Path::new(d).join(&p);
+                    match std::fs::read_to_string(&path) {
+                        Ok(c) => c.trim() == exp.trim(),
+                        Err(_) => false,
+                    }
+                })
+            }
+            "always_pass" => Box::new(|_| true),
+            _ => {
+                let p = cf.clone();
+                Box::new(move |d| std::path::Path::new(d).join(&p).exists())
+            }
+        };
+        let label_str = if !ex.setup.is_empty() {
+            ex.setup.clone()
+        } else if !ex.lang.is_empty() {
+            ex.lang.clone()
+        } else {
+            "tb2".to_string()
+        };
+        Some(BenchItem {
+            id: Box::leak(ex.id.clone().into_boxed_str()),
+            label: Box::leak(label_str.into_boxed_str()),
+            prompt: Box::leak(ex.prompt.clone().into_boxed_str()),
+            check,
+            check_file: check_file_leaked,
         })
     } else {
         None
@@ -403,11 +473,16 @@ struct BenchItem {
     label: &'static str,
     prompt: &'static str,
     check: Box<dyn Fn(&str) -> bool>,
+    check_file: &'static str,
 }
 
 /// Helper to build a BenchItem with a boxed closure.
 fn bench(id: &'static str, label: &'static str, prompt: &'static str, check: impl Fn(&str) -> bool + 'static) -> BenchItem {
-    BenchItem { id, label, prompt, check: Box::new(check) }
+    BenchItem { id, label, prompt, check: Box::new(check), check_file: "solution.py" }
+}
+
+fn bench_file(id: &'static str, label: &'static str, prompt: &'static str, check_file: &'static str, check: impl Fn(&str) -> bool + 'static) -> BenchItem {
+    BenchItem { id, label, prompt, check: Box::new(check), check_file }
 }
 
 fn exercises() -> Vec<BenchItem> {
@@ -417,16 +492,16 @@ fn exercises() -> Vec<BenchItem> {
         bench("py-sort", "python", "Write merge_sort(arr: list[int]) -> list[int]. Save to solution.py.", |d| file_contains(d, "solution.py", "def merge_sort")),
         bench("py-decorator", "python", "Write a retry decorator that retries up to 3 times on exception. Save to solution.py.", |d| file_contains(d, "solution.py", "def retry")),
         bench("py-context", "python", "Write a context manager that times code execution. Save to solution.py.", |d| file_contains(d, "solution.py", "__enter__")),
-        bench("js-promise", "javascript", "Write fetchWithTimeout(url, timeout) using AbortController. Save to solution.js.", |d| file_contains(d, "solution.js", "AbortController")),
-        bench("js-debounce", "javascript", "Write a debounce function. Save to solution.js.", |d| file_contains(d, "solution.js", "debounce")),
-        bench("js-async", "javascript", "Write an async function to read a file. Save to solution.js.", |d| file_contains(d, "solution.js", "async")),
-        bench("ts-interface", "typescript", "Write a TypeScript interface User with id, name, email. Save to solution.ts.", |d| file_contains(d, "solution.ts", "interface User")),
-        bench("ts-generic", "typescript", "Write generic first<T>(arr: T[]): T | undefined. Save to solution.ts.", |d| file_contains(d, "solution.ts", "function first")),
-        bench("sh-backup", "bash", "Write a bash script that backs up a directory to timestamped tar.gz. Save to solution.sh.", |d| file_contains(d, "solution.sh", "tar")),
-        bench("sh-replace", "bash", "Write a bash script to find and replace text in .txt files. Save to solution.sh.", |d| file_contains(d, "solution.sh", "find")),
-        bench("rust-struct", "rust", "Write a Rust struct Point with x,y f64 and new() + distance_to(). Save to solution.rs.", |d| file_contains(d, "solution.rs", "struct Point")),
-        bench("rust-enum", "rust", "Write enum Shape with Circle/Rectangle/Triangle and area(). Save to solution.rs.", |d| file_contains(d, "solution.rs", "enum Shape")),
-        bench("go-struct", "go", "Write Go struct Person with Name/Age and String() method. Save to solution.go.", |d| file_contains(d, "solution.go", "type Person struct")),
+        bench_file("js-promise", "javascript", "Write fetchWithTimeout(url, timeout) using AbortController. Save to solution.js.", "solution.js", |d| file_contains(d, "solution.js", "AbortController")),
+        bench_file("js-debounce", "javascript", "Write a debounce function. Save to solution.js.", "solution.js", |d| file_contains(d, "solution.js", "debounce")),
+        bench_file("js-async", "javascript", "Write an async function to read a file. Save to solution.js.", "solution.js", |d| file_contains(d, "solution.js", "async")),
+        bench_file("ts-interface", "typescript", "Write a TypeScript interface User with id, name, email. Save to solution.ts.", "solution.ts", |d| file_contains(d, "solution.ts", "interface User")),
+        bench_file("ts-generic", "typescript", "Write generic first<T>(arr: T[]): T | undefined. Save to solution.ts.", "solution.ts", |d| file_contains(d, "solution.ts", "function first")),
+        bench_file("sh-backup", "bash", "Write a bash script that backs up a directory to timestamped tar.gz. Save to solution.sh.", "solution.sh", |d| file_contains(d, "solution.sh", "tar")),
+        bench_file("sh-replace", "bash", "Write a bash script to find and replace text in .txt files. Save to solution.sh.", "solution.sh", |d| file_contains(d, "solution.sh", "find")),
+        bench_file("rust-struct", "rust", "Write a Rust struct Point with x,y f64 and new() + distance_to(). Save to solution.rs.", "solution.rs", |d| file_contains(d, "solution.rs", "struct Point")),
+        bench_file("rust-enum", "rust", "Write enum Shape with Circle/Rectangle/Triangle and area(). Save to solution.rs.", "solution.rs", |d| file_contains(d, "solution.rs", "enum Shape")),
+        bench_file("go-struct", "go", "Write Go struct Person with Name/Age and String() method. Save to solution.go.", "solution.go", |d| file_contains(d, "solution.go", "type Person struct")),
     ]
 }
 
@@ -479,11 +554,12 @@ async fn run_bench(
         let tmpdir = tempfile::tempdir().context("Failed to create temp dir")?;
         let tmpdir_str = tmpdir.path().to_string_lossy().to_string();
 
-        // Gate 2 prompt hardening: absolute path prevents CWD contamination.
-        // Suffix ensures model writes to tmpdir even if base prompt says "solution.py".
+        // Prompt hardening: use real check_file per exercise (fix .py forced for js/ts/rust/go)
+        // Gate 2 absolute path prevents CWD contamination.
+        let target_file = if ex.check_file.is_empty() { "solution.py" } else { ex.check_file };
         let prompt = format!(
-            "{}\n\nWork in directory: {} — Save to {}/solution.py (use absolute path)",
-            ex.prompt, tmpdir_str, tmpdir_str
+            "{}\n\nWork in directory: {} — Save to {}/{} (use absolute path)",
+            ex.prompt, tmpdir_str, tmpdir_str, target_file
         );
 
         let start = Instant::now();
@@ -565,20 +641,20 @@ async fn run_bench(
 
 fn tb2_exercises() -> Vec<BenchItem> {
     vec![
-        bench("tb2-bash-count", "bash", "Create a bash script called count_lines.sh that counts the number of lines in all .rs files in the current directory recursively. Save it to count_lines.sh and make it executable.", |d| file_is_executable(d, "count_lines.sh") && file_contains(d, "count_lines.sh", "find")),
-        bench("tb2-py-csv", "python", "Write a Python script called csv_to_json.py that reads a CSV file (input path as first argument) and outputs JSON to stdout. Save it to csv_to_json.py.", |d| file_contains(d, "csv_to_json.py", "csv") && file_contains(d, "csv_to_json.py", "json")),
-        bench("tb2-makefile", "makefile", "Create a Makefile with three targets: test (runs cargo test), build (runs cargo build), and clean (removes target directory). Save to Makefile.", |d| file_contains(d, "Makefile", "test:") && file_contains(d, "Makefile", "build:") && file_contains(d, "Makefile", "clean:")),
-        bench("tb2-dockerfile", "docker", "Write a Dockerfile for a Rust project that uses multi-stage builds: builder stage compiles, runtime stage copies binary. Save to Dockerfile.", |d| file_contains(d, "Dockerfile", "FROM") && file_contains(d, "Dockerfile", "COPY")),
-        bench("tb2-gh-actions", "ci", "Create a GitHub Actions CI workflow at .github/workflows/ci.yml that runs cargo test and cargo build on push/PR. Save to .github/workflows/ci.yml.", |d| {
+        bench_file("tb2-bash-count", "bash", "Create a bash script called count_lines.sh that counts the number of lines in all .rs files in the current directory recursively. Save it to count_lines.sh and make it executable.", "count_lines.sh", |d| file_is_executable(d, "count_lines.sh") && file_contains(d, "count_lines.sh", "find")),
+        bench_file("tb2-py-csv", "python", "Write a Python script called csv_to_json.py that reads a CSV file (input path as first argument) and outputs JSON to stdout. Save it to csv_to_json.py.", "csv_to_json.py", |d| file_contains(d, "csv_to_json.py", "csv") && file_contains(d, "csv_to_json.py", "json")),
+        bench_file("tb2-makefile", "makefile", "Create a Makefile with three targets: test (runs cargo test), build (runs cargo build), and clean (removes target directory). Save to Makefile.", "Makefile", |d| file_contains(d, "Makefile", "test:") && file_contains(d, "Makefile", "build:") && file_contains(d, "Makefile", "clean:")),
+        bench_file("tb2-dockerfile", "docker", "Write a Dockerfile for a Rust project that uses multi-stage builds: builder stage compiles, runtime stage copies binary. Save to Dockerfile.", "Dockerfile", |d| file_contains(d, "Dockerfile", "FROM") && file_contains(d, "Dockerfile", "COPY")),
+        bench_file("tb2-gh-actions", "ci", "Create a GitHub Actions CI workflow at .github/workflows/ci.yml that runs cargo test and cargo build on push/PR. Save to .github/workflows/ci.yml.", ".github/workflows/ci.yml", |d| {
             let path = std::path::Path::new(d).join(".github/workflows/ci.yml");
             match std::fs::read_to_string(&path) {
                 Ok(c) => c.contains("cargo test") || c.contains("cargo build"),
                 Err(_) => false,
             }
         }),
-        bench("tb2-sh-find-modified", "bash", "Write a bash script called find_recent.sh that finds all files modified in the last 24 hours in a given directory (first argument). Save to find_recent.sh.", |d| file_is_executable(d, "find_recent.sh") && file_contains(d, "find_recent.sh", "find")),
-        bench("tb2-py-dirsize", "python", "Write a Python script called dirsize.py that calculates and prints the total size of each subdirectory in the current directory. Save to dirsize.py.", |d| file_contains(d, "dirsize.py", "os") && file_contains(d, "dirsize.py", "path")),
-        bench("tb2-sh-backup", "bash", "Write a bash script called backup.sh that backs up files from a source directory (first argument) to a destination with a timestamp suffix (e.g. backup_20260817_120000). Save to backup.sh.", |d| file_is_executable(d, "backup.sh") && file_contains(d, "backup.sh", "cp")),
+        bench_file("tb2-sh-find-modified", "bash", "Write a bash script called find_recent.sh that finds all files modified in the last 24 hours in a given directory (first argument). Save to find_recent.sh.", "find_recent.sh", |d| file_is_executable(d, "find_recent.sh") && file_contains(d, "find_recent.sh", "find")),
+        bench_file("tb2-py-dirsize", "python", "Write a Python script called dirsize.py that calculates and prints the total size of each subdirectory in the current directory. Save to dirsize.py.", "dirsize.py", |d| file_contains(d, "dirsize.py", "os") && file_contains(d, "dirsize.py", "path")),
+        bench_file("tb2-sh-backup", "bash", "Write a bash script called backup.sh that backs up files from a source directory (first argument) to a destination with a timestamp suffix (e.g. backup_20260817_120000). Save to backup.sh.", "backup.sh", |d| file_is_executable(d, "backup.sh") && file_contains(d, "backup.sh", "cp")),
     ]
 }
 

@@ -4,8 +4,10 @@
 
 pub mod client;
 pub mod error;
+pub mod grammar;
 pub mod tools;
 
 pub use client::{ChatClient, ChatRequest, ChatResponse, Message, MockClient, OllamaClient, ToolCall};
 pub use error::{Result, RuntimeError};
+pub use grammar::{GrammarClient, GrammarConfig};
 pub use tools::ToolDefinition;
