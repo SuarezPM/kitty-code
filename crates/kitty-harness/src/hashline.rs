@@ -21,6 +21,9 @@ pub enum HashlineError {
     #[error("No line matched hash: {0}")]
     HashNotFound(String),
 
+    #[error("Ambiguous hash prefix '{0}' matches multiple lines")]
+    AmbiguousPrefix(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -106,7 +109,12 @@ impl HashlineEditor {
             .collect()
     }
 
-    /// Edit a file by replacing the line with the given hash.
+    /// Edit a file by replacing the line with the given hash prefix.
+    ///
+    /// Uses prefix matching: if `old_hash` is 8 chars, it matches any full
+    /// hash starting with those 8 chars. If the prefix matches multiple lines,
+    /// returns `AmbiguousPrefix`. If fewer than 6 chars, falls through to
+    /// exact match.
     ///
     /// Returns the new file content. Does NOT write to disk — caller decides.
     /// If the file changed since last read, returns `FileChanged` error.
@@ -130,14 +138,38 @@ impl HashlineEditor {
             });
         }
 
-        // Find and replace the line
-        let mut found = false;
+        // Collect matching lines using prefix match (min 6 chars for prefix)
+        let use_prefix = old_hash.len() >= 6;
+        let matching_indices: Vec<usize> = snapshot
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                if use_prefix {
+                    line.hash.starts_with(old_hash)
+                } else {
+                    line.hash == old_hash
+                }
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        if matching_indices.is_empty() {
+            return Err(HashlineError::HashNotFound(old_hash.to_string()));
+        }
+
+        if matching_indices.len() > 1 {
+            return Err(HashlineError::AmbiguousPrefix(old_hash.to_string()));
+        }
+
+        // Exactly one match — replace it
+        let target_idx = matching_indices[0];
         let result: Vec<String> = snapshot
             .lines
             .iter()
-            .map(|line| {
-                if line.hash == old_hash {
-                    found = true;
+            .enumerate()
+            .map(|(i, line)| {
+                if i == target_idx {
                     new_content.to_string()
                 } else {
                     line.content.clone()
@@ -145,9 +177,65 @@ impl HashlineEditor {
             })
             .collect();
 
-        if !found {
+        Ok(result.join("\n"))
+    }
+
+    /// Edit by hash prefix AND line number for disambiguation.
+    ///
+    /// Verifies the hash prefix matches the line at `line_num`, then replaces.
+    /// Returns `HashNotFound` if the prefix doesn't match the specified line.
+    pub fn edit_by_hash_and_line(
+        &self,
+        path: impl AsRef<Path>,
+        old_hash: &str,
+        line_num: usize,
+        new_content: &str,
+    ) -> Result<String, HashlineError> {
+        let path = path.as_ref();
+        let snapshot = self
+            .snapshots
+            .get(path)
+            .ok_or_else(|| HashlineError::NotLoaded(path.display().to_string()))?;
+
+        // Verify file hasn't changed
+        let current_hash = Self::compute_current_file_hash(path)?;
+        if current_hash != snapshot.file_hash {
+            return Err(HashlineError::FileChanged {
+                expected: snapshot.file_hash.clone(),
+            });
+        }
+
+        // Find the line at the given line number
+        let target = snapshot
+            .lines
+            .iter()
+            .find(|l| l.line_num == line_num)
+            .ok_or_else(|| HashlineError::HashNotFound(old_hash.to_string()))?;
+
+        // Verify the hash prefix matches
+        let use_prefix = old_hash.len() >= 6;
+        let hash_matches = if use_prefix {
+            target.hash.starts_with(old_hash)
+        } else {
+            target.hash == old_hash
+        };
+
+        if !hash_matches {
             return Err(HashlineError::HashNotFound(old_hash.to_string()));
         }
+
+        // Replace that specific line
+        let result: Vec<String> = snapshot
+            .lines
+            .iter()
+            .map(|line| {
+                if line.line_num == line_num {
+                    new_content.to_string()
+                } else {
+                    line.content.clone()
+                }
+            })
+            .collect();
 
         Ok(result.join("\n"))
     }
@@ -281,5 +369,86 @@ mod tests {
         };
         let tagged = HashlineEditor::format_tagged(&snapshot);
         assert_eq!(tagged, "1:abc123|hello\n2:def456|world");
+    }
+
+    #[test]
+    fn edit_by_hash_prefix_matches_full_hash() {
+        let f = temp_file("aaa\nbbb\nccc");
+        let mut editor = HashlineEditor::new();
+        let snapshot = editor.read_file(f.path()).unwrap();
+        let full_hash = &snapshot.lines[1].hash;
+        let prefix = &full_hash[..8.min(full_hash.len())];
+        let result = editor.edit_by_hash(f.path(), prefix, "BBB").unwrap();
+        assert_eq!(result, "aaa\nBBB\nccc");
+    }
+
+    #[test]
+    fn edit_by_hash_full_64_char_hash_still_works() {
+        let f = temp_file("aaa\nbbb\nccc");
+        let mut editor = HashlineEditor::new();
+        let snapshot = editor.read_file(f.path()).unwrap();
+        let full_hash = snapshot.lines[1].hash.clone();
+        assert_eq!(full_hash.len(), 64); // BLAKE3 produces 64 hex chars
+        let result = editor.edit_by_hash(f.path(), &full_hash, "BBB").unwrap();
+        assert_eq!(result, "aaa\nBBB\nccc");
+    }
+
+    #[test]
+    fn edit_by_hash_ambiguous_prefix_returns_error() {
+        // Create file with two identical lines
+        let f = temp_file("same\nsame\ndifferent");
+        let mut editor = HashlineEditor::new();
+        let snapshot = editor.read_file(f.path()).unwrap();
+        let hash_line0 = &snapshot.lines[0].hash;
+        let hash_line1 = &snapshot.lines[1].hash;
+        // Identical lines → identical hashes
+        assert_eq!(hash_line0, hash_line1);
+        let prefix = &hash_line0[..8.min(hash_line0.len())];
+        let err = editor
+            .edit_by_hash(f.path(), prefix, "REPLACED")
+            .unwrap_err();
+        assert!(matches!(err, HashlineError::AmbiguousPrefix(_)));
+    }
+
+    #[test]
+    fn edit_by_hash_and_line_disambiguates() {
+        // Create file with two identical lines
+        let f = temp_file("same\nsame\ndifferent");
+        let mut editor = HashlineEditor::new();
+        let snapshot = editor.read_file(f.path()).unwrap();
+        let hash_line0 = &snapshot.lines[0].hash;
+        let prefix = &hash_line0[..8.min(hash_line0.len())];
+        let result = editor
+            .edit_by_hash_and_line(f.path(), prefix, 1, "FIRST")
+            .unwrap();
+        assert_eq!(result, "FIRST\nsame\ndifferent");
+    }
+
+    #[test]
+    fn edit_by_hash_short_prefix_falls_to_exact_match() {
+        let f = temp_file("aaa\nbbb\nccc");
+        let mut editor = HashlineEditor::new();
+        let snapshot = editor.read_file(f.path()).unwrap();
+        // 5-char prefix should NOT match (too short for prefix mode)
+        let short_prefix = &snapshot.lines[1].hash[..5];
+        let err = editor
+            .edit_by_hash(f.path(), short_prefix, "BBB")
+            .unwrap_err();
+        // Falls through to exact match, which won't find a 5-char hash
+        assert!(matches!(err, HashlineError::HashNotFound(_)));
+    }
+
+    #[test]
+    fn edit_by_hash_and_line_rejects_mismatched_hash() {
+        let f = temp_file("aaa\nbbb\nccc");
+        let mut editor = HashlineEditor::new();
+        let snapshot = editor.read_file(f.path()).unwrap();
+        let hash_a = &snapshot.lines[0].hash;
+        let prefix_a = &hash_a[..8.min(hash_a.len())];
+        // Try to edit line 2 using line 0's hash prefix → should fail
+        let err = editor
+            .edit_by_hash_and_line(f.path(), prefix_a, 2, "BBB")
+            .unwrap_err();
+        assert!(matches!(err, HashlineError::HashNotFound(_)));
     }
 }

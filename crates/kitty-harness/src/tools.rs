@@ -157,6 +157,8 @@ impl ToolRegistry {
                 reason: "missing 'new' content".to_string(),
             })?;
 
+        let line_num = args.get("line").and_then(|v| v.as_u64()).map(|n| n as usize);
+
         let path_buf = PathBuf::from(path);
 
         // Read-before-edit guard
@@ -164,27 +166,60 @@ impl ToolRegistry {
             return Err(ToolError::EditBlocked(path.to_string()));
         }
 
-        match self.hashline.edit_by_hash(&path_buf, old_hash, new_content) {
-            Ok(new_file_content) => {
-                std::fs::write(&path_buf, &new_file_content)?;
-                // Re-read to get updated hashes
-                self.hashline.read_file(&path_buf)?;
-                Ok(ToolResult {
-                    success: true,
-                    output: format!("Edit applied to {path}"),
+        // If line number provided, use disambiguation path
+        if let Some(line) = line_num {
+            match self
+                .hashline
+                .edit_by_hash_and_line(&path_buf, old_hash, line, new_content)
+            {
+                Ok(new_file_content) => {
+                    std::fs::write(&path_buf, &new_file_content)?;
+                    self.hashline.read_file(&path_buf)?;
+                    Ok(ToolResult {
+                        success: true,
+                        output: format!("Edit applied to {path} (line {line})"),
+                        retry: false,
+                    })
+                }
+                Err(crate::hashline::HashlineError::FileChanged { .. }) => Ok(ToolResult {
+                    success: false,
+                    output: format!("File {path} changed since last read. Re-read and retry."),
+                    retry: true,
+                }),
+                Err(e) => Err(e.into()),
+            }
+        } else {
+            // Normal path — prefix match
+            match self.hashline.edit_by_hash(&path_buf, old_hash, new_content) {
+                Ok(new_file_content) => {
+                    std::fs::write(&path_buf, &new_file_content)?;
+                    // Re-read to get updated hashes
+                    self.hashline.read_file(&path_buf)?;
+                    Ok(ToolResult {
+                        success: true,
+                        output: format!("Edit applied to {path}"),
+                        retry: false,
+                    })
+                }
+                Err(crate::hashline::HashlineError::FileChanged { .. }) => Ok(ToolResult {
+                    success: false,
+                    output: format!("File {path} changed since last read. Re-read and retry."),
+                    retry: true,
+                }),
+                Err(crate::hashline::HashlineError::HashNotFound(h)) => {
+                    // Fallback: try search-replace using old content
+                    self.fallback_search_replace(path, &h, new_content)
+                }
+                Err(crate::hashline::HashlineError::AmbiguousPrefix(h)) => Ok(ToolResult {
+                    success: false,
+                    output: format!(
+                        "Hash prefix '{h}' matches multiple lines in {path}. \
+                         Re-run Edit with the 'line' parameter set to the line number to disambiguate."
+                    ),
                     retry: false,
-                })
+                }),
+                Err(e) => Err(e.into()),
             }
-            Err(crate::hashline::HashlineError::FileChanged { .. }) => Ok(ToolResult {
-                success: false,
-                output: format!("File {path} changed since last read. Re-read and retry."),
-                retry: true,
-            }),
-            Err(crate::hashline::HashlineError::HashNotFound(h)) => {
-                // Fallback: try search-replace using old content
-                self.fallback_search_replace(path, &h, new_content)
-            }
-            Err(e) => Err(e.into()),
         }
     }
 
@@ -509,11 +544,15 @@ pub fn standard_tool_definitions() -> Vec<kitty_runtime::ToolDefinition> {
                     },
                     "hash": {
                         "type": "string",
-                        "description": "Line hash from Read output"
+                        "description": "Line hash from Read output (8-char prefix or full hash)"
                     },
                     "new": {
                         "type": "string",
                         "description": "New content for the line"
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "Line number to disambiguate when hash prefix matches multiple lines"
                     }
                 },
                 "required": ["path", "hash", "new"]

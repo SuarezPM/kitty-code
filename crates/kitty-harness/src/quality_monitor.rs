@@ -81,13 +81,21 @@ impl QualityMonitor {
     }
 
     /// Advance to the next turn.
+    ///
+    /// F2.4: The sliding window is NOT cleared between turns so that
+    /// cross-turn tool loops (same tool+args across 3+ consecutive turns)
+    /// are detected. The window is only reset when a different tool appears
+    /// or a pure text response breaks the pattern.
     pub fn next_turn(&mut self) {
         self.turn += 1;
-        self.recent_tool_calls.clear();
+        // Intentionally NOT clearing recent_tool_calls here (F2.4).
     }
 
     /// Check an LLM response for quality issues.
     /// Returns the list of violations found and suggested corrective actions.
+    ///
+    /// F2.4: The sliding window persists across turns but resets when a
+    /// different tool name appears or a pure text response breaks the pattern.
     pub fn check_response(
         &mut self,
         content: Option<&str>,
@@ -106,6 +114,11 @@ impl QualityMonitor {
             violations.push(QualityViolation::EmptyResponse);
         }
 
+        // F2.4: Reset window when a pure text response breaks the tool pattern
+        if !has_tools && !self.recent_tool_calls.is_empty() {
+            self.recent_tool_calls.clear();
+        }
+
         // Check for hallucinated tools
         for tc in tool_calls {
             if !self.registered_tools.contains(&tc.name) {
@@ -117,6 +130,13 @@ impl QualityMonitor {
 
         // Check for tool loops
         for tc in tool_calls {
+            // F2.4: Reset window if a different tool name appears (breaks the pattern)
+            if let Some(last_name) = self.recent_tool_calls.back() {
+                if last_name != &tc.name {
+                    self.recent_tool_calls.clear();
+                }
+            }
+
             self.recent_tool_calls.push_back(tc.name.clone());
             // Keep only the last N entries
             while self.recent_tool_calls.len() > self.config.loop_threshold {
@@ -313,7 +333,9 @@ mod tests {
     }
 
     #[test]
-    fn turn_reset_clears_loop_window() {
+    fn turn_reset_does_not_clear_loop_window() {
+        // F2.4: next_turn() no longer clears the window — cross-turn loops
+        // are detected. The window resets only when a different tool appears.
         let config = QualityConfig {
             loop_threshold: 3,
         };
@@ -325,8 +347,36 @@ mod tests {
         monitor.check_response(None, std::slice::from_ref(&tc));
         monitor.check_response(None, std::slice::from_ref(&tc));
         monitor.next_turn();
-        // After turn reset, loop window is cleared
+        // After turn reset, window persists — third call triggers loop
         let violations = monitor.check_response(None, &[tc]);
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            QualityViolation::ToolLoop { tool_name, count }
+                if tool_name == "Read" && *count == 3
+        )));
+    }
+
+    #[test]
+    fn different_tool_resets_loop_window() {
+        // F2.4: A different tool name resets the sliding window.
+        let config = QualityConfig {
+            loop_threshold: 3,
+        };
+        let mut monitor = QualityMonitor::new(config, default_tools());
+        let read_tc = ParsedToolCall {
+            name: "Read".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let edit_tc = ParsedToolCall {
+            name: "Edit".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        monitor.check_response(None, std::slice::from_ref(&read_tc));
+        monitor.check_response(None, std::slice::from_ref(&read_tc));
+        // Different tool resets the window
+        monitor.check_response(None, std::slice::from_ref(&edit_tc));
+        // Now two more reads — still under threshold since window was reset
+        let violations = monitor.check_response(None, std::slice::from_ref(&read_tc));
         assert!(violations
             .iter()
             .all(|v| !matches!(v, QualityViolation::ToolLoop { .. })));

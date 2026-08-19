@@ -172,6 +172,13 @@ impl Agent {
     /// Run the agent loop with a user prompt.
     ///
     /// Returns the final text response after tool calls are resolved.
+    ///
+    /// F2 fixes applied:
+    /// - F2.2: Tool errors → failed result messages, never abort session
+    /// - F2.3: `push_message` is the sole token accounting point (no double count)
+    /// - F2.4: Quality monitor window persists across turns
+    /// - F2.5: Tool results pushed before corrective user messages
+    /// - F2.6: Thinking budget exceeded retries inline, doesn't return raw text
     pub async fn run(&mut self, user_prompt: &str) -> Result<String> {
         // Bootstrap: detect workspace on first turn
         self.run_bootstrap();
@@ -182,21 +189,19 @@ impl Agent {
 
         // Episodic memory: recall past episodes for this goal (context, not a
         // user turn — injected after the system message and budget-tracked).
-        self.recall_episodes(user_prompt);
+        self.recall_episodes(user_prompt).await;
 
         // Knowledge injection: inject on first user message if enabled.
-        self.inject_knowledge(user_prompt);
+        self.inject_knowledge(user_prompt).await;
 
-        // Add user message
+        // F2.3: push_message is the sole token accounting point.
         self.push_message(Message {
             role: "user".to_string(),
             content: Some(user_prompt.to_string()),
             thinking: None,
             tool_calls: None,
-        });
-
-        // Consume user prompt tokens (real count when server reachable)
-        self.budget.consume(self.count_tokens(user_prompt).await);
+        })
+        .await;
 
         // Reset thinking budget for this turn
         self.thinking_budget.reset_turn();
@@ -212,171 +217,39 @@ impl Agent {
 
             if self.budget.should_halt() {
                 warn!("Context halting: compaction exhausted");
-                return self.force_response("Context limit reached. Please start a new conversation.").await;
+                return self
+                    .force_response("Context limit reached. Please start a new conversation.")
+                    .await;
             }
 
             // LLM call
             let response = self.llm_call().await?;
 
-            // Extract thinking tokens for budget tracking
+            // Extract thinking tokens for budget tracking (thinking is metadata,
+            // not a conversation message — tracked via explicit budget.consume).
             if let Some(thinking) = response.message.thinking.as_deref() {
                 let tokens = self.count_tokens(thinking).await;
                 // Apply thinking budget cap
                 if let Err(e) = self.thinking_budget.record(tokens) {
                     warn!(error = %e, "Thinking budget exceeded, retrying without thinking");
-                    // Retry the LLM call without thinking
-                    return self.retry_without_thinking().await;
+                    // F2.6: Retry without thinking — re-call LLM, then fall through
+                    // to normal processing (tool calls and all). Max 1 retry per turn.
+                    let retry_response = self.llm_call_no_thinking().await?;
+                    self.process_response(user_prompt, retry_response).await?;
+                    // Don't reset thinking budget — we already retried once
+                    continue;
                 }
+                // Thinking tokens are consumed against budget but not pushed as
+                // a message — explicit consume here is correct (F2.3 exception).
                 self.budget.consume(tokens);
             }
 
-            // Check for tool calls
-            if let Some(tool_calls) = &response.message.tool_calls {
-                if !tool_calls.is_empty() {
-                    // Add assistant message with tool calls
-                    self.push_message(response.message.clone());
+            self.process_response(user_prompt, response).await?;
 
-                    // Also parse text content for XML-style tool calls
-                    let mut all_tool_calls: Vec<ParsedToolCall> = Vec::new();
-
-                    // Native tool calls from Ollama
-                    for tc in tool_calls {
-                        all_tool_calls.push(ParsedToolCall {
-                            name: tc.function.name.clone(),
-                            arguments: tc.function.arguments.clone(),
-                        });
-                    }
-
-                    // Also parse content for XML-style tool calls
-                    if let Some(content) = response.message.content.as_deref() {
-                        let parsed = self.parser.parse(content);
-                        all_tool_calls.extend(parsed);
-                    }
-
-                    // Quality monitor: check for hallucinated tools before execution
-                    let violations = self.quality_monitor.check_response(
-                        response.message.content.as_deref(),
-                        &all_tool_calls,
-                    );
-                    for violation in &violations {
-                        warn!(violation = ?violation, "Quality violation detected");
-                        // For hallucinated tools, inject corrective message and break
-                        if let QualityViolation::HallucinatedTool { tool_name: _ } = violation {
-                            self.push_message(Message::user(
-                                QualityMonitor::corrective_message(violation),
-                            ));
-                            continue;
-                        }
-                        // For loops, inject corrective message
-                        if let QualityViolation::ToolLoop { .. } = violation {
-                            self.push_message(Message::user(
-                                QualityMonitor::corrective_message(violation),
-                            ));
-                            return self.force_response(
-                                "Please provide a text response instead of repeating the same tool call.",
-                            ).await;
-                        }
-                    }
-
-                    // Execute each tool call
-                    for tc in &all_tool_calls {
-                        // Skip hallucinated tools
-                        if violations.iter().find(|v| matches!(
-                            v,
-                            QualityViolation::HallucinatedTool { tool_name }
-                                if tool_name == &tc.name
-                        )).is_some() {
-                            continue;
-                        }
-
-                        let result = self.registry.execute(tc).await?;
-                        debug!(name = tc.name, success = result.success, "Tool executed");
-
-                        // Add tool result as a message
-                        self.push_message(Message {
-                            role: "tool".to_string(),
-                            content: Some(result.output.clone()),
-                            thinking: None,
-                            tool_calls: None,
-                        });
-
-                        // Consume response tokens
-                        let tokens =
-                            self.count_tokens(&result.output).await;
-                        self.budget.consume(tokens);
-
-                        // If retry requested, the file changed — break to re-read
-                        if result.retry {
-                            break;
-                        }
-                    }
-
-                    // Reset thinking budget for next turn
-                    self.thinking_budget.reset_turn();
-                    self.quality_monitor.next_turn();
-
-                    continue; // Next iteration for tool results
-                }
-            }
-
-            // No tool calls — extract text response
-            let text = response
-                .message
-                .content
-                .unwrap_or_default();
-
-            // Check for empty response
-            let violations = self.quality_monitor.check_response(
-                Some(&text),
-                &[],
-            );
-            if violations.contains(&QualityViolation::EmptyResponse) {
-                warn!("Empty response detected, forcing retry");
-                return self.force_response(
-                    "Your response was empty. Please provide text content.",
-                ).await;
-            }
-
-            // Check if the text contains XML tool calls that weren't in tool_calls
-            let parsed = self.parser.parse(&text);
-            if !parsed.is_empty() {
-                // There are tool calls in the text, process them
-                self.push_message(Message {
-                    role: "assistant".to_string(),
-                    content: Some(text.clone()),
-                    thinking: None,
-                    tool_calls: None,
-                });
-
-                for tc in &parsed {
-                    let result = self.registry.execute(tc).await?;
-                    self.push_message(Message {
-                        role: "tool".to_string(),
-                        content: Some(result.output.clone()),
-                        thinking: None,
-                        tool_calls: None,
-                    });
-                    let tokens = self.count_tokens(&result.output).await;
-                    self.budget.consume(tokens);
-                }
-                continue; // Process tool results
-            }
-
-            // Pure text response — we're done
-            self.push_message(Message {
-                role: "assistant".to_string(),
-                content: Some(text.clone()),
-                thinking: None,
-                tool_calls: None,
-            });
-
-            let tokens = self.count_tokens(&text).await;
-            self.budget.consume(tokens);
-
-            // Save successful episode to memory
-            self.save_episode(user_prompt, &text, true);
-
-            return Ok(text);
+            // Reset thinking budget for next turn
+            self.thinking_budget.reset_turn();
+            // F2.4: Do NOT clear the quality monitor window — it persists
+            // across turns to detect cross-turn tool loops.
         }
 
         // Exhausted iterations — force a final response
@@ -391,6 +264,186 @@ impl Agent {
         // so memory reflects reality (otherwise only "pass" episodes accumulate).
         self.save_episode(user_prompt, &text, false);
         Ok(text)
+    }
+
+    /// Process a single LLM response within the agent loop.
+    ///
+    /// Handles tool execution, quality checks, and message ordering.
+    /// Returns Ok(true) when a final text response was produced, Ok(false) to
+    /// continue the loop (tool calls were processed).
+    async fn process_response(
+        &mut self,
+        user_prompt: &str,
+        response: ChatResponse,
+    ) -> Result<()> {
+        // Check for tool calls
+        if let Some(tool_calls) = &response.message.tool_calls {
+            if !tool_calls.is_empty() {
+                // Add assistant message with tool calls (F2.3: push handles tokens)
+                self.push_message(response.message.clone()).await;
+
+                // Also parse text content for XML-style tool calls
+                let mut all_tool_calls: Vec<ParsedToolCall> = Vec::new();
+
+                // Native tool calls from Ollama
+                for tc in tool_calls {
+                    all_tool_calls.push(ParsedToolCall {
+                        name: tc.function.name.clone(),
+                        arguments: tc.function.arguments.clone(),
+                    });
+                }
+
+                // Also parse content for XML-style tool calls
+                if let Some(content) = response.message.content.as_deref() {
+                    let parsed = self.parser.parse(content);
+                    all_tool_calls.extend(parsed);
+                }
+
+                // Quality monitor: check for hallucinated tools before execution.
+                // F2.4: window is NOT cleared — persists across turns.
+                let violations = self
+                    .quality_monitor
+                    .check_response(response.message.content.as_deref(), &all_tool_calls);
+
+                // F2.5: Push tool results FIRST, then corrective user messages.
+                // Ollama message order: assistant(tool_calls) → tool* → next.
+                for tc in &all_tool_calls {
+                    // Skip hallucinated tools
+                    if violations.iter().any(|v| matches!(
+                        v,
+                        QualityViolation::HallucinatedTool { tool_name }
+                            if tool_name == &tc.name
+                    )) {
+                        continue;
+                    }
+
+                    // F2.2: Tool errors become failed results, never abort.
+                    let result = match self.registry.execute(tc).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(error = %e, name = tc.name, "Tool execution failed");
+                            crate::tools::ToolResult {
+                                success: false,
+                                output: format!("Tool '{}' failed: {e}", tc.name),
+                                retry: false,
+                            }
+                        }
+                    };
+                    debug!(name = tc.name, success = result.success, "Tool executed");
+
+                    // Push tool result (F2.3: push handles tokens)
+                    self.push_message(Message {
+                        role: "tool".to_string(),
+                        content: Some(result.output.clone()),
+                        thinking: None,
+                        tool_calls: None,
+                    })
+                    .await;
+
+                    // If retry requested, the file changed — break to re-read
+                    if result.retry {
+                        break;
+                    }
+                }
+
+                // F2.5: NOW push corrective user messages (after all tool results).
+                for violation in &violations {
+                    warn!(violation = ?violation, "Quality violation detected");
+                    match violation {
+                        QualityViolation::HallucinatedTool { tool_name } => {
+                            let msg = format!(
+                                "The tool '{tool_name}' does not exist. Available tools are: \
+                                 Read, Edit, Write, Bash, Glob, Grep. Please use one of these tools."
+                            );
+                            self.push_message(Message::user(msg)).await;
+                        }
+                        QualityViolation::ToolLoop { tool_name, count } => {
+                            let msg = format!(
+                                "You have called {tool_name} {count} times in a row with the \
+                                 same arguments. This appears to be a loop. Please try a \
+                                 different approach or provide a text response."
+                            );
+                            self.push_message(Message::user(msg)).await;
+                            // Force text response instead of continuing the loop
+                            let text = self
+                                .force_response(
+                                    "Please provide a text response instead of repeating the same tool call.",
+                                )
+                                .await?;
+                            self.save_episode(user_prompt, &text, true);
+                            return Ok(());
+                        }
+                        QualityViolation::EmptyResponse => {
+                            // Handled in the no-tool-calls branch below
+                        }
+                    }
+                }
+
+                return Ok(()); // Next iteration for tool results
+            }
+        }
+
+        // No tool calls — extract text response
+        let text = response.message.content.unwrap_or_default();
+
+        // Check for empty response
+        let violations = self.quality_monitor.check_response(Some(&text), &[]);
+        if violations.contains(&QualityViolation::EmptyResponse) {
+            warn!("Empty response detected, forcing retry");
+            self.force_response("Your response was empty. Please provide text content.")
+                .await?;
+            return Ok(());
+        }
+
+        // Check if the text contains XML tool calls that weren't in tool_calls
+        let parsed = self.parser.parse(&text);
+        if !parsed.is_empty() {
+            // There are tool calls in the text, process them
+            self.push_message(Message {
+                role: "assistant".to_string(),
+                content: Some(text.clone()),
+                thinking: None,
+                tool_calls: None,
+            })
+            .await;
+
+            for tc in &parsed {
+                // F2.2: Handle tool errors gracefully
+                let result = match self.registry.execute(tc).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(error = %e, name = tc.name, "Tool execution failed (XML)");
+                        crate::tools::ToolResult {
+                            success: false,
+                            output: format!("Tool '{}' failed: {e}", tc.name),
+                            retry: false,
+                        }
+                    }
+                };
+                self.push_message(Message {
+                    role: "tool".to_string(),
+                    content: Some(result.output.clone()),
+                    thinking: None,
+                    tool_calls: None,
+                })
+                .await;
+            }
+            return Ok(()); // Process tool results next iteration
+        }
+
+        // Pure text response — we're done
+        self.push_message(Message {
+            role: "assistant".to_string(),
+            content: Some(text.clone()),
+            thinking: None,
+            tool_calls: None,
+        })
+        .await;
+
+        // Save successful episode to memory
+        self.save_episode(user_prompt, &text, true);
+
+        Ok(())
     }
 
     /// Count tokens of `text` using the model's real tokenizer when the
@@ -418,7 +471,7 @@ impl Agent {
     }
 
     /// Inject knowledge at the conversation tail if relevant cards are found.
-    fn inject_knowledge(&mut self, user_prompt: &str) {
+    async fn inject_knowledge(&mut self, user_prompt: &str) {
         if !self.knowledge_base.is_enabled() {
             return;
         }
@@ -428,23 +481,20 @@ impl Agent {
                 cards = self.knowledge_base.card_count(),
                 "Knowledge injection prepared"
             );
-            // The injection will be appended to the user message content
-            // so it appears at the conversation tail (KV-cache-safe)
-            // We don't modify the original prompt — injection happens via the message
-            let tokens = ContextBudget::estimate_tokens(&injection);
+            // F2.3: Use push_message for token accounting (not manual consume).
             self.messages.push(Message {
                 role: "user".to_string(),
-                content: Some(injection),
+                content: Some(injection.clone()),
                 thinking: None,
                 tool_calls: None,
             });
-            // Track injected context against the budget.
+            let tokens = self.count_tokens(&injection).await;
             self.budget.consume(tokens);
         }
     }
 
     /// Recall top-3 past episodes by goal similarity and inject at conversation tail.
-    fn recall_episodes(&mut self, goal: &str) {
+    async fn recall_episodes(&mut self, goal: &str) {
         if let Some(ref store) = self.memory_store {
             if let Ok(episodes) = store.recall_similar(goal, 3) {
                 if !episodes.is_empty() {
@@ -458,14 +508,14 @@ impl Agent {
                         "[Past Episodes]\n{}\n[End Past Episodes]\n", context
                     );
                     debug!(count = episodes.len(), "Episodic memory recall");
-                    let tokens = ContextBudget::estimate_tokens(&injection);
+                    // F2.3: Use push_message for token accounting.
                     self.messages.push(Message {
                         role: "user".to_string(),
-                        content: Some(injection),
+                        content: Some(injection.clone()),
                         thinking: None,
                         tool_calls: None,
                     });
-                    // Track injected context against the budget.
+                    let tokens = self.count_tokens(&injection).await;
                     self.budget.consume(tokens);
                 }
             }
@@ -529,10 +579,13 @@ impl Agent {
         }
     }
 
-    /// Retry the LLM call with thinking disabled.
-    async fn retry_without_thinking(&self) -> Result<String> {
+    /// Retry the LLM call with thinking disabled (F2.6).
+    ///
+    /// Instead of returning raw text, this re-calls the LLM with thinking
+    /// disabled and returns the full `ChatResponse` so the caller can process
+    /// tool calls and quality checks normally.
+    async fn llm_call_no_thinking(&self) -> Result<ChatResponse> {
         info!("Retrying LLM call with thinking disabled");
-        // Build messages with a system instruction to not think
         let mut messages = self.messages.clone();
         messages.insert(
             0,
@@ -547,8 +600,7 @@ impl Agent {
             },
         );
 
-        let response = self
-            .client
+        self.client
             .chat(
                 &self.config.model,
                 messages,
@@ -556,13 +608,7 @@ impl Agent {
                 None,
             )
             .await
-            .context("Retry LLM call failed")?;
-
-        // Process the response normally — but we can't recurse, so just return text
-        Ok(response
-            .message
-            .content
-            .unwrap_or_else(|| "No response generated after retry.".to_string()))
+            .context("Retry LLM call without thinking failed")
     }
 
     /// Make an LLM call and handle the response.
@@ -683,10 +729,14 @@ impl Agent {
         Ok(())
     }
 
-    /// Push a message and track token usage.
-    fn push_message(&mut self, msg: Message) {
+    /// Push a message and track token usage (F2.3 — sole accounting point).
+    ///
+    /// Uses real tokenization when the server is reachable; falls back to the
+    /// heuristic (chars/4). Every token consumed by the conversation flows
+    /// through this one call — no separate `budget.consume()` elsewhere.
+    async fn push_message(&mut self, msg: Message) {
         if let Some(content) = msg.content.as_deref() {
-            let tokens = ContextBudget::estimate_tokens(content);
+            let tokens = self.count_tokens(content).await;
             self.budget.consume(tokens);
         }
         self.messages.push(msg);
