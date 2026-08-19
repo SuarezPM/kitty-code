@@ -62,6 +62,19 @@ impl Default for AgentConfig {
     }
 }
 
+/// Maximum consecutive empty LLM responses before failing fast.
+///
+/// After this many empty responses the agent terminates the turn quickly
+/// instead of looping until `max_iterations`/timeout (handoff §6).
+const MAX_EMPTY_STREAK: u8 = 3;
+
+/// Returns `true` when the empty-response streak has reached the fail-fast cap.
+///
+/// Exposed for unit testing the streak logic without a live LLM.
+pub fn should_fail_fast(streak: u8) -> bool {
+    streak >= MAX_EMPTY_STREAK
+}
+
 /// The core agent loop.
 pub struct Agent {
     client: OllamaClient,
@@ -79,6 +92,8 @@ pub struct Agent {
     bootstrap_done: bool,
     /// Episodic memory store. None when memory is disabled.
     memory_store: Option<EpisodeStore>,
+    /// Consecutive empty responses in the current turn (fail-fast §6).
+    empty_response_streak: u8,
 }
 
 impl Agent {
@@ -136,6 +151,7 @@ impl Agent {
             bootstrap,
             bootstrap_done: false,
             memory_store,
+            empty_response_streak: 0,
         }
     }
 
@@ -150,6 +166,8 @@ impl Agent {
     /// - F2.5: Tool results pushed before corrective user messages
     /// - F2.6: Thinking budget exceeded retries inline, doesn't return raw text
     pub async fn run(&mut self, user_prompt: &str) -> Result<String> {
+        // Fase 0 remediation: reset empty streak per run (prevents cross-run contamination)
+        self.empty_response_streak = 0;
         // Bootstrap: detect workspace on first turn
         self.run_bootstrap();
 
@@ -206,6 +224,10 @@ impl Agent {
                     // to normal processing (tool calls and all). Max 1 retry per turn.
                     let retry_response = self.llm_call_no_thinking().await?;
                     self.process_response(user_prompt, retry_response).await?;
+                    // Fail-fast after retry as well (handoff §6).
+                    if should_fail_fast(self.empty_response_streak) {
+                        return Ok("no response (empty after 3 retries)".to_string());
+                    }
                     // Don't reset thinking budget — we already retried once
                     continue;
                 }
@@ -215,6 +237,13 @@ impl Agent {
             }
 
             self.process_response(user_prompt, response).await?;
+
+            // Fail-fast: 3 consecutive empty responses → terminate quickly
+            // instead of looping until max_iterations/timeout (handoff §6).
+            if should_fail_fast(self.empty_response_streak) {
+                // Episode already saved as failure in process_response.
+                return Ok("no response (empty after 3 retries)".to_string());
+            }
 
             // Reset thinking budget for next turn
             self.thinking_budget.reset_turn();
@@ -246,9 +275,11 @@ impl Agent {
         user_prompt: &str,
         response: ChatResponse,
     ) -> Result<()> {
-        // Check for tool calls
+        // Check for tool calls — any tool call resets the empty streak
+        // (progress was made, handoff §6).
         if let Some(tool_calls) = &response.message.tool_calls {
             if !tool_calls.is_empty() {
+                self.empty_response_streak = 0;
                 // Add assistant message with tool calls (F2.3: push handles tokens)
                 self.push_message(response.message.clone()).await;
 
@@ -263,9 +294,15 @@ impl Agent {
                     });
                 }
 
-                // Also parse content for XML-style tool calls
+                // Also parse content for XML-style tool calls (with diagnostics for malformed)
                 if let Some(content) = response.message.content.as_deref() {
-                    let parsed = self.parser.parse(content);
+                    let (parsed, diagnostics) = self.parser.parse_with_diagnostics(content);
+                    if !diagnostics.is_empty() {
+                        for diag in diagnostics {
+                            warn!(diagnostic = %diag, "Malformed tool call detected");
+                            self.push_message(Message::user(diag)).await;
+                        }
+                    }
                     all_tool_calls.extend(parsed);
                 }
 
@@ -366,15 +403,34 @@ impl Agent {
         })
         .await;
 
-        // Check for empty response — just continue the loop so the model
-        // sees its own empty response and retries.
+        // Fail-fast on consecutive empty responses (handoff §6):
+        // push already done above so history stays consistent, no orphaned
+        // LLM round-trips. Streak resets on any non-empty content or tool call.
         if text.trim().is_empty() {
+            self.empty_response_streak = self.empty_response_streak.saturating_add(1);
+            if should_fail_fast(self.empty_response_streak) {
+                warn!(
+                    streak = self.empty_response_streak,
+                    "Empty response streak cap reached (3), failing fast"
+                );
+                self.save_episode(user_prompt, "no response (empty after 3 retries)", false);
+                return Ok(());
+            }
             warn!("Empty response detected, continuing loop for retry");
             return Ok(());
         }
+        // Non-empty text resets the streak
+        self.empty_response_streak = 0;
 
-        // Check if the text contains XML tool calls that weren't in tool_calls
-        let parsed = self.parser.parse(&text);
+        // Check if the text contains XML tool calls that weren't in tool_calls (with diagnostics)
+        let (parsed, diagnostics) = self.parser.parse_with_diagnostics(&text);
+        if !diagnostics.is_empty() && parsed.is_empty() {
+            for diag in diagnostics {
+                warn!(diagnostic = %diag, "Malformed tool call in text response");
+                self.push_message(Message::user(diag)).await;
+            }
+            return Ok(());
+        }
         if !parsed.is_empty() {
             // There are tool calls in the text, process them
             for tc in &parsed {
@@ -728,5 +784,80 @@ impl Agent {
     /// Get the bootstrap result.
     pub fn bootstrap_result(&self) -> Option<&crate::bootstrap::BootstrapResult> {
         self.bootstrap.result()
+    }
+
+    /// Current consecutive empty-response count (for testing / introspection).
+    pub fn empty_streak(&self) -> u8 {
+        self.empty_response_streak
+    }
+
+    /// Associated helper mirroring the free `should_fail_fast` (for `Agent::` call sites).
+    pub fn should_fail_fast(streak: u8) -> bool {
+        should_fail_fast(streak)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kitty_runtime::OllamaClient;
+
+    fn dummy_agent() -> Agent {
+        let client = OllamaClient::new("http://localhost:11434");
+        let cfg = AgentConfig {
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        Agent::new(client, cfg)
+    }
+
+    #[test]
+    fn should_fail_fast_false_before_cap() {
+        assert!(!should_fail_fast(0));
+        assert!(!should_fail_fast(1));
+        assert!(!should_fail_fast(2));
+        assert!(!Agent::should_fail_fast(2));
+    }
+
+    #[test]
+    fn should_fail_fast_true_at_and_beyond_cap() {
+        assert!(should_fail_fast(3));
+        assert!(should_fail_fast(4));
+        assert!(should_fail_fast(255));
+        assert!(Agent::should_fail_fast(3));
+        assert_eq!(MAX_EMPTY_STREAK, 3);
+    }
+
+    #[test]
+    fn agent_empty_streak_starts_zero() {
+        let agent = dummy_agent();
+        assert_eq!(agent.empty_streak(), 0);
+        assert!(!Agent::should_fail_fast(agent.empty_streak()));
+    }
+
+    #[test]
+    fn agent_streak_increments_and_resets_logic() {
+        // Simulate the counter logic without needing LLM calls.
+        let mut streak: u8 = 0;
+        // two empties → no fail-fast
+        streak = streak.saturating_add(1);
+        assert_eq!(streak, 1);
+        assert!(!should_fail_fast(streak));
+        streak = streak.saturating_add(1);
+        assert_eq!(streak, 2);
+        assert!(!should_fail_fast(streak));
+        // third empty → fail-fast
+        streak = streak.saturating_add(1);
+        assert_eq!(streak, 3);
+        assert!(should_fail_fast(streak));
+        // non-empty resets to 0
+        streak = 0;
+        assert_eq!(streak, 0);
+        assert!(!should_fail_fast(streak));
+        // tool call also resets (same as non-empty)
+        let tool_call_streak_before: u8 = 3;
+        assert!(should_fail_fast(tool_call_streak_before));
+        let tool_call_streak_after: u8 = 0;
+        assert!(!should_fail_fast(tool_call_streak_after));
     }
 }

@@ -20,6 +20,9 @@ pub struct ParsedToolCall {
 /// Parser for tool calls from model output.
 pub struct ToolCallParser;
 
+/// Canonical error emitted when a tool call intent is detected but parsing fails.
+const MALFORMED_ERROR: &str = "Malformed tool call detected. Expected format: {\"name\":\"ToolName\",\"arguments\":{...}} or <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>. Available tools: Read, Edit, Write, Bash, Glob, Grep.";
+
 impl ToolCallParser {
     pub fn new() -> Self {
         Self
@@ -28,6 +31,54 @@ impl ToolCallParser {
     /// Parse all tool calls from the model's output text.
     /// Returns empty vec if none found (caller decides what to do).
     pub fn parse(&self, content: &str) -> Vec<ParsedToolCall> {
+        let results = self.parse_internal(content);
+
+        if results.is_empty() && self.has_tool_call_intent(content) {
+            tracing::warn!(content = %content, "malformed tool call detected (parse returned empty but intent heuristic matched)");
+        }
+
+        results
+    }
+
+    /// Parse with diagnostics: returns calls plus a list of diagnostic error strings.
+    ///
+    /// Heuristic: if content contains a tool call intent marker (`<tool_call>`,
+    /// ` ```json `, `{"name"`, `{"function"`, `{"tool"`) but `parse()` yields
+    /// no calls, a single diagnostic string is returned explaining the expected format.
+    pub fn parse_with_diagnostics(&self, content: &str) -> (Vec<ParsedToolCall>, Vec<String>) {
+        let calls = self.parse_internal(content);
+        if calls.is_empty() && self.has_tool_call_intent(content) {
+            (calls, vec![MALFORMED_ERROR.to_string()])
+        } else {
+            (calls, Vec::new())
+        }
+    }
+
+    /// Try to parse, returning `Err` with a diagnostic if a malformed intent is detected.
+    ///
+    /// Returns `Ok(calls)` when parsing succeeds — including the legitimate empty case
+    /// (no intent). Returns `Err(message)` only when intent heuristics fire but no
+    /// call could be parsed.
+    pub fn try_parse_with_error(&self, content: &str) -> Result<Vec<ParsedToolCall>, String> {
+        let (calls, diagnostics) = self.parse_with_diagnostics(content);
+        if let Some(err) = diagnostics.into_iter().next() {
+            Err(err)
+        } else {
+            Ok(calls)
+        }
+    }
+
+    /// Heuristic detector for "model tried to call a tool but syntax was broken".
+    fn has_tool_call_intent(&self, content: &str) -> bool {
+        content.contains("<tool_call>")
+            || content.contains("```json")
+            || content.contains(r#"{"name""#)
+            || content.contains(r#"{"function""#)
+            || content.contains(r#"{"tool""#)
+    }
+
+    /// Internal parsing logic without diagnostics side-effects.
+    fn parse_internal(&self, content: &str) -> Vec<ParsedToolCall> {
         let mut results = Vec::new();
 
         // 1. Try XML <tool_call> blocks
@@ -293,5 +344,82 @@ some text here
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Grep");
         assert_eq!(calls[0].arguments["pattern"], "fn main");
+    }
+
+    // --- diagnostics hardening tests ---
+
+    #[test]
+    fn diagnostics_malformed_xml_returns_error() {
+        let parser = ToolCallParser::new();
+        let input = "<tool_call>{not json}</tool_call>";
+        let calls = parser.parse(input);
+        assert!(calls.is_empty(), "parse should still return empty for malformed");
+
+        let (calls2, diagnostics) = parser.parse_with_diagnostics(input);
+        assert!(calls2.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0].contains("Malformed"),
+            "diagnostic should contain Malformed, got: {}",
+            diagnostics[0]
+        );
+        assert!(
+            diagnostics[0].contains("Available tools"),
+            "diagnostic should list available tools"
+        );
+
+        let err = parser.try_parse_with_error(input).unwrap_err();
+        assert!(err.contains("Malformed"));
+    }
+
+    #[test]
+    fn diagnostics_valid_xml_no_error() {
+        let parser = ToolCallParser::new();
+        let input = r#"<tool_call>{"name":"Read","arguments":{"path":"foo.rs"}}</tool_call>"#;
+        let (calls, diagnostics) = parser.parse_with_diagnostics(input);
+        assert_eq!(calls.len(), 1);
+        assert!(diagnostics.is_empty(), "valid call should produce no diagnostics");
+        assert!(parser.try_parse_with_error(input).is_ok());
+    }
+
+    #[test]
+    fn diagnostics_plain_text_no_error() {
+        let parser = ToolCallParser::new();
+        let input = "Hello world, this is just plain text without any tool intent.";
+        let (calls, diagnostics) = parser.parse_with_diagnostics(input);
+        assert!(calls.is_empty());
+        assert!(diagnostics.is_empty(), "plain text should not trigger diagnostic");
+        assert!(parser.try_parse_with_error(input).is_ok());
+        assert!(parser.try_parse_with_error(input).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diagnostics_malformed_json_block() {
+        let parser = ToolCallParser::new();
+        let input = "```json\n{not valid json}\n```";
+        let (calls, diagnostics) = parser.parse_with_diagnostics(input);
+        assert!(calls.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("Malformed"));
+    }
+
+    #[test]
+    fn diagnostics_malformed_standalone_name() {
+        let parser = ToolCallParser::new();
+        // Contains {"name" heuristic but invalid JSON / missing arguments field
+        let input = r#"{"name": "Read", "arguments": not_json}"#;
+        let (calls, diagnostics) = parser.parse_with_diagnostics(input);
+        assert!(calls.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("Malformed"));
+    }
+
+    #[test]
+    fn diagnostics_empty_no_error() {
+        let parser = ToolCallParser::new();
+        let (calls, diagnostics) = parser.parse_with_diagnostics("");
+        assert!(calls.is_empty());
+        assert!(diagnostics.is_empty());
+        assert!(parser.try_parse_with_error("").is_ok());
     }
 }

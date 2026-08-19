@@ -53,8 +53,8 @@ pub struct QualityMonitor {
     config: QualityConfig,
     /// Registered tool names (for hallucination detection).
     registered_tools: std::collections::HashSet<String>,
-    /// Recent tool call names for loop detection (sliding window).
-    recent_tool_calls: VecDeque<String>,
+    /// Recent tool calls for loop detection (sliding window) — name + hash of args.
+    recent_tool_calls: VecDeque<(String, u64)>,
     /// Quality events recorded this session.
     events: Vec<QualityEvent>,
     /// Current turn number.
@@ -62,6 +62,14 @@ pub struct QualityMonitor {
 }
 
 impl QualityMonitor {
+    /// Hash tool arguments deterministically for loop detection.
+    fn args_hash(args: &serde_json::Value) -> u64 {
+        let s = serde_json::to_string(args).unwrap_or_default();
+        let hash = blake3::hash(s.as_bytes());
+        let bytes = hash.as_bytes();
+        u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0u8; 8]))
+    }
+
     /// Create a new quality monitor.
     pub fn new(config: QualityConfig, registered_tools: Vec<String>) -> Self {
         Self {
@@ -121,27 +129,28 @@ impl QualityMonitor {
             }
         }
 
-        // Check for tool loops
+        // Check for tool loops — args-aware dedup (spec small-model-tool-loop)
         for tc in tool_calls {
-            // F2.4: Reset window if a different tool name appears (breaks the pattern)
-            if let Some(last_name) = self.recent_tool_calls.back() {
-                if last_name != &tc.name {
+            let arg_hash = Self::args_hash(&tc.arguments);
+            // F2.4 + args-aware: Reset window if tool name OR args differ (breaks the pattern)
+            if let Some((last_name, last_hash)) = self.recent_tool_calls.back() {
+                if last_name != &tc.name || last_hash != &arg_hash {
                     self.recent_tool_calls.clear();
                 }
             }
 
-            self.recent_tool_calls.push_back(tc.name.clone());
+            self.recent_tool_calls.push_back((tc.name.clone(), arg_hash));
             // Keep only the last N entries
             while self.recent_tool_calls.len() > self.config.loop_threshold {
                 self.recent_tool_calls.pop_front();
             }
 
-            // Check if all recent calls are the same tool
+            // Check if all recent calls are the same tool WITH same args
             if self.recent_tool_calls.len() >= self.config.loop_threshold {
                 let all_same = self
                     .recent_tool_calls
                     .iter()
-                    .all(|n| n == &tc.name);
+                    .all(|(n, h)| n == &tc.name && h == &arg_hash);
                 if all_same {
                     violations.push(QualityViolation::ToolLoop {
                         tool_name: tc.name.clone(),
@@ -158,7 +167,7 @@ impl QualityMonitor {
                     "Injected corrective message to prompt for content".to_string()
                 }
                 QualityViolation::ToolLoop { tool_name, .. } => {
-                    format!("Injected message to break {tool_name} loop")
+                    format!("Injected message to break {tool_name} loop with same arguments")
                 }
                 QualityViolation::HallucinatedTool { tool_name } => {
                     format!("Rejected hallucinated tool: {tool_name}")
@@ -410,5 +419,56 @@ mod tests {
         let summary = monitor.violation_summary();
         assert_eq!(summary.len(), 1);
         assert_eq!(summary.values().next().unwrap(), &2);
+    }
+
+    #[test]
+    fn same_tool_same_args_triggers_loop() {
+        let config = QualityConfig { loop_threshold: 3 };
+        let mut monitor = QualityMonitor::new(config, default_tools());
+        let tc = ParsedToolCall {
+            name: "Read".to_string(),
+            arguments: serde_json::json!({"path": "foo.rs"}),
+        };
+        monitor.check_response(None, std::slice::from_ref(&tc));
+        monitor.check_response(None, std::slice::from_ref(&tc));
+        let violations = monitor.check_response(None, std::slice::from_ref(&tc));
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            QualityViolation::ToolLoop { tool_name, count }
+                if tool_name == "Read" && *count == 3
+        )));
+        // corrective message must mention same arguments
+        let msg = QualityMonitor::corrective_message(&QualityViolation::ToolLoop {
+            tool_name: "Read".to_string(),
+            count: 3,
+        });
+        assert!(msg.contains("same arguments"));
+    }
+
+    #[test]
+    fn same_tool_different_args_no_loop() {
+        let config = QualityConfig { loop_threshold: 3 };
+        let mut monitor = QualityMonitor::new(config, default_tools());
+        let tc_a = ParsedToolCall {
+            name: "Read".to_string(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        };
+        let tc_b = ParsedToolCall {
+            name: "Read".to_string(),
+            arguments: serde_json::json!({"path": "b.rs"}),
+        };
+        let tc_c = ParsedToolCall {
+            name: "Read".to_string(),
+            arguments: serde_json::json!({"path": "c.rs"}),
+        };
+        monitor.check_response(None, std::slice::from_ref(&tc_a));
+        monitor.check_response(None, std::slice::from_ref(&tc_b));
+        let violations = monitor.check_response(None, &[tc_c]);
+        assert!(
+            violations
+                .iter()
+                .all(|v| !matches!(v, QualityViolation::ToolLoop { .. })),
+            "same tool with different args should not trigger loop"
+        );
     }
 }
