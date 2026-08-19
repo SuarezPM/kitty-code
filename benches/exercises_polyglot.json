@@ -1,0 +1,1577 @@
+[
+  {
+    "id": "py-fibonacci",
+    "lang": "python",
+    "prompt": "Write fibonacci(n) returning first n numbers. Save to solution.py.",
+    "check_str": "def fibonacci",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-bubble_sort",
+    "lang": "python",
+    "prompt": "Write bubble_sort(arr). Save to solution.py.",
+    "check_str": "def bubble_sort",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-quick_sort",
+    "lang": "python",
+    "prompt": "Write quick_sort(arr). Save to solution.py.",
+    "check_str": "def quick_sort",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-binary_search",
+    "lang": "python",
+    "prompt": "Write binary_search(arr, target). Save to solution.py.",
+    "check_str": "def binary_search",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-factorial",
+    "lang": "python",
+    "prompt": "Write factorial(n) recursively. Save to solution.py.",
+    "check_str": "def factorial",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-is_palindrome",
+    "lang": "python",
+    "prompt": "Write is_palindrome(s). Save to solution.py.",
+    "check_str": "def is_palindrome",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-flatten",
+    "lang": "python",
+    "prompt": "Write flatten(nested_list). Save to solution.py.",
+    "check_str": "def flatten",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-chunk",
+    "lang": "python",
+    "prompt": "Write chunk(arr, size). Save to solution.py.",
+    "check_str": "def chunk",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-unique",
+    "lang": "python",
+    "prompt": "Write unique(arr). Save to solution.py.",
+    "check_str": "def unique",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-compact",
+    "lang": "python",
+    "prompt": "Write compact(arr) removing falsy values. Save to solution.py.",
+    "check_str": "def compact",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-sum_range",
+    "lang": "python",
+    "prompt": "Write sum_range(start, end). Save to solution.py.",
+    "check_str": "def sum_range",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-clamp",
+    "lang": "python",
+    "prompt": "Write clamp(value, min_val, max_val). Save to solution.py.",
+    "check_str": "def clamp",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-capitalize",
+    "lang": "python",
+    "prompt": "Write capitalize(s). Save to solution.py.",
+    "check_str": "def capitalize",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-truncate",
+    "lang": "python",
+    "prompt": "Write truncate(s, max_len). Save to solution.py.",
+    "check_str": "def truncate",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-camelize",
+    "lang": "python",
+    "prompt": "Write camelize(s). Save to solution.py.",
+    "check_str": "def camelize",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-kebab",
+    "lang": "python",
+    "prompt": "Write kebab(s). Save to solution.py.",
+    "check_str": "def kebab",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-pick",
+    "lang": "python",
+    "prompt": "Write pick(d, keys). Save to solution.py.",
+    "check_str": "def pick",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-omit",
+    "lang": "python",
+    "prompt": "Write omit(d, keys). Save to solution.py.",
+    "check_str": "def omit",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-merge",
+    "lang": "python",
+    "prompt": "Write merge(d1, d2). Save to solution.py.",
+    "check_str": "def merge",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-deep_get",
+    "lang": "python",
+    "prompt": "Write deep_get(d, path). Save to solution.py.",
+    "check_str": "def deep_get",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-uuid",
+    "lang": "python",
+    "prompt": "Write uuid4() returning UUID string. Save to solution.py.",
+    "check_str": "def uuid4",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-slugify",
+    "lang": "python",
+    "prompt": "Write slugify(s). Save to solution.py.",
+    "check_str": "def slugify",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-wrap",
+    "lang": "python",
+    "prompt": "Write wrap(text, width). Save to solution.py.",
+    "check_str": "def wrap",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-center",
+    "lang": "python",
+    "prompt": "Write center(s, width). Save to solution.py.",
+    "check_str": "def center",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-ltrim",
+    "lang": "python",
+    "prompt": "Write ltrim(s). Save to solution.py.",
+    "check_str": "def ltrim",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-rtrim",
+    "lang": "python",
+    "prompt": "Write rtrim(s). Save to solution.py.",
+    "check_str": "def rtrim",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-repeat",
+    "lang": "python",
+    "prompt": "Write repeat(s, n). Save to solution.py.",
+    "check_str": "def repeat",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-reverse_str",
+    "lang": "python",
+    "prompt": "Write reverse_str(s). Save to solution.py.",
+    "check_str": "def reverse_str",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-count_chars",
+    "lang": "python",
+    "prompt": "Write count_chars(s). Save to solution.py.",
+    "check_str": "def count_chars",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-anagram",
+    "lang": "python",
+    "prompt": "Write anagram(s1, s2). Save to solution.py.",
+    "check_str": "def anagram",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-is_anagram",
+    "lang": "python",
+    "prompt": "Write is_anagram(s1, s2). Save to solution.py.",
+    "check_str": "def is_anagram",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-title_case",
+    "lang": "python",
+    "prompt": "Write title_case(s). Save to solution.py.",
+    "check_str": "def title_case",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-swap_case",
+    "lang": "python",
+    "prompt": "Write swap_case(s). Save to solution.py.",
+    "check_str": "def swap_case",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-is_number",
+    "lang": "python",
+    "prompt": "Write is_number(s). Save to solution.py.",
+    "check_str": "def is_number",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-to_int",
+    "lang": "python",
+    "prompt": "Write to_int(s, default=0). Save to solution.py.",
+    "check_str": "def to_int",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-to_float",
+    "lang": "python",
+    "prompt": "Write to_float(s, default=0.0). Save to solution.py.",
+    "check_str": "def to_float",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-clamp_int",
+    "lang": "python",
+    "prompt": "Write clamp_int(value, min_val, max_val). Save to solution.py.",
+    "check_str": "def clamp_int",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-avg",
+    "lang": "python",
+    "prompt": "Write avg(numbers). Save to solution.py.",
+    "check_str": "def avg",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-median",
+    "lang": "python",
+    "prompt": "Write median(numbers). Save to solution.py.",
+    "check_str": "def median",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-mode",
+    "lang": "python",
+    "prompt": "Write mode(numbers). Save to solution.py.",
+    "check_str": "def mode",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-stdev",
+    "lang": "python",
+    "prompt": "Write stdev(numbers). Save to solution.py.",
+    "check_str": "def stdev",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-percentile",
+    "lang": "python",
+    "prompt": "Write percentile(numbers, p). Save to solution.py.",
+    "check_str": "def percentile",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-gcd",
+    "lang": "python",
+    "prompt": "Write gcd(a, b). Save to solution.py.",
+    "check_str": "def gcd",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-lcm",
+    "lang": "python",
+    "prompt": "Write lcm(a, b). Save to solution.py.",
+    "check_str": "def lcm",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-is_prime",
+    "lang": "python",
+    "prompt": "Write is_prime(n). Save to solution.py.",
+    "check_str": "def is_prime",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-primes",
+    "lang": "python",
+    "prompt": "Write primes(n). Save to solution.py.",
+    "check_str": "def primes",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-collatz",
+    "lang": "python",
+    "prompt": "Write collatz(n). Save to solution.py.",
+    "check_str": "def collatz",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-fibonacci_gen",
+    "lang": "python",
+    "prompt": "Write fibonacci_gen() as generator. Save to solution.py.",
+    "check_str": "def fibonacci_gen",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-chain",
+    "lang": "python",
+    "prompt": "Write chain(*iterables). Save to solution.py.",
+    "check_str": "def chain",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-group_by",
+    "lang": "python",
+    "prompt": "Write group_by(arr, key_fn). Save to solution.py.",
+    "check_str": "def group_by",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "js-map",
+    "lang": "javascript",
+    "prompt": "Write map(arr, fn). Save to solution.js.",
+    "check_str": "function map",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-filter",
+    "lang": "javascript",
+    "prompt": "Write filter(arr, fn). Save to solution.js.",
+    "check_str": "function filter",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-reduce",
+    "lang": "javascript",
+    "prompt": "Write reduce(arr, fn, init). Save to solution.js.",
+    "check_str": "function reduce",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-flatten",
+    "lang": "javascript",
+    "prompt": "Write flatten(arr). Save to solution.js.",
+    "check_str": "function flatten",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-chunk",
+    "lang": "javascript",
+    "prompt": "Write chunk(arr, size). Save to solution.js.",
+    "check_str": "function chunk",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-unique",
+    "lang": "javascript",
+    "prompt": "Write unique(arr). Save to solution.js.",
+    "check_str": "function unique",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-compact",
+    "lang": "javascript",
+    "prompt": "Write compact(arr). Save to solution.js.",
+    "check_str": "function compact",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-debounce",
+    "lang": "javascript",
+    "prompt": "Write debounce(fn, ms). Save to solution.js.",
+    "check_str": "function debounce",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-throttle",
+    "lang": "javascript",
+    "prompt": "Write throttle(fn, ms). Save to solution.js.",
+    "check_str": "function throttle",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-memoize",
+    "lang": "javascript",
+    "prompt": "Write memoize(fn). Save to solution.js.",
+    "check_str": "function memoize",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-once",
+    "lang": "javascript",
+    "prompt": "Write once(fn). Save to solution.js.",
+    "check_str": "function once",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-curry",
+    "lang": "javascript",
+    "prompt": "Write curry(fn). Save to solution.js.",
+    "check_str": "function curry",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-pipe",
+    "lang": "javascript",
+    "prompt": "Write pipe(...fns). Save to solution.js.",
+    "check_str": "function pipe",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-compose",
+    "lang": "javascript",
+    "prompt": "Write compose(...fns). Save to solution.js.",
+    "check_str": "function compose",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-deep_clone",
+    "lang": "javascript",
+    "prompt": "Write deepClone(obj). Save to solution.js.",
+    "check_str": "function deepClone",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-pick",
+    "lang": "javascript",
+    "prompt": "Write pick(obj, keys). Save to solution.js.",
+    "check_str": "function pick",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-omit",
+    "lang": "javascript",
+    "prompt": "Write omit(obj, keys). Save to solution.js.",
+    "check_str": "function omit",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-merge",
+    "lang": "javascript",
+    "prompt": "Write merge(obj1, obj2). Save to solution.js.",
+    "check_str": "function merge",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-get",
+    "lang": "javascript",
+    "prompt": "Write get(obj, path). Save to solution.js.",
+    "check_str": "function get",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-set",
+    "lang": "javascript",
+    "prompt": "Write set(obj, path, value). Save to solution.js.",
+    "check_str": "function set",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-range",
+    "lang": "javascript",
+    "prompt": "Write range(start, end). Save to solution.js.",
+    "check_str": "function range",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-sum",
+    "lang": "javascript",
+    "prompt": "Write sum(arr). Save to solution.js.",
+    "check_str": "function sum",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-avg",
+    "lang": "javascript",
+    "prompt": "Write avg(arr). Save to solution.js.",
+    "check_str": "function avg",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-min",
+    "lang": "javascript",
+    "prompt": "Write min(arr). Save to solution.js.",
+    "check_str": "function min",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-max",
+    "lang": "javascript",
+    "prompt": "Write max(arr). Save to solution.js.",
+    "check_str": "function max",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-clamp",
+    "lang": "javascript",
+    "prompt": "Write clamp(val, min, max). Save to solution.js.",
+    "check_str": "function clamp",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-capitalize",
+    "lang": "javascript",
+    "prompt": "Write capitalize(s). Save to solution.js.",
+    "check_str": "function capitalize",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-camel",
+    "lang": "javascript",
+    "prompt": "Write camelCase(s). Save to solution.js.",
+    "check_str": "function camelCase",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-kebab",
+    "lang": "javascript",
+    "prompt": "Write kebabCase(s). Save to solution.js.",
+    "check_str": "function kebabCase",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-snake",
+    "lang": "javascript",
+    "prompt": "Write snakeCase(s). Save to solution.js.",
+    "check_str": "function snakeCase",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-slugify",
+    "lang": "javascript",
+    "prompt": "Write slugify(s). Save to solution.js.",
+    "check_str": "function slugify",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-truncate",
+    "lang": "javascript",
+    "prompt": "Write truncate(s, len). Save to solution.js.",
+    "check_str": "function truncate",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-wrap",
+    "lang": "javascript",
+    "prompt": "Write wrap(text, width). Save to solution.js.",
+    "check_str": "function wrap",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-pad",
+    "lang": "javascript",
+    "prompt": "Write pad(s, len). Save to solution.js.",
+    "check_str": "function pad",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-reverse",
+    "lang": "javascript",
+    "prompt": "Write reverse(s). Save to solution.js.",
+    "check_str": "function reverse",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-is_palindrome",
+    "lang": "javascript",
+    "prompt": "Write isPalindrome(s). Save to solution.js.",
+    "check_str": "function isPalindrome",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-is_anagram",
+    "lang": "javascript",
+    "prompt": "Write isAnagram(s1, s2). Save to solution.js.",
+    "check_str": "function isAnagram",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-count",
+    "lang": "javascript",
+    "prompt": "Write count(arr, val). Save to solution.js.",
+    "check_str": "function count",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-group_by",
+    "lang": "javascript",
+    "prompt": "Write groupBy(arr, fn). Save to solution.js.",
+    "check_str": "function groupBy",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-sort_by",
+    "lang": "javascript",
+    "prompt": "Write sortBy(arr, fn). Save to solution.js.",
+    "check_str": "function sortBy",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-zip",
+    "lang": "javascript",
+    "prompt": "Write zip(...arrays). Save to solution.js.",
+    "check_str": "function zip",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-unzip",
+    "lang": "javascript",
+    "prompt": "Write unzip(arr). Save to solution.js.",
+    "check_str": "function unzip",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-interleave",
+    "lang": "javascript",
+    "prompt": "Write interleave(...arrays). Save to solution.js.",
+    "check_str": "function interleave",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-difference",
+    "lang": "javascript",
+    "prompt": "Write difference(a, b). Save to solution.js.",
+    "check_str": "function difference",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-intersection",
+    "lang": "javascript",
+    "prompt": "Write intersection(a, b). Save to solution.js.",
+    "check_str": "function intersection",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-union",
+    "lang": "javascript",
+    "prompt": "Write union(a, b). Save to solution.js.",
+    "check_str": "function union",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-without",
+    "lang": "javascript",
+    "prompt": "Write without(arr, ...vals). Save to solution.js.",
+    "check_str": "function without",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-sample",
+    "lang": "javascript",
+    "prompt": "Write sample(arr). Save to solution.js.",
+    "check_str": "function sample",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-shuffle",
+    "lang": "javascript",
+    "prompt": "Write shuffle(arr). Save to solution.js.",
+    "check_str": "function shuffle",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "js-keys",
+    "lang": "javascript",
+    "prompt": "Write keys(obj). Save to solution.js.",
+    "check_str": "function keys",
+    "check_file": "solution.js"
+  },
+  {
+    "id": "ts-interface_user",
+    "lang": "typescript",
+    "prompt": "Write interface User {id, name, email}. Save to solution.ts.",
+    "check_str": "interface User",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-interface_product",
+    "lang": "typescript",
+    "prompt": "Write interface Product {id, name, price}. Save to solution.ts.",
+    "check_str": "interface Product",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_first",
+    "lang": "typescript",
+    "prompt": "Write first<T>(arr: T[]): T | undefined. Save to solution.ts.",
+    "check_str": "function first",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_last",
+    "lang": "typescript",
+    "prompt": "Write last<T>(arr: T[]): T | undefined. Save to solution.ts.",
+    "check_str": "function last",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_unique",
+    "lang": "typescript",
+    "prompt": "Write unique<T>(arr: T[]): T[]. Save to solution.ts.",
+    "check_str": "function unique",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_group",
+    "lang": "typescript",
+    "prompt": "Write groupBy<T>(arr: T[], fn: (t: T) => string). Save to solution.ts.",
+    "check_str": "function groupBy",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_result",
+    "lang": "typescript",
+    "prompt": "Write type Result<T, E> = {ok: true, value: T} | {ok: false, error: E}. Save to solution.ts.",
+    "check_str": "type Result",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_option",
+    "lang": "typescript",
+    "prompt": "Write type Option<T> = {some: T} | {none: true}. Save to solution.ts.",
+    "check_str": "type Option",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_nullable",
+    "lang": "typescript",
+    "prompt": "Write type Nullable<T> = T | null. Save to solution.ts.",
+    "check_str": "type Nullable",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_deep_partial",
+    "lang": "typescript",
+    "prompt": "Write type DeepPartial<T>. Save to solution.ts.",
+    "check_str": "type DeepPartial",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-enum_direction",
+    "lang": "typescript",
+    "prompt": "Write enum Direction { Up, Down, Left, Right }. Save to solution.ts.",
+    "check_str": "enum Direction",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-enum_status",
+    "lang": "typescript",
+    "prompt": "Write enum Status { Active, Inactive, Pending }. Save to solution.ts.",
+    "check_str": "enum Status",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_record",
+    "lang": "typescript",
+    "prompt": "Write type StringRecord = Record<string, string>. Save to solution.ts.",
+    "check_str": "type StringRecord",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_partial",
+    "lang": "typescript",
+    "prompt": "Write type PartialUser = Partial<User>. Save to solution.ts.",
+    "check_str": "type PartialUser",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_required",
+    "lang": "typescript",
+    "prompt": "Write type RequiredUser = Required<User>. Save to solution.ts.",
+    "check_str": "type RequiredUser",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_pick",
+    "lang": "typescript",
+    "prompt": "Write type UserBasic = Pick<User, 'id' | 'name'>. Save to solution.ts.",
+    "check_str": "type UserBasic",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_omit",
+    "lang": "typescript",
+    "prompt": "Write type UserWithoutEmail = Omit<User, 'email'>. Save to solution.ts.",
+    "check_str": "type UserWithoutEmail",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_map",
+    "lang": "typescript",
+    "prompt": "Write map<T, U>(arr: T[], fn: (t: T) => U): U[]. Save to solution.ts.",
+    "check_str": "function map",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_filter",
+    "lang": "typescript",
+    "prompt": "Write filter<T>(arr: T[], fn: (t: T) => boolean): T[]. Save to solution.ts.",
+    "check_str": "function filter",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_reduce",
+    "lang": "typescript",
+    "prompt": "Write reduce<T, U>(arr: T[], fn: (acc: U, t: T) => U, init: U): U. Save to solution.ts.",
+    "check_str": "function reduce",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_pipe",
+    "lang": "typescript",
+    "prompt": "Write pipe<T>(...fns: Function[]): T. Save to solution.ts.",
+    "check_str": "function pipe",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_event",
+    "lang": "typescript",
+    "prompt": "Write type Event = { type: string; payload: unknown; timestamp: number }. Save to solution.ts.",
+    "check_str": "type Event",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_config",
+    "lang": "typescript",
+    "prompt": "Write type Config = { host: string; port: number; debug?: boolean }. Save to solution.ts.",
+    "check_str": "type Config",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_response",
+    "lang": "typescript",
+    "prompt": "Write type ApiResponse<T> = { data: T; status: number; ok: boolean }. Save to solution.ts.",
+    "check_str": "type ApiResponse",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_merge",
+    "lang": "typescript",
+    "prompt": "Write type Merge<A, B> = Omit<A, keyof B> & B. Save to solution.ts.",
+    "check_str": "type Merge",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_exclusive",
+    "lang": "typescript",
+    "prompt": "Write type Exclusive<T, K> = T & {[P in K]?: never}. Save to solution.ts.",
+    "check_str": "type Exclusive",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_readonly",
+    "lang": "typescript",
+    "prompt": "Write type Immutable<T> = Readonly<T>. Save to solution.ts.",
+    "check_str": "type Immutable",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-generic_mutable",
+    "lang": "typescript",
+    "prompt": "Write type Mutable<T> = {-readonly [P in keyof T]: T[P]}. Save to solution.ts.",
+    "check_str": "type Mutable",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_error",
+    "lang": "typescript",
+    "prompt": "Write class AppError extends Error { code: number }. Save to solution.ts.",
+    "check_str": "class AppError",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "ts-type_success",
+    "lang": "typescript",
+    "prompt": "Write class Success<T> { value: T }. Save to solution.ts.",
+    "check_str": "class Success",
+    "check_file": "solution.ts"
+  },
+  {
+    "id": "rust-struct_point",
+    "lang": "rust",
+    "prompt": "Write struct Point { x: f64, y: f64 } with new() and distance_to(). Save to solution.rs.",
+    "check_str": "struct Point",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_rect",
+    "lang": "rust",
+    "prompt": "Write struct Rectangle with area() and perimeter(). Save to solution.rs.",
+    "check_str": "struct Rectangle",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_circle",
+    "lang": "rust",
+    "prompt": "Write struct Circle with area() and circumference(). Save to solution.rs.",
+    "check_str": "struct Circle",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_triangle",
+    "lang": "rust",
+    "prompt": "Write struct Triangle with area(). Save to solution.rs.",
+    "check_str": "struct Triangle",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_vector2d",
+    "lang": "rust",
+    "prompt": "Write struct Vector2D with add(), magnitude(), normalize(). Save to solution.rs.",
+    "check_str": "struct Vector2D",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-enum_shape",
+    "lang": "rust",
+    "prompt": "Write enum Shape { Circle(f64), Rectangle(f64, f64) } with area(). Save to solution.rs.",
+    "check_str": "enum Shape",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-enum_color",
+    "lang": "rust",
+    "prompt": "Write enum Color { Red, Green, Blue } with name(). Save to solution.rs.",
+    "check_str": "enum Color",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-enum_direction",
+    "lang": "rust",
+    "prompt": "Write enum Direction { Up, Down, Left, Right } with opposite(). Save to solution.rs.",
+    "check_str": "enum Direction",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-enum_option_demo",
+    "lang": "rust",
+    "prompt": "Write enum MyOption<T> { Some(T), None } with map(). Save to solution.rs.",
+    "check_str": "enum MyOption",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-enum_result_demo",
+    "lang": "rust",
+    "prompt": "Write enum MyResult<T, E> { Ok(T), Err(E) } with unwrap_or(). Save to solution.rs.",
+    "check_str": "enum MyResult",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-impl_display",
+    "lang": "rust",
+    "prompt": "Write impl Display for Point. Save to solution.rs.",
+    "check_str": "impl Display for Point",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-impl_add",
+    "lang": "rust",
+    "prompt": "Write impl Add for Point. Save to solution.rs.",
+    "check_str": "impl Add",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-impl_from",
+    "lang": "rust",
+    "prompt": "Write impl From<(f64, f64)> for Point. Save to solution.rs.",
+    "check_str": "impl From",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-impl_into",
+    "lang": "rust",
+    "prompt": "Write impl Into<(f64, f64)> for Point. Save to solution.rs.",
+    "check_str": "impl Into",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-impl_default",
+    "lang": "rust",
+    "prompt": "Write impl Default for Point. Save to solution.rs.",
+    "check_str": "impl Default",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_bubble_sort",
+    "lang": "rust",
+    "prompt": "Write fn bubble_sort<T: Ord>(arr: &mut [T]). Save to solution.rs.",
+    "check_str": "fn bubble_sort",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_binary_search",
+    "lang": "rust",
+    "prompt": "Write fn binary_search<T: Ord>(arr: &[T], target: &T) -> Option<usize>. Save to solution.rs.",
+    "check_str": "fn binary_search",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_merge_sort",
+    "lang": "rust",
+    "prompt": "Write fn merge_sort(arr: &mut Vec<i32>). Save to solution.rs.",
+    "check_str": "fn merge_sort",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_quicksort",
+    "lang": "rust",
+    "prompt": "Write fn quicksort(arr: &mut [i32]). Save to solution.rs.",
+    "check_str": "fn quicksort",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_factorial",
+    "lang": "rust",
+    "prompt": "Write fn factorial(n: u64) -> u64. Save to solution.rs.",
+    "check_str": "fn factorial",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_fibonacci",
+    "lang": "rust",
+    "prompt": "Write fn fibonacci(n: usize) -> Vec<u64>. Save to solution.rs.",
+    "check_str": "fn fibonacci",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_is_prime",
+    "lang": "rust",
+    "prompt": "Write fn is_prime(n: u64) -> bool. Save to solution.rs.",
+    "check_str": "fn is_prime",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_gcd",
+    "lang": "rust",
+    "prompt": "Write fn gcd(a: u64, b: u64) -> u64. Save to solution.rs.",
+    "check_str": "fn gcd",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_lcm",
+    "lang": "rust",
+    "prompt": "Write fn lcm(a: u64, b: u64) -> u64. Save to solution.rs.",
+    "check_str": "fn lcm",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_clamp",
+    "lang": "rust",
+    "prompt": "Write fn clamp<T: Ord>(val: T, min: T, max: T) -> T. Save to solution.rs.",
+    "check_str": "fn clamp",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_abs_diff",
+    "lang": "rust",
+    "prompt": "Write fn abs_diff(a: i32, b: i32) -> i32. Save to solution.rs.",
+    "check_str": "fn abs_diff",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_is_palindrome",
+    "lang": "rust",
+    "prompt": "Write fn is_palindrome(s: &str) -> bool. Save to solution.rs.",
+    "check_str": "fn is_palindrome",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_reverse_str",
+    "lang": "rust",
+    "prompt": "Write fn reverse_str(s: &str) -> String. Save to solution.rs.",
+    "check_str": "fn reverse_str",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_count_chars",
+    "lang": "rust",
+    "prompt": "Write fn count_chars(s: &str) -> HashMap<char, usize>. Save to solution.rs.",
+    "check_str": "fn count_chars",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_anagram",
+    "lang": "rust",
+    "prompt": "Write fn anagram(s1: &str, s2: &str) -> bool. Save to solution.rs.",
+    "check_str": "fn anagram",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_title_case",
+    "lang": "rust",
+    "prompt": "Write fn title_case(s: &str) -> String. Save to solution.rs.",
+    "check_str": "fn title_case",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-fn_slugify",
+    "lang": "rust",
+    "prompt": "Write fn slugify(s: &str) -> String. Save to solution.rs.",
+    "check_str": "fn slugify",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-trait_serialize",
+    "lang": "rust",
+    "prompt": "Write trait Serialize { fn serialize(&self) -> String; }. Save to solution.rs.",
+    "check_str": "trait Serialize",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-trait_deserialize",
+    "lang": "rust",
+    "prompt": "Write trait Deserialize: Sized { fn deserialize(s: &str) -> Option<Self>; }. Save to solution.rs.",
+    "check_str": "trait Deserialize",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-trait_validator",
+    "lang": "rust",
+    "prompt": "Write trait Validate { fn validate(&self) -> bool; }. Save to solution.rs.",
+    "check_str": "trait Validate",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-trait_clone",
+    "lang": "rust",
+    "prompt": "Write trait DeepCopy { fn deep_copy(&self) -> Self; }. Save to solution.rs.",
+    "check_str": "trait DeepCopy",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-trait_iterator",
+    "lang": "rust",
+    "prompt": "Write trait Fibonacci { fn next_fib(&mut self) -> u64; }. Save to solution.rs.",
+    "check_str": "trait Fibonacci",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_stack",
+    "lang": "rust",
+    "prompt": "Write struct Stack<T> with push(), pop(), peek(). Save to solution.rs.",
+    "check_str": "struct Stack",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_queue",
+    "lang": "rust",
+    "prompt": "Write struct Queue<T> with enqueue(), dequeue(). Save to solution.rs.",
+    "check_str": "struct Queue",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_linked_list",
+    "lang": "rust",
+    "prompt": "Write struct LinkedList<T> with push(), pop(). Save to solution.rs.",
+    "check_str": "struct LinkedList",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_hashmap",
+    "lang": "rust",
+    "prompt": "Write struct SimpleHashMap with insert(), get(). Save to solution.rs.",
+    "check_str": "struct SimpleHashMap",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_cache",
+    "lang": "rust",
+    "prompt": "Write struct Cache<K, V> with get(), set(). Save to solution.rs.",
+    "check_str": "struct Cache",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_builder",
+    "lang": "rust",
+    "prompt": "Write struct UrlBuilder with host(), path(), build(). Save to solution.rs.",
+    "check_str": "struct UrlBuilder",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_option_type",
+    "lang": "rust",
+    "prompt": "Write struct MyOption<T> { value: Option<T> } with and_then(). Save to solution.rs.",
+    "check_str": "struct MyOption",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "rust-struct_heap",
+    "lang": "rust",
+    "prompt": "Write struct MinHeap with push(), pop(), peek(). Save to solution.rs.",
+    "check_str": "struct MinHeap",
+    "check_file": "solution.rs"
+  },
+  {
+    "id": "go-struct_person",
+    "lang": "go",
+    "prompt": "Write type Person struct { Name string; Age int } with String() method. Save to solution.go.",
+    "check_str": "type Person struct",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-struct_point",
+    "lang": "go",
+    "prompt": "Write type Point struct { X, Y float64 } with Distance(). Save to solution.go.",
+    "check_str": "type Point struct",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-struct_rect",
+    "lang": "go",
+    "prompt": "Write type Rect struct with Area() and Perimeter(). Save to solution.go.",
+    "check_str": "type Rect struct",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-struct_circle",
+    "lang": "go",
+    "prompt": "Write type Circle struct with Area(). Save to solution.go.",
+    "check_str": "type Circle struct",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-struct_stack",
+    "lang": "go",
+    "prompt": "Write type Stack[T any] with Push(), Pop(). Save to solution.go.",
+    "check_str": "type Stack",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-struct_queue",
+    "lang": "go",
+    "prompt": "Write type Queue[T any] with Enqueue(), Dequeue(). Save to solution.go.",
+    "check_str": "type Queue",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-struct_node",
+    "lang": "go",
+    "prompt": "Write type Node struct with Value and Next. Save to solution.go.",
+    "check_str": "type Node struct",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-struct_error",
+    "lang": "go",
+    "prompt": "Write type AppError struct with Message and Code. Save to solution.go.",
+    "check_str": "type AppError struct",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-struct_result",
+    "lang": "go",
+    "prompt": "Write type Result[T any] struct with Value and Error. Save to solution.go.",
+    "check_str": "type Result struct",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-struct_option",
+    "lang": "go",
+    "prompt": "Write type Option[T any] struct with Value. Save to solution.go.",
+    "check_str": "type Option struct",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_bubble_sort",
+    "lang": "go",
+    "prompt": "Write func BubbleSort(arr []int). Save to solution.go.",
+    "check_str": "func BubbleSort",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_binary_search",
+    "lang": "go",
+    "prompt": "Write func BinarySearch(arr []int, target int) int. Save to solution.go.",
+    "check_str": "func BinarySearch",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_merge_sort",
+    "lang": "go",
+    "prompt": "Write func MergeSort(arr []int) []int. Save to solution.go.",
+    "check_str": "func MergeSort",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_factorial",
+    "lang": "go",
+    "prompt": "Write func Factorial(n int) int. Save to solution.go.",
+    "check_str": "func Factorial",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_fibonacci",
+    "lang": "go",
+    "prompt": "Write func Fibonacci(n int) []int. Save to solution.go.",
+    "check_str": "func Fibonacci",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_is_prime",
+    "lang": "go",
+    "prompt": "Write func IsPrime(n int) bool. Save to solution.go.",
+    "check_str": "func IsPrime",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_gcd",
+    "lang": "go",
+    "prompt": "Write func GCD(a, b int) int. Save to solution.go.",
+    "check_str": "func GCD",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_lcm",
+    "lang": "go",
+    "prompt": "Write func LCM(a, b int) int. Save to solution.go.",
+    "check_str": "func LCM",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_clamp",
+    "lang": "go",
+    "prompt": "Write func Clamp(val, min, max int) int. Save to solution.go.",
+    "check_str": "func Clamp",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_abs_diff",
+    "lang": "go",
+    "prompt": "Write func AbsDiff(a, b int) int. Save to solution.go.",
+    "check_str": "func AbsDiff",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_is_palindrome",
+    "lang": "go",
+    "prompt": "Write func IsPalindrome(s string) bool. Save to solution.go.",
+    "check_str": "func IsPalindrome",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_reverse_str",
+    "lang": "go",
+    "prompt": "Write func ReverseStr(s string) string. Save to solution.go.",
+    "check_str": "func ReverseStr",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_count_chars",
+    "lang": "go",
+    "prompt": "Write func CountChars(s string) map[rune]int. Save to solution.go.",
+    "check_str": "func CountChars",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_anagram",
+    "lang": "go",
+    "prompt": "Write func Anagram(s1, s2 string) bool. Save to solution.go.",
+    "check_str": "func Anagram",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_title_case",
+    "lang": "go",
+    "prompt": "Write func TitleCase(s string) string. Save to solution.go.",
+    "check_str": "func TitleCase",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_slugify",
+    "lang": "go",
+    "prompt": "Write func Slugify(s string) string. Save to solution.go.",
+    "check_str": "func Slugify",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_map_arr",
+    "lang": "go",
+    "prompt": "Write func Map[T, U any](arr []T, fn func(T) U) []U. Save to solution.go.",
+    "check_str": "func Map[",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_filter_arr",
+    "lang": "go",
+    "prompt": "Write func Filter[T any](arr []T, fn func(T) bool) []T. Save to solution.go.",
+    "check_str": "func Filter[",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_reduce_arr",
+    "lang": "go",
+    "prompt": "Write func Reduce[T, U any](arr []T, fn func(U, T) U, init U) U. Save to solution.go.",
+    "check_str": "func Reduce[",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "go-fn_zip",
+    "lang": "go",
+    "prompt": "Write func Zip(a, b []int) [][]int. Save to solution.go.",
+    "check_str": "func Zip",
+    "check_file": "solution.go"
+  },
+  {
+    "id": "cpp-vector_sum",
+    "lang": "cpp",
+    "prompt": "Write int sum(vector<int>& v). Save to solution.cpp.",
+    "check_str": "int sum",
+    "check_file": "solution.cpp"
+  },
+  {
+    "id": "cpp-vector_avg",
+    "lang": "cpp",
+    "prompt": "Write double average(vector<int>& v). Save to solution.cpp.",
+    "check_str": "double average",
+    "check_file": "solution.cpp"
+  },
+  {
+    "id": "cpp-vector_max",
+    "lang": "cpp",
+    "prompt": "Write int findMax(vector<int>& v). Save to solution.cpp.",
+    "check_str": "int findMax",
+    "check_file": "solution.cpp"
+  },
+  {
+    "id": "cpp-vector_min",
+    "lang": "cpp",
+    "prompt": "Write int findMin(vector<int>& v). Save to solution.cpp.",
+    "check_str": "int findMin",
+    "check_file": "solution.cpp"
+  },
+  {
+    "id": "cpp-string_reverse",
+    "lang": "cpp",
+    "prompt": "Write string reverseStr(string s). Save to solution.cpp.",
+    "check_str": "string reverseStr",
+    "check_file": "solution.cpp"
+  },
+  {
+    "id": "cpp-string_palindrome",
+    "lang": "cpp",
+    "prompt": "Write bool isPalindrome(string s). Save to solution.cpp.",
+    "check_str": "bool isPalindrome",
+    "check_file": "solution.cpp"
+  },
+  {
+    "id": "cpp-factorial_fn",
+    "lang": "cpp",
+    "prompt": "Write int factorial(int n). Save to solution.cpp.",
+    "check_str": "int factorial",
+    "check_file": "solution.cpp"
+  },
+  {
+    "id": "cpp-fibonacci_fn",
+    "lang": "cpp",
+    "prompt": "Write int fibonacci(int n). Save to solution.cpp.",
+    "check_str": "int fibonacci",
+    "check_file": "solution.cpp"
+  },
+  {
+    "id": "cpp-binary_search_fn",
+    "lang": "cpp",
+    "prompt": "Write int binarySearch(vector<int>& v, int target). Save to solution.cpp.",
+    "check_str": "int binarySearch",
+    "check_file": "solution.cpp"
+  },
+  {
+    "id": "cpp-bubble_sort_fn",
+    "lang": "cpp",
+    "prompt": "Write void bubbleSort(vector<int>& v). Save to solution.cpp.",
+    "check_str": "void bubbleSort",
+    "check_file": "solution.cpp"
+  },
+  {
+    "id": "java-string_reverse",
+    "lang": "java",
+    "prompt": "Write public static String reverse(String s). Save to solution.java.",
+    "check_str": "public static String reverse",
+    "check_file": "solution.java"
+  },
+  {
+    "id": "java-string_palindrome",
+    "lang": "java",
+    "prompt": "Write public static boolean isPalindrome(String s). Save to solution.java.",
+    "check_str": "public static boolean isPalindrome",
+    "check_file": "solution.java"
+  },
+  {
+    "id": "java-factorial_fn",
+    "lang": "java",
+    "prompt": "Write public static int factorial(int n). Save to solution.java.",
+    "check_str": "public static int factorial",
+    "check_file": "solution.java"
+  },
+  {
+    "id": "java-fibonacci_fn",
+    "lang": "java",
+    "prompt": "Write public static int fibonacci(int n). Save to solution.java.",
+    "check_str": "public static int fibonacci",
+    "check_file": "solution.java"
+  },
+  {
+    "id": "java-bubble_sort_fn",
+    "lang": "java",
+    "prompt": "Write public static void bubbleSort(int[] arr). Save to solution.java.",
+    "check_str": "public static void bubbleSort",
+    "check_file": "solution.java"
+  },
+  {
+    "id": "java-binary_search_fn",
+    "lang": "java",
+    "prompt": "Write public static int binarySearch(int[] arr, int target). Save to solution.java.",
+    "check_str": "public static int binarySearch",
+    "check_file": "solution.java"
+  },
+  {
+    "id": "java-max_fn",
+    "lang": "java",
+    "prompt": "Write public static int max(int a, int b). Save to solution.java.",
+    "check_str": "public static int max",
+    "check_file": "solution.java"
+  },
+  {
+    "id": "java-min_fn",
+    "lang": "java",
+    "prompt": "Write public static int min(int a, int b). Save to solution.java.",
+    "check_str": "public static int min",
+    "check_file": "solution.java"
+  },
+  {
+    "id": "java-clamp_fn",
+    "lang": "java",
+    "prompt": "Write public static int clamp(int val, int min, int max). Save to solution.java.",
+    "check_str": "public static int clamp",
+    "check_file": "solution.java"
+  },
+  {
+    "id": "java-gcd_fn",
+    "lang": "java",
+    "prompt": "Write public static int gcd(int a, int b). Save to solution.java.",
+    "check_str": "public static int gcd",
+    "check_file": "solution.java"
+  }
+]

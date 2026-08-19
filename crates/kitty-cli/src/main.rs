@@ -80,6 +80,9 @@ pub enum Commands {
         /// Output file for results
         #[arg(short, long, default_value = "bench_results.json")]
         out: PathBuf,
+        /// Path to JSON exercises file (overrides built-in exercises)
+        #[arg(long)]
+        exercises: Option<PathBuf>,
         /// Disable episodic memory recall/save
         #[arg(long)]
         no_memory: bool,
@@ -140,6 +143,7 @@ async fn main() -> Result<()> {
             suite,
             limit,
             out,
+            exercises: exercises_path,
             no_memory,
         } => {
             // Ensure memory DB directory exists
@@ -150,17 +154,45 @@ async fn main() -> Result<()> {
                 }
             }
 
+            let cfg = BenchConfig {
+                client: client.clone(),
+                model: cli.model.clone(),
+                limit,
+                use_memory: !no_memory,
+                thinking_budget: cli.thinking_budget,
+                context_window: cli.context_window,
+                max_iterations: cli.max_iterations,
+                bash_timeout: cli.bash_timeout,
+            };
+
             println!("Kitty Code Benchmark");
             println!("  Model: {}", cli.model);
             println!("  Suite: {} (limit: {})", suite, limit);
             println!("  Memory: {}", if no_memory { "off" } else { "on" });
             println!("  Thinking budget: {}", cli.thinking_budget);
             println!("  Context window: {}", cli.context_window);
+            if let Some(ref path) = exercises_path {
+                println!("  Exercises JSON: {}", path.display());
+            }
             println!();
 
-            let results = match suite.as_str() {
-                "tb2" => run_tb2_bench(&client, &cli.model, limit, !no_memory, cli.thinking_budget, cli.context_window, cli.max_iterations, cli.bash_timeout).await?,
-                _ => run_polyglot_bench(&client, &cli.model, limit, !no_memory, cli.thinking_budget, cli.context_window, cli.max_iterations, cli.bash_timeout).await?,
+            // If --exercises provided, load from JSON; otherwise use built-in
+            let results = if let Some(ref path) = exercises_path {
+                let json_exercises = load_json_exercises(path)?;
+                let bench_items: Vec<BenchItem> = json_exercises
+                    .iter()
+                    .filter_map(json_to_bench_item)
+                    .collect();
+                if bench_items.is_empty() {
+                    anyhow::bail!("No valid exercises found in {}", path.display());
+                }
+                println!("  Loaded {} exercises from JSON", bench_items.len());
+                run_bench(&bench_items, &cfg).await?
+            } else {
+                match suite.as_str() {
+                    "tb2" => run_bench(&tb2_exercises(), &cfg).await?,
+                    _ => run_bench(&exercises(), &cfg).await?,
+                }
             };
 
             let passed = results.iter().filter(|r| r.passed).count();
@@ -258,31 +290,89 @@ struct BenchResult {
     latency_ms: f64,
 }
 
+/// A benchmark exercise loaded from JSON.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)] // Fields used for deserialization; not all checked in Rust.
+struct JsonExercise {
+    id: String,
+    #[serde(default)]
+    lang: String,
+    prompt: String,
+    /// String to search for in the check_file (polyglot format).
+    #[serde(default)]
+    check_str: String,
+    /// File to check for the check_str.
+    #[serde(default)]
+    check_file: String,
+    /// Check type for TB2 tasks: "file_exists", "file_content_exact", etc.
+    #[serde(default)]
+    check_type: String,
+    /// Relative path for the check (TB2 format).
+    #[serde(default)]
+    check_path: String,
+    /// Expected content for file_content_exact checks.
+    #[serde(default)]
+    expected: String,
+    /// Setup category for TB2 tasks: "file_ops", "text_proc", etc.
+    #[serde(default)]
+    setup: String,
+}
+
+/// Convert a JsonExercise to BenchItem (for polyglot JSON format).
+fn json_to_bench_item(ex: &JsonExercise) -> Option<BenchItem> {
+    if !ex.check_str.is_empty() && !ex.check_file.is_empty() {
+        let check_str = ex.check_str.clone();
+        let check_file = ex.check_file.clone();
+        Some(BenchItem {
+            id: Box::leak(ex.id.clone().into_boxed_str()),
+            label: Box::leak(ex.lang.clone().into_boxed_str()),
+            prompt: Box::leak(ex.prompt.clone().into_boxed_str()),
+            check: Box::new(move |d| file_contains(d, &check_file, &check_str)),
+        })
+    } else {
+        None
+    }
+}
+
+/// Load exercises from a JSON file.
+fn load_json_exercises(path: &std::path::Path) -> Result<Vec<JsonExercise>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read exercises file: {}", path.display()))?;
+    let exercises: Vec<JsonExercise> = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse exercises JSON: {}", path.display()))?;
+    Ok(exercises)
+}
+
 struct BenchItem {
     id: &'static str,
     /// Grouping label shown in results (language or category).
     label: &'static str,
     prompt: &'static str,
-    check: fn(&str) -> bool,
+    check: Box<dyn Fn(&str) -> bool>,
+}
+
+/// Helper to build a BenchItem with a boxed closure.
+fn bench(id: &'static str, label: &'static str, prompt: &'static str, check: impl Fn(&str) -> bool + 'static) -> BenchItem {
+    BenchItem { id, label, prompt, check: Box::new(check) }
 }
 
 fn exercises() -> Vec<BenchItem> {
     vec![
-        BenchItem { id: "py-fib", label: "python", prompt: "Write a function fibonacci(n: int) -> list[int] that returns the first n Fibonacci numbers. Save to solution.py.", check: |d| file_contains(d, "solution.py", "def fibonacci") },
-        BenchItem { id: "py-class", label: "python", prompt: "Create a BankAccount class with deposit() and withdraw() methods. Save to solution.py.", check: |d| file_contains(d, "solution.py", "class BankAccount") },
-        BenchItem { id: "py-sort", label: "python", prompt: "Write merge_sort(arr: list[int]) -> list[int]. Save to solution.py.", check: |d| file_contains(d, "solution.py", "def merge_sort") },
-        BenchItem { id: "py-decorator", label: "python", prompt: "Write a retry decorator that retries up to 3 times on exception. Save to solution.py.", check: |d| file_contains(d, "solution.py", "def retry") },
-        BenchItem { id: "py-context", label: "python", prompt: "Write a context manager that times code execution. Save to solution.py.", check: |d| file_contains(d, "solution.py", "__enter__") },
-        BenchItem { id: "js-promise", label: "javascript", prompt: "Write fetchWithTimeout(url, timeout) using AbortController. Save to solution.js.", check: |d| file_contains(d, "solution.js", "AbortController") },
-        BenchItem { id: "js-debounce", label: "javascript", prompt: "Write a debounce function. Save to solution.js.", check: |d| file_contains(d, "solution.js", "debounce") },
-        BenchItem { id: "js-async", label: "javascript", prompt: "Write an async function to read a file. Save to solution.js.", check: |d| file_contains(d, "solution.js", "async") },
-        BenchItem { id: "ts-interface", label: "typescript", prompt: "Write a TypeScript interface User with id, name, email. Save to solution.ts.", check: |d| file_contains(d, "solution.ts", "interface User") },
-        BenchItem { id: "ts-generic", label: "typescript", prompt: "Write generic first<T>(arr: T[]): T | undefined. Save to solution.ts.", check: |d| file_contains(d, "solution.ts", "function first") },
-        BenchItem { id: "sh-backup", label: "bash", prompt: "Write a bash script that backs up a directory to timestamped tar.gz. Save to solution.sh.", check: |d| file_contains(d, "solution.sh", "tar") },
-        BenchItem { id: "sh-replace", label: "bash", prompt: "Write a bash script to find and replace text in .txt files. Save to solution.sh.", check: |d| file_contains(d, "solution.sh", "find") },
-        BenchItem { id: "rust-struct", label: "rust", prompt: "Write a Rust struct Point with x,y f64 and new() + distance_to(). Save to solution.rs.", check: |d| file_contains(d, "solution.rs", "struct Point") },
-        BenchItem { id: "rust-enum", label: "rust", prompt: "Write enum Shape with Circle/Rectangle/Triangle and area(). Save to solution.rs.", check: |d| file_contains(d, "solution.rs", "enum Shape") },
-        BenchItem { id: "go-struct", label: "go", prompt: "Write Go struct Person with Name/Age and String() method. Save to solution.go.", check: |d| file_contains(d, "solution.go", "type Person struct") },
+        bench("py-fib", "python", "Write a function fibonacci(n: int) -> list[int] that returns the first n Fibonacci numbers. Save to solution.py.", |d| file_contains(d, "solution.py", "def fibonacci")),
+        bench("py-class", "python", "Create a BankAccount class with deposit() and withdraw() methods. Save to solution.py.", |d| file_contains(d, "solution.py", "class BankAccount")),
+        bench("py-sort", "python", "Write merge_sort(arr: list[int]) -> list[int]. Save to solution.py.", |d| file_contains(d, "solution.py", "def merge_sort")),
+        bench("py-decorator", "python", "Write a retry decorator that retries up to 3 times on exception. Save to solution.py.", |d| file_contains(d, "solution.py", "def retry")),
+        bench("py-context", "python", "Write a context manager that times code execution. Save to solution.py.", |d| file_contains(d, "solution.py", "__enter__")),
+        bench("js-promise", "javascript", "Write fetchWithTimeout(url, timeout) using AbortController. Save to solution.js.", |d| file_contains(d, "solution.js", "AbortController")),
+        bench("js-debounce", "javascript", "Write a debounce function. Save to solution.js.", |d| file_contains(d, "solution.js", "debounce")),
+        bench("js-async", "javascript", "Write an async function to read a file. Save to solution.js.", |d| file_contains(d, "solution.js", "async")),
+        bench("ts-interface", "typescript", "Write a TypeScript interface User with id, name, email. Save to solution.ts.", |d| file_contains(d, "solution.ts", "interface User")),
+        bench("ts-generic", "typescript", "Write generic first<T>(arr: T[]): T | undefined. Save to solution.ts.", |d| file_contains(d, "solution.ts", "function first")),
+        bench("sh-backup", "bash", "Write a bash script that backs up a directory to timestamped tar.gz. Save to solution.sh.", |d| file_contains(d, "solution.sh", "tar")),
+        bench("sh-replace", "bash", "Write a bash script to find and replace text in .txt files. Save to solution.sh.", |d| file_contains(d, "solution.sh", "find")),
+        bench("rust-struct", "rust", "Write a Rust struct Point with x,y f64 and new() + distance_to(). Save to solution.rs.", |d| file_contains(d, "solution.rs", "struct Point")),
+        bench("rust-enum", "rust", "Write enum Shape with Circle/Rectangle/Triangle and area(). Save to solution.rs.", |d| file_contains(d, "solution.rs", "enum Shape")),
+        bench("go-struct", "go", "Write Go struct Person with Name/Age and String() method. Save to solution.go.", |d| file_contains(d, "solution.go", "type Person struct")),
     ]
 }
 
@@ -398,88 +488,24 @@ async fn run_bench(
     Ok(results)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_polyglot_bench(
-    client: &OllamaClient,
-    model: &str,
-    limit: usize,
-    use_memory: bool,
-    thinking_budget: usize,
-    context_window: usize,
-    max_iterations: usize,
-    bash_timeout: u64,
-) -> Result<Vec<BenchResult>> {
-    let cfg = BenchConfig {
-        client: client.clone(),
-        model: model.to_string(),
-        limit,
-        use_memory,
-        thinking_budget,
-        context_window,
-        max_iterations,
-        bash_timeout,
-    };
-    run_bench(&exercises(), &cfg).await
-}
-
 // ── TB2: Terminal-Bench 2.0 ──────────────────────────────────────────
 
 fn tb2_exercises() -> Vec<BenchItem> {
     vec![
-        BenchItem {
-            id: "tb2-bash-count",
-            label: "bash",
-            prompt: "Create a bash script called count_lines.sh that counts the number of lines in all .rs files in the current directory recursively. Save it to count_lines.sh and make it executable.",
-            check: |d| file_is_executable(d, "count_lines.sh") && file_contains(d, "count_lines.sh", "find"),
-        },
-        BenchItem {
-            id: "tb2-py-csv",
-            label: "python",
-            prompt: "Write a Python script called csv_to_json.py that reads a CSV file (input path as first argument) and outputs JSON to stdout. Save it to csv_to_json.py.",
-            check: |d| file_contains(d, "csv_to_json.py", "csv") && file_contains(d, "csv_to_json.py", "json"),
-        },
-        BenchItem {
-            id: "tb2-makefile",
-            label: "makefile",
-            prompt: "Create a Makefile with three targets: test (runs cargo test), build (runs cargo build), and clean (removes target directory). Save to Makefile.",
-            check: |d| file_contains(d, "Makefile", "test:") && file_contains(d, "Makefile", "build:") && file_contains(d, "Makefile", "clean:"),
-        },
-        BenchItem {
-            id: "tb2-dockerfile",
-            label: "docker",
-            prompt: "Write a Dockerfile for a Rust project that uses multi-stage builds: builder stage compiles, runtime stage copies binary. Save to Dockerfile.",
-            check: |d| file_contains(d, "Dockerfile", "FROM") && file_contains(d, "Dockerfile", "COPY"),
-        },
-        BenchItem {
-            id: "tb2-gh-actions",
-            label: "ci",
-            prompt: "Create a GitHub Actions CI workflow at .github/workflows/ci.yml that runs cargo test and cargo build on push/PR. Save to .github/workflows/ci.yml.",
-            check: |d| {
-                let path = std::path::Path::new(d).join(".github/workflows/ci.yml");
-                match std::fs::read_to_string(&path) {
-                    Ok(c) => c.contains("cargo test") || c.contains("cargo build"),
-                    Err(_) => false,
-                }
-            },
-        },
-        BenchItem {
-            id: "tb2-sh-find-modified",
-            label: "bash",
-            prompt: "Write a bash script called find_recent.sh that finds all files modified in the last 24 hours in a given directory (first argument). Save to find_recent.sh.",
-            check: |d| file_is_executable(d, "find_recent.sh") && file_contains(d, "find_recent.sh", "find"),
-        },
-        BenchItem {
-            id: "tb2-py-dirsize",
-            label: "python",
-            prompt: "Write a Python script called dirsize.py that calculates and prints the total size of each subdirectory in the current directory. Save to dirsize.py.",
-            check: |d| file_contains(d, "dirsize.py", "os") && file_contains(d, "dirsize.py", "path"),
-        },
-        BenchItem {
-            id: "tb2-sh-backup",
-            label: "bash",
-            prompt: "Write a bash script called backup.sh that backs up files from a source directory (first argument) to a destination with a timestamp suffix (e.g. backup_20260817_120000). Save to backup.sh.",
-            check: |d| file_is_executable(d, "backup.sh") && file_contains(d, "backup.sh", "cp"),
-        },
+        bench("tb2-bash-count", "bash", "Create a bash script called count_lines.sh that counts the number of lines in all .rs files in the current directory recursively. Save it to count_lines.sh and make it executable.", |d| file_is_executable(d, "count_lines.sh") && file_contains(d, "count_lines.sh", "find")),
+        bench("tb2-py-csv", "python", "Write a Python script called csv_to_json.py that reads a CSV file (input path as first argument) and outputs JSON to stdout. Save it to csv_to_json.py.", |d| file_contains(d, "csv_to_json.py", "csv") && file_contains(d, "csv_to_json.py", "json")),
+        bench("tb2-makefile", "makefile", "Create a Makefile with three targets: test (runs cargo test), build (runs cargo build), and clean (removes target directory). Save to Makefile.", |d| file_contains(d, "Makefile", "test:") && file_contains(d, "Makefile", "build:") && file_contains(d, "Makefile", "clean:")),
+        bench("tb2-dockerfile", "docker", "Write a Dockerfile for a Rust project that uses multi-stage builds: builder stage compiles, runtime stage copies binary. Save to Dockerfile.", |d| file_contains(d, "Dockerfile", "FROM") && file_contains(d, "Dockerfile", "COPY")),
+        bench("tb2-gh-actions", "ci", "Create a GitHub Actions CI workflow at .github/workflows/ci.yml that runs cargo test and cargo build on push/PR. Save to .github/workflows/ci.yml.", |d| {
+            let path = std::path::Path::new(d).join(".github/workflows/ci.yml");
+            match std::fs::read_to_string(&path) {
+                Ok(c) => c.contains("cargo test") || c.contains("cargo build"),
+                Err(_) => false,
+            }
+        }),
+        bench("tb2-sh-find-modified", "bash", "Write a bash script called find_recent.sh that finds all files modified in the last 24 hours in a given directory (first argument). Save to find_recent.sh.", |d| file_is_executable(d, "find_recent.sh") && file_contains(d, "find_recent.sh", "find")),
+        bench("tb2-py-dirsize", "python", "Write a Python script called dirsize.py that calculates and prints the total size of each subdirectory in the current directory. Save to dirsize.py.", |d| file_contains(d, "dirsize.py", "os") && file_contains(d, "dirsize.py", "path")),
+        bench("tb2-sh-backup", "bash", "Write a bash script called backup.sh that backs up files from a source directory (first argument) to a destination with a timestamp suffix (e.g. backup_20260817_120000). Save to backup.sh.", |d| file_is_executable(d, "backup.sh") && file_contains(d, "backup.sh", "cp")),
     ]
 }
 
@@ -511,28 +537,4 @@ fn list_files(dir: &str) -> Vec<String> {
         }
     }
     files
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_tb2_bench(
-    client: &OllamaClient,
-    model: &str,
-    limit: usize,
-    use_memory: bool,
-    thinking_budget: usize,
-    context_window: usize,
-    max_iterations: usize,
-    bash_timeout: u64,
-) -> Result<Vec<BenchResult>> {
-    let cfg = BenchConfig {
-        client: client.clone(),
-        model: model.to_string(),
-        limit,
-        use_memory,
-        thinking_budget,
-        context_window,
-        max_iterations,
-        bash_timeout,
-    };
-    run_bench(&tb2_exercises(), &cfg).await
 }

@@ -1,0 +1,625 @@
+[
+  {
+    "id": "file_copy",
+    "prompt": "Copy data.txt to data_backup.txt. Save it.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "data_backup.txt"
+  },
+  {
+    "id": "file_move",
+    "prompt": "Move data.csv to archive/data.csv creating the archive directory.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "archive/data.csv"
+  },
+  {
+    "id": "file_delete",
+    "prompt": "Delete the file data.txt.",
+    "setup": "file_ops",
+    "check_type": "file_not_exists",
+    "check_path": "data.txt"
+  },
+  {
+    "id": "file_rename",
+    "prompt": "Rename data.txt to data_renamed.txt.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "data_renamed.txt"
+  },
+  {
+    "id": "file_concat",
+    "prompt": "Concatenate the contents of src/main.py and src/lib/utils.py into combined.py.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "combined.py"
+  },
+  {
+    "id": "file_count_lines",
+    "prompt": "Count the number of lines in data.txt and write the count to line_count.txt.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "line_count.txt"
+  },
+  {
+    "id": "file_sort",
+    "prompt": "Sort the lines of data.txt alphabetically and save to sorted.txt.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "sorted.txt"
+  },
+  {
+    "id": "file_unique_lines",
+    "prompt": "Write only the unique lines from data.txt to unique.txt.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "unique.txt"
+  },
+  {
+    "id": "file_grep",
+    "prompt": "Search for lines containing '3' in data.txt and write matches to matches.txt.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "matches.txt"
+  },
+  {
+    "id": "file_word_count",
+    "prompt": "Count words in data.txt and write the count to word_count.txt.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "word_count.txt"
+  },
+  {
+    "id": "file_json_pretty",
+    "prompt": "Read config.json and write a reformatted version with 4-space indentation to config_pretty.json.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "config_pretty.json"
+  },
+  {
+    "id": "file_json_query",
+    "prompt": "Read config.json and write the value of the 'port' key to port.txt.",
+    "setup": "file_ops",
+    "check_type": "file_content_exact",
+    "check_path": "port.txt",
+    "expected": "8080"
+  },
+  {
+    "id": "file_csv_column",
+    "prompt": "Extract the 'name' column from data.csv and write to names.txt.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "names.txt"
+  },
+  {
+    "id": "file_csv_filter",
+    "prompt": "Filter rows from data.csv where age > 28 and write to filtered.csv.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "filtered.csv"
+  },
+  {
+    "id": "file_backup_dir",
+    "prompt": "Create a backup directory and copy all .py files into it.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "backup"
+  },
+  {
+    "id": "file_find_extension",
+    "prompt": "Find all files ending in .py and write the list to py_files.txt.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "py_files.txt"
+  },
+  {
+    "id": "file_create_dirs",
+    "prompt": "Create the directory structure: build/src/include with mkdir -p.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "build/src/include"
+  },
+  {
+    "id": "file_symlink",
+    "prompt": "Create a symbolic link from link.txt pointing to data.txt.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "link.txt"
+  },
+  {
+    "id": "file_chmod",
+    "prompt": "Make data.txt executable with chmod.",
+    "setup": "file_ops",
+    "check_type": "file_executable",
+    "check_path": "data.txt"
+  },
+  {
+    "id": "file_file_size",
+    "prompt": "Get the file size of data.txt in bytes and write it to size.txt.",
+    "setup": "file_ops",
+    "check_type": "file_exists",
+    "check_path": "size.txt"
+  },
+  {
+    "id": "text_reverse_lines",
+    "prompt": "Reverse the order of lines in sample.txt and save to reversed.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "reversed.txt"
+  },
+  {
+    "id": "text_uppercase",
+    "prompt": "Convert all text in sample.txt to uppercase and save to upper.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "upper.txt"
+  },
+  {
+    "id": "text_lowercase",
+    "prompt": "Convert all text in sample.txt to lowercase and save to lower.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "lower.txt"
+  },
+  {
+    "id": "text_replace",
+    "prompt": "Replace all occurrences of 'is' with 'was' in sample.txt and save to replaced.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "replaced.txt"
+  },
+  {
+    "id": "text_remove_empty",
+    "prompt": "Remove empty lines from sample.txt and save to noempty.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "noempty.txt"
+  },
+  {
+    "id": "text_word_freq",
+    "prompt": "Count word frequency in sample.txt and write to word_freq.txt (format: word count).",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "word_freq.txt"
+  },
+  {
+    "id": "text_char_count",
+    "prompt": "Count total characters in sample.txt (including spaces) and write to char_count.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "char_count.txt"
+  },
+  {
+    "id": "text_line_number",
+    "prompt": "Add line numbers to sample.txt (1: Hello World, 2: ...) and save to numbered.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "numbered.txt"
+  },
+  {
+    "id": "text_grep_error",
+    "prompt": "Extract all lines containing 'ERROR' from log.txt and write to errors.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "errors.txt"
+  },
+  {
+    "id": "text_extract_date",
+    "prompt": "Extract unique dates from log.txt and write to dates.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "dates.txt"
+  },
+  {
+    "id": "text_substring",
+    "prompt": "Extract the first 5 characters from each line in sample.txt and save to substr.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "substr.txt"
+  },
+  {
+    "id": "text_trim_lines",
+    "prompt": "Trim trailing whitespace from each line in sample.txt and save to trimmed.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "trimmed.txt"
+  },
+  {
+    "id": "text_dedup",
+    "prompt": "Remove duplicate lines from sample.txt and save to dedup.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "dedup.txt"
+  },
+  {
+    "id": "text_format_csv",
+    "prompt": "Convert sample.txt (space-separated) into CSV format and save to formatted.csv.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "formatted.csv"
+  },
+  {
+    "id": "text_extract_words",
+    "prompt": "Extract only words containing 'a' from sample.txt and save to a_words.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "a_words.txt"
+  },
+  {
+    "id": "text_join_lines",
+    "prompt": "Join all lines of sample.txt into a single line separated by commas and save to joined.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "joined.txt"
+  },
+  {
+    "id": "text_wrap",
+    "prompt": "Wrap each line of sample.txt at 20 characters and save to wrapped.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "wrapped.txt"
+  },
+  {
+    "id": "text_stats",
+    "prompt": "Compute line count, word count, and character count of sample.txt and write all three to stats.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "stats.txt"
+  },
+  {
+    "id": "text_filter_short",
+    "prompt": "Remove lines shorter than 10 characters from sample.txt and save to long_lines.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "long_lines.txt"
+  },
+  {
+    "id": "text_extract_last",
+    "prompt": "Extract the last word from each line in sample.txt and save to last_words.txt.",
+    "setup": "text_proc",
+    "check_type": "file_exists",
+    "check_path": "last_words.txt"
+  },
+  {
+    "id": "shell_ls",
+    "prompt": "List all files in the project directory recursively and write the output to filelist.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "filelist.txt"
+  },
+  {
+    "id": "shell_find_py",
+    "prompt": "Find all .py files in the project directory and write the list to py_files.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "py_files.txt"
+  },
+  {
+    "id": "shell_wc",
+    "prompt": "Count lines in each .py file in project/src/ and write to line_counts.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "line_counts.txt"
+  },
+  {
+    "id": "shell_grep",
+    "prompt": "Search for 'def ' in all .py files and write the results to functions.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "functions.txt"
+  },
+  {
+    "id": "shell_sort_numbers",
+    "prompt": "Sort the numbers in numbers.txt numerically and save to sorted_numbers.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "sorted_numbers.txt"
+  },
+  {
+    "id": "shell_sum_numbers",
+    "prompt": "Sum all numbers in numbers.txt and write the result to sum.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "sum.txt"
+  },
+  {
+    "id": "shell_sort_unique",
+    "prompt": "Sort unique numbers from numbers.txt and save to unique_sorted.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "unique_sorted.txt"
+  },
+  {
+    "id": "shell_max_number",
+    "prompt": "Find the maximum number in numbers.txt and write it to max_num.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "max_num.txt"
+  },
+  {
+    "id": "shell_min_number",
+    "prompt": "Find the minimum number in numbers.txt and write it to min_num.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "min_num.txt"
+  },
+  {
+    "id": "shell_disk_usage",
+    "prompt": "Show disk usage of the project directory and write to disk_usage.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "disk_usage.txt"
+  },
+  {
+    "id": "shell_file_count",
+    "prompt": "Count total number of files in the project directory and write to file_count.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "file_count.txt"
+  },
+  {
+    "id": "shell_date",
+    "prompt": "Write the current date in ISO format (YYYY-MM-DD) to date.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "date.txt"
+  },
+  {
+    "id": "shell_whoami",
+    "prompt": "Write the current username to whoami.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "whoami.txt"
+  },
+  {
+    "id": "shell_env",
+    "prompt": "Write the value of the PATH environment variable to path.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "path.txt"
+  },
+  {
+    "id": "shell_uptime",
+    "prompt": "Write system uptime to uptime.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "uptime.txt"
+  },
+  {
+    "id": "shell_cpu_count",
+    "prompt": "Write the number of CPU cores to cpu_count.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "cpu_count.txt"
+  },
+  {
+    "id": "shell_memory",
+    "prompt": "Write total system memory in MB to memory.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "memory.txt"
+  },
+  {
+    "id": "shell_git_log",
+    "prompt": "Initialize a git repo in project/, add all files, commit, then write the git log to git_log.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "git_log.txt"
+  },
+  {
+    "id": "shell_tree",
+    "prompt": "Create a tree-like directory listing of project/ and save to tree.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "tree.txt"
+  },
+  {
+    "id": "shell_md5",
+    "prompt": "Compute the md5sum of project/README.md and write to checksum.txt.",
+    "setup": "shell",
+    "check_type": "file_exists",
+    "check_path": "checksum.txt"
+  },
+  {
+    "id": "data_json_to_csv",
+    "prompt": "Convert employees.json to CSV format (employees.csv) with headers name,dept,salary.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "employees.csv"
+  },
+  {
+    "id": "data_filter_salary",
+    "prompt": "Filter employees.json for salary > 90000 and write to high_earners.json.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "high_earners.json"
+  },
+  {
+    "id": "data_sort_by_salary",
+    "prompt": "Sort employees.json by salary descending and save to sorted_employees.json.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "sorted_employees.json"
+  },
+  {
+    "id": "data_group_dept",
+    "prompt": "Group employees by department and write the result to dept_groups.json.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "dept_groups.json"
+  },
+  {
+    "id": "data_avg_salary",
+    "prompt": "Calculate the average salary from employees.json and write to avg_salary.txt.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "avg_salary.txt"
+  },
+  {
+    "id": "data_tsv_to_json",
+    "prompt": "Convert scores.tsv to JSON format (scores.json).",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "scores.json"
+  },
+  {
+    "id": "data_avg_score",
+    "prompt": "Calculate average math score from scores.tsv and write to avg_math.txt.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "avg_math.txt"
+  },
+  {
+    "id": "data_top_student",
+    "prompt": "Find the student with the highest total score from scores.tsv and write to top_student.txt.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "top_student.txt"
+  },
+  {
+    "id": "data_json_merge",
+    "prompt": "Add a 'bonus' field (10% of salary) to each employee in employees.json and save to employees_bonus.json.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "employees_bonus.json"
+  },
+  {
+    "id": "data_csv_stats",
+    "prompt": "Read scores.tsv, compute min/max/avg for each subject, and write to score_stats.json.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "score_stats.json"
+  },
+  {
+    "id": "data_json_flatten",
+    "prompt": "Flatten employees.json into a simple name:salary mapping and write to salary_map.json.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "salary_map.json"
+  },
+  {
+    "id": "data_json_count",
+    "prompt": "Count employees per department in employees.json and write to dept_count.json.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "dept_count.json"
+  },
+  {
+    "id": "data_json_select",
+    "prompt": "Select only name and dept fields from employees.json and save to names_depts.json.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "names_depts.json"
+  },
+  {
+    "id": "data_tsv_filter",
+    "prompt": "Filter scores.tsv for students with math > 85 and write to math_good.tsv.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "math_good.tsv"
+  },
+  {
+    "id": "data_json_validate",
+    "prompt": "Validate employees.json has all required fields (name, dept, salary) and write result (valid/invalid) to validation.txt.",
+    "setup": "data_transform",
+    "check_type": "file_exists",
+    "check_path": "validation.txt"
+  },
+  {
+    "id": "sys_write_script",
+    "prompt": "Create a bash script called hello.sh that prints 'Hello, World!' and make it executable.",
+    "setup": "sys_ops",
+    "check_type": "file_executable",
+    "check_path": "hello.sh"
+  },
+  {
+    "id": "sys_python_script",
+    "prompt": "Create a Python script called calculator.py that takes two numbers as arguments and prints their sum. Test it with: python3 calculator.py 3 5",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "calculator.py"
+  },
+  {
+    "id": "sys_count_errors",
+    "prompt": "Count the total number of ERROR lines across all log files in logs/ and write to error_count.txt.",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "error_count.txt"
+  },
+  {
+    "id": "sys_merge_logs",
+    "prompt": "Merge all log files in logs/ into a single merged.log sorted by date.",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "merged.log"
+  },
+  {
+    "id": "sys_extract_errors",
+    "prompt": "Extract all ERROR lines from all logs into errors.log.",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "errors.log"
+  },
+  {
+    "id": "sys_log_summary",
+    "prompt": "Create a summary: count INFO, ERROR, WARNING lines per log file and write to log_summary.txt.",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "log_summary.txt"
+  },
+  {
+    "id": "sys_cleanup_old",
+    "prompt": "Delete all .log files older than 3 days from logs/ (simulate with find -mtime).",
+    "setup": "sys_ops",
+    "check_type": "always_pass"
+  },
+  {
+    "id": "sys_make_build",
+    "prompt": "Run 'make build' using the makefile and write the output to build_output.txt.",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "build_output.txt"
+  },
+  {
+    "id": "sys_cron_entry",
+    "prompt": "Create a cron entry file cron.txt with: '0 2 * * * /usr/bin/backup.sh' (just write the text, don't install).",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "cron.txt"
+  },
+  {
+    "id": "sys_env_check",
+    "prompt": "Check if python3 and git are available, write 'python3: yes/no' and 'git: yes/no' to env_check.txt.",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "env_check.txt"
+  },
+  {
+    "id": "sys_temp_cleanup",
+    "prompt": "Find and list all files in /tmp matching 'kitty_*' and write to tmp_files.txt.",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "tmp_files.txt"
+  },
+  {
+    "id": "sys_process_list",
+    "prompt": "List running processes and write the top 10 by memory usage to processes.txt.",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "processes.txt"
+  },
+  {
+    "id": "sys_network_check",
+    "prompt": "Check if localhost:11434 is reachable and write the result to network.txt.",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "network.txt"
+  },
+  {
+    "id": "sys_makefile_target",
+    "prompt": "Run 'make test' and write the output to test_output.txt.",
+    "setup": "sys_ops",
+    "check_type": "file_exists",
+    "check_path": "test_output.txt"
+  }
+]
