@@ -44,7 +44,7 @@ static TINY: ModelProfile = ModelProfile {
 static MEDIUM: ModelProfile = ModelProfile {
     name: "medium",
     context_window: 16384,
-    max_thinking_tokens: Some(2048),
+    max_thinking_tokens: Some(1024),
     max_iterations: 20,
     tool_subset: &["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
     use_native_tools: true,
@@ -70,7 +70,7 @@ impl ModelProfile {
     pub fn tiny() -> &'static Self {
         &TINY
     }
-    /// Preset for 8-13B models (16K, 2048 thinking, 20 iter, 6 tools, native).
+    /// Preset for 8-13B models (16K, 1024 thinking — bench ab 50 knee 1024>2048 96% vs 90% p0.44, 20 iter, 6 tools, native).
     pub fn medium() -> &'static Self {
         &MEDIUM
     }
@@ -112,7 +112,7 @@ mod tests {
         let p = ModelProfile::medium();
         assert_eq!(p.name, "medium");
         assert_eq!(p.context_window, 16384);
-        assert_eq!(p.max_thinking_tokens, Some(2048));
+        assert_eq!(p.max_thinking_tokens, Some(1024));
         assert_eq!(p.max_iterations, 20);
         assert_eq!(p.tool_subset.len(), 6);
         assert!(p.use_native_tools);
