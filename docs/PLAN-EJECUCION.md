@@ -1,9 +1,18 @@
 # Plan de Ejecución — Kitty Code: Hardening + Roadmap
 
-**Fecha:** 2026-08-19
-**Autor:** Análisis técnico de sesión (hallazgos verificados: 104 tests OK, clippy limpio)
-**Alcance:** Corregir bugs críticos y altos, robustez operativa, calidad de código, unificar
-benchmarks, higiene del repo (rename + git + OpenSSF) y avanzar el roadmap declarado.
+**Fecha:** 2026-08-19 (actualizado noche — deepwork E2E orquestado)
+**Autor:** Análisis técnico + orquestador muse-spark-1.2 (239 tests OK, clippy limpio, 5 commits hoy)
+**Alcance:** Corregir bugs críticos y altos, robustez operativa, calidad de código, unificar benchmarks, higiene del repo (rename + git + OpenSSF) y avanzar el roadmap declarado.
+
+> **Actualización 2026-08-19 noche — Deepwork E2E completado (ver `.slim/deepwork/handoff.md` + `orchestration-e2e.md`):**
+> - **F0 Higiene** ✅ `38297cd` + `65b065a` (rename Qwen3.8-27B→Kitty-Code, LICENSE MIT, .gitignore, GGUF borrado)
+> - **F1 Seguridad** ✅ `c0f46de` + `171819c` guard Layer1b (command substitution `$(` + eval hard-block + timeout tokio 30s)
+> - **F2 Core** ✅ `da72a40` + `3048272` hashline prefix 8-char, tool errors→failed result, budget single-point async, quality cross-turn, ordering, retry
+> - **F3 Robustez** ✅ `55e8a57` Read cap 300 + Grep `ignore` crate
+> - **F4 Calidad** ✅ `55e8a57` dedup new_inner + `171819c` ChatClient Box<dyn> + MockClient + CLI flags
+> - **F5 Benchmarks** ✅ `34bf2f0` + `861a7c4` JSON loading + `docs/FLOOR-BENCHMARK.md` 53% smollm2/qwen3 + `benches/baseline.json` 96.44
+> - **P0 Fundación** ✅ `171819c` ChatClient trait + ModelProfile tiny/medium/large + router 2-stage + safety hardening (57 guard / 20 tools tests)
+> - **P1 Cierre** ✅ `875bd6a` + `d5f6375` contract done-guard + bench exit 0/1/2 gate 50 + prompt check_file + TB2 89 + grammar GBNF spike + MCP stdio 6 tools + cleaner (+7 tests) — **239 tests, Gate 1-4 aprobados**
 
 ---
 
