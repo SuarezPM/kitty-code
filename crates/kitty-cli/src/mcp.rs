@@ -5,6 +5,8 @@
 //! Every call goes through the same security stack (Guard + write-vs-edit
 //! + permission-gate) because it reuses `ToolRegistry::execute`.
 
+use std::sync::Arc;
+
 use kitty_harness::parser::ParsedToolCall;
 use kitty_harness::tools::{standard_tool_definitions, ToolRegistry};
 use kitty_runtime::ToolDefinition;
@@ -14,6 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// MCP server that advertises Kitty Code tools.
 pub struct McpServer {
     tools: Vec<ToolDefinition>,
+    registry: Arc<tokio::sync::Mutex<ToolRegistry>>,
 }
 
 impl McpServer {
@@ -21,6 +24,7 @@ impl McpServer {
     pub fn new() -> Self {
         Self {
             tools: standard_tool_definitions(),
+            registry: Arc::new(tokio::sync::Mutex::new(ToolRegistry::new())),
         }
     }
 
@@ -38,7 +42,7 @@ impl McpServer {
             name: name.to_string(),
             arguments: args,
         };
-        let mut registry = ToolRegistry::new();
+        let mut registry = self.registry.lock().await;
         match registry.execute(&tc).await {
             Ok(result) => json!({
                 "success": result.success,
@@ -266,6 +270,46 @@ mod tests {
         let resp = server.handle_request(req).await;
         let result = resp.get("result").expect("should have result");
         assert_eq!(result.get("success").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_persist_read_then_edit_sequential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persist_test.txt");
+        std::fs::write(&path, "hello\nworld").unwrap();
+
+        let server = McpServer::new();
+
+        let read_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "Read", "arguments": {"path": path.to_str().unwrap()}}
+        });
+        let read_resp = server.handle_request(read_req).await;
+        let read_result = read_resp.get("result").expect("Read should have result");
+        assert_eq!(
+            read_result.get("success").and_then(|v| v.as_bool()),
+            Some(true),
+            "Read should succeed, got {read_result:?}"
+        );
+        let output = read_result.get("output").and_then(|v| v.as_str()).unwrap_or("");
+        let first_line = output.lines().next().expect("Read output should have at least one line");
+        let hash = first_line.split(':').nth(1).unwrap().split('|').next().unwrap();
+
+        let edit_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "Edit", "arguments": {"path": path.to_str().unwrap(), "hash": hash, "new": "HELLO"}}
+        });
+        let edit_resp = server.handle_request(edit_req).await;
+        let edit_result = edit_resp.get("result").expect("Edit should have result");
+        assert_eq!(
+            edit_result.get("success").and_then(|v| v.as_bool()),
+            Some(true),
+            "Edit after Read should succeed, got {edit_result:?}"
+        );
     }
 
     #[tokio::test]

@@ -85,6 +85,7 @@ impl AgentConfig {
         self.max_thinking_tokens = p.max_thinking_tokens;
         self.bash_timeout_secs = p.bash_timeout_secs;
         self.compact_threshold = p.compact_threshold;
+        // dedup: with_profile and new_inner both enforce tiny→grammar for CLI vs direct Agent::new callers
         if p.name == "tiny" {
             self.enable_grammar = true;
         }
@@ -186,6 +187,7 @@ impl Agent {
             }
         };
         // Grammar enforcement: auto-enable for tiny profile (spike).
+        // dedup: with_profile and new_inner both enforce tiny→grammar for CLI vs direct Agent::new callers
         if config.profile.name == "tiny" {
             config.enable_grammar = true;
         }
@@ -1080,6 +1082,83 @@ mod tests {
         c2.add_assertion(crate::contract::AssertionCheck::FileExists("b.rs".into()));
         agent2.set_contract(c2);
         assert!(agent2.check_done_guard("hello world").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_contract_integration_nudge_injected() {
+        let prev = std::env::var("SMALLCODE_CONTRACT").ok();
+        std::env::remove_var("SMALLCODE_CONTRACT");
+        let mock = MockClient::new(vec![]);
+        let mut agent = Agent::new(
+            mock,
+            AgentConfig {
+                workspace: std::path::PathBuf::from("/tmp"),
+                ..Default::default()
+            },
+        );
+        let mut c = crate::contract::Contract::new("test");
+        c.add_assertion(crate::contract::AssertionCheck::FileExists(
+            "/tmp/contract-test".into(),
+        ));
+        agent.set_contract(c);
+        let resp = dummy_response("All done");
+        agent
+            .process_response("test prompt", resp)
+            .await
+            .expect("process_response should succeed");
+        assert!(agent.messages().len() >= 2);
+        let last = agent.messages().last().expect("last message");
+        let content = last.content.as_deref().unwrap_or("");
+        assert!(
+            content.contains("[CONTRACT-GUARD]"),
+            "expected [CONTRACT-GUARD] in last message, got: {content}"
+        );
+        assert!(
+            content.contains("a01"),
+            "expected blocker a01 in nudge, got: {content}"
+        );
+        assert_eq!(last.role, "user");
+        if let Some(v) = prev {
+            std::env::set_var("SMALLCODE_CONTRACT", v);
+        } else {
+            std::env::remove_var("SMALLCODE_CONTRACT");
+        }
+    }
+
+    #[test]
+    fn test_tiny_forces_grammar_dedup() {
+        // case 1: with_profile("tiny") with enable_grammar false → true
+        let cfg_tiny = AgentConfig {
+            enable_grammar: false,
+            ..Default::default()
+        }
+        .with_profile("tiny");
+        assert!(
+            cfg_tiny.enable_grammar,
+            "with_profile tiny should force enable_grammar true even when explicitly false"
+        );
+        // case 2: with_profile("medium") false → false
+        let cfg_medium = AgentConfig {
+            enable_grammar: false,
+            ..Default::default()
+        }
+        .with_profile("medium");
+        assert!(
+            !cfg_medium.enable_grammar,
+            "with_profile medium should keep enable_grammar false"
+        );
+        // case 3: new_inner with tiny → true (direct Agent::new path)
+        let cfg_direct = AgentConfig {
+            profile: ModelProfile::tiny(),
+            enable_grammar: false,
+            ..Default::default()
+        };
+        let mock = MockClient::new(vec![dummy_response("ok")]);
+        let agent = Agent::new(mock, cfg_direct);
+        assert!(
+            agent.config().enable_grammar,
+            "new_inner tiny should force enable_grammar true even when explicitly false"
+        );
     }
 
     // Gate3: additional smoke tests to keep count >=154 when guard is old baseline

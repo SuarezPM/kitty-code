@@ -63,6 +63,17 @@ regex = "1"
 # Temp files for tests
 tempfile = "3"
 
+rand = "0.8"
+
+# F6.4 ADR-005 llama.cpp GBNF real adapter — defer spike (doc only, no dep added here).
+# When GO (sub-2B tier requires >95% tool-call validity), add in-process adapter:
+#   llama-cpp-2 = "0.1.154"  # LlamaSampler::grammar + json_schema_to_grammar + grammar_lazy
+# Pitfall: custom grammar + tools exclusive → HTTP 400 (server-common.cpp:1289); use
+# grammar_lazy triggers (PR #9639) — do NOT send grammar + tools together.
+# Alternatives: llama-cpp-2 in-process (preferred) vs llama-server HTTP daemon (fallback).
+# See docs/STRATEGY.md F6.4 ADR-005 and crates/kitty-runtime/src/grammar.rs:6-8.
+# Decision: defer — keep post-hoc serde_json + required-field validation only.
+
 [profile.release]
 opt-level = 3
 lto = true

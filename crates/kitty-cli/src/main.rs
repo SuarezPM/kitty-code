@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kitty_harness::agent::{Agent, AgentConfig};
 use kitty_harness::tools::standard_tool_definitions;
+use kitty_harness::knowledge::KnowledgeConfig;
 use kitty_harness::ModelProfile;
 use kitty_memory::{Episode, EpisodeStore};
 use kitty_runtime::OllamaClient;
@@ -43,11 +44,12 @@ pub struct Cli {
     pub thinking_budget: usize,
 
     /// Enable knowledge injection (cards from knowledge/ directory)
-    #[arg(long)]
+    /// Recommended after T13: 5 cards, 500 tok/card limit, threshold 2.0
+    #[arg(long, global = true)]
     pub knowledge: bool,
 
     /// Directory containing knowledge cards (default: knowledge/)
-    #[arg(long, default_value = "knowledge")]
+    #[arg(long, global = true, default_value = "knowledge")]
     pub knowledge_dir: String,
 
     /// Context window size in tokens (default: 16384)
@@ -95,6 +97,28 @@ pub enum Commands {
         #[arg(long)]
         no_memory: bool,
     },
+    /// Run A/B thinking-budget benchmark with interleaved execution
+    #[command(name = "bench-ab")]
+    BenchAb {
+        /// Comma-separated thinking budgets (e.g. 1024,2048,4096)
+        #[arg(long, default_value = "1024,2048,4096")]
+        thinking: String,
+        /// Number of exercises per budget
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Repetitions per (task,budget) pair
+        #[arg(long, default_value = "1")]
+        reps: usize,
+        /// Benchmark suite: polyglot, tb2
+        #[arg(long, default_value = "polyglot")]
+        suite: String,
+        /// Output file for results
+        #[arg(short, long, default_value = "bench_ab.json")]
+        out: PathBuf,
+        /// Interleave execution order (shuffle with seed 42)
+        #[arg(long, default_value = "true")]
+        interleave: bool,
+    },
     /// Show model info and status
     Info,
     /// Start MCP server over stdio (exposes Read/Edit/Write/Bash/Glob/Grep)
@@ -127,6 +151,11 @@ async fn main() -> Result<()> {
             let base_config = AgentConfig {
                 model: cli.model.clone(),
                 enable_knowledge: cli.knowledge,
+                knowledge_config: KnowledgeConfig {
+                    enabled: cli.knowledge,
+                    knowledge_dir: PathBuf::from(cli.knowledge_dir.clone()),
+                    ..Default::default()
+                },
                 memory_db_path,
                 ..Default::default()
             }
@@ -188,13 +217,7 @@ async fn main() -> Result<()> {
             // Gate 2 tuning: bench uses max_iterations=5 for sub-20s smoke (default 20 remains for `run`).
             // If CLI left default 20, bench overrides to 5; explicit CLI value is respected.
             let bench_max_iterations = if cli.max_iterations == 20 { 5 } else { cli.max_iterations };
-            // Gate 2: --no-memory by default for small models (e.g. qwen3:4b) to avoid retrieval overhead.
-            // Effective memory off if either --no-memory flag set or model looks small.
-            let is_small_model = cli.model.contains(":4b")
-                || cli.model.contains(":2b")
-                || cli.model.contains(":1b")
-                || cli.model.contains("1.7b")
-                || cli.model.contains("0.5b");
+            let is_small_model = is_small_model(&cli.profile, &cli.model);
             let effective_no_memory = no_memory || is_small_model;
             if is_small_model && !no_memory {
                 warn!(model = %cli.model, "small model detected — auto-disabling episodic memory for bench (use explicit --no-memory to silence)");
@@ -210,12 +233,15 @@ async fn main() -> Result<()> {
                 max_iterations: bench_max_iterations,
                 bash_timeout: cli.bash_timeout,
                 profile: ModelProfile::from_cli(&cli.profile),
+                enable_knowledge: cli.knowledge,
+                knowledge_dir: PathBuf::from(cli.knowledge_dir.clone()),
             };
 
             println!("Kitty Code Benchmark");
             println!("  Model: {}", cli.model);
             println!("  Suite: {} (limit: {})", suite, limit);
             println!("  Memory: {}", if effective_no_memory { "off" } else { "on" });
+            println!("  Knowledge: {}", if cli.knowledge { format!("on ({})", cli.knowledge_dir) } else { "off (use --knowledge to enable, 5 cards)".to_string() });
             if bench_max_iterations != cli.max_iterations {
                 println!("  Max iterations: {} (bench override, CLI default 20)", bench_max_iterations);
             } else {
@@ -298,7 +324,9 @@ async fn main() -> Result<()> {
             std::fs::write(&out, serde_json::to_string_pretty(&output)?)?;
             println!("Results saved to {}", out.display());
             // bench-reproducibility: exit-code 0=pass/improved, 1=gate failed, 2=noise (no significant change)
-            let baseline_rate: Option<f64> = std::fs::read_to_string("benches/baseline.json")
+            let baseline_rate: Option<f64> = std::fs::read_to_string(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benches/baseline.json"),
+            )
                 .ok()
                 .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
                 .and_then(|v| v.get("rate_pct").and_then(|r| r.as_f64()));
@@ -330,6 +358,142 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Mcp => mcp::run().await,
+        Commands::BenchAb {
+            thinking,
+            limit,
+            reps,
+            suite,
+            out,
+            interleave,
+        } => {
+            let budgets = parse_thinking_budgets(&thinking)?;
+            let plan = build_ab_plan(limit, &budgets, reps, interleave);
+
+            // Same tuning as `bench`: 5 iterations for sub-20s smoke unless CLI overrides.
+            let bench_max_iterations = if cli.max_iterations == 20 { 5 } else { cli.max_iterations };
+            let is_small_model = is_small_model(&cli.profile, &cli.model);
+            let effective_no_memory = is_small_model;
+            if is_small_model {
+                warn!(model = %cli.model, "small model detected — auto-disabling episodic memory for bench-ab");
+            }
+
+            let base_cfg = BenchConfig {
+                client: client.clone(),
+                model: cli.model.clone(),
+                limit,
+                use_memory: !effective_no_memory,
+                thinking_budget: 2048, // overridden per run below
+                context_window: cli.context_window,
+                max_iterations: bench_max_iterations,
+                bash_timeout: cli.bash_timeout,
+                profile: ModelProfile::from_cli(&cli.profile),
+                enable_knowledge: cli.knowledge,
+                knowledge_dir: PathBuf::from(cli.knowledge_dir.clone()),
+            };
+
+            let items: Vec<BenchItem> = match suite.as_str() {
+                "tb2" => tb2_exercises(),
+                _ => exercises(),
+            };
+
+            let store = if base_cfg.use_memory {
+                Some(EpisodeStore::open(&default_db_path())?)
+            } else {
+                None
+            };
+
+            println!("Kitty Code A/B Benchmark");
+            println!("  Model: {}", cli.model);
+            println!("  Suite: {} (limit: {}, reps: {})", suite, limit, reps);
+            println!("  Budgets: {:?}", budgets);
+            println!("  Interleave: {}", interleave);
+            println!("  Runs: {}", plan.len());
+            println!();
+
+            let mut per_budget: std::collections::HashMap<usize, Vec<BenchResult>> =
+                std::collections::HashMap::new();
+            for (i, (task_idx, budget)) in plan.iter().enumerate() {
+                let ex = &items[*task_idx % items.len()];
+                let mut cfg = base_cfg.clone();
+                cfg.thinking_budget = *budget;
+                print!("[{:2}/{:2}] budget={:4} task={:2} ", i + 1, plan.len(), budget, task_idx);
+                let r = run_one_bench(ex, &cfg, store.as_ref()).await?;
+                per_budget.entry(*budget).or_default().push(r);
+            }
+
+            let mut budgets_sorted: Vec<usize> = per_budget.keys().copied().collect();
+            budgets_sorted.sort_unstable();
+
+            let mut per_budget_out = Vec::new();
+            for budget in &budgets_sorted {
+                let results = &per_budget[budget];
+                let passed = results.iter().filter(|r| r.passed).count();
+                let total = results.len();
+                let rate = if total > 0 {
+                    100.0 * passed as f64 / total as f64
+                } else {
+                    0.0
+                };
+                let (lo, hi) = wilson_ci(passed, total);
+                let p50 = p50_ms(results.iter().map(|r| r.latency_ms).collect());
+                per_budget_out.push(serde_json::json!({
+                    "budget": budget,
+                    "passed": passed,
+                    "total": total,
+                    "rate": rate,
+                    "wilson_ci": [lo, hi],
+                    "p50_ms": p50,
+                }));
+            }
+
+            let mut pairwise = Vec::new();
+            for i in 0..budgets_sorted.len() {
+                for j in (i + 1)..budgets_sorted.len() {
+                    let a = &per_budget_out[i];
+                    let b = &per_budget_out[j];
+                    let a_rate = a["rate"].as_f64().unwrap_or(0.0);
+                    let b_rate = b["rate"].as_f64().unwrap_or(0.0);
+                    let winner = if a_rate >= b_rate { a["budget"].clone() } else { b["budget"].clone() };
+                    pairwise.push(serde_json::json!({
+                        "a": a["budget"],
+                        "b": b["budget"],
+                        "a_rate": a_rate,
+                        "b_rate": b_rate,
+                        "winner": winner,
+                    }));
+                }
+            }
+
+            println!();
+            println!("RESULTS");
+            for entry in &per_budget_out {
+                let b = entry["budget"].as_u64().unwrap_or(0);
+                println!(
+                    "  budget={:4}  {}/{} ({:.1}%)  wilson95=[{:.1}%, {:.1}%]  p50={:.0}ms",
+                    b,
+                    entry["passed"].as_u64().unwrap_or(0),
+                    entry["total"].as_u64().unwrap_or(0),
+                    entry["rate"].as_f64().unwrap_or(0.0),
+                    entry["wilson_ci"][0].as_f64().unwrap_or(0.0) * 100.0,
+                    entry["wilson_ci"][1].as_f64().unwrap_or(0.0) * 100.0,
+                    entry["p50_ms"].as_f64().unwrap_or(0.0),
+                );
+            }
+
+            let output = serde_json::json!({
+                "model": cli.model,
+                "suite": suite,
+                "limit": limit,
+                "reps": reps,
+                "interleave": interleave,
+                "budgets": budgets_sorted,
+                "per_budget": per_budget_out,
+                "pairwise": pairwise,
+            });
+            std::fs::write(&out, serde_json::to_string_pretty(&output)?)?;
+            println!("Results saved to {}", out.display());
+            Ok(())
+        }
         #[cfg(feature = "tui")]
         Commands::Tui => {
             let context_window = AgentConfig::default().context_window;
@@ -505,6 +669,7 @@ fn file_contains(dir: &str, filename: &str, pattern: &str) -> bool {
 }
 
 /// Shared benchmark configuration.
+#[derive(Clone)]
 struct BenchConfig {
     client: OllamaClient,
     model: String,
@@ -515,6 +680,8 @@ struct BenchConfig {
     max_iterations: usize,
     bash_timeout: u64,
     profile: &'static ModelProfile,
+    enable_knowledge: bool,
+    knowledge_dir: PathBuf,
 }
 
 /// Shared benchmark driver used by every exercise set.
@@ -531,100 +698,117 @@ async fn run_bench(
     };
 
     for (i, ex) in items.iter().take(cfg.limit).enumerate() {
-        print!("[{:2}/{:2}] {:20}...", i + 1, cfg.limit.min(items.len()), ex.id);
-
-        // Recall similar past episodes
-        if let Some(ref store) = store {
-            let past = store.recall_similar(ex.prompt, 3)?;
-            if !past.is_empty() {
-                print!(" ({} past)", past.len());
-            }
-        }
-
-        let tmpdir = tempfile::tempdir().context("Failed to create temp dir")?;
-        let tmpdir_str = tmpdir.path().to_string_lossy().to_string();
-
-        // Prompt hardening: use real check_file per exercise (fix .py forced for js/ts/rust/go)
-        // Gate 2 absolute path prevents CWD contamination.
-        let target_file = if ex.check_file.is_empty() { "solution.py" } else { ex.check_file };
-        let prompt = format!(
-            "{}\n\nWork in directory: {} — Save to {}/{} (use absolute path)",
-            ex.prompt, tmpdir_str, tmpdir_str, target_file
-        );
-
-        let start = Instant::now();
-        let base_config = AgentConfig {
-            model: cfg.model.clone(),
-            profile: cfg.profile,
-            ..Default::default()
-        };
-        let mut agent = Agent::new(cfg.client.clone(), base_config);
-        // Bench smoke override: bench uses 5 iterations even for medium (20) to stay <20s.
-        // Agent::new syncs profile fields, so patch explicit bench overrides here.
-        // Copy Run overlay logic to preserve profile tiny/medium/large unless CLI explicitly differs.
-        agent.config_mut().max_iterations = cfg.max_iterations;
-        if cfg.context_window != 16384 {
-            agent.config_mut().context_window = cfg.context_window;
-            agent.budget_mut().set_max(cfg.context_window);
-        }
-        if cfg.thinking_budget != 2048 {
-            agent.config_mut().max_thinking_tokens = Some(cfg.thinking_budget);
-        }
-        if cfg.bash_timeout != 60 {
-            agent.config_mut().bash_timeout_secs = cfg.bash_timeout;
-        }
-        // Ensure compact threshold follows profile (tiny 0.7, medium 0.8, large 0.8)
-        agent.config_mut().compact_threshold = cfg.profile.compact_threshold;
-        // Re-sync budget threshold from profile (ensures tiny 0.7 vs medium 0.8)
-        agent.budget_mut().set_threshold(cfg.profile.compact_threshold);
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            agent.run(&prompt),
-        ).await;
-
-        // Determine pass/fail and persist an episode for memory.
-        let (passed, verdict, latency_ms) = match outcome {
-            Ok(Ok(_)) => {
-                let passed = (ex.check)(&tmpdir_str);
-                (passed, if passed { "pass" } else { "fail" }, start.elapsed().as_millis() as f64)
-            }
-            Ok(Err(e)) => {
-                println!(" error: {}", e);
-                (false, "error", start.elapsed().as_millis() as f64)
-            }
-            Err(_) => {
-                println!(" timeout");
-                (false, "timeout", 30000.0)
-            }
-        };
-
-        let status = if passed { "PASS" } else { "FAIL" };
-        println!("{} ({:.0}ms)", status, latency_ms);
-
-        if let Some(ref store) = store {
-            let files_touched = if verdict == "pass" || verdict == "fail" {
-                list_files(&tmpdir_str)
-            } else {
-                vec![]
-            };
-            let ep = Episode::new(
-                ex.prompt.to_string(),
-                files_touched,
-                Some(verdict.into()),
-                format!("{verdict} (latency {latency_ms:.0}ms)"),
-            );
-            store.save(&ep).ok();
-        }
-
-        results.push(BenchResult {
-            id: ex.id.to_string(),
-            lang: ex.label.to_string(),
-            passed,
-            latency_ms,
-        });
+        print!("[{:2}/{:2}] ", i + 1, cfg.limit.min(items.len()));
+        results.push(run_one_bench(ex, cfg, store.as_ref()).await?);
     }
 
     Ok(results)
+}
+
+/// Run a single benchmark exercise with the given config.
+/// Shared by `run_bench` and the A/B thinking-budget benchmark.
+async fn run_one_bench(
+    ex: &BenchItem,
+    cfg: &BenchConfig,
+    store: Option<&EpisodeStore>,
+) -> Result<BenchResult> {
+    print!("{:20}...", ex.id);
+
+    // Recall similar past episodes
+    if let Some(store) = store {
+        let past = store.recall_similar(ex.prompt, 3)?;
+        if !past.is_empty() {
+            print!(" ({} past)", past.len());
+        }
+    }
+
+    let tmpdir = tempfile::tempdir().context("Failed to create temp dir")?;
+    let tmpdir_str = tmpdir.path().to_string_lossy().to_string();
+
+    // Prompt hardening: use real check_file per exercise (fix .py forced for js/ts/rust/go)
+    // Gate 2 absolute path prevents CWD contamination.
+    let target_file = if ex.check_file.is_empty() { "solution.py" } else { ex.check_file };
+    let prompt = format!(
+        "{}\n\nWork in directory: {} — Save to {}/{} (use absolute path)",
+        ex.prompt, tmpdir_str, tmpdir_str, target_file
+    );
+
+    let start = Instant::now();
+    let base_config = AgentConfig {
+        model: cfg.model.clone(),
+        profile: cfg.profile,
+        enable_knowledge: cfg.enable_knowledge,
+        knowledge_config: KnowledgeConfig {
+            enabled: cfg.enable_knowledge,
+            knowledge_dir: cfg.knowledge_dir.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut agent = Agent::new(cfg.client.clone(), base_config);
+    // Bench smoke override: bench uses 5 iterations even for medium (20) to stay <20s.
+    // Agent::new syncs profile fields, so patch explicit bench overrides here.
+    // Copy Run overlay logic to preserve profile tiny/medium/large unless CLI explicitly differs.
+    agent.config_mut().max_iterations = cfg.max_iterations;
+    if cfg.context_window != 16384 {
+        agent.config_mut().context_window = cfg.context_window;
+        agent.budget_mut().set_max(cfg.context_window);
+    }
+    if cfg.thinking_budget != 2048 {
+        agent.config_mut().max_thinking_tokens = Some(cfg.thinking_budget);
+    }
+    if cfg.bash_timeout != 60 {
+        agent.config_mut().bash_timeout_secs = cfg.bash_timeout;
+    }
+    // Ensure compact threshold follows profile (tiny 0.7, medium 0.8, large 0.8)
+    agent.config_mut().compact_threshold = cfg.profile.compact_threshold;
+    // Re-sync budget threshold from profile (ensures tiny 0.7 vs medium 0.8)
+    agent.budget_mut().set_threshold(cfg.profile.compact_threshold);
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        agent.run(&prompt),
+    ).await;
+
+    // Determine pass/fail and persist an episode for memory.
+    let (passed, verdict, latency_ms) = match outcome {
+        Ok(Ok(_)) => {
+            let passed = (ex.check)(&tmpdir_str);
+            (passed, if passed { "pass" } else { "fail" }, start.elapsed().as_millis() as f64)
+        }
+        Ok(Err(e)) => {
+            println!(" error: {}", e);
+            (false, "error", start.elapsed().as_millis() as f64)
+        }
+        Err(_) => {
+            println!(" timeout");
+            (false, "timeout", 30000.0)
+        }
+    };
+
+    let status = if passed { "PASS" } else { "FAIL" };
+    println!("{} ({:.0}ms)", status, latency_ms);
+
+    if let Some(store) = store {
+        let files_touched = if verdict == "pass" || verdict == "fail" {
+            list_files(&tmpdir_str)
+        } else {
+            vec![]
+        };
+        let ep = Episode::new(
+            ex.prompt.to_string(),
+            files_touched,
+            Some(verdict.into()),
+            format!("{verdict} (latency {latency_ms:.0}ms)"),
+        );
+        store.save(&ep).ok();
+    }
+
+    Ok(BenchResult {
+        id: ex.id.to_string(),
+        lang: ex.label.to_string(),
+        passed,
+        latency_ms,
+    })
 }
 
 // ── TB2: Terminal-Bench 2.0 ──────────────────────────────────────────
@@ -725,5 +909,172 @@ mod bench_exit_tests {
     #[test]
     fn no_baseline_pass_returns_0() {
         assert_eq!(bench_exit_code(80.0, 50.0, None), 0);
+    }
+
+    #[test]
+    fn test_baseline_path_cargo_manifest() {
+        let manifest_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benches/baseline.json");
+        assert!(
+            manifest_path.exists(),
+            "baseline not found via CARGO_MANIFEST_DIR: {} (exists={})",
+            manifest_path.display(),
+            manifest_path.exists()
+        );
+        let content = std::fs::read_to_string(&manifest_path).expect("read baseline via CARGO_MANIFEST_DIR");
+        let v: serde_json::Value = serde_json::from_str(&content).expect("parse baseline");
+        assert!(v.get("rate_pct").is_some(), "baseline missing rate_pct");
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if cwd.ends_with("crates") || cwd.ends_with("kitty-cli") {
+            assert!(
+                !std::path::Path::new("benches/baseline.json").exists(),
+                "old relative path unexpectedly exists from subdir CWD={}",
+                cwd.display()
+            );
+        }
+    }
+}
+
+fn parse_thinking_budgets(s: &str) -> anyhow::Result<Vec<usize>> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("thinking budgets string empty");
+    }
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let v: usize = p
+            .parse()
+            .with_context(|| format!("invalid thinking budget: {p}"))?;
+        if v == 0 {
+            anyhow::bail!("thinking budget must be > 0: {v}");
+        }
+        out.push(v);
+    }
+    if out.is_empty() {
+        anyhow::bail!("no valid budgets parsed from: {s}");
+    }
+    Ok(out)
+}
+
+fn build_ab_plan(limit: usize, budgets: &[usize], reps: usize, interleave: bool) -> Vec<(usize, usize)> {
+    let mut plan = Vec::new();
+    let reps = reps.max(1);
+    for &budget in budgets {
+        for task_idx in 0..limit {
+            for _ in 0..reps {
+                plan.push((task_idx, budget));
+            }
+        }
+    }
+    if interleave {
+        use rand::seq::SliceRandom;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        let mut rng = StdRng::seed_from_u64(42);
+        plan.shuffle(&mut rng);
+    }
+    plan
+}
+
+fn wilson_ci(passed: usize, total: usize) -> (f64, f64) {
+    if total == 0 {
+        return (0.0, 0.0);
+    }
+    let n = total as f64;
+    let p = passed as f64 / n;
+    let z: f64 = 1.96;
+    let z2 = z * z;
+    let denom = 1.0 + z2 / n;
+    let centre = p + z2 / (2.0 * n);
+    let inner = (p * (1.0 - p) + z2 / (4.0 * n)) / n;
+    let delta = z * inner.sqrt();
+    let lo = (centre - delta) / denom;
+    let hi = (centre + delta) / denom;
+    (lo.clamp(0.0, 1.0), hi.clamp(0.0, 1.0))
+}
+
+fn p50_ms(mut latencies: Vec<f64>) -> f64 {
+    if latencies.is_empty() {
+        return 0.0;
+    }
+    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = latencies.len();
+    if n % 2 == 1 {
+        latencies[n / 2]
+    } else {
+        (latencies[n / 2 - 1] + latencies[n / 2]) / 2.0
+    }
+}
+
+fn is_small_model(profile: &str, _model: &str) -> bool {
+    ModelProfile::from_cli(profile).name == "tiny"
+}
+
+#[cfg(test)]
+mod bench_ab_tests {
+    use super::{build_ab_plan, parse_thinking_budgets, wilson_ci, Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn test_bench_ab_parses() {
+        let cli = Cli::try_parse_from([
+            "kitty",
+            "bench-ab",
+            "--thinking",
+            "1024,2048,4096",
+            "--limit",
+            "50",
+        ])
+        .expect("parse bench-ab");
+        match cli.command {
+            Commands::BenchAb { thinking, limit, .. } => {
+                assert_eq!(limit, 50);
+                let budgets = parse_thinking_budgets(&thinking).expect("parse budgets");
+                assert_eq!(budgets, vec![1024, 2048, 4096]);
+            }
+            _ => panic!("expected BenchAb"),
+        }
+    }
+
+    #[test]
+    fn test_bench_ab_interleave() {
+        let budgets = vec![1024, 2048];
+        let plan = build_ab_plan(2, &budgets, 1, true);
+        assert_eq!(plan.len(), 4);
+        let plan_no_shuffle = build_ab_plan(2, &budgets, 1, false);
+        assert_ne!(plan, plan_no_shuffle, "interleaved should be shuffled");
+        let plan2 = build_ab_plan(2, &budgets, 1, true);
+        assert_eq!(plan, plan2, "shuffled with seed 42 should be deterministic");
+        let t4096 = wilson_ci(25, 50);
+        assert!(t4096.0 < 0.5 && t4096.1 > 0.5, "wilson ci should surround p=0.5");
+    }
+}
+
+#[cfg(test)]
+mod profile_heuristic_tests {
+    use super::is_small_model;
+
+    #[test]
+    fn test_is_small_uses_profile() {
+        assert!(
+            is_small_model("tiny", "qwen3:4b"),
+            "qwen3:4b+tiny should be small (profile tiny)"
+        );
+        assert!(
+            !is_small_model("medium", "ornith:9b"),
+            "ornith:9b+medium should NOT be small"
+        );
+        assert!(
+            is_small_model("tiny", "smollm2:1.7b"),
+            "smollm2:1.7b+tiny should be small"
+        );
+        assert!(
+            is_small_model("tiny", "ornith:9b"),
+            "ornith:9b+tiny should be small (profile tiny) — diverges from old heuristic"
+        );
     }
 }

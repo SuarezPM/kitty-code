@@ -25,7 +25,7 @@ This is an honest-by-construction document. The following are **not** claimed:
 - **Production readiness**: This is a research harness, not a production system.
 - **Benchmark parity**: Consumer Q4_K_M quantization on 8GB VRAM is not equivalent to vendor FP16 benchmarks on A100/H100 hardware.
 - **Multi-step agentic tasks**: The 12.36% KittyShell-89 score shows ornith:9b struggles with chained tool calls without scaffolding.
-- **Memory persistence**: Episodic memory (kitty-memory) exists but is not yet wired into the agent loop.
+- **Memory persistence**: Episodic memory wired at agent.rs:650 (recall_episodes) / 679 (save_episode) — verified in harness loop (preflight→recall→knowledge→loop).
 - **TUI interactivity**: The TUI is a status display MVP. It does not yet support interactive prompting or scrolling.
 
 ### Targets (not yet achieved)

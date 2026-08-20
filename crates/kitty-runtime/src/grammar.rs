@@ -3,6 +3,9 @@
 //! Generates a GBNF string that restricts tool-calls to `{"name": enum, "arguments": object}`
 //! and validates via `serde_json` + required-field check. This is a spike, not a
 //! production llama.cpp bindgen.
+//! SPIKE defer: no llama.cpp bind — validated post-hoc via serde_json + required-field check.
+//! Real enforcement requires llama-cpp-2 crate (LlamaSampler::grammar, json_schema_to_grammar) with decode-time enforcement.
+//! Decision: defer to F6.4 ADR. See docs/STRATEGY.md F6.4.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -346,6 +349,14 @@ mod tests {
         let calls = out.message.tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "Read");
+    }
+
+    #[test]
+    fn test_gbnf_spike_documented() {
+        assert!(
+            include_str!("grammar.rs").contains(concat!("SPIKE", " defer")),
+            "grammar.rs header must document spike defer — see docs/STRATEGY.md F6.4"
+        );
     }
 
     #[tokio::test]

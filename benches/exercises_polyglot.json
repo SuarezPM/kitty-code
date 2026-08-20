@@ -1573,5 +1573,26 @@
     "prompt": "Write public static int gcd(int a, int b). Save to solution.java.",
     "check_str": "public static int gcd",
     "check_file": "solution.java"
+  },
+  {
+    "id": "py-list-comp",
+    "lang": "python",
+    "prompt": "Write a Python function that uses list comprehension to filter even numbers from a list. The function should be called filter_evens and take a list of ints, returning only even numbers. Save to solution.py.",
+    "check_str": "for x in",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-decorator-args",
+    "lang": "python",
+    "prompt": "Write a Python decorator with arguments that retries a function up to 3 times on exception. The decorator should be called retry and accept max_retries param. Save to solution.py.",
+    "check_str": "def decorator",
+    "check_file": "solution.py"
+  },
+  {
+    "id": "py-async-await",
+    "lang": "python",
+    "prompt": "Write an async Python function using asyncio.gather to run two coroutines concurrently. The function should be called run_concurrent and use async def and await. Save to solution.py.",
+    "check_str": "async def",
+    "check_file": "solution.py"
   }
 ]

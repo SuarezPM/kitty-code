@@ -101,8 +101,45 @@ modelo sub-2B es **< 50%**, re-encuadrar el claim del tier antes de especificar 
 > >70% en string-match homemade es plausible para sub-2B; >70% en grading por unit tests
 > (benchmark oficial) no lo es. El spec fija el método en cada métrica.
 
-### F6.4 Grammar enforcement — GBNF spike (ADR)
+### F6.4 Grammar enforcement — GBNF spike (ADR-005: llama.cpp GBNF real adapter — defer spike)
 
-SPIKE defer: no llama.cpp bind — validated post-hoc via serde_json + required-field check.
+**Status:** Accepted (spike defer) · **Date:** 2026-08-19 · **Scope:** `crates/kitty-runtime/src/grammar.rs`, `crates/kitty-runtime/Cargo.toml`, `Cargo.toml`
 
-- Decision: spike defer — post-hoc validation only, no bind, target >95% validity requires llama-cpp-2.
+#### Context
+The spike generates a GBNF string (`GrammarConfig::to_gbnf()` for `{"name": enum, "arguments": object}` with JSON value rules) but enforces only **post-hoc**: `serde_json` parse + `required`-field check + `GrammarClient` strict filtering (`crates/kitty-runtime/src/grammar.rs:6-8` SPIKE defer). There is no decode-time enforcement — the grammar is never passed to a sampler/decoder. `ChatClient` (`crates/kitty-runtime/src/client.rs`) has no grammar field; `OllamaClient::chat` does not send GBNF.
+
+Real enforcement requires a llama.cpp sampling stage that constrains tokens during generation. The tier sub-2B differentiator depends on raising tool-call validity from the current post-hoc filter rate to a **target >95% valid tool calls** (STRATEGY §6 target >90%; F6.4 target >95% for sub-2B, plan T21 SC-GBNF-VALIDITY). The research question was whether to bind `llama-cpp-2` now or keep the spike.
+
+#### Decision
+**Defer real adapter — keep spike.** No `llama-cpp-2` bind in this increment; keep post-hoc validation as the only enforcement.
+
+- `GrammarConfig::to_gbnf()` and `GrammarClient` remain as the contract surface (GBNF string generated, `validate()` as post-hoc gate).
+- Real adapter is implemented **only when the sub-2B tier demands >95% validity** (floor 225 shows <50% single-file success without decode-time grammar; GO when a model tier requires >95% tool-call validity and post-hoc filtering is insufficient). Condition to GO: bench `kitty bench polyglot` with `ModelProfile::tiny` shows validity <95% after prompt/router tuning, and product decision confirms sub-2B agent claim.
+- When GO, implement via **`llama-cpp-2` crate `0.1.154`** in-process adapter (recommended crate): `LlamaSampler::grammar` (or `LlamaSampler::grammar_lazy` with triggers), `json_schema_to_grammar` for schema→GBNF conversion, wired through `ChatClient` abstraction (F6.4 plan `LlamaCppClient: ChatClient`).
+
+> Cargo note: do **not** add the dependency now. When GO, add `llama-cpp-2 = "0.1.154"` to `[workspace.dependencies]` / `kitty-runtime` (see `Cargo.toml` comments). This ADR is the doc; no `Cargo.toml` dep is added in defer mode.
+
+#### Consequences
+- **No bind now:** no `llama-cpp-2` / `llama.cpp` build cost, no GGUF loading in-process, no FFI/sampler lifecycle to maintain. Spike remains `serde_json` + required-field only.
+- **GBNF string generated but not enforced at decode:** invalid JSON is caught after generation and filtered (strict mode drops invalid `tool_calls`), not prevented. Tail risk: models that emit invalid JSON still cost a full generation.
+- **Target >95% requires decode-time enforcement:** to hit >95% on sub-2B, one of:
+  - **In-process `llama-cpp-2`** (`LlamaSampler::grammar` / `grammar_lazy`) — tightest control, no daemon, but build + model loading complexity; or
+  - **`llama-server` native tools auto-lazy grammar** — HTTP daemon mode where `tools` auto-generates a lazy grammar (PR #9639), simpler ops but requires running `llama-server`.
+- **Pitfall to avoid when GO:** custom grammar + `tools` are **exclusive** — `server-common.cpp:1289` returns HTTP 400 if both are sent. `grammar_lazy` (PR #9639) solves this for native tool-calling: tool schemas are auto-converted to a lazy grammar triggered only when the model emits a tool-call prefix. Do **not** send `grammar` string and `tools` array together on the HTTP path; use `grammar_lazy` triggers (see `AutoAgents` `build_tool_response_schema` example).
+- **Interface preserved:** `GrammarConfig` + `GrammarClient<C: ChatClient>` is the seam for the real adapter; `to_gbnf()` output becomes the sampler input when GO.
+
+#### Alternatives considered
+| Alternative | Effort | Validity | Tradeoff |
+|-------------|--------|----------|----------|
+| **A — `llama-cpp-2` in-process** (`LlamaSampler::grammar`, `json_schema_to_grammar`, `grammar_lazy` triggers) | 3–5 days (F6.4 est.) | >95% (decode-time) | Best control, no daemon, but Rust FFI build, GGUF path/Q4 handling, sampler lifecycle, `Send/Sync` care for `ChatClient`. Recommended when GO. |
+| **B — `llama-server` HTTP daemon** (native `tools` → auto lazy grammar, PR #9639) | 1–2 days | >95% (server-side) | Simplest ops, no Rust bindgen, but requires daemon lifecycle + HTTP 400 pitfall (custom grammar + tools exclusive, `server-common.cpp:1289`). Viable fallback if in-process build is too heavy. |
+| **C — Keep spike only (chosen)** | 0 | Post-hoc only | No decode-time guarantee; sufficient until floor proves >95% is required for tier claim. |
+
+Reject B as default because the project already standardizes on Ollama HTTP; adding a second daemon fragments runtime. Prefer A for in-process control when the tier demands >95%.
+
+#### References
+- `ggml-org/llama.cpp` — `grammars/README.md` (GBNF spec, `json_schema_to_grammar` CLI `examples/json_schema_to_grammar.py`).
+- `llama-cpp-2` crate `0.1.154` — docs.rs `llama_cpp_2::sampler::LlamaSampler::grammar`, `grammar_lazy`, `json_schema_to_grammar` (and `AutoAgents` example `build_tool_response_schema` usage).
+- PR `ggml-org/llama.cpp#9639` — lazy grammars (`grammar_lazy`, triggers) enabling native `tools` auto-grammar without custom `grammar` field.
+- Pitfall: `server-common.cpp:1289` — `custom grammar + tools exclusive` returns HTTP 400; discussion `ggml-org/llama.cpp#22408` (custom grammar vs tools conflict).
+- `crates/kitty-runtime/src/grammar.rs:6-8` SPIKE defer header; T21 SC-GBNF-VALIDITY; Wave 4 ultrabrain.
