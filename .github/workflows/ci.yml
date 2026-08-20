@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0ca39d26cca967362 # v1
+        with:
+          toolchain: stable
+          override: true
+      - name: cargo test
+        run: cargo test --workspace
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0ca39d26cca967362 # v1
+        with:
+          toolchain: stable
+          override: true
+          components: clippy
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0ca39d26cca967362 # v1
+        with:
+          toolchain: stable
+          override: true
+          components: rustfmt
+      - name: cargo fmt
+        run: cargo fmt --check
+
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0ca39d26cca967362 # v1
+        with:
+          toolchain: stable
+          override: true
+      - uses: EmbarkStudios/cargo-deny-action@1ad33e49304de844c2c6cc106246e37cb1c21dc4e # v2.0.5
+        with:
+          command: check
