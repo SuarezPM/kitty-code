@@ -1,0 +1,71 @@
+# Task 1 evidence — harbor kitty adapter (2026-08-21)
+
+## 0. Environment
+- harbor 0.21.0 (uv tool), docker 29.7.2, ollama 0.32.14
+- Host prereqs applied: OLLAMA_HOST=0.0.0.0, OLLAMA_CONTEXT_LENGTH=16384 (systemd override), ufw allow 172.16.0.0/12 -> 11434
+- Binary: bench/harbor/adapters/kitty/bin/kitty-cli built in ubuntu:22.04 (glibc 2.35) via build-binary.sh; host build rejected by jammy (GLIBC_2.39 not found — verified)
+- NOTE: requested smoke task 'polyglot_python_hello-world' does not exist in the local aider-polyglot dataset (225 tasks); used 'polyglot_python_phone-number' instead.
+
+## 1. Negative check: -a kitty.unregistered.Name
+```
+│ │    29 │   │   │   raise ValueError("SingleStepTrial requires a task      │ │
+│ │ ❱ 204 │   │   │   raise ValueError(                                      │ │
+│ │   205 │   │   │   │   f"Agent name {name} is not valid. Valid agent      │ │
+```
+exit code: 1 (agent-not-found error, no silent fallback)
+
+## 2. Smoke A: KITTY_BENCH_MODEL=ornith:9b (default)
+```
+Uploading kitty binary /home/thelinconx/Proyectos/Kitty-Code/bench/harbor/adapters/kitty/bin/kitty-cli
+  1/1 Mean: 0.000 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:04:08 0:00:00
+aider-polyglot • kitty
+┏━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━┓
+┃ Trials ┃ Exceptions ┃  Mean ┃
+┡━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━┩
+│      1 │          0 │ 0.000 │
+└────────┴────────────┴───────┘
+
+┏━━━━━━━━┳━━━━━━━┓
+┃ Reward ┃ Count ┃
+┡━━━━━━━━╇━━━━━━━┩
+│ 0.0    │     1 │
+└────────┴───────┘
+
+Job Info
+Total runtime: 4m 8s
+Results written to jobs/2026-08-21__19-28-04/result.json
+Inspect results by running `harbor view jobs`
+Share results by running `harbor upload jobs/2026-08-21__19-28-04`
+
+```
+
+## 3. Smoke B: KITTY_BENCH_MODEL=ornith-1.5:9b
+```
+Uploading kitty binary /home/thelinconx/Proyectos/Kitty-Code/bench/harbor/adapters/kitty/bin/kitty-cli
+  1/1 Mean: 0.000 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:16:17 0:00:00
+aider-polyglot • kitty
+┏━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━┓
+┃ Trials ┃ Exceptions ┃  Mean ┃
+┡━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━┩
+│      1 │          0 │ 0.000 │
+└────────┴────────────┴───────┘
+
+┏━━━━━━━━┳━━━━━━━┓
+┃ Reward ┃ Count ┃
+┡━━━━━━━━╇━━━━━━━┩
+│ 0.0    │     1 │
+└────────┴───────┘
+
+Job Info
+Total runtime: 16m 17s
+Results written to jobs/2026-08-21__19-32-52/result.json
+Inspect results by running `harbor view jobs`
+Share results by running `harbor upload jobs/2026-08-21__19-32-52`
+
+```
+
+## 4. Observations
+- ornith:9b: 5.15GiB fully in VRAM; agent ran 20 iterations / 229s; reward 0 (Write-on-existing blocked by Guard, needs Edit; model exhausted iterations)
+- ornith-1.5:9b: 6.45GB weights, only 5.66GB in VRAM -> PARTIAL OFFLOAD (~0.8GB to CPU) as expected on 8GB RTX 2060 Super with 16k ctx KV cache; run took 958.8s; repeated thinking-budget overruns (6k tokens vs 1024 budget); reward 0
+- tok/s (direct API, short gen): ornith:9b 53.7 tok/s; ornith-1.5:9b 53.6 tok/s gen but prompt processing 213 tok/s vs 560 tok/s (offload penalty)
+- kitty-env.txt per trial confirms model/profile/ollama_url parameterization (see jobs/<ts>/.../agent/kitty-env.txt)
