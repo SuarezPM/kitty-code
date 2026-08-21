@@ -4,8 +4,15 @@
 //! wire format against any base URL (OpenAI, Azure, OpenRouter, etc.).
 //! No vendor is hardcoded. API key is read from `KITTY_CLOUD_API_KEY` and
 //! never logged. Timeout is 120s, cost is metered via `tracing::info!`.
+//!
+//! The key is held in [`SecretString`] (pattern stolen from Catalyst
+//! `apohara-secrets`): zeroized on drop, redacted in `Debug`, and exposed
+//! as cleartext only at the HTTP transport boundary via
+//! [`SecretString::expose`]. Env vars forwarded to child processes should be
+//! filtered through [`is_secret_env_name`] / [`sanitize_env`].
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -13,6 +20,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use zeroize::Zeroize;
 
 use crate::client::{ChatResponse, Message, ToolCall, ToolCallFunction};
 use crate::error::{Result, RuntimeError};
@@ -20,6 +28,150 @@ use crate::tools::ToolDefinition;
 
 const ENV_API_KEY: &str = "KITTY_CLOUD_API_KEY";
 const ENV_BASE_URL: &str = "KITTY_CLOUD_BASE_URL";
+
+// ---------------------------------------------------------------------------
+// SecretString — zeroize-on-drop, Debug-redacted (Catalyst apohara-secrets)
+// ---------------------------------------------------------------------------
+
+/// Wrapper around a secret string that:
+///   - zeroes its memory on drop (defeats heap re-read attacks),
+///   - hides its value in `Debug` so `tracing::info!(?secret, ...)` cannot
+///     accidentally log the cleartext token.
+///
+/// Use [`SecretString::expose`] only at the moment you have to hand the bytes
+/// to a transport (HTTP header, env var, file write) and never `.clone()`
+/// the inner String — that would extend the lifetime of plaintext into
+/// callers that may forget the zeroize discipline.
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the cleartext. Caller is responsible for not copying the
+    /// returned slice into long-lived plaintext storage.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        // Bypasses the Drop scrubber — only use when the caller has its
+        // own zeroize discipline (rare).
+        let mut s = self;
+        std::mem::take(&mut s.0)
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretString(***)")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Secret env-name predicate — ported from Catalyst apohara-sandbox runner
+// ---------------------------------------------------------------------------
+
+/// Patterns (substring match on uppercased name) that ALWAYS strip the
+/// variable: `*_API_KEY`, `*_TOKEN`, `AWS_*`, provider prefixes, etc.
+/// Mirrors Catalyst `apohara-sandbox/src/runner/imp.rs:is_secret_env_name`.
+#[must_use]
+pub fn is_secret_env_name(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    const SUFFIXES: &[&str] = &[
+        "_API_KEY",
+        "_KEY",
+        "_TOKEN",
+        "_SECRET",
+        "_PASSWORD",
+        "_PASSWD",
+    ];
+    const PREFIXES: &[&str] = &[
+        "ANTHROPIC_",
+        "OPENAI_",
+        "GROQ_",
+        "TOGETHER_",
+        "MISTRAL_",
+        "OPENROUTER_",
+        "GEMINI_",
+        "GOOGLE_",
+        "COHERE_",
+        "XAI_",
+        "DEEPSEEK_",
+        "PERPLEXITY_",
+        "FIREWORKS_",
+        "PINECONE_",
+        "VOYAGE_",
+        "REPLICATE_",
+        "HUGGINGFACE_",
+        "AWS_",
+        "GCP_",
+        "GCLOUD_",
+        "AZURE_",
+        "CLOUDFLARE_",
+        "DIGITALOCEAN_",
+        "VERCEL_",
+        "NETLIFY_",
+        "HEROKU_",
+        "RENDER_",
+        "SUPABASE_",
+        "STRIPE_",
+        "SENTRY_",
+        "CIRCLE_",
+        "GITLAB_",
+        "BITBUCKET_",
+    ];
+    if PREFIXES.iter().any(|p| up.starts_with(p)) {
+        return true;
+    }
+    if SUFFIXES.iter().any(|s| up.ends_with(s)) {
+        return true;
+    }
+    matches!(
+        up.as_str(),
+        "HF_TOKEN"
+            | "GITHUB_TOKEN"
+            | "GH_TOKEN"
+            | "FLY_API_TOKEN"
+            | "RAILWAY_TOKEN"
+            | "NPM_TOKEN"
+            | "DATABASE_URL"
+            | "MONGODB_URI"
+            | "MYSQL_URL"
+            | "POSTGRES_URL"
+            | "REDIS_URL"
+            | "NOTION_TOKEN"
+            | "SLACK_TOKEN"
+            | "SLACK_BOT_TOKEN"
+            | "DISCORD_TOKEN"
+            | "TELEGRAM_TOKEN"
+            | "LINEAR_API_KEY"
+    )
+}
+
+/// Strip every secret-looking variable from an env pair collection before it
+/// reaches a child process or log line. Especially strips
+/// `KITTY_CLOUD_API_KEY`, so sandboxed children can never enable paid cloud
+/// fallback with host credentials.
+#[must_use]
+pub fn sanitize_env<I, K, V>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    vars.into_iter()
+        .filter(|(k, _)| !is_secret_env_name(k.as_ref()))
+        .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Wire types — OpenAI-compatible
@@ -101,13 +253,15 @@ struct CloudModelsResponse {
 ///
 /// - `base_url`: any OpenAI-compatible endpoint, e.g. `https://api.example.com/v1`
 ///   or a self-hosted proxy. No vendor is hardcoded.
-/// - `api_key`: bearer token, read from `KITTY_CLOUD_API_KEY` via [`CloudClient::from_env`].
+/// - `api_key`: bearer token held as [`SecretString`] (zeroized on drop,
+///   redacted in `Debug`), read from `KITTY_CLOUD_API_KEY` via
+///   [`CloudClient::from_env`]. Cleartext exists only at the transport
+///   boundary ([`CloudClient::auth_header`]).
 /// - Timeout is 120s per request (rustls).
 /// - Cost is metered via `tracing::info!` on every successful chat (tokens + cost_usd).
-#[derive(Clone)]
 pub struct CloudClient {
     base_url: String,
-    api_key: String,
+    api_key: SecretString,
     http: reqwest::Client,
 }
 
@@ -115,7 +269,9 @@ impl std::fmt::Debug for CloudClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CloudClient")
             .field("base_url", &self.base_url)
-            .field("api_key", &"<redacted>")
+            // SecretString's Debug renders "SecretString(***)" — the key can
+            // never surface through `{client:?}` logging.
+            .field("api_key", &self.api_key)
             .finish()
     }
 }
@@ -124,7 +280,7 @@ impl CloudClient {
     /// Create with explicit base URL and API key.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        let api_key = api_key.into();
+        let api_key = SecretString::new(api_key.into());
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -179,7 +335,9 @@ impl CloudClient {
     }
 
     fn auth_header(&self) -> String {
-        format!("Bearer {}", self.api_key)
+        // Only place the cleartext leaves the SecretString: the HTTP
+        // transport boundary. Never logged, never stored elsewhere.
+        format!("Bearer {}", self.api_key.expose())
     }
 
     async fn chat_inner(
@@ -574,5 +732,99 @@ mod tests {
         let needle_b = String::from_utf8(vec![112, 114, 105, 110, 116, 108, 110]).unwrap();
         let has_both = src.contains(&needle_b) && src.contains("api_key");
         assert!(!has_both, "must not log key material");
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn CloudClient_debug_redacts() {
+        let client = CloudClient::new("https://example.com/v1", "sk-test-1234567890");
+        let rendered = format!("{client:?}");
+        assert!(
+            !rendered.contains("sk-"),
+            "Debug must never leak key material, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("SecretString(***)"),
+            "Debug must show the redacted SecretString marker, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn cloud_secret_string_debug_redacts_verbatim() {
+        let s = SecretString::new("sk-123".to_string());
+        assert_eq!(format!("{s:?}"), "SecretString(***)");
+        assert_eq!(s.expose(), "sk-123");
+    }
+
+    #[test]
+    fn cloud_secret_string_zeroize_scrubs_buffer() {
+        // Validates the exact scrubbing call `SecretString::drop` performs
+        // (`self.0.zeroize()`), inspected while the buffer is still alive.
+        // Reading the buffer *after* drop is unsound: the allocator reuses
+        // freed-chunk headers for its own metadata.
+        const SECRET: &[u8] = b"top-secret-key-value";
+        let s = SecretString::new(String::from_utf8(SECRET.to_vec()).unwrap());
+        let mut inner = s.into_inner(); // bypasses the Drop scrubber on purpose
+        assert_eq!(inner.as_bytes(), SECRET);
+        inner.zeroize();
+        assert!(
+            inner.as_bytes().iter().all(|&b| b == 0),
+            "buffer must be fully scrubbed by zeroize"
+        );
+    }
+
+    #[test]
+    fn cloud_is_secret_env_name_strips_patterns() {
+        for name in [
+            "KITTY_CLOUD_API_KEY",
+            "OPENAI_API_KEY",
+            "MY_SERVICE_CLIENT_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "GITHUB_TOKEN",
+            "MY_DB_PASSWORD",
+            "SERVICE_PASSWD",
+            "DATABASE_URL",
+            "LINEAR_API_KEY",
+            "huggingface_token",
+        ] {
+            assert!(
+                is_secret_env_name(name),
+                "{name} must be classified as secret"
+            );
+        }
+        for name in [
+            "PATH",
+            "HOME",
+            "KITTY_BENCH_MODEL",
+            "KITTY_CLOUD_BASE_URL",
+            "OLLAMA_HOST",
+            "TERM",
+        ] {
+            assert!(
+                !is_secret_env_name(name),
+                "{name} must NOT be classified as secret"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_sanitize_env_strips_secrets_keeps_rest() {
+        let env = vec![
+            ("KITTY_CLOUD_API_KEY", "sk-host-secret"),
+            ("AWS_SESSION_TOKEN", "tok"),
+            ("PATH", "/usr/bin"),
+            ("KITTY_BENCH_MODEL", "ornith:9b"),
+        ];
+        let sanitized = sanitize_env(env);
+        assert!(!sanitized.iter().any(|(k, _)| k == "KITTY_CLOUD_API_KEY"));
+        assert!(!sanitized.iter().any(|(k, _)| k == "AWS_SESSION_TOKEN"));
+        assert_eq!(
+            sanitized,
+            vec![
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("KITTY_BENCH_MODEL".to_string(), "ornith:9b".to_string()),
+            ]
+        );
     }
 }
