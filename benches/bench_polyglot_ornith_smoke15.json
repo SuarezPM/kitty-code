@@ -5,9 +5,12 @@
   "profile": "medium",
   "context_window": 16384,
   "thinking_budget": 2048,
-  "total": 225,
-  "passed": 195,
-  "failed": 30,
+  "method": "simulated (homemade string-match smoke; NOT harbor verifier)",
+  "n_total_trials": 15,
+  "total": 15,
+  "dataset_size": 225,
+  "passed": 13,
+  "failed": 2,
   "rate_pct": 86.67,
   "grading": "string-match-homemade (NOT harbor verifier) - estimate from smoketest",
   "smoketest": {
@@ -112,7 +115,7 @@
     "output": "/tmp/bench_polyglot_ornith_limit15.json"
   },
   "estimation": {
-    "method": "homemade string-match 13/15 86.7% extrapolated to 225 => 195/225; NOT comparable to official harbor 225 unit-test grading",
+    "method": "homemade string-match smoke 13/15 86.7% on a first-N subset; any full-225 figure would be a projection, NOT measured here; NOT comparable to official harbor unit-test grading",
     "per_task_avg_ms": 13854.6,
     "estimated_full_runtime_s": 3117,
     "estimated_full_runtime_h": 0.87,

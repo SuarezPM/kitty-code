@@ -1,0 +1,80 @@
+# Task 3 evidence — P0 rename JSON honestidad (2026-08-21T23:16:45Z)
+
+== renames (git mv) ==
+R100	benches/bench_polyglot_225_oracle.json	benches/bench_polyglot_oracle_smoke15.json
+R100	benches/bench_polyglot_225_ornith9b.json	benches/bench_polyglot_ornith_smoke15.json
+R100	benches/bench_tb2_89_oracle.json	benches/bench_tb2_oracle_ars_k5.json
+R100	benches/bench_tb2_ornith9b.json	benches/bench_tb2_ornith_smoke15.json
+M	CNAS.md
+M	benches/bench_polyglot_oracle_smoke15.json
+M	benches/bench_polyglot_ornith_smoke15.json
+M	benches/bench_tb2_oracle_ars_k5.json
+M	benches/bench_tb2_ornith_smoke15.json
+M	docs/AUDIT.md
+M	docs/FLOOR-BENCHMARK.md
+
+== canonical files exist ==
+-rw-r--r-- 1 thelinconx thelinconx 1431 ago 21 20:08 benches/bench_polyglot_oracle_smoke15.json
+-rw-r--r-- 1 thelinconx thelinconx 3598 ago 21 20:09 benches/bench_polyglot_ornith_smoke15.json
+-rw-r--r-- 1 thelinconx thelinconx 2198 ago 21 20:12 benches/bench_tb2_oracle_ars_k5.json
+-rw-r--r-- 1 thelinconx thelinconx 8238 ago 21 20:12 benches/bench_tb2_ornith_smoke15.json
+
+== old names gone ==
+GONE: benches/bench_polyglot_225_oracle.json
+GONE: benches/bench_polyglot_225_ornith9b.json
+GONE: benches/bench_tb2_89_oracle.json
+GONE: benches/bench_tb2_ornith9b.json
+
+== jq validity ==
+VALID: benches/bench_polyglot_oracle_smoke15.json
+VALID: benches/bench_polyglot_ornith_smoke15.json
+VALID: benches/bench_tb2_oracle_ars_k5.json
+VALID: benches/bench_tb2_ornith_smoke15.json
+
+== n_total_trials == length per file ==
+[bench_polyglot_oracle_smoke15] n_total_trials=15 smoketest.total=15
+[bench_polyglot_ornith_smoke15] n_total_trials=15 details.len=15
+[bench_tb2_oracle_ars_k5] n_total_trials=5 smoketest.total=5
+[bench_tb2_ornith_smoke15] n_total_trials=15 details.len=15
+
+== grep -r '225/225' benches/ (expect no output / exit 1) ==
+grep exit=1
+
+== grep 'NOT comparable' docs/AUDIT.md count (expect >=1) ==
+6
+
+== method notation per file ==
+benches/bench_polyglot_oracle_smoke15.json -> harbor-verifier (real harbor run, smoke subset n=15 of 225; full suite NOT measured)
+benches/bench_polyglot_ornith_smoke15.json -> simulated (homemade string-match smoke; NOT harbor verifier)
+benches/bench_tb2_oracle_ars_k5.json -> harbor-verifier (real harbor run, smoke: single task adaptive-rejection-sampler x5 attempts; full 89-task suite NOT measured)
+benches/bench_tb2_ornith_smoke15.json -> simulated (homemade string-match smoke; NOT harbor verifier)
+
+== limitation annotations in docs/AUDIT.md ==
+157:1. **Guard limitation (Write-on-existing-file).** Kitty's Guard blocks Write on an existing file unless the Edit tool is used. This stalled ornith:9b on tasks requiring file modification during smoke k1.
+158:2. **Thinking-budget mismatch.** ornith-1.5:9b repeatedly overran the medium profile thinking budget (1024 tokens, set by the earlier bench-ab knee decision tuned on ornith:9b). Its numbers are NOT budget-comparable to ornith:9b's.
+159:3. **Context-length dependency.** kitty-cli does not send `num_ctx`; benchmarks require server-side `OLLAMA_CONTEXT_LENGTH=16384` (host prereq documented in `bench/harbor/adapters/kitty/README.md`). Without it Ollama truncates prompts at the 4096 default → empty responses.
+161:### Approved night strategy (pre-registered)
+
+== cargo test --workspace --all-features ==
+TOTAL passed: 313 | failed: 0
+
+== git status --short (scope check at evidence time) ==
+ M CNAS.md
+RM benches/bench_polyglot_225_oracle.json -> benches/bench_polyglot_oracle_smoke15.json
+RM benches/bench_polyglot_225_ornith9b.json -> benches/bench_polyglot_ornith_smoke15.json
+RM benches/bench_tb2_89_oracle.json -> benches/bench_tb2_oracle_ars_k5.json
+RM benches/bench_tb2_ornith9b.json -> benches/bench_tb2_ornith_smoke15.json
+ M docs/AUDIT.md
+ M docs/FLOOR-BENCHMARK.md
+?? .omo/drafts/
+?? .omo/evidence/bench_tb2_89_oracle.json
+?? .omo/evidence/bench_tb2_ornith9b.json
+?? .omo/evidence/f6-remaining-tracks-opt-order/
+?? .omo/evidence/harbor-tb2-smoke-result.json
+?? .omo/notepads/
+?? .omo/plans/
+?? .omo/run-continuation/
+?? .opencode/commands/
+?? .opencode/skills/
+?? docs/AUDIT-2026-08.md
+?? jobs/

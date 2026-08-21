@@ -29,10 +29,10 @@ Oracle proves the stack is healthy. Consumer (ornith:9b) on official verifier is
 
 | Column | Value | Source |
 |--------|-------|--------|
-| **Oracle (Vendor ceiling)** | **15/15 100% mean 1.0** n_errors 0, 5m06s | `benches/bench_polyglot_225_oracle.json` smoketest + `.omo/evidence/f6-remaining-tracks-opt-order/harbor_polyglot_oracle_15_result.json` |
-| **Extrapolated oracle 225** | **225/225 100%** estimated 0.7h at n=2, 20.4s/task | same file `estimation` (oracle copies solution, deterministic) |
-| **Consumer (ornith:9b) official verifier** | **N/A, no harbor adapter for kitty** | `benches/bench_polyglot_225_ornith9b.json:harbor_note` |
-| **Consumer proxy (homemade string-match)** | **13/15 86.7%** 195/225 extrapolated, 207s, avg 13.8s/task | `benches/bench_polyglot_225_ornith9b.json` smoketest + `estimation` |
+| **Oracle (Vendor ceiling)** | **15/15 100% mean 1.0** n_errors 0, 5m06s — `method: harbor-verifier`, smoke subset n=15 of 225 | `benches/bench_polyglot_oracle_smoke15.json` smoketest + `.omo/evidence/f6-remaining-tracks-opt-order/harbor_polyglot_oracle_15_result.json` |
+| **Full-225 projection (NOT measured)** | oracle copies solution ⇒ full run expected to hold ceiling if stack stays healthy; est. 0.7h at n=2, 20.4s/task — projection only, not a result | same file `estimation` |
+| **Consumer (ornith:9b) official verifier** | **N/A, no harbor adapter for kitty** | `benches/bench_polyglot_ornith_smoke15.json:harbor_note` |
+| **Consumer proxy (homemade string-match)** | **13/15 86.7%** — `method: simulated` (smoke subset; any full-225 figure is a projection, not a result), 207s, avg 13.8s/task | `benches/bench_polyglot_ornith_smoke15.json` smoketest + `estimation` |
 | **Grading** | Oracle = `harbor-verifier-unit-tests`, Consumer proxy = `string-match-homemade NOT comparable` |  |
 | **Verdict** | Infra healthy. Do NOT compare 86.7% homemade to 100% oracle unit-test. |  |
 
@@ -53,12 +53,12 @@ jq '.passed, .total, .rate_pct' /tmp/bench_polyglot_ornith_limit15.json
 
 | Column | Value | Source |
 |--------|-------|--------|
-| **Oracle (Vendor ceiling)** | **5/5 100% mean 1.0** n_errors 0, 3m19s on `adaptive-rejection-sampler` x5 | `benches/bench_tb2_89_oracle.json` smoketest + `/tmp/harbor-tb2-smoke/2026-08-21__06-05-11/result.json` |
-| **Extrapolated oracle 89** | **89/89 100%** estimated 0.49h at n=2, 40s/task (0.99h seq) | same file `estimation` (oracle copies solution, deterministic) |
-| **Gate 9.2%** | **PASSED** 100% > 9.2% | `bench_tb2_89_oracle.json:gate` |
-| **Consumer (ornith:9b) official verifier** | **N/A, no harbor adapter for kitty** | `benches/bench_tb2_ornith9b.json` grading note |
-| **Consumer proxy (homemade) builtin shell** | **8/8 100%** avg 12.5s/task, gate passed | `benches/bench_tb2_ornith9b_builtin8.json` + `bench_tb2_ornith9b.json:smoketest_builtin` |
-| **Consumer proxy (homemade) file_ops** | **2/15 13.3%** ~12/89 estimated, gate 13.3% > 9.2% PASSED (barely) | `benches/bench_tb2_ornith9b.json` + `benches/bench_tb2_ornith9b_fileops15.json` |
+| **Oracle (Vendor ceiling)** | **5/5 100% mean 1.0** n_errors 0, 3m19s on `adaptive-rejection-sampler` x5 — `method: harbor-verifier`, smoke: single task, k=5 attempts (full suite NOT measured) | `benches/bench_tb2_oracle_ars_k5.json` smoketest + `/tmp/harbor-tb2-smoke/2026-08-21__06-05-11/result.json` |
+| **Full-89 projection (NOT measured)** | oracle copies solution ⇒ full run expected to hold ceiling if stack stays healthy; est. 0.49h at n=2 (0.99h seq) — projection only, not a result | same file `estimation` |
+| **Gate 9.2%** | **PASSED** on smoke basis only (single-task k=5); full-suite gate measurement pending night run | `bench_tb2_oracle_ars_k5.json:gate` |
+| **Consumer (ornith:9b) official verifier** | **N/A, no harbor adapter for kitty** | `benches/bench_tb2_ornith_smoke15.json` grading note |
+| **Consumer proxy (homemade) builtin shell** | **8/8 100%** avg 12.5s/task, gate passed — `method: simulated` | `benches/bench_tb2_ornith9b_builtin8.json` + `bench_tb2_ornith_smoke15.json:smoketest_builtin` |
+| **Consumer proxy (homemade) file_ops** | **2/15 13.3%** (~12/89 projected, NOT measured), gate 13.3% > 9.2% PASSED (barely) — `method: simulated` | `benches/bench_tb2_ornith_smoke15.json` + `benches/bench_tb2_ornith9b_fileops15.json` |
 | **Grading** | Oracle = `harbor-verifier-unit-tests`, Consumer proxy = `string-match-homemade NOT comparable` |  |
 | **Verdict** | Infra healthy. Builtin shell tasks are easy for the harness, file_ops expose single-file limits. Both proxies are homemade and NOT comparable to official 89. |  |
 
@@ -75,7 +75,7 @@ jq '.stats.evals["oracle__terminal-bench-2"].metrics[0].mean' /tmp/harbor-tb2-sm
 
 Notes:
 
-* Full 225 and full 89 oracle were not run as long blocks (would be 0.7h + 0.49h at n=2, spec said 15-24h at n=1 with heavy env builds). Smoketest 15/15 and 5/5 with mean 1.0 proves Harbor + Docker healthy, and oracle is deterministic (copy solution), so extrapolation to 225/225 and 89/89 is valid as a stack health gate, not as a vendor claim.
+* Full 225 and full 89 oracle were not run as long blocks (would be 0.7h + 0.49h at n=2, spec said 15-24h at n=1 with heavy env builds). Smoketest 15/15 and 5/5 with mean 1.0 proves Harbor + Docker healthy; because oracle is deterministic (copy solution), a full-suite run is expected to hold the ceiling — that expectation is a stack health gate, not a measured vendor claim or result. The approved night oracle-full runs close this gap.
 * First 5 alphabetic TB2 tasks gave 3/5 60% with oracle due to 2 flaky upstream tasks (`build-cython-ext` 1/11 pyknotid failure, `build-pmars` 4/4). Retrying with a known-good task (`adaptive-rejection-sampler` x5) gives 5/5 100%.
 
 ---
@@ -87,8 +87,8 @@ These are the numbers historically cited as 96.44%. They stay in the record but 
 | Suite | Result | Grading | Source |
 |-------|--------|---------|--------|
 | **KittyQuiz-225** (homemade) ornith:9b 217/225 **96.44%** | 17.6 min, 4.6s avg, 2 runs 0% variance | `string-match-homemade NOT comparable to Aider Polyglot` | `benches/baseline.json` 96.44, `docs/FLOOR-BENCHMARK.md` smoke, `docs/TECHNICAL_AUDIT_REPORT.md` 3.1 |
-| **KittyQuiz-225** proxy ornith:9b 13/15 **86.7%** | 207s, 13.8s avg | `string-match-homemade` | `benches/bench_polyglot_225_ornith9b.json` |
-| **KittyShell-89** (homemade) 11/89 **12.36%** | 3.4 min, 2.3s/task | homemade | `docs/TECHNICAL_AUDIT_REPORT.md` 3.2, `benches/bench_tb2_ornith9b.json` warning |
+| **KittyQuiz-225** proxy ornith:9b 13/15 **86.7%** | 207s, 13.8s avg | `string-match-homemade` (`method: simulated`) | `benches/bench_polyglot_ornith_smoke15.json` |
+| **KittyShell-89** (homemade) 11/89 **12.36%** | 3.4 min, 2.3s/task | homemade | `docs/TECHNICAL_AUDIT_REPORT.md` 3.2, `benches/bench_tb2_ornith_smoke15.json` warning |
 | **KittyShell file_ops** 2/15 **13.3%** | 13.3% > 9.2% gate | homemade | `benches/bench_tb2_ornith9b_fileops15.json` |
 | **KittyShell builtin** 8/8 **100%** | ceiling on easy shell | homemade | `benches/bench_tb2_ornith9b_builtin8.json` |
 
@@ -112,25 +112,25 @@ Per-language breakdown (KittyQuiz-225, 96.44% run, string-match):
 
 | Artifact | Location | What it proves |
 |----------|----------|----------------|
-| Polyglot 225 oracle smoketest | `benches/bench_polyglot_225_oracle.json` + `.omo/evidence/f6-remaining-tracks-opt-order/harbor_polyglot_oracle_15_result.json` | 15/15 mean 1.0, 225/225 extrapolated 100% |
-| Polyglot 225 ornith 13/15 proxy | `benches/bench_polyglot_225_ornith9b.json` + `/tmp/bench_polyglot_ornith_limit15.json` | 13/15 86.67% homemade, 195/225 estimated |
-| TB2 89 oracle smoketest | `benches/bench_tb2_89_oracle.json` + `/tmp/harbor-tb2-smoke/2026-08-21__06-05-11/result.json` | 5/5 mean 1.0, 89/89 extrapolated 100% |
-| TB2 ornith builtin 8/8 | `benches/bench_tb2_ornith9b_builtin8.json` + `benches/bench_tb2_ornith9b.json` | 8/8 100% homemade |
-| TB2 ornith file_ops 2/15 | `benches/bench_tb2_ornith9b_fileops15.json` + `benches/bench_tb2_ornith9b.json` | 2/15 13.3% homemade |
+| Polyglot oracle smoke (n=15) | `benches/bench_polyglot_oracle_smoke15.json` + `.omo/evidence/f6-remaining-tracks-opt-order/harbor_polyglot_oracle_15_result.json` | 15/15 mean 1.0 harbor-verifier smoke; full-225 NOT measured |
+| Polyglot ornith 13/15 proxy | `benches/bench_polyglot_ornith_smoke15.json` + `/tmp/bench_polyglot_ornith_limit15.json` | 13/15 86.67% homemade (`method: simulated`); full-225 projections are not results |
+| TB2 oracle single-task k=5 smoke | `benches/bench_tb2_oracle_ars_k5.json` + `/tmp/harbor-tb2-smoke/2026-08-21__06-05-11/result.json` | 5/5 mean 1.0 on adaptive-rejection-sampler; full-89 NOT measured |
+| TB2 ornith builtin 8/8 | `benches/bench_tb2_ornith9b_builtin8.json` + `benches/bench_tb2_ornith_smoke15.json` | 8/8 100% homemade easy-subset ceiling |
+| TB2 ornith file_ops 2/15 | `benches/bench_tb2_ornith9b_fileops15.json` + `benches/bench_tb2_ornith_smoke15.json` | 2/15 13.3% homemade |
 | Harbor logs | `.omo/evidence/f6-remaining-tracks-opt-order/task-24-polyglot.log`, `task-25.log` | infra + per-task details |
 | bench/official untouched | `git status -- bench/official` shows `??` untracked, `git diff` empty | not modified |
 
 Verify quickly:
 
 ```bash
-jq '.smoketest.passed, .smoketest.total, .rate_pct' benches/bench_polyglot_225_oracle.json
-# 15 15 100
-jq '.smoketest.passed, .smoketest.total, .rate_pct' benches/bench_polyglot_225_ornith9b.json
-# 13 15 86.67
-jq '.smoketest.passed, .smoketest.total, .rate_pct' benches/bench_tb2_89_oracle.json
-# 5 5 100
-jq '.smoketest.passed, .smoketest.total, .smoketest.rate_pct' benches/bench_tb2_ornith9b.json
-# 2 15 13.33
+jq '.n_total_trials, (.smoketest.total), .rate_pct' benches/bench_polyglot_oracle_smoke15.json
+# 15 15 100   (n_total_trials == smoketest.total == trials actually run)
+jq '.n_total_trials, (.smoketest.details | length), .smoketest.passed' benches/bench_polyglot_ornith_smoke15.json
+# 15 15 13
+jq '.n_total_trials, (.smoketest.total), .rate_pct' benches/bench_tb2_oracle_ars_k5.json
+# 5 5 100     (single task x5 attempts)
+jq '.n_total_trials, (.smoketest.details | length), .smoketest.passed, .smoketest.rate_pct' benches/bench_tb2_ornith_smoke15.json
+# 15 15 2 13.33
 jq '.passed, .total, .rate_pct' benches/bench_tb2_ornith9b_builtin8.json
 # 8 8 100
 ```
@@ -150,7 +150,21 @@ Per CNAS methodology:
 
 ---
 
-## 6. Roadmap
+## 6. Known Harness Limitations (tonight's adapter smokes)
+
+Recorded from the 2026-08-21 kitty harbor-adapter smokes (Oracle Gate 1 requirement). They qualify every consumer number in this doc until fixed:
+
+1. **Guard limitation (Write-on-existing-file).** Kitty's Guard blocks Write on an existing file unless the Edit tool is used. This stalled ornith:9b on tasks requiring file modification during smoke k1.
+2. **Thinking-budget mismatch.** ornith-1.5:9b repeatedly overran the medium profile thinking budget (1024 tokens, set by the earlier bench-ab knee decision tuned on ornith:9b). Its numbers are NOT budget-comparable to ornith:9b's.
+3. **Context-length dependency.** kitty-cli does not send `num_ctx`; benchmarks require server-side `OLLAMA_CONTEXT_LENGTH=16384` (host prereq documented in `bench/harbor/adapters/kitty/README.md`). Without it Ollama truncates prompts at the 4096 default → empty responses.
+
+### Approved night strategy (pre-registered)
+
+Oracle-full runs go first: TB2-89 (`harbor run -p bench/official/terminal-bench-2 -a oracle -k 1`) and polyglot-225 (`harbor run -p bench/official/aider-harbor/aider-polyglot -a oracle -k 1`) — the re-audit gate #3 requirement. Kitty runs are SAMPLED, not full, with a pre-registered first-N selection rule: `-l N` takes the FIRST N tasks in dataset order, no post-hoc cherry-picking — `-l 50` with ornith:9b → `bench_polyglot_kitty_l50.json`, `-l 15` with ornith-1.5:9b → `bench_polyglot_kitty15_l15.json`.
+
+---
+
+## 7. Roadmap
 
 * [x] Harbor + Docker stack verified (oracle 15/15 and 5/5)
 * [x] Homemade proxies for ornith:9b 13/15 86.7% and TB2 8/8 100% + 2/15 13.3%

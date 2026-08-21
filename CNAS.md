@@ -19,7 +19,7 @@ This is an honest-by-construction document. The following are **not** claimed:
 
 - **Aider Polyglot scores.** "KittyQuiz-225" is a homemade 225-exercise coding quiz with string-match grading. It is NOT the official Aider Polyglot benchmark. Results are NOT comparable.
 - **Terminal-Bench 2.0 scores.** "KittyShell-89" is a homemade 89-task terminal quiz. It is NOT the official Terminal-Bench 2.0 benchmark. No Docker, no Harbor. Results are NOT comparable.
-- **Official benchmark status.** Official Aider Polyglot and TB2 oracle verified via Harbor 15/15 and 5/5 100% with extrapolation to 225/225 and 89/89. Kitty + ornith:9b via Harbor verifier NOT yet run (needs custom adapter), reported as homemade proxy with warning. See `docs/AUDIT.md`.
+- **Official benchmark status.** Official Aider Polyglot and TB2 oracle verified via Harbor smoke runs only (polyglot n=15 subset, TB2 single-task k=5) at 100%; full suites NOT yet measured (night oracle-full runs pending). Kitty + ornith:9b via Harbor verifier NOT yet run (needs custom adapter), reported as homemade proxy with warning. See `docs/AUDIT.md`.
 - **Frontier-level reasoning**: ornith:9b is a small local model. It does not match GPT-4/Claude on complex multi-step reasoning.
 - **Long-context capability**: 16K effective context is small. No retrieval-augmented generation (RAG) yet.
 - **Production readiness**: This is a research harness, not a production system.
@@ -43,10 +43,20 @@ See `docs/AUDIT.md` section 2 for Consumer vs Vendor table. Official rates with 
 
 | Benchmark | Vendor/Oracle ceiling (Harbor verifier) | Consumer ornith:9b Q4_K_M 8GB (this harness) | Grading |
 |-----------|------------------------------------------|----------------------------------------------|---------|
-| **Aider Polyglot 225** | **15/15 100%** smoketest 5m06s, 225/225 100% est 0.7h | **13/15 86.7%** proxy 195/225 est 86.67% (homemade string-match) | Oracle verifier, Consumer homemade NOT comparable |
-| **Terminal-Bench 2.0 89** | **5/5 100%** smoketest 3m19s, 89/89 100% est 0.49h, gate 9.2% PASSED | **8/8 100% builtin** + **2/15 13.3% file_ops** ~12/89 13.3% >9.2% PASSED (homemade) | Oracle verifier, Consumer homemade NOT comparable |
+| **Aider Polyglot 225** | **15/15 100%** harbor-verifier smoke 5m06s (n=15 of 225; full suite NOT measured) | **13/15 86.7%** homemade string-match smoke (`method: simulated`; full-225 projections are not results) | Oracle verifier, Consumer homemade NOT comparable |
+| **Terminal-Bench 2.0 89** | **5/5 100%** harbor-verifier smoke 3m19s, single task `adaptive-rejection-sampler` x5 (full suite NOT measured); gate 9.2% provisionally met on smoke basis | **8/8 100% builtin** + **2/15 13.3% file_ops** (~12/89 projected, NOT measured; >9.2% PASSED homemade, `method: simulated`) | Oracle verifier, Consumer homemade NOT comparable |
 
-Sources: `benches/bench_polyglot_225_oracle.json` + `harbor_polyglot_oracle_15_result.json` mean 1.0, `benches/bench_tb2_89_oracle.json` + `/tmp/harbor-tb2-smoke/.../result.json` mean 1.0, `benches/bench_polyglot_225_ornith9b.json` 13/15, `benches/bench_tb2_ornith9b*.json` 8/8 and 2/15. Evidence `.omo/evidence/f6-remaining-tracks-opt-order/task-24-polyglot.log`, `task-25.log`. Full 225/89 not run as long block (estimated at n=2), smoketest proves stack healthy, oracle deterministic.
+Sources: `benches/bench_polyglot_oracle_smoke15.json` + `harbor_polyglot_oracle_15_result.json` mean 1.0, `benches/bench_tb2_oracle_ars_k5.json` + `/tmp/harbor-tb2-smoke/.../result.json` mean 1.0, `benches/bench_polyglot_ornith_smoke15.json` 13/15, `benches/bench_tb2_ornith9b*.json` + `benches/bench_tb2_ornith_smoke15.json` 8/8 and 2/15. Evidence `.omo/evidence/f6-remaining-tracks-opt-order/task-24-polyglot.log`, `task-25.log`. Full 225/89 not run yet (night oracle-full runs pending); smoketests prove stack healthy; projections are not results.
+
+Repro gate (harbor verifier smokes):
+
+```bash
+sudo env PATH=$HOME/.local/bin:$PATH harbor run -p bench/official/aider-harbor/aider-polyglot -a oracle -n 2 -l 15
+jq '.stats.evals["oracle__aider-polyglot"].metrics[0].mean' /tmp/harbor-polyglot-oracle-15/*/result.json  # 1.0
+
+sudo env PATH=$HOME/.local/bin:$PATH harbor run -p bench/official/terminal-bench-2 -a oracle -l 1 -k 5 --include-task-name adaptive-rejection-sampler -o /tmp/harbor-tb2-smoke
+jq '.stats.evals["oracle__terminal-bench-2"].metrics[0].mean' /tmp/harbor-tb2-smoke/*/result.json  # 1.0
+```
 
 > **Honesty:** Do NOT compare 86.7% / 13.3% homemade proxy to 100% oracle verifier. Different grading. See `docs/AUDIT.md` section 1.
 

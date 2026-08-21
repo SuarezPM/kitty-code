@@ -4,8 +4,11 @@
   "agent": "oracle",
   "dataset": "aider-polyglot@1.0",
   "path": "bench/official/aider-harbor/aider-polyglot",
-  "total": 225,
-  "passed": 225,
+  "method": "harbor-verifier (real harbor run, smoke subset n=15 of 225; full suite NOT measured)",
+  "n_total_trials": 15,
+  "total": 15,
+  "dataset_size": 225,
+  "passed": 15,
   "failed": 0,
   "rate_pct": 100.0,
   "grading": "harbor-verifier-unit-tests",
@@ -21,7 +24,7 @@
     "n_errors": 0
   },
   "estimation": {
-    "method": "extrapolation from smoketest 15/15 mean 1.0, oracle copies solution => 225/225 deterministic",
+    "method": "projection only (NOT a result): smoke n=15 mean 1.0 with harbor verifier; oracle copies the reference solution so a full 225-task run is expected to hold the ceiling if the stack stays healthy - full run not measured here",
     "per_task_avg_s_smoke": 20.4,
     "concurrency": 2,
     "estimated_full_runtime_s": 2524,

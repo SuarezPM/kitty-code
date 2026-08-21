@@ -4,8 +4,12 @@
   "agent": "oracle",
   "dataset": "terminal-bench-2",
   "path": "bench/official/terminal-bench-2",
-  "total": 89,
-  "passed": 89,
+  "method": "harbor-verifier (real harbor run, smoke: single task adaptive-rejection-sampler x5 attempts; full 89-task suite NOT measured)",
+  "n_total_trials": 5,
+  "total": 5,
+  "dataset_size": 89,
+  "tasks_covered": 1,
+  "passed": 5,
   "failed": 0,
   "rate_pct": 100.0,
   "grading": "harbor-verifier-unit-tests",
@@ -25,21 +29,22 @@
     "note": "Smoketest 5 trials on single task adaptive-rejection-sampler (known good, not flaky). 5/5 Pass mean 1.0 pass@5 1.0. Prior 3/5 on first 5 alphabetic includes 2 flaky upstream (build-cython-ext, build-pmars) not harness fault."
   },
   "estimation": {
-    "method": "extrapolation from smoketest 5/5 mean 1.0, oracle copies solution => 89/89 deterministic",
+    "method": "projection only (NOT a result): single-task k=5 smoke on adaptive-rejection-sampler mean 1.0; full 89-task suite NOT measured",
     "per_task_avg_s_smoke": 40,
     "concurrency": 2,
     "estimated_full_runtime_s": 1780.0,
     "estimated_full_runtime_h": 0.49,
     "estimated_full_runtime_seq_s": 3560,
     "estimated_full_runtime_seq_h": 0.99,
-    "note": "Full 89 not run per MUST NOT 3-8h block; smoketest proves harbor+docker stack healthy. Would be ~0.99h at n=2, ~3h seq at n=1 with light tasks. Gate >9.2% PASSED via 100% oracle. Previous full 89 attempt hung 4h aborted, so this RETRY SMOKE with 10min timeout passes.",
+    "note": "Full 89 not run per MUST NOT 3-8h block; smoketest proves harbor+docker stack healthy. Would be ~0.99h at n=2, ~3h seq at n=1 with light tasks. Gate >9.2% provisionally met on smoke basis only; full-suite measurement pending. Previous full 89 attempt hung 4h aborted, so this RETRY SMOKE with 10min timeout passes.",
     "gate_pct": 9.2,
     "gate_passed": true
   },
   "gate": {
     "threshold_pct": 9.2,
     "achieved_pct": 100.0,
-    "passed": true
+    "passed": true,
+    "basis": "single-task adaptive-rejection-sampler x5 smoke; full-suite gate measurement pending night run"
   },
   "timestamp": "2026-08-21T09:14:39.484918+00:00",
   "harbor_version": "0.21.0",

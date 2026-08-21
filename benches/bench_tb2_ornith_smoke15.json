@@ -5,7 +5,10 @@
   "profile": "medium",
   "context_window": 16384,
   "thinking_budget": 2048,
-  "total": 89,
+  "method": "simulated (homemade string-match smoke; NOT harbor verifier)",
+  "n_total_trials": 15,
+  "total": 15,
+  "dataset_size": 89,
   "grading": "string-match-homemade (NOT harbor verifier) - estimate from smoketest, NOT comparable to official 89 per CNAS",
   "smoketest_builtin": {
     "details": [
@@ -323,17 +326,16 @@
     "total": 8
   },
   "estimation": {
-    "method": "extrapolation from smoketest",
+    "method": "projection from smoketest (NOT measured)",
     "smoketest_rate": 13.333333333333334,
     "estimated_passed_89": 12,
     "estimated_rate_89_pct": 13.333333333333334,
     "builtin_rate_100": 100.0,
-    "builtin_estimated_89_if_same": 89,
     "gate_pct": 9.2,
     "gate_passed": true,
     "per_task_avg_s": 18.500933333333336,
     "total_runtime_s": 277.514,
-    "note": "File_ops 13.3% => ~12/89 estimated, passes gate >9.2% (needs 9/89 =10.1%). Builtin 100% => 89/89 if same difficulty. Full 89 homemade not run to avoid block, smoketest suffices per spec."
+    "note": "File_ops 13.3% => ~12/89 projected (NOT measured), provisional gate >9.2% (needs 9/89 =10.1%). Builtin 8/8 is an easy-subset ceiling, not a full-suite projection. Full 89 homemade not run to avoid block, smoketest suffices per spec."
   },
   "gate": {
     "threshold_pct": 9.2,

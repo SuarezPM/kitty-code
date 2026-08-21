@@ -102,16 +102,17 @@ Harbor 0.21.0 + Docker 29.7.2. Oracle = copia solución, prueba que Harbor + Doc
 
 | Benchmark | Oracle (Vendor ceiling, Harbor verifier) | Consumer ornith:9b | Grading | Veredicto |
 |-----------|------------------------------------------|-------------------|---------|-----------|
-| **Aider Polyglot 225** | **15/15 100% mean 1.0** 5m06s, 225/225 100% estimado 0.7h n=2 | **13/15 86.7%** 195/225 estimado 86.67% 207s homemade proxy | Oracle verifier, Consumer string-match NOT comparable | Infra OK, no comparar 86.7% con 100% |
-| **Terminal-Bench 2.0 89** | **5/5 100% mean 1.0** 3m19s adaptive-rejection-sampler x5, 89/89 100% estimado 0.49h n=2, gate 9.2% PASSED | **8/8 100% builtin** 12.5s avg + **2/15 13.3% file_ops** ~12/89 estimado 13.3% >9.2% PASSED (barely) | Oracle verifier, Consumer homemade NOT comparable | Builtin fácil, file_ops límite single-file |
+| **Aider Polyglot 225** | **15/15 100% mean 1.0** 5m06s harbor-verifier smoke (n=15 de 225; suite completa NO medida) | **13/15 86.7%** 207s homemade proxy (`method: simulated`; proyecciones a 225 no son resultados) | Oracle verifier, Consumer string-match NOT comparable | Infra OK, no comparar 86.7% con 100% |
+| **Terminal-Bench 2.0 89** | **5/5 100% mean 1.0** 3m19s `adaptive-rejection-sampler` x5 harbor-verifier smoke (1 tarea, suite completa NO medida); gate 9.2% provisional sobre base smoke | **8/8 100% builtin** 12.5s avg + **2/15 13.3% file_ops** (~12/89 proyectado, NO medido) >9.2% PASSED (barely, `method: simulated`) | Oracle verifier, Consumer homemade NOT comparable | Builtin fácil, file_ops límite single-file |
 
 Evidencia:
 
-* `benches/bench_polyglot_225_oracle.json` 15/15 225/225 100% + `.omo/evidence/f6-remaining-tracks-opt-order/harbor_polyglot_oracle_15_result.json` mean 1.0 n_trials 15
-* `benches/bench_polyglot_225_ornith9b.json` 13/15 86.67% 195/225 estimated + smoketest details
-* `benches/bench_tb2_89_oracle.json` 5/5 89/89 100% + `/tmp/harbor-tb2-smoke/2026-08-21__06-05-11/result.json` mean 1.0
-* `benches/bench_tb2_ornith9b.json` + `benches/bench_tb2_ornith9b_builtin8.json` 8/8 100% + `benches/bench_tb2_ornith9b_fileops15.json` 2/15 13.3%
+* `benches/bench_polyglot_oracle_smoke15.json` 15/15 100% harbor-verifier smoke + `.omo/evidence/f6-remaining-tracks-opt-order/harbor_polyglot_oracle_15_result.json` mean 1.0 n_trials 15
+* `benches/bench_polyglot_ornith_smoke15.json` 13/15 86.67% homemade smoke (`method: simulated`) + smoketest details
+* `benches/bench_tb2_oracle_ars_k5.json` 5/5 100% single-task k=5 smoke + `/tmp/harbor-tb2-smoke/2026-08-21__06-05-11/result.json` mean 1.0
+* `benches/bench_tb2_ornith_smoke15.json` + `benches/bench_tb2_ornith9b_builtin8.json` 8/8 100% + `benches/bench_tb2_ornith9b_fileops15.json` 2/15 13.3%
 * Logs `.omo/evidence/f6-remaining-tracks-opt-order/task-24-polyglot.log`, `task-25.log`
+* Limitaciones del harness (Guard Write-on-existing, thinking-budget mismatch ornith-1.5, num_ctx/OLLAMA_CONTEXT_LENGTH): ver `docs/AUDIT.md` §6
 
 Honestidad: **96.44% KittyQuiz-225 sigue siendo string-match homemade NOT comparable a Polyglot 225 oficial.** No ponerlos en la misma columna. Oficial con kitty+ornith:9b vía Harbor verifier requiere adapter custom (pendiente). Ver `docs/AUDIT.md` sección 2 y 3.
 
