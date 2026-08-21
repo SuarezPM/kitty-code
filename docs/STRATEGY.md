@@ -158,13 +158,13 @@ Harbor 0.21.0 + Docker 29.7.2. Oracle = copia solución, techo del infra sano (n
 
 | Benchmark | Oracle (Vendor ceiling, Harbor verifier) | Consumer ornith:9b (homemade proxy) | Veredicto |
 |-----------|------------------------------------------|------------------------------------|-----------|
-| **Aider Polyglot 225** | **15/15 100% mean 1.0** 5m06s, 225/225 100% est 0.7h n=2 | **13/15 86.7%** 195/225 est 86.67% 207s (string-match NOT comparable) | Infra OK, NO comparar 86.7% con 100% |
-| **Terminal-Bench 2.0 89** | **5/5 100% mean 1.0** 3m19s `adaptive-rejection-sampler` x5, 89/89 100% est 0.49h n=2, gate 9.2% PASSED | **8/8 100% builtin** + **2/15 13.3% file_ops** ~12/89 13.3% >9.2% PASSED barely | Builtin fácil, file_ops límite single-file |
+| **Aider Polyglot 225** | **15/15 100% mean 1.0** harbor-verifier smoke 5m06s (n=15 of 225; full suite NOT measured) | **13/15 86.7%** smoke 207s (string-match NOT comparable; full-225 projections are not results) | Infra OK, NO comparar 86.7% con 100% |
+| **Terminal-Bench 2.0 89** | **5/5 100% mean 1.0** harbor-verifier smoke 3m19s `adaptive-rejection-sampler` x5 (single task k=5; full suite NOT measured), gate 9.2% PASSED on smoke basis | **8/8 100% builtin** + **2/15 13.3% file_ops** (~12/89 projected, NOT measured) >9.2% PASSED barely | Builtin fácil, file_ops límite single-file |
 
-Evidencia: `benches/bench_polyglot_225_oracle.json` + `.omo/evidence/.../harbor_polyglot_oracle_15_result.json` mean 1.0, `benches/bench_tb2_89_oracle.json` + `/tmp/harbor-tb2-smoke/2026-08-21__06-05-11/result.json` mean 1.0, `benches/bench_polyglot_225_ornith9b.json` 13/15, `benches/bench_tb2_*.json` 8/8 + 2/15, logs `task-24-polyglot.log` + `task-25.log`.
+Evidencia: `benches/bench_polyglot_oracle_smoke15.json` + `.omo/evidence/.../harbor_polyglot_oracle_15_result.json` mean 1.0, `benches/bench_tb2_oracle_ars_k5.json` + `/tmp/harbor-tb2-smoke/2026-08-21__06-05-11/result.json` mean 1.0, `benches/bench_polyglot_ornith_smoke15.json` 13/15, `benches/bench_tb2_*.json` 8/8 + 2/15, logs `task-24-polyglot.log` + `task-25.log`.
 
 **Consequences:**
-- Oracle extrapolado 225/225 y 89/89 es válido como **gate de salud del stack** (determinístico, copia solución, 0 errors), no como claim vendor. Spec 15-24h at n=1 innecesario (0.7h+0.49h at n=2).
+- Proyección oracle full-suite 225/89 es **gate de salud del stack** (determinístico, copia solución, 0 errors), NO medida — no es claim vendor ni resultado; night oracle-full runs cierran el gap. Spec 15-24h at n=1 innecesario (0.7h+0.49h at n=2).
 - Consumer proxies son **homemade** `string-match` — no oficial, no unit-test. No ponerlos en misma columna que oracle. Etiquetado `string-match-homemade (not comparable)` en todos los JSON/MD (AUDIT §1).
 - TB2 89 oracle 3/5 60% en primeros 5 alfabéticos es flaky upstream (`build-cython-ext`, `build-pmars`); retry con task conocida-buena `adaptive-rejection-sampler` x5 da 5/5 100% — procedimiento validado task-3.
 - `bench/official` untouched (`git status -- bench/official` `??` untracked, `git diff` empty, `git check-ignore` not ignored). `benches/baseline.json` 96.44 permanece como KittyQuiz-225 referencia.
