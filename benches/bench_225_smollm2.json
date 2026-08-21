@@ -1,0 +1,1360 @@
+{
+  "details": [
+    {
+      "id": "py-fibonacci",
+      "lang": "python",
+      "latency_ms": 1942.0,
+      "passed": true
+    },
+    {
+      "id": "py-bubble_sort",
+      "lang": "python",
+      "latency_ms": 3236.0,
+      "passed": true
+    },
+    {
+      "id": "py-quick_sort",
+      "lang": "python",
+      "latency_ms": 4825.0,
+      "passed": true
+    },
+    {
+      "id": "py-binary_search",
+      "lang": "python",
+      "latency_ms": 2194.0,
+      "passed": false
+    },
+    {
+      "id": "py-factorial",
+      "lang": "python",
+      "latency_ms": 2936.0,
+      "passed": false
+    },
+    {
+      "id": "py-is_palindrome",
+      "lang": "python",
+      "latency_ms": 3627.0,
+      "passed": true
+    },
+    {
+      "id": "py-flatten",
+      "lang": "python",
+      "latency_ms": 5137.0,
+      "passed": false
+    },
+    {
+      "id": "py-chunk",
+      "lang": "python",
+      "latency_ms": 2844.0,
+      "passed": false
+    },
+    {
+      "id": "py-unique",
+      "lang": "python",
+      "latency_ms": 2363.0,
+      "passed": false
+    },
+    {
+      "id": "py-compact",
+      "lang": "python",
+      "latency_ms": 1216.0,
+      "passed": true
+    },
+    {
+      "id": "py-sum_range",
+      "lang": "python",
+      "latency_ms": 2081.0,
+      "passed": false
+    },
+    {
+      "id": "py-clamp",
+      "lang": "python",
+      "latency_ms": 3487.0,
+      "passed": false
+    },
+    {
+      "id": "py-capitalize",
+      "lang": "python",
+      "latency_ms": 1653.0,
+      "passed": true
+    },
+    {
+      "id": "py-truncate",
+      "lang": "python",
+      "latency_ms": 3862.0,
+      "passed": false
+    },
+    {
+      "id": "py-camelize",
+      "lang": "python",
+      "latency_ms": 1340.0,
+      "passed": true
+    },
+    {
+      "id": "py-kebab",
+      "lang": "python",
+      "latency_ms": 2741.0,
+      "passed": false
+    },
+    {
+      "id": "py-pick",
+      "lang": "python",
+      "latency_ms": 2551.0,
+      "passed": false
+    },
+    {
+      "id": "py-omit",
+      "lang": "python",
+      "latency_ms": 3591.0,
+      "passed": false
+    },
+    {
+      "id": "py-merge",
+      "lang": "python",
+      "latency_ms": 1360.0,
+      "passed": true
+    },
+    {
+      "id": "py-deep_get",
+      "lang": "python",
+      "latency_ms": 3315.0,
+      "passed": true
+    },
+    {
+      "id": "py-uuid",
+      "lang": "python",
+      "latency_ms": 914.0,
+      "passed": false
+    },
+    {
+      "id": "py-slugify",
+      "lang": "python",
+      "latency_ms": 5080.0,
+      "passed": true
+    },
+    {
+      "id": "py-wrap",
+      "lang": "python",
+      "latency_ms": 1896.0,
+      "passed": false
+    },
+    {
+      "id": "py-center",
+      "lang": "python",
+      "latency_ms": 5001.0,
+      "passed": false
+    },
+    {
+      "id": "py-ltrim",
+      "lang": "python",
+      "latency_ms": 871.0,
+      "passed": false
+    },
+    {
+      "id": "py-rtrim",
+      "lang": "python",
+      "latency_ms": 6257.0,
+      "passed": false
+    },
+    {
+      "id": "py-repeat",
+      "lang": "python",
+      "latency_ms": 3744.0,
+      "passed": false
+    },
+    {
+      "id": "py-reverse_str",
+      "lang": "python",
+      "latency_ms": 2996.0,
+      "passed": false
+    },
+    {
+      "id": "py-count_chars",
+      "lang": "python",
+      "latency_ms": 845.0,
+      "passed": true
+    },
+    {
+      "id": "py-anagram",
+      "lang": "python",
+      "latency_ms": 5287.0,
+      "passed": true
+    },
+    {
+      "id": "py-is_anagram",
+      "lang": "python",
+      "latency_ms": 3413.0,
+      "passed": false
+    },
+    {
+      "id": "py-title_case",
+      "lang": "python",
+      "latency_ms": 3734.0,
+      "passed": false
+    },
+    {
+      "id": "py-swap_case",
+      "lang": "python",
+      "latency_ms": 4180.0,
+      "passed": false
+    },
+    {
+      "id": "py-is_number",
+      "lang": "python",
+      "latency_ms": 2792.0,
+      "passed": true
+    },
+    {
+      "id": "py-to_int",
+      "lang": "python",
+      "latency_ms": 1177.0,
+      "passed": false
+    },
+    {
+      "id": "py-to_float",
+      "lang": "python",
+      "latency_ms": 2824.0,
+      "passed": true
+    },
+    {
+      "id": "py-clamp_int",
+      "lang": "python",
+      "latency_ms": 4325.0,
+      "passed": false
+    },
+    {
+      "id": "py-avg",
+      "lang": "python",
+      "latency_ms": 1273.0,
+      "passed": false
+    },
+    {
+      "id": "py-median",
+      "lang": "python",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "py-mode",
+      "lang": "python",
+      "latency_ms": 1843.0,
+      "passed": false
+    },
+    {
+      "id": "py-stdev",
+      "lang": "python",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "py-percentile",
+      "lang": "python",
+      "latency_ms": 2493.0,
+      "passed": false
+    },
+    {
+      "id": "py-gcd",
+      "lang": "python",
+      "latency_ms": 1907.0,
+      "passed": true
+    },
+    {
+      "id": "py-lcm",
+      "lang": "python",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "py-is_prime",
+      "lang": "python",
+      "latency_ms": 1985.0,
+      "passed": true
+    },
+    {
+      "id": "py-primes",
+      "lang": "python",
+      "latency_ms": 5295.0,
+      "passed": true
+    },
+    {
+      "id": "py-collatz",
+      "lang": "python",
+      "latency_ms": 4191.0,
+      "passed": false
+    },
+    {
+      "id": "py-fibonacci_gen",
+      "lang": "python",
+      "latency_ms": 5121.0,
+      "passed": false
+    },
+    {
+      "id": "py-chain",
+      "lang": "python",
+      "latency_ms": 5035.0,
+      "passed": false
+    },
+    {
+      "id": "py-group_by",
+      "lang": "python",
+      "latency_ms": 1953.0,
+      "passed": true
+    },
+    {
+      "id": "js-map",
+      "lang": "javascript",
+      "latency_ms": 3002.0,
+      "passed": false
+    },
+    {
+      "id": "js-filter",
+      "lang": "javascript",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "js-reduce",
+      "lang": "javascript",
+      "latency_ms": 3204.0,
+      "passed": true
+    },
+    {
+      "id": "js-flatten",
+      "lang": "javascript",
+      "latency_ms": 4469.0,
+      "passed": true
+    },
+    {
+      "id": "js-chunk",
+      "lang": "javascript",
+      "latency_ms": 2572.0,
+      "passed": false
+    },
+    {
+      "id": "js-unique",
+      "lang": "javascript",
+      "latency_ms": 359.0,
+      "passed": false
+    },
+    {
+      "id": "js-compact",
+      "lang": "javascript",
+      "latency_ms": 5322.0,
+      "passed": false
+    },
+    {
+      "id": "js-debounce",
+      "lang": "javascript",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "js-throttle",
+      "lang": "javascript",
+      "latency_ms": 3145.0,
+      "passed": false
+    },
+    {
+      "id": "js-memoize",
+      "lang": "javascript",
+      "latency_ms": 3610.0,
+      "passed": false
+    },
+    {
+      "id": "js-once",
+      "lang": "javascript",
+      "latency_ms": 1496.0,
+      "passed": false
+    },
+    {
+      "id": "js-curry",
+      "lang": "javascript",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "js-pipe",
+      "lang": "javascript",
+      "latency_ms": 4069.0,
+      "passed": false
+    },
+    {
+      "id": "js-compose",
+      "lang": "javascript",
+      "latency_ms": 2545.0,
+      "passed": false
+    },
+    {
+      "id": "js-deep_clone",
+      "lang": "javascript",
+      "latency_ms": 2966.0,
+      "passed": false
+    },
+    {
+      "id": "js-pick",
+      "lang": "javascript",
+      "latency_ms": 2374.0,
+      "passed": true
+    },
+    {
+      "id": "js-omit",
+      "lang": "javascript",
+      "latency_ms": 4120.0,
+      "passed": false
+    },
+    {
+      "id": "js-merge",
+      "lang": "javascript",
+      "latency_ms": 1656.0,
+      "passed": true
+    },
+    {
+      "id": "js-get",
+      "lang": "javascript",
+      "latency_ms": 1069.0,
+      "passed": true
+    },
+    {
+      "id": "js-set",
+      "lang": "javascript",
+      "latency_ms": 962.0,
+      "passed": false
+    },
+    {
+      "id": "js-range",
+      "lang": "javascript",
+      "latency_ms": 2248.0,
+      "passed": true
+    },
+    {
+      "id": "js-sum",
+      "lang": "javascript",
+      "latency_ms": 2031.0,
+      "passed": false
+    },
+    {
+      "id": "js-avg",
+      "lang": "javascript",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "js-min",
+      "lang": "javascript",
+      "latency_ms": 2899.0,
+      "passed": true
+    },
+    {
+      "id": "js-max",
+      "lang": "javascript",
+      "latency_ms": 2240.0,
+      "passed": true
+    },
+    {
+      "id": "js-clamp",
+      "lang": "javascript",
+      "latency_ms": 1398.0,
+      "passed": false
+    },
+    {
+      "id": "js-capitalize",
+      "lang": "javascript",
+      "latency_ms": 2783.0,
+      "passed": true
+    },
+    {
+      "id": "js-camel",
+      "lang": "javascript",
+      "latency_ms": 6929.0,
+      "passed": false
+    },
+    {
+      "id": "js-kebab",
+      "lang": "javascript",
+      "latency_ms": 4293.0,
+      "passed": false
+    },
+    {
+      "id": "js-snake",
+      "lang": "javascript",
+      "latency_ms": 2981.0,
+      "passed": true
+    },
+    {
+      "id": "js-slugify",
+      "lang": "javascript",
+      "latency_ms": 2074.0,
+      "passed": false
+    },
+    {
+      "id": "js-truncate",
+      "lang": "javascript",
+      "latency_ms": 3441.0,
+      "passed": false
+    },
+    {
+      "id": "js-wrap",
+      "lang": "javascript",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "js-pad",
+      "lang": "javascript",
+      "latency_ms": 2433.0,
+      "passed": false
+    },
+    {
+      "id": "js-reverse",
+      "lang": "javascript",
+      "latency_ms": 1581.0,
+      "passed": false
+    },
+    {
+      "id": "js-is_palindrome",
+      "lang": "javascript",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "js-is_anagram",
+      "lang": "javascript",
+      "latency_ms": 2523.0,
+      "passed": false
+    },
+    {
+      "id": "js-count",
+      "lang": "javascript",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "js-group_by",
+      "lang": "javascript",
+      "latency_ms": 3443.0,
+      "passed": false
+    },
+    {
+      "id": "js-sort_by",
+      "lang": "javascript",
+      "latency_ms": 2292.0,
+      "passed": true
+    },
+    {
+      "id": "js-zip",
+      "lang": "javascript",
+      "latency_ms": 1515.0,
+      "passed": false
+    },
+    {
+      "id": "js-unzip",
+      "lang": "javascript",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "js-interleave",
+      "lang": "javascript",
+      "latency_ms": 4102.0,
+      "passed": true
+    },
+    {
+      "id": "js-difference",
+      "lang": "javascript",
+      "latency_ms": 1189.0,
+      "passed": false
+    },
+    {
+      "id": "js-intersection",
+      "lang": "javascript",
+      "latency_ms": 2733.0,
+      "passed": false
+    },
+    {
+      "id": "js-union",
+      "lang": "javascript",
+      "latency_ms": 2728.0,
+      "passed": false
+    },
+    {
+      "id": "js-without",
+      "lang": "javascript",
+      "latency_ms": 2188.0,
+      "passed": false
+    },
+    {
+      "id": "js-sample",
+      "lang": "javascript",
+      "latency_ms": 2929.0,
+      "passed": false
+    },
+    {
+      "id": "js-shuffle",
+      "lang": "javascript",
+      "latency_ms": 1717.0,
+      "passed": true
+    },
+    {
+      "id": "js-keys",
+      "lang": "javascript",
+      "latency_ms": 4146.0,
+      "passed": false
+    },
+    {
+      "id": "ts-interface_user",
+      "lang": "typescript",
+      "latency_ms": 9130.0,
+      "passed": false
+    },
+    {
+      "id": "ts-interface_product",
+      "lang": "typescript",
+      "latency_ms": 978.0,
+      "passed": true
+    },
+    {
+      "id": "ts-generic_first",
+      "lang": "typescript",
+      "latency_ms": 1986.0,
+      "passed": true
+    },
+    {
+      "id": "ts-generic_last",
+      "lang": "typescript",
+      "latency_ms": 363.0,
+      "passed": false
+    },
+    {
+      "id": "ts-generic_unique",
+      "lang": "typescript",
+      "latency_ms": 352.0,
+      "passed": false
+    },
+    {
+      "id": "ts-generic_group",
+      "lang": "typescript",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "ts-type_result",
+      "lang": "typescript",
+      "latency_ms": 2454.0,
+      "passed": true
+    },
+    {
+      "id": "ts-type_option",
+      "lang": "typescript",
+      "latency_ms": 1621.0,
+      "passed": false
+    },
+    {
+      "id": "ts-type_nullable",
+      "lang": "typescript",
+      "latency_ms": 815.0,
+      "passed": true
+    },
+    {
+      "id": "ts-type_deep_partial",
+      "lang": "typescript",
+      "latency_ms": 6207.0,
+      "passed": false
+    },
+    {
+      "id": "ts-enum_direction",
+      "lang": "typescript",
+      "latency_ms": 1659.0,
+      "passed": false
+    },
+    {
+      "id": "ts-enum_status",
+      "lang": "typescript",
+      "latency_ms": 3133.0,
+      "passed": false
+    },
+    {
+      "id": "ts-type_record",
+      "lang": "typescript",
+      "latency_ms": 930.0,
+      "passed": false
+    },
+    {
+      "id": "ts-type_partial",
+      "lang": "typescript",
+      "latency_ms": 1990.0,
+      "passed": true
+    },
+    {
+      "id": "ts-type_required",
+      "lang": "typescript",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "ts-type_pick",
+      "lang": "typescript",
+      "latency_ms": 1485.0,
+      "passed": true
+    },
+    {
+      "id": "ts-type_omit",
+      "lang": "typescript",
+      "latency_ms": 340.0,
+      "passed": false
+    },
+    {
+      "id": "ts-generic_map",
+      "lang": "typescript",
+      "latency_ms": 3505.0,
+      "passed": true
+    },
+    {
+      "id": "ts-generic_filter",
+      "lang": "typescript",
+      "latency_ms": 377.0,
+      "passed": false
+    },
+    {
+      "id": "ts-generic_reduce",
+      "lang": "typescript",
+      "latency_ms": 2954.0,
+      "passed": true
+    },
+    {
+      "id": "ts-generic_pipe",
+      "lang": "typescript",
+      "latency_ms": 1382.0,
+      "passed": false
+    },
+    {
+      "id": "ts-type_event",
+      "lang": "typescript",
+      "latency_ms": 6438.0,
+      "passed": false
+    },
+    {
+      "id": "ts-type_config",
+      "lang": "typescript",
+      "latency_ms": 5161.0,
+      "passed": false
+    },
+    {
+      "id": "ts-type_response",
+      "lang": "typescript",
+      "latency_ms": 2495.0,
+      "passed": false
+    },
+    {
+      "id": "ts-generic_merge",
+      "lang": "typescript",
+      "latency_ms": 1729.0,
+      "passed": true
+    },
+    {
+      "id": "ts-generic_exclusive",
+      "lang": "typescript",
+      "latency_ms": 4556.0,
+      "passed": false
+    },
+    {
+      "id": "ts-generic_readonly",
+      "lang": "typescript",
+      "latency_ms": 3115.0,
+      "passed": true
+    },
+    {
+      "id": "ts-generic_mutable",
+      "lang": "typescript",
+      "latency_ms": 2165.0,
+      "passed": true
+    },
+    {
+      "id": "ts-type_error",
+      "lang": "typescript",
+      "latency_ms": 3479.0,
+      "passed": true
+    },
+    {
+      "id": "ts-type_success",
+      "lang": "typescript",
+      "latency_ms": 982.0,
+      "passed": true
+    },
+    {
+      "id": "rust-struct_point",
+      "lang": "rust",
+      "latency_ms": 2655.0,
+      "passed": true
+    },
+    {
+      "id": "rust-struct_rect",
+      "lang": "rust",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "rust-struct_circle",
+      "lang": "rust",
+      "latency_ms": 1297.0,
+      "passed": true
+    },
+    {
+      "id": "rust-struct_triangle",
+      "lang": "rust",
+      "latency_ms": 2258.0,
+      "passed": true
+    },
+    {
+      "id": "rust-struct_vector2d",
+      "lang": "rust",
+      "latency_ms": 10102.0,
+      "passed": false
+    },
+    {
+      "id": "rust-enum_shape",
+      "lang": "rust",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "rust-enum_color",
+      "lang": "rust",
+      "latency_ms": 1290.0,
+      "passed": true
+    },
+    {
+      "id": "rust-enum_direction",
+      "lang": "rust",
+      "latency_ms": 1568.0,
+      "passed": false
+    },
+    {
+      "id": "rust-enum_option_demo",
+      "lang": "rust",
+      "latency_ms": 3081.0,
+      "passed": true
+    },
+    {
+      "id": "rust-enum_result_demo",
+      "lang": "rust",
+      "latency_ms": 907.0,
+      "passed": true
+    },
+    {
+      "id": "rust-impl_display",
+      "lang": "rust",
+      "latency_ms": 2724.0,
+      "passed": true
+    },
+    {
+      "id": "rust-impl_add",
+      "lang": "rust",
+      "latency_ms": 4117.0,
+      "passed": false
+    },
+    {
+      "id": "rust-impl_from",
+      "lang": "rust",
+      "latency_ms": 4215.0,
+      "passed": true
+    },
+    {
+      "id": "rust-impl_into",
+      "lang": "rust",
+      "latency_ms": 1286.0,
+      "passed": false
+    },
+    {
+      "id": "rust-impl_default",
+      "lang": "rust",
+      "latency_ms": 2523.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_bubble_sort",
+      "lang": "rust",
+      "latency_ms": 4262.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_binary_search",
+      "lang": "rust",
+      "latency_ms": 5946.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_merge_sort",
+      "lang": "rust",
+      "latency_ms": 6053.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_quicksort",
+      "lang": "rust",
+      "latency_ms": 3813.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_factorial",
+      "lang": "rust",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "rust-fn_fibonacci",
+      "lang": "rust",
+      "latency_ms": 2097.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_is_prime",
+      "lang": "rust",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "rust-fn_gcd",
+      "lang": "rust",
+      "latency_ms": 2036.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_lcm",
+      "lang": "rust",
+      "latency_ms": 1435.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_clamp",
+      "lang": "rust",
+      "latency_ms": 1377.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_abs_diff",
+      "lang": "rust",
+      "latency_ms": 1538.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_is_palindrome",
+      "lang": "rust",
+      "latency_ms": 2529.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_reverse_str",
+      "lang": "rust",
+      "latency_ms": 1746.0,
+      "passed": false
+    },
+    {
+      "id": "rust-fn_count_chars",
+      "lang": "rust",
+      "latency_ms": 3140.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_anagram",
+      "lang": "rust",
+      "latency_ms": 2519.0,
+      "passed": true
+    },
+    {
+      "id": "rust-fn_title_case",
+      "lang": "rust",
+      "latency_ms": 2961.0,
+      "passed": false
+    },
+    {
+      "id": "rust-fn_slugify",
+      "lang": "rust",
+      "latency_ms": 2181.0,
+      "passed": false
+    },
+    {
+      "id": "rust-trait_serialize",
+      "lang": "rust",
+      "latency_ms": 2371.0,
+      "passed": false
+    },
+    {
+      "id": "rust-trait_deserialize",
+      "lang": "rust",
+      "latency_ms": 1514.0,
+      "passed": true
+    },
+    {
+      "id": "rust-trait_validator",
+      "lang": "rust",
+      "latency_ms": 2985.0,
+      "passed": true
+    },
+    {
+      "id": "rust-trait_clone",
+      "lang": "rust",
+      "latency_ms": 1772.0,
+      "passed": true
+    },
+    {
+      "id": "rust-trait_iterator",
+      "lang": "rust",
+      "latency_ms": 3868.0,
+      "passed": true
+    },
+    {
+      "id": "rust-struct_stack",
+      "lang": "rust",
+      "latency_ms": 5496.0,
+      "passed": true
+    },
+    {
+      "id": "rust-struct_queue",
+      "lang": "rust",
+      "latency_ms": 3350.0,
+      "passed": true
+    },
+    {
+      "id": "rust-struct_linked_list",
+      "lang": "rust",
+      "latency_ms": 5542.0,
+      "passed": true
+    },
+    {
+      "id": "rust-struct_hashmap",
+      "lang": "rust",
+      "latency_ms": 5860.0,
+      "passed": true
+    },
+    {
+      "id": "rust-struct_cache",
+      "lang": "rust",
+      "latency_ms": 2728.0,
+      "passed": false
+    },
+    {
+      "id": "rust-struct_builder",
+      "lang": "rust",
+      "latency_ms": 1117.0,
+      "passed": false
+    },
+    {
+      "id": "rust-struct_option_type",
+      "lang": "rust",
+      "latency_ms": 1417.0,
+      "passed": true
+    },
+    {
+      "id": "rust-struct_heap",
+      "lang": "rust",
+      "latency_ms": 3065.0,
+      "passed": false
+    },
+    {
+      "id": "go-struct_person",
+      "lang": "go",
+      "latency_ms": 3853.0,
+      "passed": true
+    },
+    {
+      "id": "go-struct_point",
+      "lang": "go",
+      "latency_ms": 1796.0,
+      "passed": false
+    },
+    {
+      "id": "go-struct_rect",
+      "lang": "go",
+      "latency_ms": 5358.0,
+      "passed": true
+    },
+    {
+      "id": "go-struct_circle",
+      "lang": "go",
+      "latency_ms": 2091.0,
+      "passed": true
+    },
+    {
+      "id": "go-struct_stack",
+      "lang": "go",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "go-struct_queue",
+      "lang": "go",
+      "latency_ms": 1622.0,
+      "passed": true
+    },
+    {
+      "id": "go-struct_node",
+      "lang": "go",
+      "latency_ms": 7278.0,
+      "passed": true
+    },
+    {
+      "id": "go-struct_error",
+      "lang": "go",
+      "latency_ms": 4949.0,
+      "passed": false
+    },
+    {
+      "id": "go-struct_result",
+      "lang": "go",
+      "latency_ms": 2226.0,
+      "passed": false
+    },
+    {
+      "id": "go-struct_option",
+      "lang": "go",
+      "latency_ms": 3404.0,
+      "passed": false
+    },
+    {
+      "id": "go-fn_bubble_sort",
+      "lang": "go",
+      "latency_ms": 2562.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_binary_search",
+      "lang": "go",
+      "latency_ms": 367.0,
+      "passed": false
+    },
+    {
+      "id": "go-fn_merge_sort",
+      "lang": "go",
+      "latency_ms": 2875.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_factorial",
+      "lang": "go",
+      "latency_ms": 4029.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_fibonacci",
+      "lang": "go",
+      "latency_ms": 2398.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_is_prime",
+      "lang": "go",
+      "latency_ms": 2338.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_gcd",
+      "lang": "go",
+      "latency_ms": 1470.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_lcm",
+      "lang": "go",
+      "latency_ms": 3932.0,
+      "passed": false
+    },
+    {
+      "id": "go-fn_clamp",
+      "lang": "go",
+      "latency_ms": 4374.0,
+      "passed": false
+    },
+    {
+      "id": "go-fn_abs_diff",
+      "lang": "go",
+      "latency_ms": 3440.0,
+      "passed": false
+    },
+    {
+      "id": "go-fn_is_palindrome",
+      "lang": "go",
+      "latency_ms": 1922.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_reverse_str",
+      "lang": "go",
+      "latency_ms": 4684.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_count_chars",
+      "lang": "go",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "go-fn_anagram",
+      "lang": "go",
+      "latency_ms": 1422.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_title_case",
+      "lang": "go",
+      "latency_ms": 2215.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_slugify",
+      "lang": "go",
+      "latency_ms": 4508.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_map_arr",
+      "lang": "go",
+      "latency_ms": 2549.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_filter_arr",
+      "lang": "go",
+      "latency_ms": 933.0,
+      "passed": true
+    },
+    {
+      "id": "go-fn_reduce_arr",
+      "lang": "go",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "go-fn_zip",
+      "lang": "go",
+      "latency_ms": 2519.0,
+      "passed": true
+    },
+    {
+      "id": "cpp-vector_sum",
+      "lang": "cpp",
+      "latency_ms": 363.0,
+      "passed": false
+    },
+    {
+      "id": "cpp-vector_avg",
+      "lang": "cpp",
+      "latency_ms": 1089.0,
+      "passed": false
+    },
+    {
+      "id": "cpp-vector_max",
+      "lang": "cpp",
+      "latency_ms": 955.0,
+      "passed": true
+    },
+    {
+      "id": "cpp-vector_min",
+      "lang": "cpp",
+      "latency_ms": 4070.0,
+      "passed": false
+    },
+    {
+      "id": "cpp-string_reverse",
+      "lang": "cpp",
+      "latency_ms": 3460.0,
+      "passed": false
+    },
+    {
+      "id": "cpp-string_palindrome",
+      "lang": "cpp",
+      "latency_ms": 3511.0,
+      "passed": true
+    },
+    {
+      "id": "cpp-factorial_fn",
+      "lang": "cpp",
+      "latency_ms": 3826.0,
+      "passed": true
+    },
+    {
+      "id": "cpp-fibonacci_fn",
+      "lang": "cpp",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "cpp-binary_search_fn",
+      "lang": "cpp",
+      "latency_ms": 427.0,
+      "passed": false
+    },
+    {
+      "id": "cpp-bubble_sort_fn",
+      "lang": "cpp",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "java-string_reverse",
+      "lang": "java",
+      "latency_ms": 2621.0,
+      "passed": false
+    },
+    {
+      "id": "java-string_palindrome",
+      "lang": "java",
+      "latency_ms": 4324.0,
+      "passed": false
+    },
+    {
+      "id": "java-factorial_fn",
+      "lang": "java",
+      "latency_ms": 1594.0,
+      "passed": true
+    },
+    {
+      "id": "java-fibonacci_fn",
+      "lang": "java",
+      "latency_ms": 3182.0,
+      "passed": true
+    },
+    {
+      "id": "java-bubble_sort_fn",
+      "lang": "java",
+      "latency_ms": 2862.0,
+      "passed": true
+    },
+    {
+      "id": "java-binary_search_fn",
+      "lang": "java",
+      "latency_ms": 4482.0,
+      "passed": true
+    },
+    {
+      "id": "java-max_fn",
+      "lang": "java",
+      "latency_ms": 5949.0,
+      "passed": false
+    },
+    {
+      "id": "java-min_fn",
+      "lang": "java",
+      "latency_ms": 2730.0,
+      "passed": false
+    },
+    {
+      "id": "java-clamp_fn",
+      "lang": "java",
+      "latency_ms": 1782.0,
+      "passed": true
+    },
+    {
+      "id": "java-gcd_fn",
+      "lang": "java",
+      "latency_ms": 3675.0,
+      "passed": true
+    }
+  ],
+  "memory": true,
+  "model": "smollm2:1.7b",
+  "passed": 102,
+  "rate_pct": 45.333333333333336,
+  "suite": "polyglot",
+  "total": 225
+}

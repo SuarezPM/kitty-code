@@ -1,0 +1,347 @@
+{
+  "suite": "tb2",
+  "model": "ornith:9b",
+  "model_variant": "ornith:9b Q4_K_M 5.6GB qwen35",
+  "profile": "medium",
+  "context_window": 16384,
+  "thinking_budget": 2048,
+  "total": 89,
+  "grading": "string-match-homemade (NOT harbor verifier) - estimate from smoketest, NOT comparable to official 89 per CNAS",
+  "smoketest_builtin": {
+    "details": [
+      {
+        "id": "tb2-bash-count",
+        "lang": "bash",
+        "latency_ms": 9720.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-py-csv",
+        "lang": "python",
+        "latency_ms": 15364.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-makefile",
+        "lang": "makefile",
+        "latency_ms": 7449.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-dockerfile",
+        "lang": "docker",
+        "latency_ms": 18326.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-gh-actions",
+        "lang": "ci",
+        "latency_ms": 9339.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-sh-find-modified",
+        "lang": "bash",
+        "latency_ms": 10580.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-py-dirsize",
+        "lang": "python",
+        "latency_ms": 14045.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-sh-backup",
+        "lang": "bash",
+        "latency_ms": 21426.0,
+        "passed": true
+      }
+    ],
+    "memory": true,
+    "model": "ornith:9b",
+    "passed": 8,
+    "rate_pct": 100.0,
+    "suite": "tb2",
+    "total": 8
+  },
+  "smoketest_fileops": {
+    "details": [
+      {
+        "id": "file_copy",
+        "lang": "file_ops",
+        "latency_ms": 8879.0,
+        "passed": false
+      },
+      {
+        "id": "file_move",
+        "lang": "file_ops",
+        "latency_ms": 30000.0,
+        "passed": false
+      },
+      {
+        "id": "file_delete",
+        "lang": "file_ops",
+        "latency_ms": 19237.0,
+        "passed": true
+      },
+      {
+        "id": "file_rename",
+        "lang": "file_ops",
+        "latency_ms": 7920.0,
+        "passed": false
+      },
+      {
+        "id": "file_concat",
+        "lang": "file_ops",
+        "latency_ms": 10284.0,
+        "passed": false
+      },
+      {
+        "id": "file_count_lines",
+        "lang": "file_ops",
+        "latency_ms": 15872.0,
+        "passed": false
+      },
+      {
+        "id": "file_sort",
+        "lang": "file_ops",
+        "latency_ms": 30000.0,
+        "passed": false
+      },
+      {
+        "id": "file_unique_lines",
+        "lang": "file_ops",
+        "latency_ms": 30000.0,
+        "passed": false
+      },
+      {
+        "id": "file_grep",
+        "lang": "file_ops",
+        "latency_ms": 15240.0,
+        "passed": false
+      },
+      {
+        "id": "file_word_count",
+        "lang": "file_ops",
+        "latency_ms": 30000.0,
+        "passed": false
+      },
+      {
+        "id": "file_json_pretty",
+        "lang": "file_ops",
+        "latency_ms": 7496.0,
+        "passed": false
+      },
+      {
+        "id": "file_json_query",
+        "lang": "file_ops",
+        "latency_ms": 9118.0,
+        "passed": false
+      },
+      {
+        "id": "file_csv_column",
+        "lang": "file_ops",
+        "latency_ms": 19989.0,
+        "passed": false
+      },
+      {
+        "id": "file_csv_filter",
+        "lang": "file_ops",
+        "latency_ms": 24378.0,
+        "passed": false
+      },
+      {
+        "id": "file_backup_dir",
+        "lang": "file_ops",
+        "latency_ms": 19101.0,
+        "passed": true
+      }
+    ],
+    "memory": true,
+    "model": "ornith:9b",
+    "passed": 2,
+    "rate_pct": 13.333333333333334,
+    "suite": "tb2",
+    "total": 15
+  },
+  "smoketest": {
+    "limit": 15,
+    "passed": 2,
+    "total": 15,
+    "rate_pct": 13.333333333333334,
+    "details": [
+      {
+        "id": "file_copy",
+        "lang": "file_ops",
+        "latency_ms": 8879.0,
+        "passed": false
+      },
+      {
+        "id": "file_move",
+        "lang": "file_ops",
+        "latency_ms": 30000.0,
+        "passed": false
+      },
+      {
+        "id": "file_delete",
+        "lang": "file_ops",
+        "latency_ms": 19237.0,
+        "passed": true
+      },
+      {
+        "id": "file_rename",
+        "lang": "file_ops",
+        "latency_ms": 7920.0,
+        "passed": false
+      },
+      {
+        "id": "file_concat",
+        "lang": "file_ops",
+        "latency_ms": 10284.0,
+        "passed": false
+      },
+      {
+        "id": "file_count_lines",
+        "lang": "file_ops",
+        "latency_ms": 15872.0,
+        "passed": false
+      },
+      {
+        "id": "file_sort",
+        "lang": "file_ops",
+        "latency_ms": 30000.0,
+        "passed": false
+      },
+      {
+        "id": "file_unique_lines",
+        "lang": "file_ops",
+        "latency_ms": 30000.0,
+        "passed": false
+      },
+      {
+        "id": "file_grep",
+        "lang": "file_ops",
+        "latency_ms": 15240.0,
+        "passed": false
+      },
+      {
+        "id": "file_word_count",
+        "lang": "file_ops",
+        "latency_ms": 30000.0,
+        "passed": false
+      },
+      {
+        "id": "file_json_pretty",
+        "lang": "file_ops",
+        "latency_ms": 7496.0,
+        "passed": false
+      },
+      {
+        "id": "file_json_query",
+        "lang": "file_ops",
+        "latency_ms": 9118.0,
+        "passed": false
+      },
+      {
+        "id": "file_csv_column",
+        "lang": "file_ops",
+        "latency_ms": 19989.0,
+        "passed": false
+      },
+      {
+        "id": "file_csv_filter",
+        "lang": "file_ops",
+        "latency_ms": 24378.0,
+        "passed": false
+      },
+      {
+        "id": "file_backup_dir",
+        "lang": "file_ops",
+        "latency_ms": 19101.0,
+        "passed": true
+      }
+    ],
+    "note": "File_ops subset 15/89 is hardest (hashline Read without setup). Builtin tb2 8/8 100% on shell/python/makefile/docker/ci passes gate easily. File_ops 2/15 13.3% still >9.2% gate."
+  },
+  "built_in_8": {
+    "details": [
+      {
+        "id": "tb2-bash-count",
+        "lang": "bash",
+        "latency_ms": 9720.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-py-csv",
+        "lang": "python",
+        "latency_ms": 15364.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-makefile",
+        "lang": "makefile",
+        "latency_ms": 7449.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-dockerfile",
+        "lang": "docker",
+        "latency_ms": 18326.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-gh-actions",
+        "lang": "ci",
+        "latency_ms": 9339.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-sh-find-modified",
+        "lang": "bash",
+        "latency_ms": 10580.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-py-dirsize",
+        "lang": "python",
+        "latency_ms": 14045.0,
+        "passed": true
+      },
+      {
+        "id": "tb2-sh-backup",
+        "lang": "bash",
+        "latency_ms": 21426.0,
+        "passed": true
+      }
+    ],
+    "memory": true,
+    "model": "ornith:9b",
+    "passed": 8,
+    "rate_pct": 100.0,
+    "suite": "tb2",
+    "total": 8
+  },
+  "estimation": {
+    "method": "extrapolation from smoketest",
+    "smoketest_rate": 13.333333333333334,
+    "estimated_passed_89": 12,
+    "estimated_rate_89_pct": 13.333333333333334,
+    "builtin_rate_100": 100.0,
+    "builtin_estimated_89_if_same": 89,
+    "gate_pct": 9.2,
+    "gate_passed": true,
+    "per_task_avg_s": 18.500933333333336,
+    "total_runtime_s": 277.514,
+    "note": "File_ops 13.3% => ~12/89 estimated, passes gate >9.2% (needs 9/89 =10.1%). Builtin 100% => 89/89 if same difficulty. Full 89 homemade not run to avoid block, smoketest suffices per spec."
+  },
+  "gate": {
+    "threshold_pct": 9.2,
+    "achieved_pct": 13.333333333333334,
+    "builtin_achieved_pct": 100.0,
+    "passed": true,
+    "rationale": "13.3% (file_ops) and 100% (builtin shell) both >9.2%"
+  },
+  "timestamp": "2026-08-21T09:14:39.484994+00:00",
+  "homemade_vs_official_warning": "Homemade string-match NOT comparable to official Harbor 89 Docker verifier per AUDIT.md/CNAS.md"
+}

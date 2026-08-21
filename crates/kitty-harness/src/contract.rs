@@ -130,7 +130,12 @@ impl Contract {
     pub fn blockers(&self) -> Vec<&Assertion> {
         self.assertions
             .iter()
-            .filter(|a| matches!(a.status, AssertionStatus::Pending | AssertionStatus::Failed(_)))
+            .filter(|a| {
+                matches!(
+                    a.status,
+                    AssertionStatus::Pending | AssertionStatus::Failed(_)
+                )
+            })
             .collect()
     }
 
@@ -160,7 +165,10 @@ impl Contract {
                 AssertionStatus::Skipped => "Skipped".to_string(),
                 AssertionStatus::Failed(reason) => format!("Failed: {reason}"),
             };
-            out.push_str(&format!("- {mark} **{}** — {} _({})_\n", a.id, a.description, status_str));
+            out.push_str(&format!(
+                "- {mark} **{}** — {} _({})_\n",
+                a.id, a.description, status_str
+            ));
             match &a.check {
                 AssertionCheck::FileExists(p) => {
                     out.push_str(&format!("  - check: FileExists({p})\n"));
@@ -342,7 +350,10 @@ mod tests {
         assert!(looks_like_done_claim("Successfully completed"));
         // ready variants
         assert!(looks_like_done_claim("ready to ship"));
-        assert!(looks_like_done_claim("ready for review"), "ready for review");
+        assert!(
+            looks_like_done_claim("ready for review"),
+            "ready for review"
+        );
         assert!(looks_like_done_claim("Ready to merge"));
         // everything / all
         assert!(looks_like_done_claim("everything is done"));
@@ -359,8 +370,14 @@ mod tests {
         assert!(!looks_like_done_claim("   "), "whitespace");
         // question should be skipped
         assert!(!looks_like_done_claim("done?"), "question");
-        assert!(!looks_like_done_claim("Is this done?"), "question with done");
-        assert!(!looks_like_done_claim("Are we done?  "), "question with spaces");
+        assert!(
+            !looks_like_done_claim("Is this done?"),
+            "question with done"
+        );
+        assert!(
+            !looks_like_done_claim("Are we done?  "),
+            "question with spaces"
+        );
         // similar but not matching ready for review question
         assert!(!looks_like_done_claim("ready for review?"));
         // random words
@@ -379,10 +396,16 @@ mod tests {
     #[test]
     fn to_markdown_contains_id_and_assertions() {
         let mut c = Contract::new("md-test");
-        c.add_assertion(AssertionCheck::FileContains("src/main.rs".into(), "fn main".into()));
+        c.add_assertion(AssertionCheck::FileContains(
+            "src/main.rs".into(),
+            "fn main".into(),
+        ));
         c.mark_passed("a01");
         let md = c.to_markdown();
-        assert!(md.contains("md-test"), "markdown should contain contract id");
+        assert!(
+            md.contains("md-test"),
+            "markdown should contain contract id"
+        );
         assert!(md.contains("a01"), "markdown should contain assertion id");
         assert!(md.contains("Passed"), "markdown should contain status");
     }
@@ -396,7 +419,10 @@ mod tests {
         let mut c2 = Contract::new("ret2");
         let a2 = c2.add_assertion(AssertionCheck::FileExists("x".into()));
         assert!(c2.mark_failed(&a2, "reason"));
-        assert_eq!(c2.assertions[0].status, AssertionStatus::Failed("reason".into()));
+        assert_eq!(
+            c2.assertions[0].status,
+            AssertionStatus::Failed("reason".into())
+        );
         assert!(!c2.mark_failed("ghost", "x"));
     }
 
@@ -406,7 +432,10 @@ mod tests {
         let id1 = c.add_assertion(AssertionCheck::FileExists("foo.txt".into()));
         assert_eq!(id1, "a01");
         assert_eq!(c.assertions[0].description, "File exists: foo.txt");
-        let id2 = c.add_assertion(AssertionCheck::FileContains("bar.rs".into(), "hello".into()));
+        let id2 = c.add_assertion(AssertionCheck::FileContains(
+            "bar.rs".into(),
+            "hello".into(),
+        ));
         assert_eq!(id2, "a02");
         assert!(c.assertions[1].description.contains("bar.rs"));
         let id3 = c.add_assertion(AssertionCheck::CommandSucceeds("make".into()));

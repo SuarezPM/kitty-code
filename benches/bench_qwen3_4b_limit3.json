@@ -1,0 +1,28 @@
+{
+  "details": [
+    {
+      "id": "py-fibonacci",
+      "lang": "python",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "py-bubble_sort",
+      "lang": "python",
+      "latency_ms": 29987.0,
+      "passed": true
+    },
+    {
+      "id": "py-quick_sort",
+      "lang": "python",
+      "latency_ms": 25390.0,
+      "passed": true
+    }
+  ],
+  "memory": false,
+  "model": "qwen3:4b",
+  "passed": 2,
+  "rate_pct": 66.66666666666667,
+  "suite": "polyglot",
+  "total": 3
+}

@@ -1,0 +1,58 @@
+{
+  "details": [
+    {
+      "id": "tb2-bash-count",
+      "lang": "bash",
+      "latency_ms": 9720.0,
+      "passed": true
+    },
+    {
+      "id": "tb2-py-csv",
+      "lang": "python",
+      "latency_ms": 15364.0,
+      "passed": true
+    },
+    {
+      "id": "tb2-makefile",
+      "lang": "makefile",
+      "latency_ms": 7449.0,
+      "passed": true
+    },
+    {
+      "id": "tb2-dockerfile",
+      "lang": "docker",
+      "latency_ms": 18326.0,
+      "passed": true
+    },
+    {
+      "id": "tb2-gh-actions",
+      "lang": "ci",
+      "latency_ms": 9339.0,
+      "passed": true
+    },
+    {
+      "id": "tb2-sh-find-modified",
+      "lang": "bash",
+      "latency_ms": 10580.0,
+      "passed": true
+    },
+    {
+      "id": "tb2-py-dirsize",
+      "lang": "python",
+      "latency_ms": 14045.0,
+      "passed": true
+    },
+    {
+      "id": "tb2-sh-backup",
+      "lang": "bash",
+      "latency_ms": 21426.0,
+      "passed": true
+    }
+  ],
+  "memory": true,
+  "model": "ornith:9b",
+  "passed": 8,
+  "rate_pct": 100.0,
+  "suite": "tb2",
+  "total": 8
+}

@@ -19,6 +19,11 @@ hex.workspace = true
 glob.workspace = true
 ignore.workspace = true
 regex.workspace = true
+toml = "0.8"
+
+[features]
+default = []
+embedding = ["kitty-memory/embedding"]
 
 [dev-dependencies]
 tempfile.workspace = true

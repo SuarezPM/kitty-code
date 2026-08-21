@@ -110,13 +110,13 @@ impl ToolRegistry {
 
     /// Execute a Read tool call.
     fn execute_read(&mut self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArgs {
-                tool: "Read".to_string(),
-                reason: "missing 'path'".to_string(),
-            })?;
+        let path =
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidArgs {
+                    tool: "Read".to_string(),
+                    reason: "missing 'path'".to_string(),
+                })?;
 
         let path_buf = PathBuf::from(path);
 
@@ -158,31 +158,34 @@ impl ToolRegistry {
 
     /// Execute an Edit tool call (hashline-based).
     fn execute_edit(&mut self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArgs {
-                tool: "Edit".to_string(),
-                reason: "missing 'path'".to_string(),
-            })?;
+        let path =
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidArgs {
+                    tool: "Edit".to_string(),
+                    reason: "missing 'path'".to_string(),
+                })?;
 
-        let old_hash = args
-            .get("hash")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArgs {
-                tool: "Edit".to_string(),
-                reason: "missing 'hash' (use line hash from Read output)".to_string(),
-            })?;
+        let old_hash =
+            args.get("hash")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidArgs {
+                    tool: "Edit".to_string(),
+                    reason: "missing 'hash' (use line hash from Read output)".to_string(),
+                })?;
 
-        let new_content = args
-            .get("new")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArgs {
-                tool: "Edit".to_string(),
-                reason: "missing 'new' content".to_string(),
-            })?;
+        let new_content =
+            args.get("new")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidArgs {
+                    tool: "Edit".to_string(),
+                    reason: "missing 'new' content".to_string(),
+                })?;
 
-        let line_num = args.get("line").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let line_num = args
+            .get("line")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
 
         let path_buf = PathBuf::from(path);
 
@@ -289,13 +292,13 @@ impl ToolRegistry {
 
     /// Execute a Write tool call.
     fn execute_write(&mut self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArgs {
-                tool: "Write".to_string(),
-                reason: "missing 'path'".to_string(),
-            })?;
+        let path =
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidArgs {
+                    tool: "Write".to_string(),
+                    reason: "missing 'path'".to_string(),
+                })?;
 
         let content = args
             .get("content")
@@ -475,10 +478,7 @@ impl ToolRegistry {
                 reason: "missing 'pattern'".to_string(),
             })?;
 
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
         let include = args.get("include").and_then(|v| v.as_str());
 
@@ -760,7 +760,11 @@ mod tests {
         let args = serde_json::json!({"command": "sleep 10"});
         let result = registry.execute_bash(&args).await.unwrap();
         assert!(!result.success);
-        assert!(result.output.contains("timed out"), "got: {}", result.output);
+        assert!(
+            result.output.contains("timed out"),
+            "got: {}",
+            result.output
+        );
         assert!(!result.retry);
     }
 
@@ -808,7 +812,9 @@ mod tests {
             result.output
         );
         assert!(
-            result.output.contains("use Grep to search specific content"),
+            result
+                .output
+                .contains("use Grep to search specific content"),
             "got: {}",
             result.output
         );
@@ -883,7 +889,13 @@ mod tests {
         // Extract hash from first line
         let first_line = read_res.output.lines().next().unwrap();
         // Format is "1:HASH|content"
-        let hash = first_line.split(':').nth(1).unwrap().split('|').next().unwrap();
+        let hash = first_line
+            .split(':')
+            .nth(1)
+            .unwrap()
+            .split('|')
+            .next()
+            .unwrap();
         let edit_args = serde_json::json!({
             "path": f.path().to_str().unwrap(),
             "hash": hash,
@@ -919,7 +931,17 @@ mod tests {
         // Now edit without explicit Read — should succeed because Write populated snapshot
         let read_args = serde_json::json!({"path": path.to_str().unwrap()});
         let read_res = registry.execute_read(&read_args).unwrap();
-        let hash = read_res.output.lines().next().unwrap().split(':').nth(1).unwrap().split('|').next().unwrap();
+        let hash = read_res
+            .output
+            .lines()
+            .next()
+            .unwrap()
+            .split(':')
+            .nth(1)
+            .unwrap()
+            .split('|')
+            .next()
+            .unwrap();
         let edit_args = serde_json::json!({
             "path": path.to_str().unwrap(),
             "hash": hash,
@@ -935,7 +957,10 @@ mod tests {
         let args = serde_json::json!({"command": "cat > /tmp/evil.txt"});
         let err = registry.execute_bash(&args).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("do not redirect") || msg.contains("Write"), "got: {msg}");
+        assert!(
+            msg.contains("do not redirect") || msg.contains("Write"),
+            "got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -943,7 +968,11 @@ mod tests {
         let registry = ToolRegistry::new();
         let args = serde_json::json!({"command": "echo hi > /dev/null"});
         let result = registry.execute_bash(&args).await.unwrap();
-        assert!(result.success || !result.output.contains("blocked"), "should allow /dev/null, got: {:?}", result);
+        assert!(
+            result.success || !result.output.contains("blocked"),
+            "should allow /dev/null, got: {:?}",
+            result
+        );
         // If it blocks, it's a failure — but /dev/null should be allowed
         // Verify no BashBlocked error was thrown
     }

@@ -54,17 +54,9 @@ impl ProjectType {
                 "cargo test".to_string(),
                 "cargo clippy".to_string(),
             ],
-            ProjectType::Node => vec![
-                "npm run build".to_string(),
-                "npm test".to_string(),
-            ],
-            ProjectType::Python => vec![
-                "pytest".to_string(),
-            ],
-            ProjectType::Go => vec![
-                "go build ./...".to_string(),
-                "go test ./...".to_string(),
-            ],
+            ProjectType::Node => vec!["npm run build".to_string(), "npm test".to_string()],
+            ProjectType::Python => vec!["pytest".to_string()],
+            ProjectType::Go => vec!["go build ./...".to_string(), "go test ./...".to_string()],
         }
     }
 }
@@ -145,10 +137,7 @@ impl Bootstrap {
 
     /// Execute the test command for the detected project type.
     pub fn execute_test(&self) -> Result<String, BootstrapError> {
-        let result = self
-            .cached
-            .as_ref()
-            .ok_or(BootstrapError::NoTestCommand)?;
+        let result = self.cached.as_ref().ok_or(BootstrapError::NoTestCommand)?;
 
         let cmd = result
             .test_command

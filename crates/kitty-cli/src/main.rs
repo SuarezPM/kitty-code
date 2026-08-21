@@ -8,8 +8,8 @@ mod mcp;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kitty_harness::agent::{Agent, AgentConfig};
-use kitty_harness::tools::standard_tool_definitions;
 use kitty_harness::knowledge::KnowledgeConfig;
+use kitty_harness::tools::standard_tool_definitions;
 use kitty_harness::ModelProfile;
 use kitty_memory::{Episode, EpisodeStore};
 use kitty_runtime::OllamaClient;
@@ -67,6 +67,14 @@ pub struct Cli {
     /// Model profile preset: tiny|medium|large (default: medium)
     #[arg(long, global = true, default_value = "medium", value_parser = clap::builder::PossibleValuesParser::new(["tiny", "medium", "large"]))]
     pub profile: String,
+
+    /// Enable semantic memory (hybrid BM25+embedding RRF, medium/large only)
+    #[arg(long, global = true)]
+    pub semantic_memory: bool,
+
+    /// Enable cloud fallback on failure (requires KITTY_CLOUD_API_KEY)
+    #[arg(long, global = true)]
+    pub cloud_fallback: bool,
 }
 
 #[derive(Subcommand)]
@@ -175,6 +183,20 @@ async fn main() -> Result<()> {
             if cli.bash_timeout != 60 {
                 agent.config_mut().bash_timeout_secs = cli.bash_timeout;
             }
+            if cli.semantic_memory {
+                if cli.profile == "tiny" {
+                    warn!("--semantic-memory requires medium/large profile, ignoring for tiny");
+                } else {
+                    warn!("--semantic-memory enabled (hybrid BM25+embedding RRF)");
+                }
+            }
+            if cli.cloud_fallback {
+                if std::env::var("KITTY_CLOUD_API_KEY").is_ok() {
+                    warn!("--cloud-fallback enabled");
+                } else {
+                    warn!("--cloud-fallback enabled but KITTY_CLOUD_API_KEY not set, fallback will warn and be skipped");
+                }
+            }
 
             println!("Model: {}", cli.model);
             println!("Prompt: {}", prompt);
@@ -216,7 +238,11 @@ async fn main() -> Result<()> {
 
             // Gate 2 tuning: bench uses max_iterations=5 for sub-20s smoke (default 20 remains for `run`).
             // If CLI left default 20, bench overrides to 5; explicit CLI value is respected.
-            let bench_max_iterations = if cli.max_iterations == 20 { 5 } else { cli.max_iterations };
+            let bench_max_iterations = if cli.max_iterations == 20 {
+                5
+            } else {
+                cli.max_iterations
+            };
             let is_small_model = is_small_model(&cli.profile, &cli.model);
             let effective_no_memory = no_memory || is_small_model;
             if is_small_model && !no_memory {
@@ -240,10 +266,23 @@ async fn main() -> Result<()> {
             println!("Kitty Code Benchmark");
             println!("  Model: {}", cli.model);
             println!("  Suite: {} (limit: {})", suite, limit);
-            println!("  Memory: {}", if effective_no_memory { "off" } else { "on" });
-            println!("  Knowledge: {}", if cli.knowledge { format!("on ({})", cli.knowledge_dir) } else { "off (use --knowledge to enable, 5 cards)".to_string() });
+            println!(
+                "  Memory: {}",
+                if effective_no_memory { "off" } else { "on" }
+            );
+            println!(
+                "  Knowledge: {}",
+                if cli.knowledge {
+                    format!("on ({})", cli.knowledge_dir)
+                } else {
+                    "off (use --knowledge to enable, 5 cards)".to_string()
+                }
+            );
             if bench_max_iterations != cli.max_iterations {
-                println!("  Max iterations: {} (bench override, CLI default 20)", bench_max_iterations);
+                println!(
+                    "  Max iterations: {} (bench override, CLI default 20)",
+                    bench_max_iterations
+                );
             } else {
                 println!("  Max iterations: {}", bench_max_iterations);
             }
@@ -295,7 +334,13 @@ async fn main() -> Result<()> {
                 }
             }
             for (lang, (t, p)) in by_lang.iter() {
-                println!("  {}: {}/{} ({:.0}%)", lang, p, t, 100.0 * *p as f64 / *t as f64);
+                println!(
+                    "  {}: {}/{} ({:.0}%)",
+                    lang,
+                    p,
+                    t,
+                    100.0 * *p as f64 / *t as f64
+                );
             }
 
             let gate = 50.0;
@@ -325,11 +370,12 @@ async fn main() -> Result<()> {
             println!("Results saved to {}", out.display());
             // bench-reproducibility: exit-code 0=pass/improved, 1=gate failed, 2=noise (no significant change)
             let baseline_rate: Option<f64> = std::fs::read_to_string(
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benches/baseline.json"),
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../benches/baseline.json"),
             )
-                .ok()
-                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                .and_then(|v| v.get("rate_pct").and_then(|r| r.as_f64()));
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| v.get("rate_pct").and_then(|r| r.as_f64()));
             let exit_code = bench_exit_code(rate, gate, baseline_rate);
             std::process::exit(exit_code);
         }
@@ -370,7 +416,11 @@ async fn main() -> Result<()> {
             let plan = build_ab_plan(limit, &budgets, reps, interleave);
 
             // Same tuning as `bench`: 5 iterations for sub-20s smoke unless CLI overrides.
-            let bench_max_iterations = if cli.max_iterations == 20 { 5 } else { cli.max_iterations };
+            let bench_max_iterations = if cli.max_iterations == 20 {
+                5
+            } else {
+                cli.max_iterations
+            };
             let is_small_model = is_small_model(&cli.profile, &cli.model);
             let effective_no_memory = is_small_model;
             if is_small_model {
@@ -416,7 +466,13 @@ async fn main() -> Result<()> {
                 let ex = &items[*task_idx % items.len()];
                 let mut cfg = base_cfg.clone();
                 cfg.thinking_budget = *budget;
-                print!("[{:2}/{:2}] budget={:4} task={:2} ", i + 1, plan.len(), budget, task_idx);
+                print!(
+                    "[{:2}/{:2}] budget={:4} task={:2} ",
+                    i + 1,
+                    plan.len(),
+                    budget,
+                    task_idx
+                );
                 let r = run_one_bench(ex, &cfg, store.as_ref()).await?;
                 per_budget.entry(*budget).or_default().push(r);
             }
@@ -453,7 +509,11 @@ async fn main() -> Result<()> {
                     let b = &per_budget_out[j];
                     let a_rate = a["rate"].as_f64().unwrap_or(0.0);
                     let b_rate = b["rate"].as_f64().unwrap_or(0.0);
-                    let winner = if a_rate >= b_rate { a["budget"].clone() } else { b["budget"].clone() };
+                    let winner = if a_rate >= b_rate {
+                        a["budget"].clone()
+                    } else {
+                        b["budget"].clone()
+                    };
                     pairwise.push(serde_json::json!({
                         "a": a["budget"],
                         "b": b["budget"],
@@ -632,12 +692,35 @@ struct BenchItem {
 }
 
 /// Helper to build a BenchItem with a boxed closure.
-fn bench(id: &'static str, label: &'static str, prompt: &'static str, check: impl Fn(&str) -> bool + 'static) -> BenchItem {
-    BenchItem { id, label, prompt, check: Box::new(check), check_file: "solution.py" }
+fn bench(
+    id: &'static str,
+    label: &'static str,
+    prompt: &'static str,
+    check: impl Fn(&str) -> bool + 'static,
+) -> BenchItem {
+    BenchItem {
+        id,
+        label,
+        prompt,
+        check: Box::new(check),
+        check_file: "solution.py",
+    }
 }
 
-fn bench_file(id: &'static str, label: &'static str, prompt: &'static str, check_file: &'static str, check: impl Fn(&str) -> bool + 'static) -> BenchItem {
-    BenchItem { id, label, prompt, check: Box::new(check), check_file }
+fn bench_file(
+    id: &'static str,
+    label: &'static str,
+    prompt: &'static str,
+    check_file: &'static str,
+    check: impl Fn(&str) -> bool + 'static,
+) -> BenchItem {
+    BenchItem {
+        id,
+        label,
+        prompt,
+        check: Box::new(check),
+        check_file,
+    }
 }
 
 fn exercises() -> Vec<BenchItem> {
@@ -685,10 +768,7 @@ struct BenchConfig {
 }
 
 /// Shared benchmark driver used by every exercise set.
-async fn run_bench(
-    items: &[BenchItem],
-    cfg: &BenchConfig,
-) -> Result<Vec<BenchResult>> {
+async fn run_bench(items: &[BenchItem], cfg: &BenchConfig) -> Result<Vec<BenchResult>> {
     let mut results = Vec::new();
 
     let store = if cfg.use_memory {
@@ -727,7 +807,11 @@ async fn run_one_bench(
 
     // Prompt hardening: use real check_file per exercise (fix .py forced for js/ts/rust/go)
     // Gate 2 absolute path prevents CWD contamination.
-    let target_file = if ex.check_file.is_empty() { "solution.py" } else { ex.check_file };
+    let target_file = if ex.check_file.is_empty() {
+        "solution.py"
+    } else {
+        ex.check_file
+    };
     let prompt = format!(
         "{}\n\nWork in directory: {} — Save to {}/{} (use absolute path)",
         ex.prompt, tmpdir_str, tmpdir_str, target_file
@@ -763,17 +847,21 @@ async fn run_one_bench(
     // Ensure compact threshold follows profile (tiny 0.7, medium 0.8, large 0.8)
     agent.config_mut().compact_threshold = cfg.profile.compact_threshold;
     // Re-sync budget threshold from profile (ensures tiny 0.7 vs medium 0.8)
-    agent.budget_mut().set_threshold(cfg.profile.compact_threshold);
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        agent.run(&prompt),
-    ).await;
+    agent
+        .budget_mut()
+        .set_threshold(cfg.profile.compact_threshold);
+    let outcome =
+        tokio::time::timeout(std::time::Duration::from_secs(30), agent.run(&prompt)).await;
 
     // Determine pass/fail and persist an episode for memory.
     let (passed, verdict, latency_ms) = match outcome {
         Ok(Ok(_)) => {
             let passed = (ex.check)(&tmpdir_str);
-            (passed, if passed { "pass" } else { "fail" }, start.elapsed().as_millis() as f64)
+            (
+                passed,
+                if passed { "pass" } else { "fail" },
+                start.elapsed().as_millis() as f64,
+            )
         }
         Ok(Err(e)) => {
             println!(" error: {}", e);
@@ -913,15 +1001,16 @@ mod bench_exit_tests {
 
     #[test]
     fn test_baseline_path_cargo_manifest() {
-        let manifest_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benches/baseline.json");
+        let manifest_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benches/baseline.json");
         assert!(
             manifest_path.exists(),
             "baseline not found via CARGO_MANIFEST_DIR: {} (exists={})",
             manifest_path.display(),
             manifest_path.exists()
         );
-        let content = std::fs::read_to_string(&manifest_path).expect("read baseline via CARGO_MANIFEST_DIR");
+        let content =
+            std::fs::read_to_string(&manifest_path).expect("read baseline via CARGO_MANIFEST_DIR");
         let v: serde_json::Value = serde_json::from_str(&content).expect("parse baseline");
         assert!(v.get("rate_pct").is_some(), "baseline missing rate_pct");
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -960,7 +1049,12 @@ fn parse_thinking_budgets(s: &str) -> anyhow::Result<Vec<usize>> {
     Ok(out)
 }
 
-fn build_ab_plan(limit: usize, budgets: &[usize], reps: usize, interleave: bool) -> Vec<(usize, usize)> {
+fn build_ab_plan(
+    limit: usize,
+    budgets: &[usize],
+    reps: usize,
+    interleave: bool,
+) -> Vec<(usize, usize)> {
     let mut plan = Vec::new();
     let reps = reps.max(1);
     for &budget in budgets {
@@ -971,9 +1065,9 @@ fn build_ab_plan(limit: usize, budgets: &[usize], reps: usize, interleave: bool)
         }
     }
     if interleave {
+        use rand::rngs::StdRng;
         use rand::seq::SliceRandom;
         use rand::SeedableRng;
-        use rand::rngs::StdRng;
         let mut rng = StdRng::seed_from_u64(42);
         plan.shuffle(&mut rng);
     }
@@ -1031,7 +1125,9 @@ mod bench_ab_tests {
         ])
         .expect("parse bench-ab");
         match cli.command {
-            Commands::BenchAb { thinking, limit, .. } => {
+            Commands::BenchAb {
+                thinking, limit, ..
+            } => {
                 assert_eq!(limit, 50);
                 let budgets = parse_thinking_budgets(&thinking).expect("parse budgets");
                 assert_eq!(budgets, vec![1024, 2048, 4096]);
@@ -1050,7 +1146,10 @@ mod bench_ab_tests {
         let plan2 = build_ab_plan(2, &budgets, 1, true);
         assert_eq!(plan, plan2, "shuffled with seed 42 should be deterministic");
         let t4096 = wilson_ci(25, 50);
-        assert!(t4096.0 < 0.5 && t4096.1 > 0.5, "wilson ci should surround p=0.5");
+        assert!(
+            t4096.0 < 0.5 && t4096.1 > 0.5,
+            "wilson ci should surround p=0.5"
+        );
     }
 }
 

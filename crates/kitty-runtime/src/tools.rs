@@ -79,7 +79,11 @@ mod tests {
 
     #[test]
     fn tool_definition_serializes() {
-        let def = ToolDefinition::new("Read", "Read a file", json_params(&[("path", "string", "File path")]));
+        let def = ToolDefinition::new(
+            "Read",
+            "Read a file",
+            json_params(&[("path", "string", "File path")]),
+        );
         let json = serde_json::to_string(&def).unwrap();
         assert!(json.contains("\"name\":\"Read\""));
         assert!(json.contains("\"type\":\"function\""));

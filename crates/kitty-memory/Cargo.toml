@@ -14,6 +14,12 @@ tracing.workspace = true
 blake3.workspace = true
 hex.workspace = true
 rusqlite.workspace = true
+bm25 = { version = "2.3", default-features = false }
+fastembed = { version = "4", optional = true }
+
+[features]
+default = []
+embedding = ["dep:fastembed"]
 
 [dev-dependencies]
 tempfile.workspace = true

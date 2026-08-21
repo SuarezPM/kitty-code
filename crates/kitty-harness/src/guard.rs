@@ -43,8 +43,7 @@ const BLOCKED_PATTERNS: &[&str] = &[
 /// and must be detected as a write (see `detect_write_targets`). `tee` without
 /// args is still Allow via redirect detection (no targets).
 const SAFE_OUTPUT_COMMANDS: &[&str] = &[
-    "echo", "cat", "grep", "printf", "read",
-    "test", "[", "true", "false", "head", "tail", "wc",
+    "echo", "cat", "grep", "printf", "read", "test", "[", "true", "false", "head", "tail", "wc",
     "sort", "uniq", "cut", "tr",
 ];
 
@@ -54,11 +53,34 @@ const SAFE_OUTPUT_COMMANDS: &[&str] = &[
 /// would otherwise hide it (e.g. `sh -c 'rm -rf /'` or
 /// `awk 'BEGIN{system("rm -rf /")}'`).
 const INTERPRETERS: &[&str] = &[
-    "sh", "bash", "dash", "ash", "zsh", "ksh", "csh", "tcsh", "fish",
-    "python", "python3", "python2", "perl", "ruby", "node", "lua",
-    "php", "pwsh", "powershell", "cmd", "awk",
+    "sh",
+    "bash",
+    "dash",
+    "ash",
+    "zsh",
+    "ksh",
+    "csh",
+    "tcsh",
+    "fish",
+    "python",
+    "python3",
+    "python2",
+    "perl",
+    "ruby",
+    "node",
+    "lua",
+    "php",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "awk",
     // These guys also execute their arguments, so they get the raw scan too:
-    "source", ".", "env", "xargs", "timeout", "nohup",
+    "source",
+    ".",
+    "env",
+    "xargs",
+    "timeout",
+    "nohup",
 ];
 
 /// Commands that are *always* blocked, no matter the arguments.
@@ -108,7 +130,9 @@ fn strip_quotes(cmd: &str) -> String {
                 while i < bytes.len() && bytes[i] != b'\'' {
                     i += 1;
                 }
-                if i < bytes.len() { i += 1; } // skip closing quote
+                if i < bytes.len() {
+                    i += 1;
+                } // skip closing quote
             }
             b'"' => {
                 // Double quote: backslash escapes next char
@@ -120,7 +144,9 @@ fn strip_quotes(cmd: &str) -> String {
                         i += 1;
                     }
                 }
-                if i < bytes.len() { i += 1; } // skip closing quote
+                if i < bytes.len() {
+                    i += 1;
+                } // skip closing quote
             }
             _ => {
                 result.push(bytes[i] as char);
@@ -279,7 +305,9 @@ pub fn strip_heredoc_bodies(cmd: &str) -> String {
             let start = idx;
             if start < bytes.len() && (bytes[start].is_ascii_alphabetic() || bytes[start] == b'_') {
                 idx += 1;
-                while idx < bytes.len() && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_') {
+                while idx < bytes.len()
+                    && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_')
+                {
                     idx += 1;
                 }
                 delim = out[start..idx].to_string();
@@ -542,7 +570,7 @@ pub fn split_words(s: &str) -> Vec<String> {
             continue;
         }
         // Unquoted redirect ends current word (`cat>f` is two words)
-        if quote.is_none() && (b == b'>' || b == b'<' ) {
+        if quote.is_none() && (b == b'>' || b == b'<') {
             if !cur.is_empty() {
                 words.push(cur.clone());
                 cur.clear();
@@ -604,7 +632,11 @@ pub fn extract_redirect_targets(segment: &str) -> Vec<String> {
     while i < len {
         let b = bytes[i];
         if quote.is_none() && b == b'\\' {
-            if i + 1 < len { i += 2; } else { i += 1; }
+            if i + 1 < len {
+                i += 2;
+            } else {
+                i += 1;
+            }
             continue;
         }
         if quote == Some(b'\'') && b == b'\\' {
@@ -701,7 +733,9 @@ pub fn extract_tee_targets(segment: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
     for t in out {
-        if seen.contains(&t) { continue; }
+        if seen.contains(&t) {
+            continue;
+        }
         seen.insert(t.clone());
         deduped.push(t);
     }
@@ -736,7 +770,9 @@ pub fn extract_dd_targets(segment: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
     for t in out {
-        if seen.contains(&t) { continue; }
+        if seen.contains(&t) {
+            continue;
+        }
         seen.insert(t.clone());
         deduped.push(t);
     }
@@ -1013,21 +1049,33 @@ mod tests {
     fn echo_quoted_dangerous_not_blocked() {
         // Arguments to echo are just strings, not executed
         assert_eq!(Guard::check_command("echo 'rm -rf /'"), GuardVerdict::Allow);
-        assert_eq!(Guard::check_command("echo \"rm -rf /\""), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("echo \"rm -rf /\""),
+            GuardVerdict::Allow
+        );
     }
 
     #[test]
     fn cat_quoted_dangerous_not_blocked() {
         // cat's arguments are file paths / strings, not executed
         assert_eq!(Guard::check_command("cat 'rm -rf /'"), GuardVerdict::Allow);
-        assert_eq!(Guard::check_command("cat \"rm -rf /\""), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("cat \"rm -rf /\""),
+            GuardVerdict::Allow
+        );
     }
 
     #[test]
     fn grep_quoted_dangerous_not_blocked() {
         // grep's arguments are patterns, not executed
-        assert_eq!(Guard::check_command("grep 'rm -rf' file.txt"), GuardVerdict::Allow);
-        assert_eq!(Guard::check_command("grep \"rm -rf\" file.txt"), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("grep 'rm -rf' file.txt"),
+            GuardVerdict::Allow
+        );
+        assert_eq!(
+            Guard::check_command("grep \"rm -rf\" file.txt"),
+            GuardVerdict::Allow
+        );
     }
 
     #[test]
@@ -1038,7 +1086,10 @@ mod tests {
 
     #[test]
     fn sed_quoted_dangerous_not_blocked() {
-        assert_eq!(Guard::check_command("sed 's/rm -rf/foo/' file"), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("sed 's/rm -rf/foo/' file"),
+            GuardVerdict::Allow
+        );
     }
 
     #[test]
@@ -1073,8 +1124,14 @@ mod tests {
 
     #[test]
     fn benign_interpreter_commands_still_allowed() {
-        assert_eq!(Guard::check_command("python3 build.py"), GuardVerdict::Allow);
-        assert_eq!(Guard::check_command("sh -c 'cargo build'"), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("python3 build.py"),
+            GuardVerdict::Allow
+        );
+        assert_eq!(
+            Guard::check_command("sh -c 'cargo build'"),
+            GuardVerdict::Allow
+        );
         assert_eq!(Guard::check_command("node index.js"), GuardVerdict::Allow);
     }
 
@@ -1197,10 +1254,7 @@ mod tests {
             Guard::check_command("echo \"cost: $5\""),
             GuardVerdict::Allow
         );
-        assert_eq!(
-            Guard::check_command("echo $HOME/path"),
-            GuardVerdict::Allow
-        );
+        assert_eq!(Guard::check_command("echo $HOME/path"), GuardVerdict::Allow);
     }
 
     #[test]
@@ -1257,7 +1311,9 @@ mod tests {
     #[test]
     fn redirect_cat_to_file_blocked() {
         match Guard::check_command("cat > file.txt") {
-            GuardVerdict::Block(msg) => assert!(msg.contains("do not redirect") || msg.contains("Write")),
+            GuardVerdict::Block(msg) => {
+                assert!(msg.contains("do not redirect") || msg.contains("Write"))
+            }
             other => panic!("Expected Block for cat > file, got {other:?}"),
         }
         assert!(is_write_via_redirect("cat > file.txt"));
@@ -1288,7 +1344,10 @@ mod tests {
             GuardVerdict::Block(_) => {}
             other => panic!("Expected Block for tee out.log, got {other:?}"),
         }
-        assert_eq!(detect_write_targets("echo x | tee -a out.log"), vec!["out.log"]);
+        assert_eq!(
+            detect_write_targets("echo x | tee -a out.log"),
+            vec!["out.log"]
+        );
     }
 
     #[test]
@@ -1300,29 +1359,47 @@ mod tests {
 
     #[test]
     fn tee_to_dev_null_allowed() {
-        assert_eq!(Guard::check_command("echo x | tee /dev/null"), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("echo x | tee /dev/null"),
+            GuardVerdict::Allow
+        );
         assert!(!is_write_via_redirect("echo x | tee /dev/null"));
     }
 
     #[test]
     fn redirect_to_dev_null_allowed() {
         assert_eq!(Guard::check_command("cat > /dev/null"), GuardVerdict::Allow);
-        assert_eq!(Guard::check_command("cmd > /dev/null 2>&1"), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("cmd > /dev/null 2>&1"),
+            GuardVerdict::Allow
+        );
         assert!(!is_write_via_redirect("cat > /dev/null"));
         assert!(!is_write_via_redirect("cmd > /dev/null 2>&1"));
     }
 
     #[test]
     fn redirect_stderr_to_dev_null_allowed() {
-        assert_eq!(Guard::check_command("grep -ri \"x\" ~/.config/ 2>/dev/null"), GuardVerdict::Allow);
-        assert_eq!(Guard::check_command("make 2>/dev/null"), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("grep -ri \"x\" ~/.config/ 2>/dev/null"),
+            GuardVerdict::Allow
+        );
+        assert_eq!(
+            Guard::check_command("make 2>/dev/null"),
+            GuardVerdict::Allow
+        );
         assert!(!is_write_via_redirect("make 2>/dev/null"));
     }
 
     #[test]
     fn redirect_to_dev_stdout_allowed() {
-        assert_eq!(Guard::check_command("cmd > /dev/stdout"), GuardVerdict::Allow);
-        assert_eq!(Guard::check_command("cmd 2> /dev/stderr"), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("cmd > /dev/stdout"),
+            GuardVerdict::Allow
+        );
+        assert_eq!(
+            Guard::check_command("cmd 2> /dev/stderr"),
+            GuardVerdict::Allow
+        );
         assert!(!is_write_via_redirect("cmd > /dev/stdout"));
     }
 
@@ -1335,7 +1412,10 @@ mod tests {
 
     #[test]
     fn tar_czf_still_allowed() {
-        assert_eq!(Guard::check_command("tar -czf backup.tar.gz dir/"), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("tar -czf backup.tar.gz dir/"),
+            GuardVerdict::Allow
+        );
         assert!(!is_write_via_redirect("tar -czf backup.tar.gz dir/"));
     }
 
@@ -1354,7 +1434,10 @@ mod tests {
 
     #[test]
     fn heredoc_body_not_split_as_commands() {
-        assert_eq!(split_command_chain("cat > f.sh << 'EOF'\nrm -rf /\nEOF"), vec!["cat > f.sh"]);
+        assert_eq!(
+            split_command_chain("cat > f.sh << 'EOF'\nrm -rf /\nEOF"),
+            vec!["cat > f.sh"]
+        );
     }
 
     #[test]
@@ -1367,7 +1450,10 @@ mod tests {
 
     #[test]
     fn dd_of_file_blocked() {
-        assert_eq!(detect_write_targets("dd if=/dev/zero of=disk.img bs=1M"), vec!["disk.img"]);
+        assert_eq!(
+            detect_write_targets("dd if=/dev/zero of=disk.img bs=1M"),
+            vec!["disk.img"]
+        );
         match Guard::check_command("dd if=/dev/zero of=disk.img bs=1M") {
             GuardVerdict::Block(_) => {}
             other => panic!("Expected Block for dd of=, got {other:?}"),
@@ -1376,29 +1462,56 @@ mod tests {
 
     #[test]
     fn dd_of_dev_null_allowed() {
-        assert_eq!(detect_write_targets("dd if=big.img of=/dev/null"), Vec::<String>::new());
-        assert_eq!(Guard::check_command("dd if=big.img of=/dev/null"), GuardVerdict::Allow);
+        assert_eq!(
+            detect_write_targets("dd if=big.img of=/dev/null"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            Guard::check_command("dd if=big.img of=/dev/null"),
+            GuardVerdict::Allow
+        );
     }
 
     #[test]
     fn dd_if_dev_null_not_blocked() {
         // Refined dd if= : benign input should not be blocked
-        assert_eq!(Guard::check_command("dd if=/dev/null of=/dev/null"), GuardVerdict::Allow);
-        assert_eq!(Guard::check_command("dd if=/dev/null bs=1 count=1"), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("dd if=/dev/null of=/dev/null"),
+            GuardVerdict::Allow
+        );
+        assert_eq!(
+            Guard::check_command("dd if=/dev/null bs=1 count=1"),
+            GuardVerdict::Allow
+        );
     }
 
     #[test]
     fn redirect_inside_quotes_not_flagged() {
-        assert_eq!(detect_write_targets("grep \"a > b\" file.txt"), Vec::<String>::new());
+        assert_eq!(
+            detect_write_targets("grep \"a > b\" file.txt"),
+            Vec::<String>::new()
+        );
         assert_eq!(detect_write_targets("echo 'x >> y'"), Vec::<String>::new());
-        assert_eq!(Guard::check_command("grep \"a > b\" file.txt"), GuardVerdict::Allow);
+        assert_eq!(
+            Guard::check_command("grep \"a > b\" file.txt"),
+            GuardVerdict::Allow
+        );
     }
 
     #[test]
     fn input_redirect_not_flagged() {
-        assert_eq!(detect_write_targets("wc -l < input.txt"), Vec::<String>::new());
-        assert_eq!(detect_write_targets("grep foo <<< \"$var\""), Vec::<String>::new());
-        assert_eq!(Guard::check_command("wc -l < input.txt"), GuardVerdict::Allow);
+        assert_eq!(
+            detect_write_targets("wc -l < input.txt"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            detect_write_targets("grep foo <<< \"$var\""),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            Guard::check_command("wc -l < input.txt"),
+            GuardVerdict::Allow
+        );
     }
 
     #[test]
@@ -1413,8 +1526,14 @@ mod tests {
     #[test]
     fn extract_redirect_targets_works() {
         assert_eq!(extract_redirect_targets("cat > file.txt"), vec!["file.txt"]);
-        assert_eq!(extract_redirect_targets("echo hi >> file.txt"), vec!["file.txt"]);
-        assert_eq!(extract_redirect_targets("cmd > /dev/null"), Vec::<String>::new());
+        assert_eq!(
+            extract_redirect_targets("echo hi >> file.txt"),
+            vec!["file.txt"]
+        );
+        assert_eq!(
+            extract_redirect_targets("cmd > /dev/null"),
+            Vec::<String>::new()
+        );
         assert_eq!(extract_redirect_targets("cmd 2>&1"), Vec::<String>::new());
     }
 
@@ -1431,14 +1550,29 @@ mod tests {
 
     #[test]
     fn split_command_chain_quote_aware() {
-        assert_eq!(split_command_chain("echo 'a && b' ; ls"), vec!["echo 'a && b'", "ls"]);
-        assert_eq!(split_command_chain("ls && rm -rf / ; echo done | wc -l"), vec!["ls", "rm -rf /", "echo done", "wc -l"]);
+        assert_eq!(
+            split_command_chain("echo 'a && b' ; ls"),
+            vec!["echo 'a && b'", "ls"]
+        );
+        assert_eq!(
+            split_command_chain("ls && rm -rf / ; echo done | wc -l"),
+            vec!["ls", "rm -rf /", "echo done", "wc -l"]
+        );
     }
 
     #[test]
     fn strip_heredoc_bodies_works() {
-        assert_eq!(strip_heredoc_bodies("cat > f << 'EOF'\nbody\nEOF"), "cat > f ");
-        assert_eq!(strip_heredoc_bodies("cat > f << EOF\nbody without terminator"), "cat > f ");
-        assert_eq!(strip_heredoc_bodies("grep foo <<< \"bar\""), "grep foo <<< \"bar\"");
+        assert_eq!(
+            strip_heredoc_bodies("cat > f << 'EOF'\nbody\nEOF"),
+            "cat > f "
+        );
+        assert_eq!(
+            strip_heredoc_bodies("cat > f << EOF\nbody without terminator"),
+            "cat > f "
+        );
+        assert_eq!(
+            strip_heredoc_bodies("grep foo <<< \"bar\""),
+            "grep foo <<< \"bar\""
+        );
     }
 }

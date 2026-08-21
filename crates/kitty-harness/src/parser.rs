@@ -285,7 +285,8 @@ mod tests {
     #[test]
     fn parse_function_format() {
         let parser = ToolCallParser::new();
-        let input = r#"{"function":{"name":"Edit","arguments":{"path":"a.rs","old":"x","new":"y"}}}"#;
+        let input =
+            r#"{"function":{"name":"Edit","arguments":{"path":"a.rs","old":"x","new":"y"}}}"#;
         let calls = parser.parse(input);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Edit");
@@ -353,7 +354,10 @@ some text here
         let parser = ToolCallParser::new();
         let input = "<tool_call>{not json}</tool_call>";
         let calls = parser.parse(input);
-        assert!(calls.is_empty(), "parse should still return empty for malformed");
+        assert!(
+            calls.is_empty(),
+            "parse should still return empty for malformed"
+        );
 
         let (calls2, diagnostics) = parser.parse_with_diagnostics(input);
         assert!(calls2.is_empty());
@@ -378,7 +382,10 @@ some text here
         let input = r#"<tool_call>{"name":"Read","arguments":{"path":"foo.rs"}}</tool_call>"#;
         let (calls, diagnostics) = parser.parse_with_diagnostics(input);
         assert_eq!(calls.len(), 1);
-        assert!(diagnostics.is_empty(), "valid call should produce no diagnostics");
+        assert!(
+            diagnostics.is_empty(),
+            "valid call should produce no diagnostics"
+        );
         assert!(parser.try_parse_with_error(input).is_ok());
     }
 
@@ -388,7 +395,10 @@ some text here
         let input = "Hello world, this is just plain text without any tool intent.";
         let (calls, diagnostics) = parser.parse_with_diagnostics(input);
         assert!(calls.is_empty());
-        assert!(diagnostics.is_empty(), "plain text should not trigger diagnostic");
+        assert!(
+            diagnostics.is_empty(),
+            "plain text should not trigger diagnostic"
+        );
         assert!(parser.try_parse_with_error(input).is_ok());
         assert!(parser.try_parse_with_error(input).unwrap().is_empty());
     }

@@ -85,11 +85,23 @@ fn def_write() -> &'static CategoryDef {
     static CELL: OnceLock<CategoryDef> = OnceLock::new();
     CELL.get_or_init(|| CategoryDef {
         signals: vec![
-            sig(r"(?i)\b(fix|change|update|modify|edit|refactor|rename|replace|patch)\b", 3.0),
-            sig(r"(?i)\b(add|insert|append|prepend|implement|create|write|make)\b", 2.5),
+            sig(
+                r"(?i)\b(fix|change|update|modify|edit|refactor|rename|replace|patch)\b",
+                3.0,
+            ),
+            sig(
+                r"(?i)\b(add|insert|append|prepend|implement|create|write|make)\b",
+                2.5,
+            ),
             sig(r"(?i)\b(remove|delete|strip|clean\s*up|drop)\b", 2.0),
-            sig(r"(?i)\b(bug|error|typo|issue|broken|wrong|incorrect|failing|fail|crash)\b", 2.0),
-            sig(r"(?i)\b(file|function|class|method|variable|import|export)\b", 1.0),
+            sig(
+                r"(?i)\b(bug|error|typo|issue|broken|wrong|incorrect|failing|fail|crash)\b",
+                2.0,
+            ),
+            sig(
+                r"(?i)\b(file|function|class|method|variable|import|export)\b",
+                1.0,
+            ),
             sig(r"(?i)\b(explain|what|why|how\s+does|tell\s+me)\b", -1.5),
             sig(r"(?i)\b(search|find|grep|look\s+for)\b", -1.5),
         ],
@@ -113,10 +125,16 @@ fn def_run() -> &'static CategoryDef {
         signals: vec![
             sig(r"(?i)\b(run|execute|start|launch|invoke)\b", 3.0),
             sig(r"(?i)\b(tests?|specs?|jest|pytest|mocha|vitest)\b", 3.0),
-            sig(r"(?i)\b(build|compile|make|bundle|webpack|tsc|cargo)\b", 3.0),
+            sig(
+                r"(?i)\b(build|compile|make|bundle|webpack|tsc|cargo)\b",
+                3.0,
+            ),
             sig(r"(?i)\b(install|npm|pip|yarn|pnpm|apt|brew)\b", 2.5),
             sig(r"(?i)\b(lint|format|prettier|eslint|black|ruff)\b", 2.0),
-            sig(r"(?i)\b(git|commit|push|pull|merge|branch|checkout|diff|status)\b", 2.0),
+            sig(
+                r"(?i)\b(git|commit|push|pull|merge|branch|checkout|diff|status)\b",
+                2.0,
+            ),
             sig(r"(?i)\b(deploy|docker|k8s|kubernetes|terraform)\b", 2.0),
             sig(r"(?i)\b(explain|what|why|how\s+does)\b", -1.5),
         ],
@@ -127,10 +145,22 @@ fn def_plan() -> &'static CategoryDef {
     CELL.get_or_init(|| CategoryDef {
         signals: vec![
             sig(r"(?i)\b(implement|build|create|design|architect)\b", 2.0),
-            sig(r"(?i)\b(full|complete|entire|whole|end\.to\.end|e2e)\b", 2.5),
-            sig(r"(?i)\b(system|module|feature|service|api|app|application)\b", 1.5),
-            sig(r"(?i)\b(step\s+by\s+step|plan|break\s+down|decompose|how\s+should\s+i)\b", 3.0),
-            sig(r"(?i)\b(multiple\s+files|several\s+files|across\s+files|refactor\s+all)\b", 2.0),
+            sig(
+                r"(?i)\b(full|complete|entire|whole|end\.to\.end|e2e)\b",
+                2.5,
+            ),
+            sig(
+                r"(?i)\b(system|module|feature|service|api|app|application)\b",
+                1.5,
+            ),
+            sig(
+                r"(?i)\b(step\s+by\s+step|plan|break\s+down|decompose|how\s+should\s+i)\b",
+                3.0,
+            ),
+            sig(
+                r"(?i)\b(multiple\s+files|several\s+files|across\s+files|refactor\s+all)\b",
+                2.0,
+            ),
             sig(r"(?i)\b(show|read|display|cat)\b", -2.0),
         ],
     })
@@ -316,10 +346,19 @@ mod tests {
     #[test]
     fn classify_write_file_is_write() {
         let cat = classify("write file");
-        assert_eq!(cat, ToolCategory::Write, "expected Write for 'write file', got {:?}", cat);
+        assert_eq!(
+            cat,
+            ToolCategory::Write,
+            "expected Write for 'write file', got {:?}",
+            cat
+        );
         let tools = tools_for_category(cat);
         let names: Vec<_> = tools.iter().map(|d| d.function.name.as_str()).collect();
-        assert!(names.contains(&"Write"), "Write tools should contain Write, got {:?}", names);
+        assert!(
+            names.contains(&"Write"),
+            "Write tools should contain Write, got {:?}",
+            names
+        );
         assert!(names.contains(&"Edit"), "Write tools should contain Edit");
     }
 
@@ -329,7 +368,11 @@ mod tests {
         let first = router.classify("write file");
         assert_eq!(first, ToolCategory::Write);
         let second = router.classify("yes");
-        assert_eq!(second, ToolCategory::Write, "affirmation 'yes' should keep Write");
+        assert_eq!(
+            second,
+            ToolCategory::Write,
+            "affirmation 'yes' should keep Write"
+        );
         let tools = tools_for_category(second);
         assert!(!tools.is_empty());
     }
@@ -346,7 +389,11 @@ mod tests {
     fn affirmation_variants_keep_write() {
         for aff in &["yes", "ok", "sure", "go", "proceed", "YES", "Ok", "SURE"] {
             let cat = classify_with_history(aff, Some(ToolCategory::Write));
-            assert_eq!(cat, ToolCategory::Write, "affirmation '{aff}' should keep Write");
+            assert_eq!(
+                cat,
+                ToolCategory::Write,
+                "affirmation '{aff}' should keep Write"
+            );
         }
     }
 

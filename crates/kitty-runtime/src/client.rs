@@ -305,9 +305,7 @@ impl ChatClient for OllamaClient {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
-        Box::pin(async move {
-            OllamaClient::chat(self, model, messages, tools, None).await
-        })
+        Box::pin(async move { OllamaClient::chat(self, model, messages, tools, None).await })
     }
 
     fn count_tokens<'a>(
@@ -520,7 +518,10 @@ mod tests {
     #[tokio::test]
     async fn mock_client_count_tokens_and_health_check() {
         let mock = MockClient::new(vec![dummy_response("ok")]);
-        let count = mock.count_tokens("test-model", "hello world").await.unwrap();
+        let count = mock
+            .count_tokens("test-model", "hello world")
+            .await
+            .unwrap();
         // "hello world" len 11 -> ceil(11/4)=3
         assert_eq!(count, 3);
         assert!(mock.health_check().await.is_ok());

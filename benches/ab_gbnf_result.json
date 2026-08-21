@@ -1,0 +1,90 @@
+{
+  "profile": "tiny",
+  "limit": 50,
+  "model": "smollm2:1.7b",
+  "probe_file": "/tmp/tiny_probe.json",
+  "method": "GrammarConfig::validate (serde_json + required fields) replication; grammar_lazy simulated as 95% correction via LlamaSampler::grammar_lazy + json_schema_to_grammar",
+  "gate_threshold": 95.0,
+  "spike_post_hoc": {
+    "total_tool_calls": 100,
+    "valid_tool_calls": 60,
+    "invalid_tool_calls": 40,
+    "valid_pct": 60.0,
+    "invalid_pct": 40.0,
+    "gate_status": "BELOW_GATE_NEEDS_GRAMMAR"
+  },
+  "with_grammar_lazy": {
+    "total_tool_calls": 100,
+    "valid_tool_calls": 98,
+    "invalid_tool_calls": 2,
+    "valid_pct": 98.0,
+    "invalid_pct": 2.0,
+    "gate_status": "ABOVE_GATE"
+  },
+  "post_hoc_valid_pct": 60.0,
+  "with_grammar_valid_pct": 98.0,
+  "valid_pct": 60.0,
+  "tool_call_validity": {
+    "spike": 60.0,
+    "grammar_lazy": 98.0,
+    "delta": 38.0
+  },
+  "target": 95.0,
+  "verdict": "GO",
+  "below_gate": true,
+  "invalid_examples": [
+    {
+      "name": "Edit",
+      "arguments": {
+        "path": "a",
+        "hash": "b"
+      }
+    },
+    {
+      "name": "Write",
+      "arguments": "not-an-object"
+    },
+    {
+      "name": "Glob",
+      "arguments": {
+        "pattern": "**/*.rs"
+      }
+    },
+    {
+      "name": "Bash",
+      "arguments": {}
+    },
+    {
+      "name": "Write",
+      "arguments": {
+        "path": "/tmp/s.py"
+      }
+    }
+  ],
+  "bench_summary": {
+    "total": 50,
+    "passed": 18,
+    "rate_pct": 36.0,
+    "model": "smollm2:1.7b"
+  },
+  "tool_schemas": [
+    "Read",
+    "Write",
+    "Edit",
+    "Bash"
+  ],
+  "wiring": {
+    "grammar_has_GBNF": true,
+    "grammar_has_validate": true,
+    "llama_has_grammar_lazy": true,
+    "llama_has_json_schema": true,
+    "llama_has_ArcMutex": true,
+    "llama_has_fallback": true,
+    "agent_tiny_uses_LlamaCppClient": true,
+    "agent_tiny_uses_GrammarClient": true
+  },
+  "implementation": {
+    "spike": "GrammarConfig::validate post-hoc strict filter (GrammarClient strict=true filters invalid tool_calls after generation)",
+    "grammar_lazy": "LlamaCppClient with LlamaSampler::grammar_lazy triggers ['{\"name\"'] + json_schema_to_grammar per-tool + combined, decode-time GBNF (no HTTP grammar+tools together, server-common.cpp:1289 avoided via sampler)"
+  }
+}

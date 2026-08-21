@@ -1,0 +1,100 @@
+{
+  "details": [
+    {
+      "id": "py-fibonacci",
+      "lang": "python",
+      "latency_ms": 409.0,
+      "passed": false
+    },
+    {
+      "id": "py-bubble_sort",
+      "lang": "python",
+      "latency_ms": 4117.0,
+      "passed": true
+    },
+    {
+      "id": "py-quick_sort",
+      "lang": "python",
+      "latency_ms": 3146.0,
+      "passed": true
+    },
+    {
+      "id": "py-binary_search",
+      "lang": "python",
+      "latency_ms": 4379.0,
+      "passed": true
+    },
+    {
+      "id": "py-factorial",
+      "lang": "python",
+      "latency_ms": 3289.0,
+      "passed": true
+    },
+    {
+      "id": "py-is_palindrome",
+      "lang": "python",
+      "latency_ms": 3626.0,
+      "passed": true
+    },
+    {
+      "id": "py-flatten",
+      "lang": "python",
+      "latency_ms": 1973.0,
+      "passed": false
+    },
+    {
+      "id": "py-chunk",
+      "lang": "python",
+      "latency_ms": 2001.0,
+      "passed": false
+    },
+    {
+      "id": "py-unique",
+      "lang": "python",
+      "latency_ms": 2102.0,
+      "passed": false
+    },
+    {
+      "id": "py-compact",
+      "lang": "python",
+      "latency_ms": 2606.0,
+      "passed": false
+    },
+    {
+      "id": "py-sum_range",
+      "lang": "python",
+      "latency_ms": 1549.0,
+      "passed": true
+    },
+    {
+      "id": "py-clamp",
+      "lang": "python",
+      "latency_ms": 344.0,
+      "passed": false
+    },
+    {
+      "id": "py-capitalize",
+      "lang": "python",
+      "latency_ms": 5918.0,
+      "passed": true
+    },
+    {
+      "id": "py-truncate",
+      "lang": "python",
+      "latency_ms": 1863.0,
+      "passed": false
+    },
+    {
+      "id": "py-camelize",
+      "lang": "python",
+      "latency_ms": 4097.0,
+      "passed": true
+    }
+  ],
+  "memory": false,
+  "model": "smollm2:1.7b",
+  "passed": 8,
+  "rate_pct": 53.333333333333336,
+  "suite": "polyglot",
+  "total": 15
+}

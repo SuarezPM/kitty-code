@@ -331,9 +331,7 @@ mod tests {
         write!(f2, "aaa\nXXX\nccc").unwrap();
         drop(f2);
 
-        let err = editor
-            .edit_by_hash(f.path(), "dummy", "new")
-            .unwrap_err();
+        let err = editor.edit_by_hash(f.path(), "dummy", "new").unwrap_err();
         assert!(matches!(err, HashlineError::FileChanged { .. }));
     }
 

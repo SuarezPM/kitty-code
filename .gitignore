@@ -12,8 +12,8 @@ Cargo.lock.bak
 # --- Python / bench artifacts ---
 __pycache__/
 *.pyc
-bench_*.json
-week0_*.json
+/bench_*.json
+/week0_*.json
 results/
 
 # --- Local state ---

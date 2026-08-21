@@ -211,7 +211,9 @@ impl KnowledgeBase {
             if card.token_count > self.config.max_tokens_per_card {
                 continue; // Skip oversized cards
             }
-            if total_tokens + card.token_count > self.config.max_tokens_per_card * self.config.max_cards {
+            if total_tokens + card.token_count
+                > self.config.max_tokens_per_card * self.config.max_cards
+            {
                 break; // Would exceed total token budget
             }
             total_tokens += card.token_count;
@@ -231,10 +233,7 @@ impl KnowledgeBase {
 
         let mut injection = String::from("[Knowledge Context]\n");
         for card in &relevant {
-            injection.push_str(&format!(
-                "\n--- {} ---\n{}\n",
-                card.id, card.content
-            ));
+            injection.push_str(&format!("\n--- {} ---\n{}\n", card.id, card.content));
         }
         injection.push_str("\n[End Knowledge Context]\n");
 
@@ -302,7 +301,10 @@ mod tests {
             max_tokens_per_card: 5, // Very small
             ..Default::default()
         };
-        let mut base = KnowledgeBase { config, cards: Vec::new() };
+        let mut base = KnowledgeBase {
+            config,
+            cards: Vec::new(),
+        };
         base.cards.push(KnowledgeCard::parse(
             "big",
             "This is a very long card that should exceed the token limit for testing purposes",
@@ -330,9 +332,14 @@ mod tests {
             threshold: 0.0,
             ..Default::default()
         };
-        let mut base = KnowledgeBase { config, cards: Vec::new() };
-        base.cards
-            .push(KnowledgeCard::parse("rust-tips", "Use cargo test to run tests."));
+        let mut base = KnowledgeBase {
+            config,
+            cards: Vec::new(),
+        };
+        base.cards.push(KnowledgeCard::parse(
+            "rust-tips",
+            "Use cargo test to run tests.",
+        ));
         let injection = base.build_injection("cargo test").unwrap();
         assert!(injection.contains("[Knowledge Context]"));
         assert!(injection.contains("rust-tips"));
@@ -375,9 +382,11 @@ mod tests {
             threshold: 100.0, // Very high threshold
             ..Default::default()
         };
-        let mut base = KnowledgeBase { config, cards: Vec::new() };
-        base.cards
-            .push(KnowledgeCard::parse("test", "hello world"));
+        let mut base = KnowledgeBase {
+            config,
+            cards: Vec::new(),
+        };
+        base.cards.push(KnowledgeCard::parse("test", "hello world"));
         let relevant = base.find_relevant("hello");
         assert!(relevant.is_empty());
     }

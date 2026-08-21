@@ -17,10 +17,7 @@ pub enum QualityViolation {
     /// No content and no tool calls in the response.
     EmptyResponse,
     /// Same tool called `count` times consecutively.
-    ToolLoop {
-        tool_name: String,
-        count: usize,
-    },
+    ToolLoop { tool_name: String, count: usize },
     /// Tool name is not in the registered set.
     HallucinatedTool { tool_name: String },
 }
@@ -42,9 +39,7 @@ pub struct QualityConfig {
 
 impl Default for QualityConfig {
     fn default() -> Self {
-        Self {
-            loop_threshold: 3,
-        }
+        Self { loop_threshold: 3 }
     }
 }
 
@@ -139,7 +134,8 @@ impl QualityMonitor {
                 }
             }
 
-            self.recent_tool_calls.push_back((tc.name.clone(), arg_hash));
+            self.recent_tool_calls
+                .push_back((tc.name.clone(), arg_hash));
             // Keep only the last N entries
             while self.recent_tool_calls.len() > self.config.loop_threshold {
                 self.recent_tool_calls.pop_front();
@@ -282,9 +278,7 @@ mod tests {
 
     #[test]
     fn tool_loop_detected() {
-        let config = QualityConfig {
-            loop_threshold: 3,
-        };
+        let config = QualityConfig { loop_threshold: 3 };
         let mut monitor = QualityMonitor::new(config, default_tools());
         let tc = ParsedToolCall {
             name: "Read".to_string(),
@@ -304,9 +298,7 @@ mod tests {
 
     #[test]
     fn different_tools_no_loop() {
-        let config = QualityConfig {
-            loop_threshold: 3,
-        };
+        let config = QualityConfig { loop_threshold: 3 };
         let mut monitor = QualityMonitor::new(config, default_tools());
         monitor.check_response(
             None,
@@ -338,9 +330,7 @@ mod tests {
     fn turn_reset_does_not_clear_loop_window() {
         // F2.4: next_turn() no longer clears the window — cross-turn loops
         // are detected. The window resets only when a different tool appears.
-        let config = QualityConfig {
-            loop_threshold: 3,
-        };
+        let config = QualityConfig { loop_threshold: 3 };
         let mut monitor = QualityMonitor::new(config, default_tools());
         let tc = ParsedToolCall {
             name: "Read".to_string(),
@@ -361,9 +351,7 @@ mod tests {
     #[test]
     fn different_tool_resets_loop_window() {
         // F2.4: A different tool name resets the sliding window.
-        let config = QualityConfig {
-            loop_threshold: 3,
-        };
+        let config = QualityConfig { loop_threshold: 3 };
         let mut monitor = QualityMonitor::new(config, default_tools());
         let read_tc = ParsedToolCall {
             name: "Read".to_string(),

@@ -115,11 +115,7 @@ impl GrammarConfig {
         }
 
         // Find matching schema
-        let Some(def) = self
-            .tool_schemas
-            .iter()
-            .find(|t| t.function.name == name)
-        else {
+        let Some(def) = self.tool_schemas.iter().find(|t| t.function.name == name) else {
             return false;
         };
 

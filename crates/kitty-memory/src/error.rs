@@ -13,6 +13,9 @@ pub enum MemoryError {
 
     #[error("Episode not found: {0}")]
     NotFound(String),
+
+    #[error("Embedding error: {0}")]
+    Embedding(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;

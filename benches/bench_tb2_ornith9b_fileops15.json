@@ -1,0 +1,100 @@
+{
+  "details": [
+    {
+      "id": "file_copy",
+      "lang": "file_ops",
+      "latency_ms": 8879.0,
+      "passed": false
+    },
+    {
+      "id": "file_move",
+      "lang": "file_ops",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "file_delete",
+      "lang": "file_ops",
+      "latency_ms": 19237.0,
+      "passed": true
+    },
+    {
+      "id": "file_rename",
+      "lang": "file_ops",
+      "latency_ms": 7920.0,
+      "passed": false
+    },
+    {
+      "id": "file_concat",
+      "lang": "file_ops",
+      "latency_ms": 10284.0,
+      "passed": false
+    },
+    {
+      "id": "file_count_lines",
+      "lang": "file_ops",
+      "latency_ms": 15872.0,
+      "passed": false
+    },
+    {
+      "id": "file_sort",
+      "lang": "file_ops",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "file_unique_lines",
+      "lang": "file_ops",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "file_grep",
+      "lang": "file_ops",
+      "latency_ms": 15240.0,
+      "passed": false
+    },
+    {
+      "id": "file_word_count",
+      "lang": "file_ops",
+      "latency_ms": 30000.0,
+      "passed": false
+    },
+    {
+      "id": "file_json_pretty",
+      "lang": "file_ops",
+      "latency_ms": 7496.0,
+      "passed": false
+    },
+    {
+      "id": "file_json_query",
+      "lang": "file_ops",
+      "latency_ms": 9118.0,
+      "passed": false
+    },
+    {
+      "id": "file_csv_column",
+      "lang": "file_ops",
+      "latency_ms": 19989.0,
+      "passed": false
+    },
+    {
+      "id": "file_csv_filter",
+      "lang": "file_ops",
+      "latency_ms": 24378.0,
+      "passed": false
+    },
+    {
+      "id": "file_backup_dir",
+      "lang": "file_ops",
+      "latency_ms": 19101.0,
+      "passed": true
+    }
+  ],
+  "memory": true,
+  "model": "ornith:9b",
+  "passed": 2,
+  "rate_pct": 13.333333333333334,
+  "suite": "tb2",
+  "total": 15
+}

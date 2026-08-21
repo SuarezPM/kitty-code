@@ -6,19 +6,39 @@
 
 use anyhow::{Context, Result};
 use kitty_memory::{Episode, EpisodeStore};
-use kitty_runtime::{ChatClient, ChatResponse, GrammarClient, GrammarConfig, Message, ToolDefinition};
+use kitty_runtime::{
+    ChatClient, ChatResponse, GrammarClient, GrammarConfig, Message, ToolDefinition,
+};
 use tracing::{debug, info, warn};
 
 use crate::bootstrap::Bootstrap;
-use crate::contract::{contract_guard_enabled, looks_like_done_claim, Contract};
 use crate::context::{ContextBudget, ContextError};
+use crate::contract::{contract_guard_enabled, looks_like_done_claim, Contract};
 use crate::knowledge::{KnowledgeBase, KnowledgeConfig};
 use crate::model_profile::ModelProfile;
 use crate::parser::{ParsedToolCall, ToolCallParser};
 use crate::quality_monitor::{QualityConfig, QualityMonitor, QualityViolation};
-use crate::router::{ToolRouter, tools_for_category};
+use crate::router::{tools_for_category, ToolRouter};
 use crate::thinking_budget::ThinkingBudget;
 use crate::tools::ToolRegistry;
+
+/// Streaming events emitted during `run_with_events`.
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    Thinking(String),
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+    },
+    ToolResult {
+        name: String,
+        output: String,
+        success: bool,
+    },
+    AssistantMessage(String),
+    Error(String),
+    Done(String),
+}
 
 /// Configuration for the agent.
 #[derive(Debug, Clone)]
@@ -250,8 +270,11 @@ impl Agent {
         let cat = self.router.classify(prompt);
         let filtered = tools_for_category(cat);
         // Intersect router category with profile subset + agent tools for safety
-        let allowed: std::collections::HashSet<&str> =
-            self.tools.iter().map(|t| t.function.name.as_str()).collect();
+        let allowed: std::collections::HashSet<&str> = self
+            .tools
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
         filtered
             .into_iter()
             .filter(|t| allowed.contains(t.function.name.as_str()))
@@ -371,7 +394,10 @@ impl Agent {
             // Fail-fast: 2 consecutive empty responses → terminate quickly
             // instead of looping until max_iterations/timeout (handoff §6).
             if should_fail_fast(self.empty_response_streak) {
-                warn!(streak = self.empty_response_streak, "Empty response streak cap reached (2), failing fast");
+                warn!(
+                    streak = self.empty_response_streak,
+                    "Empty response streak cap reached (2), failing fast"
+                );
                 // Episode already saved as failure in process_response.
                 return Ok("no response (empty after 2 retries)".to_string());
             }
@@ -396,16 +422,39 @@ impl Agent {
         Ok(text)
     }
 
+    pub async fn run_with_events(
+        &mut self,
+        user_prompt: &str,
+        tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<String> {
+        self.run_inner(user_prompt, Some(tx)).await
+    }
+
+    async fn run_inner(
+        &mut self,
+        user_prompt: &str,
+        tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
+    ) -> Result<String> {
+        let result = self.run(user_prompt).await;
+        if let Some(sender) = tx {
+            match &result {
+                Ok(text) => {
+                    let _ = sender.send(AgentEvent::Done(text.clone())).await;
+                }
+                Err(e) => {
+                    let _ = sender.send(AgentEvent::Error(e.to_string())).await;
+                }
+            }
+        }
+        result
+    }
+
     /// Process a single LLM response within the agent loop.
     ///
     /// Handles tool execution, quality checks, and message ordering.
     /// Returns Ok(true) when a final text response was produced, Ok(false) to
     /// continue the loop (tool calls were processed).
-    async fn process_response(
-        &mut self,
-        user_prompt: &str,
-        response: ChatResponse,
-    ) -> Result<()> {
+    async fn process_response(&mut self, user_prompt: &str, response: ChatResponse) -> Result<()> {
         // Check for tool calls — any tool call resets the empty streak
         // (progress was made, handoff §6).
         if let Some(tool_calls) = &response.message.tool_calls {
@@ -447,11 +496,13 @@ impl Agent {
                 // Ollama message order: assistant(tool_calls) → tool* → next.
                 for tc in &all_tool_calls {
                     // Skip hallucinated tools
-                    if violations.iter().any(|v| matches!(
-                        v,
-                        QualityViolation::HallucinatedTool { tool_name }
-                            if tool_name == &tc.name
-                    )) {
+                    if violations.iter().any(|v| {
+                        matches!(
+                            v,
+                            QualityViolation::HallucinatedTool { tool_name }
+                                if tool_name == &tc.name
+                        )
+                    }) {
                         continue;
                     }
 
@@ -539,7 +590,10 @@ impl Agent {
         // LLM round-trips. Streak resets on any non-empty content or tool call.
         if text.trim().is_empty() {
             self.empty_response_streak = self.empty_response_streak.saturating_add(1);
-            warn!(streak = self.empty_response_streak, "Empty response detected, streak={}", self.empty_response_streak);
+            warn!(
+                streak = self.empty_response_streak,
+                "Empty response detected, streak={}", self.empty_response_streak
+            );
             if should_fail_fast(self.empty_response_streak) {
                 warn!(
                     streak = self.empty_response_streak,
@@ -548,7 +602,10 @@ impl Agent {
                 self.save_episode(user_prompt, "no response (empty after 2 retries)", false);
                 return Ok(());
             }
-            warn!(streak = self.empty_response_streak, "Empty response detected, continuing loop for retry");
+            warn!(
+                streak = self.empty_response_streak,
+                "Empty response detected, continuing loop for retry"
+            );
             return Ok(());
         }
         // Non-empty text resets the streak
@@ -653,15 +710,17 @@ impl Agent {
         if let Some(ref store) = self.memory_store {
             if let Ok(episodes) = store.recall_similar(goal, 3) {
                 if !episodes.is_empty() {
-                    let context = episodes.iter().map(|ep| {
-                        format!(
-                            "- Goal: {}\n  Outcome: {}\n  Files: {:?}",
-                            ep.goal, ep.outcome, ep.files_touched
-                        )
-                    }).collect::<Vec<_>>().join("\n");
-                    let injection = format!(
-                        "[Past Episodes]\n{}\n[End Past Episodes]\n", context
-                    );
+                    let context = episodes
+                        .iter()
+                        .map(|ep| {
+                            format!(
+                                "- Goal: {}\n  Outcome: {}\n  Files: {:?}",
+                                ep.goal, ep.outcome, ep.files_touched
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let injection = format!("[Past Episodes]\n{}\n[End Past Episodes]\n", context);
                     debug!(count = episodes.len(), "Episodic memory recall");
                     // F2.3: Use push_message for token accounting.
                     self.messages.push(Message {
@@ -756,11 +815,7 @@ impl Agent {
         );
 
         self.client
-            .chat(
-                &self.config.model,
-                messages,
-                Some(self.tools.clone()),
-            )
+            .chat(&self.config.model, messages, Some(self.tools.clone()))
             .await
             .context("Retry LLM call without thinking failed")
     }
@@ -860,10 +915,16 @@ impl Agent {
         let needed = ContextBudget::estimate_tokens(&summary_text) + 100;
 
         // Record compaction
-        if let Err(ContextError::InsufficientCompaction { freed: f, needed: n }) =
-            self.budget.record_compaction(freed, needed)
+        if let Err(ContextError::InsufficientCompaction {
+            freed: f,
+            needed: n,
+        }) = self.budget.record_compaction(freed, needed)
         {
-            warn!(freed = f, needed = n, "Compaction freed insufficient tokens");
+            warn!(
+                freed = f,
+                needed = n,
+                "Compaction freed insufficient tokens"
+            );
         }
 
         // Insert summary as system message at the start
@@ -1027,10 +1088,16 @@ mod tests {
     fn agent_with_mock_client_works() {
         let mock = MockClient::new(vec![dummy_response("hello")]);
         // Test Box<dyn ChatClient> wiring: both direct and boxed forms compile
-        let _agent_boxed = Agent::new(Box::new(mock.clone()) as Box<dyn kitty_runtime::ChatClient>, AgentConfig::default());
+        let _agent_boxed = Agent::new(
+            Box::new(mock.clone()) as Box<dyn kitty_runtime::ChatClient>,
+            AgentConfig::default(),
+        );
         let _agent_direct = Agent::new(mock.clone(), AgentConfig::default());
         // Also test with_client builder
-        let base = Agent::new(OllamaClient::new("http://localhost:11434"), AgentConfig::default());
+        let base = Agent::new(
+            OllamaClient::new("http://localhost:11434"),
+            AgentConfig::default(),
+        );
         let _agent_with = base.with_client(Box::new(mock));
         // Test that config threshold wiring and budget are correct
         let tiny_profile = ModelProfile::tiny();
@@ -1061,7 +1128,10 @@ mod tests {
         agent.set_contract(c);
         // contract pending (a01 Pending), text looks like done → returns Some blocker
         let nudge = agent.check_done_guard("All done");
-        assert!(nudge.is_some(), "should block pending contract on done claim");
+        assert!(
+            nudge.is_some(),
+            "should block pending contract on done claim"
+        );
         assert!(nudge.unwrap().contains("a01"));
     }
 
@@ -1075,7 +1145,10 @@ mod tests {
         let id = c.add_assertion(crate::contract::AssertionCheck::FileExists("a.rs".into()));
         c.mark_passed(&id);
         agent.set_contract(c);
-        assert!(agent.check_done_guard("All done").is_none(), "done contract should not block");
+        assert!(
+            agent.check_done_guard("All done").is_none(),
+            "done contract should not block"
+        );
         // pending contract but non-done text → None
         let mut agent2 = dummy_agent();
         let mut c2 = crate::contract::Contract::new("pending2");
@@ -1162,16 +1235,64 @@ mod tests {
     }
 
     // Gate3: additional smoke tests to keep count >=154 when guard is old baseline
-    #[test] fn gate3_dummy_01() { let x = 1; assert_eq!(x, 1); }
-    #[test] fn gate3_dummy_02() { let x = 2; assert_eq!(x, 2); }
-    #[test] fn gate3_dummy_03() { let x = 3; assert_eq!(x, 3); }
-    #[test] fn gate3_dummy_04() { let x = 4; assert_eq!(x, 4); }
-    #[test] fn gate3_dummy_05() { let x = 5; assert_eq!(x, 5); }
-    #[test] fn gate3_dummy_06() { let x = 6; assert_eq!(x, 6); }
-    #[test] fn gate3_dummy_07() { let x = 7; assert_eq!(x, 7); }
-    #[test] fn gate3_dummy_08() { let x = 8; assert_eq!(x, 8); }
-    #[test] fn gate3_dummy_09() { let x = 9; assert_eq!(x, 9); }
-    #[test] fn gate3_dummy_10() { let x = 10; assert_eq!(x, 10); }
-    #[test] fn gate3_dummy_11() { let x = 11; assert_eq!(x, 11); }
-    #[test] fn gate3_dummy_12() { let x = 12; assert_eq!(x, 12); }
+    #[test]
+    fn gate3_dummy_01() {
+        let x = 1;
+        assert_eq!(x, 1);
+    }
+    #[test]
+    fn gate3_dummy_02() {
+        let x = 2;
+        assert_eq!(x, 2);
+    }
+    #[test]
+    fn gate3_dummy_03() {
+        let x = 3;
+        assert_eq!(x, 3);
+    }
+    #[test]
+    fn gate3_dummy_04() {
+        let x = 4;
+        assert_eq!(x, 4);
+    }
+    #[test]
+    fn gate3_dummy_05() {
+        let x = 5;
+        assert_eq!(x, 5);
+    }
+    #[test]
+    fn gate3_dummy_06() {
+        let x = 6;
+        assert_eq!(x, 6);
+    }
+    #[test]
+    fn gate3_dummy_07() {
+        let x = 7;
+        assert_eq!(x, 7);
+    }
+    #[test]
+    fn gate3_dummy_08() {
+        let x = 8;
+        assert_eq!(x, 8);
+    }
+    #[test]
+    fn gate3_dummy_09() {
+        let x = 9;
+        assert_eq!(x, 9);
+    }
+    #[test]
+    fn gate3_dummy_10() {
+        let x = 10;
+        assert_eq!(x, 10);
+    }
+    #[test]
+    fn gate3_dummy_11() {
+        let x = 11;
+        assert_eq!(x, 11);
+    }
+    #[test]
+    fn gate3_dummy_12() {
+        let x = 12;
+        assert_eq!(x, 12);
+    }
 }

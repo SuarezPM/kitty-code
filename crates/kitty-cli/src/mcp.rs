@@ -72,7 +72,11 @@ impl McpServer {
                     let n = params
                         .get("name")
                         .and_then(|v| v.as_str())
-                        .or_else(|| req.get("params").and_then(|p| p.get("name")).and_then(|v| v.as_str()))
+                        .or_else(|| {
+                            req.get("params")
+                                .and_then(|p| p.get("name"))
+                                .and_then(|v| v.as_str())
+                        })
                         .unwrap_or_else(|| {
                             // also allow params directly containing name at req level (fallback)
                             req.get("name").and_then(|v| v.as_str()).unwrap_or("")
@@ -85,10 +89,7 @@ impl McpServer {
                     (n.to_string(), a)
                 } else {
                     // params may be absent — try top-level name/arguments
-                    let n = req
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let n = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let a = req.get("arguments").cloned().unwrap_or_else(|| json!({}));
                     (n.to_string(), a)
                 };
@@ -152,7 +153,8 @@ impl McpServer {
                 Ok(v) => v,
                 Err(e) => {
                     let resp = json!({"error": format!("invalid json: {}", e)});
-                    let out = serde_json::to_string(&resp).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
+                    let out = serde_json::to_string(&resp)
+                        .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
                     let _ = stdout.write_all(out.as_bytes()).await;
                     let _ = stdout.write_all(b"\n").await;
                     let _ = stdout.flush().await;
@@ -160,7 +162,8 @@ impl McpServer {
                 }
             };
             let resp = self.handle_request(req).await;
-            let out = serde_json::to_string(&resp).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
+            let out = serde_json::to_string(&resp)
+                .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
             let _ = stdout.write_all(out.as_bytes()).await;
             let _ = stdout.write_all(b"\n").await;
             let _ = stdout.flush().await;
@@ -214,7 +217,10 @@ mod tests {
     async fn call_tool_read_nonexistent_returns_error() {
         let server = McpServer::new();
         let result = server
-            .call_tool("Read", json!({"path": "/tmp/kitty_mcp_nonexistent_12345_xyz.txt"}))
+            .call_tool(
+                "Read",
+                json!({"path": "/tmp/kitty_mcp_nonexistent_12345_xyz.txt"}),
+            )
             .await;
         // Should be success:false with an error output
         assert_eq!(result.get("success").and_then(|v| v.as_bool()), Some(false));
@@ -228,9 +234,16 @@ mod tests {
         let result = server
             .call_tool("Bash", json!({"command": "echo hello"}))
             .await;
-        assert_eq!(result.get("success").and_then(|v| v.as_bool()), Some(true), "got {result:?}");
+        assert_eq!(
+            result.get("success").and_then(|v| v.as_bool()),
+            Some(true),
+            "got {result:?}"
+        );
         let output = result.get("output").and_then(|v| v.as_str()).unwrap_or("");
-        assert!(output.contains("hello"), "expected 'hello' in output, got: {output}");
+        assert!(
+            output.contains("hello"),
+            "expected 'hello' in output, got: {output}"
+        );
     }
 
     #[tokio::test]
@@ -293,9 +306,21 @@ mod tests {
             Some(true),
             "Read should succeed, got {read_result:?}"
         );
-        let output = read_result.get("output").and_then(|v| v.as_str()).unwrap_or("");
-        let first_line = output.lines().next().expect("Read output should have at least one line");
-        let hash = first_line.split(':').nth(1).unwrap().split('|').next().unwrap();
+        let output = read_result
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let first_line = output
+            .lines()
+            .next()
+            .expect("Read output should have at least one line");
+        let hash = first_line
+            .split(':')
+            .nth(1)
+            .unwrap()
+            .split('|')
+            .next()
+            .unwrap();
 
         let edit_req = json!({
             "jsonrpc": "2.0",
@@ -326,7 +351,9 @@ mod tests {
         assert_eq!(result.get("success").and_then(|v| v.as_bool()), Some(false));
         let output = result.get("output").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
-            output.contains("do not redirect") || output.contains("Write") || output.to_lowercase().contains("blocked"),
+            output.contains("do not redirect")
+                || output.contains("Write")
+                || output.to_lowercase().contains("blocked"),
             "expected redirect block, got: {output}"
         );
     }
