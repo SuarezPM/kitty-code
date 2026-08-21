@@ -114,6 +114,12 @@ class KittyAgent(BaseInstalledAgent):
             f"> {CONTAINER_ENV_LOG_PATH}"
         )
         return (
+            # Explicit pipefail so a non-zero kitty-cli exit propagates
+            # through `| tee` instead of being masked by tee's exit status.
+            # Harbor's BaseInstalledAgent._exec already sets pipefail on the
+            # outer shell; this keeps the invariant if the command is ever
+            # executed outside that wrapper.
+            "set -o pipefail; "
             f"{build_shell_secret_unset_snippet()}; "
             f"{url_resolution}; "
             f"{env_log}; "

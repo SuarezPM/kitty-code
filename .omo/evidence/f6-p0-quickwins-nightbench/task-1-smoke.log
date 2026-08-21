@@ -69,3 +69,42 @@ Share results by running `harbor upload jobs/2026-08-21__19-32-52`
 - ornith-1.5:9b: 6.45GB weights, only 5.66GB in VRAM -> PARTIAL OFFLOAD (~0.8GB to CPU) as expected on 8GB RTX 2060 Super with 16k ctx KV cache; run took 958.8s; repeated thinking-budget overruns (6k tokens vs 1024 budget); reward 0
 - tok/s (direct API, short gen): ornith:9b 53.7 tok/s; ornith-1.5:9b 53.6 tok/s gen but prompt processing 213 tok/s vs 560 tok/s (offload penalty)
 - kitty-env.txt per trial confirms model/profile/ollama_url parameterization (see jobs/<ts>/.../agent/kitty-env.txt)
+
+## pipefail verification (2026-08-21, follow-up to Oracle Gate 1 finding)
+
+Change: `agent.py:_build_run_command` now prepends `set -o pipefail;` so a
+non-zero kitty-cli exit propagates through `| tee /logs/agent/kitty.txt`.
+
+### a. Happy path unchanged — PASS
+```
+KITTY_BENCH_MODEL=ornith:9b harbor run -p bench/official/aider-harbor/aider-polyglot \
+  -a adapters.kitty.agent:KittyAgent -k 1 -l 1 --include-task-name polyglot_python_phone-number
+Trials: 1 | Exceptions: 0 | Mean: 0.000   (reward 0 = model capability, same as Smoke A above)
+Total runtime: 2m 57s
+EXIT_CODE=0
+```
+Job: jobs/2026-08-21__20-17-28
+
+### b. Forced failure surfaces — PASS
+```
+KITTY_BENCH_MODEL=model-does-not-exist (same command)
+kitty.txt tail: ollama chat returned error status=404 {"error":"model 'model-does-not-exist' not found"}
+                Error: LLM call failed / Caused by: Ollama API error (404)
+result.json:    n_errored_trials: 1, exception_stats: {UnknownApiError: 1}  <- NOT a clean completed trial
+Total runtime: 18s
+harbor CLI EXIT_CODE=0 (harbor exits 0 even when trials error; the Exception is reported in stats/result.json)
+```
+Job: jobs/2026-08-21__20-13-34
+
+### Finding: Oracle Gate 1 premise is FALSE for harbor 0.21.0
+A/B test with HEAD (pre-pipefail) agent.py reran case (b): identical outcome —
+`n_errored_trials: 1, UnknownApiError` (job jobs/2026-08-21__20-14-33). Reason:
+harbor's `BaseInstalledAgent._exec` (site-packages/harbor/agents/installed/base.py,
+`command=f"set -o pipefail; {command}"`) ALREADY prepends pipefail to every
+agent command, so `| tee` never masked kitty-cli's exit through this adapter's
+only execution path (`run -> exec_as_agent -> _exec`). There was no silent
+reward-0.0 masking to fix.
+The explicit `set -o pipefail;` is kept as defense-in-depth (invariant holds if
+the command string is ever executed outside harbor's wrapper); comment in
+agent.py states this accurately. README intentionally NOT updated: no
+operator-visible behavior changed.
