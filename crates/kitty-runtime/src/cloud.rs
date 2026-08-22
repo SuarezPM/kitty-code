@@ -3,7 +3,10 @@
 //! `CloudClient` is vendor-agnostic: it speaks the OpenAI `/v1/chat/completions`
 //! wire format against any base URL (OpenAI, Azure, OpenRouter, etc.).
 //! No vendor is hardcoded. API key is read from `KITTY_CLOUD_API_KEY` and
-//! never logged. Timeout is 120s, cost is metered via `tracing::info!`.
+//! never logged. Timeout defaults to 120s and can be raised via
+//! `KITTY_OLLAMA_TIMEOUT_SECS` (shared with [`crate::client::OllamaClient`],
+//! whose own default is 300s); invalid/missing values fall back to 120s.
+//! Cost is metered via `tracing::info!`.
 //!
 //! The key is held in [`SecretString`] (pattern stolen from Catalyst
 //! `apohara-secrets`): zeroized on drop, redacted in `Debug`, and exposed
@@ -22,12 +25,16 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use zeroize::Zeroize;
 
-use crate::client::{ChatResponse, Message, ToolCall, ToolCallFunction};
+use crate::client::parse_timeout_secs;
+use crate::client::{ChatResponse, ENV_TIMEOUT_SECS, Message, ToolCall, ToolCallFunction};
 use crate::error::{Result, RuntimeError};
 use crate::tools::ToolDefinition;
 
 const ENV_API_KEY: &str = "KITTY_CLOUD_API_KEY";
 const ENV_BASE_URL: &str = "KITTY_CLOUD_BASE_URL";
+
+/// Default request timeout for [`CloudClient`] — 120s.
+pub const DEFAULT_CLOUD_TIMEOUT_SECS: u64 = 120;
 
 // ---------------------------------------------------------------------------
 // SecretString — zeroize-on-drop, Debug-redacted (Catalyst apohara-secrets)
@@ -257,12 +264,14 @@ struct CloudModelsResponse {
 ///   redacted in `Debug`), read from `KITTY_CLOUD_API_KEY` via
 ///   [`CloudClient::from_env`]. Cleartext exists only at the transport
 ///   boundary ([`CloudClient::auth_header`]).
-/// - Timeout is 120s per request (rustls).
+/// - Timeout defaults to 120s per request (rustls), overridable via
+///   `KITTY_OLLAMA_TIMEOUT_SECS` (see [`parse_timeout_secs`]).
 /// - Cost is metered via `tracing::info!` on every successful chat (tokens + cost_usd).
 pub struct CloudClient {
     base_url: String,
     api_key: SecretString,
     http: reqwest::Client,
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for CloudClient {
@@ -278,17 +287,23 @@ impl std::fmt::Debug for CloudClient {
 
 impl CloudClient {
     /// Create with explicit base URL and API key.
+    ///
+    /// Timeout comes from `KITTY_OLLAMA_TIMEOUT_SECS` when set to a valid
+    /// `u64`, else [`DEFAULT_CLOUD_TIMEOUT_SECS`] (120s).
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let api_key = SecretString::new(api_key.into());
+        let raw = std::env::var(ENV_TIMEOUT_SECS).ok();
+        let timeout = Duration::from_secs(parse_timeout_secs(raw.as_deref(), DEFAULT_CLOUD_TIMEOUT_SECS));
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(timeout)
             .build()
             .expect("reqwest::Client builder should not fail");
         Self {
             base_url,
             api_key,
             http,
+            timeout,
         }
     }
 
@@ -329,9 +344,9 @@ impl CloudClient {
         Self::from_env(None)
     }
 
-    /// Expose timeout for verification (must be 120s).
+    /// Expose timeout for verification (default 120s, env-overridable).
     pub fn timeout(&self) -> Duration {
-        Duration::from_secs(120)
+        self.timeout
     }
 
     fn auth_header(&self) -> String {
@@ -633,6 +648,20 @@ mod tests {
     fn cloud_client_timeout_is_120s() {
         let c = CloudClient::new("https://example.com/v1", "sk-test");
         assert_eq!(c.timeout(), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn cloud_timeout_default_flows_through_parse_fn() {
+        // The constructor's env read reduces to this pure call; asserting it
+        // here pins CloudClient's 120s default without process-env mutation.
+        assert_eq!(
+            parse_timeout_secs(None, DEFAULT_CLOUD_TIMEOUT_SECS),
+            120
+        );
+        assert_eq!(
+            parse_timeout_secs(Some("900"), DEFAULT_CLOUD_TIMEOUT_SECS),
+            900
+        );
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {

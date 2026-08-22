@@ -1,0 +1,96 @@
+=== task 7: GBNF empirical measurement (or honest simulated) ===
+vie 21 ago 2026 22:34:47 -03
+
+== Download outcome ==
+pinned file: bartowski/Qwen2.5-Coder-7B-Instruct-GGUF Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf
+saved as (TRUE NAME, not renamed): ~/.kitty/models/qwen2.5-coder-7b-q4_k_m.gguf
+-rw-r--r-- 1 thelinconx thelinconx 4683074336 ago 21 22:02 /home/thelinconx/.kitty/models/qwen2.5-coder-7b-q4_k_m.gguf
+sha check (size bytes): 4683074336
+
+== Probe mechanism ==
+kitty-runtime gbnf-probe bin (feature llama-vulkan): llama-cpp-2 direct GGUF load,
+LlamaSampler::grammar_lazy triggers ['{"name"'] via grammar_lazy_sampler_for (same path as LlamaCppClient), dist sampler, Vulkan offload RTX 2060S
+
+== Canonical run (per plan command) ==
+gbnf-probe error: GGUF load failed: NullResult
+
+[ab_gbnf] method=simulated model=qwen2.5-coder-7b-q4_k_m.gguf
+ with_grammar_valid_pct=None
+ verdict=NOT_CLOSED_simulated_only
+ saved to benches/ab_gbnf_result.json
+
+== Diagnostic: max_tokens=256 (rules out truncation) ==
+{
+ "method": "empirical",
+ "model": "qwen2.5-coder-7b-q4_k_m.gguf",
+ "with_grammar_valid_pct": 94.0,
+ "without_grammar_baseline": {
+  "total_tool_calls": 50,
+  "valid_tool_calls": 47,
+  "invalid_tool_calls": 3,
+  "valid_pct": 94.0
+ },
+ "delta_pp": 0.0,
+ "verdict": "BELOW_GATE_empirical"
+}
+
+== Trigger-firing evidence ==
+50/50 generations byte-identical between arms -> lazy trigger never activated
+
+== cargo test --features llama -p kitty-runtime ==
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+(acceptance >=31 pass)
+
+## Timeout fix (night re-run prep)
+
+Date: 2026-08-22. Diagnosis correction: night-bench "operation timed out"
+trials hit OllamaClient (client.rs, /api/chat), NOT CloudClient. Measured
+last-agent-log→trial-finish gaps across the 24 errored polyglot trials
+(jobs/2026-08-22__03-07-15): median 335s, dominant cluster 313–337s ⇒ the
+effective per-request limit was OllamaClient's fixed **300s**, not 120s.
+(120s + "must be 120s" test cited in the diagnosis live in cloud.rs
+CloudClient — patched too, same env var.)
+
+### Change
+- client.rs: new pub consts `ENV_TIMEOUT_SECS = "KITTY_OLLAMA_TIMEOUT_SECS"`,
+  `DEFAULT_OLLAMA_TIMEOUT_SECS = 300`; pure `pub fn parse_timeout_secs(
+  raw: Option<&str>, default: u64) -> u64` (missing/empty/unparsable →
+  default). OllamaClient::new reads env at construction, stores timeout,
+  new accessor `timeout()`. Module docs updated.
+- cloud.rs: CloudClient::new same wiring with `DEFAULT_CLOUD_TIMEOUT_SECS =
+  120`; accessor returns stored value instead of hardcoded 120s. Docs updated.
+  Same env var drives both clients (different defaults).
+- Tests target the PURE fn (no process-env mutation → parallel-safe), plus
+  kept construction assertions: ollama default 300s, cloud default 120s.
+
+### Diff summary
+ crates/kitty-runtime/src/client.rs | 68 ++++-
+ crates/kitty-runtime/src/cloud.rs  | 41 ++--
+ (102 insertions, 7 deletions; Cargo.lock untouched)
+
+### Verification
+- cargo test --features llama -p kitty-runtime: 40 passed, 0 failed
+  (36 prior + 4 new: parse_timeout_secs x2, ollama default 300s,
+   cloud-default-through-parse-fn)
+- cargo clippy -p kitty-runtime --all-targets --all-features -- -D warnings: clean
+
+### Adapter binary refresh (container artifact)
+- bash bench/harbor/adapters/kitty/build-binary.sh (ubuntu:22.04 docker)
+- strings check: KITTY_OLLAMA_TIMEOUT_SECS present ✓
+- file: ELF x86-64 dyn, stripped; max GLIBC symbol required: 2.34 (≤2.35 jammy) ✓
+- size/mtime: 7808408 bytes, 2026-08-22 09:35, owner thelinconx (fixed post-sudo)
+
+### Host binary refresh
+- cargo build --release -p kitty-cli → target/release/kitty-cli
+  8036480 bytes, 2026-08-22 09:37
+
+### Live functional smoke (host release binary)
+Black-hole server (socat EXEC:sleep, accepts /api/chat, never responds):
+- KITTY_OLLAMA_TIMEOUT_SECS=2  → "operation timed out" after 6s  (3 attempts × 2s)
+- KITTY_OLLAMA_TIMEOUT_SECS=8  → "operation timed out" after 24s (3 attempts × 8s)
+Linear scaling proves parsed value drives reqwest timeout.
+
+### Night re-run usage
+export KITTY_OLLAMA_TIMEOUT_SECS=900   # or higher for ornith-1.5 heavy tasks
+Default absent-env behavior unchanged (300s ollama / 120s cloud) — laptop runs unaffected.

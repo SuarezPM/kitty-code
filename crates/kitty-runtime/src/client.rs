@@ -1,11 +1,40 @@
+//! Chat backend abstraction: [`ChatClient`] trait, wire types, and
+//! [`OllamaClient`] (typed Ollama HTTP API client).
+//!
+//! Request timeout defaults to 300s (long reasoning generations) and can be
+//! raised for heavy bench workloads via `KITTY_OLLAMA_TIMEOUT_SECS`
+//! (invalid/missing value falls back to the default). The same variable also
+//! overrides [`crate::cloud::CloudClient`], whose own default is 120s.
+
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::error::{Result, RuntimeError};
 use crate::tools::ToolDefinition;
+
+/// Env var overriding the HTTP request timeout, in seconds, for both
+/// [`OllamaClient`] (default 300s) and [`crate::cloud::CloudClient`]
+/// (default 120s). Invalid or missing values fall back to each default.
+pub const ENV_TIMEOUT_SECS: &str = "KITTY_OLLAMA_TIMEOUT_SECS";
+
+/// Default request timeout for [`OllamaClient`] — 5 min, sized for long
+/// reasoning generations on consumer GPUs.
+pub const DEFAULT_OLLAMA_TIMEOUT_SECS: u64 = 300;
+
+/// Parse an optional raw env value into a timeout in seconds.
+///
+/// Missing, empty, or unparsable input yields `default`; otherwise the parsed
+/// `u64`. Pure function — never touches process env — so callers and tests
+/// can exercise override semantics without parallel-unsafe env mutation.
+#[must_use]
+pub fn parse_timeout_secs(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
 
 // ---------------------------------------------------------------------------
 // ChatClient trait — abstraction for Agent (Lane A)
@@ -177,19 +206,32 @@ pub struct ModelListResponse {
 pub struct OllamaClient {
     base_url: String,
     http: reqwest::Client,
+    timeout: Duration,
 }
 
 impl OllamaClient {
     /// Create a client pointing at the given base URL.
+    ///
+    /// Timeout comes from `KITTY_OLLAMA_TIMEOUT_SECS` when set to a valid
+    /// `u64`, else [`DEFAULT_OLLAMA_TIMEOUT_SECS`] (300s).
     pub fn new(base_url: &str) -> Self {
+        let raw = std::env::var(ENV_TIMEOUT_SECS).ok();
+        let timeout_secs = parse_timeout_secs(raw.as_deref(), DEFAULT_OLLAMA_TIMEOUT_SECS);
+        let timeout = Duration::from_secs(timeout_secs);
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300)) // 5 min for long generations
+            .timeout(timeout)
             .build()
             .expect("reqwest::Client::builder should not fail");
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
+            timeout,
         }
+    }
+
+    /// Request timeout actually configured (default 300s, env-overridable).
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Convenience: client pointing at `http://localhost:11434`.
@@ -552,5 +594,29 @@ mod tests {
         let client = OllamaClient::new("http://localhost:11434");
         // Ensure we can coerce to Box<dyn ChatClient>
         let _: Box<dyn ChatClient> = Box::new(client);
+    }
+
+    #[test]
+    fn ollama_client_default_timeout_is_300s() {
+        let client = OllamaClient::new("http://localhost:11434");
+        assert_eq!(client.timeout(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn parse_timeout_secs_missing_or_invalid_uses_default() {
+        assert_eq!(parse_timeout_secs(None, 300), 300);
+        assert_eq!(parse_timeout_secs(None, 120), 120);
+        assert_eq!(parse_timeout_secs(Some(""), 300), 300);
+        assert_eq!(parse_timeout_secs(Some("   "), 120), 120);
+        assert_eq!(parse_timeout_secs(Some("abc"), 300), 300);
+        assert_eq!(parse_timeout_secs(Some("-5"), 300), 300);
+        assert_eq!(parse_timeout_secs(Some("12.5"), 120), 120);
+    }
+
+    #[test]
+    fn parse_timeout_secs_parses_valid_override() {
+        assert_eq!(parse_timeout_secs(Some("900"), 300), 900);
+        assert_eq!(parse_timeout_secs(Some("42"), 120), 42);
+        assert_eq!(parse_timeout_secs(Some(" 600 "), 300), 600);
     }
 }
