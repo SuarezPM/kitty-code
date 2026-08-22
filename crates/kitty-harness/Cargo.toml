@@ -29,7 +29,7 @@ embedding = ["kitty-memory/embedding"]
 # fail-closed allowlist + user/mount/PID namespaces. Versions matched to the
 # verified Apohara Catalyst reference implementation.
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.30", features = ["sched", "user"] }
+nix = { version = "0.30", features = ["sched", "user", "process"] }
 seccompiler = { version = "0.5", features = ["json"] }
 landlock = "0.4"
 libc = "0.2"

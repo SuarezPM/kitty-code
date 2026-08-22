@@ -17,13 +17,24 @@
 //! seccomp LAST because it fail-closes everything not allowlisted):
 //! `NO_NEW_PRIVS` → `RLIMIT_AS` → namespaces → Landlock → seccomp.
 //!
-//! Honest scope note: `unshare(CLONE_NEWPID)` moves only *descendants* of the
-//! exec'd program into the new PID namespace — the exec'd process itself stays
-//! in the host PID namespace (kernel semantics; Catalyst solved this with a
-//! double-fork runner that would break `Child::kill()` timeout semantics
-//! here). Direct cross-process signaling is covered by the seccomp allowlist
-//! instead: `kill`/`tkill`/`ptrace` are not allowlisted, so they fail with
-//! `EPERM`.
+//! Honest scope notes:
+//!
+//! - **PID namespace + double fork**: `unshare(CLONE_NEWPID)` alone makes
+//!   every subsequent `CLONE_THREAD` clone fail with EINVAL (the calling
+//!   process stays in the host PID namespace while `pid_ns_for_children`
+//!   points at the new one — threads must share their creator's active
+//!   namespace). Porting Catalyst's double-fork topology solves this: the
+//!   arming closure forks once more, and the grandchild — born *inside* the
+//!   new namespace, where it becomes PID 1 — is the process that execs the
+//!   workload. The middle process mirrors the grandchild's exit status and
+//!   `_exit`s, so the harness `Child` handle tracks it; `PR_SET_PDEATHSIG`
+//!   on the grandchild guarantees that killing the middle (timeout /
+//!   `Child::kill`) kills the workload too. Trade-off: signal identity is
+//!   flattened to `128 + signal` exit codes in [`SandboxOutcome`] (the
+//!   middle cannot transmit wait-signals verbatim).
+//! - Direct cross-process signaling is additionally covered by the seccomp
+//!   allowlist: `kill`/`tkill`/`ptrace`/`pidfd_*` are not allowlisted, so
+//!   they fail with `EPERM`.
 //!
 //! Fail-closed policy: [`Sandbox::apply`] returns an error instead of arming
 //! a partial sandbox when the kernel lacks Landlock or unprivileged user
@@ -88,6 +99,9 @@ impl Default for SandboxConfig {
 pub struct SandboxOutcome {
     pub success: bool,
     pub exit_code: Option<i32>,
+    /// Signal that killed the child. Under the double-fork containment the
+    /// middle process flattens signals to `128 + signal` exit codes, so this
+    /// is usually None; rely on [`Self::success`] / exit codes instead.
     #[cfg(unix)]
     pub signal: Option<i32>,
     pub stdout: String,
@@ -99,7 +113,6 @@ pub struct SandboxOutcome {
     pub timed_out: bool,
     pub duration_ms: u64,
 }
-
 #[derive(Debug, Clone)]
 pub struct Sandbox {
     config: SandboxConfig,
@@ -399,6 +412,13 @@ mod containment {
 
     /// Full child-side containment chain. Runs inside the forked child right
     /// before exec. Order matters: seccomp LAST (fail-closed from then on).
+    ///
+    /// Ends with the Catalyst double-fork: this process ("middle") unshares
+    /// the namespace bundle, forks once more, and the grandchild — PID 1 in
+    /// the new PID namespace — returns into std's exec path. The middle
+    /// process mirrors the grandchild's status and `_exit`s; it must NEVER
+    /// return into std's exec path or the workload would run twice, once
+    /// unsandboxed.
     pub(super) fn contain_child(
         mem_bytes: u64,
         allow_roots: &[PathBuf],
@@ -408,7 +428,46 @@ mod containment {
         apply_rlimit_as(mem_bytes)?;
         enter_isolated_namespaces()?;
         apply_landlock(allow_roots)?;
-        install_seccomp(net_deny)?;
+
+        match unsafe { nix::unistd::fork() }.map_err(|e| format!("sandbox inner fork: {e}"))? {
+            nix::unistd::ForkResult::Child => {
+                arm_pdeathsig()?;
+                // Seccomp LAST, in the process that will actually exec.
+                install_seccomp(net_deny)?;
+                Ok(())
+            }
+            nix::unistd::ForkResult::Parent { child } => {
+                use nix::sys::wait::{waitpid, WaitStatus};
+                let code = match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, c)) => c,
+                    Ok(WaitStatus::Signaled(_, sig, _)) => 128 + (sig as i32),
+                    Ok(_) => 72,
+                    Err(_) => {
+                        // waitpid failed: never leave the workload running
+                        // and never return into std's exec path.
+                        unsafe { libc::kill(child.as_raw(), libc::SIGKILL) };
+                        74
+                    }
+                };
+                unsafe { libc::_exit(code) }
+            }
+        }
+    }
+
+    /// Grandchild-side hardening: die with the middle process. Handles the
+    /// classic PDEATHSIG race by comparing getppid() around the prctl.
+    fn arm_pdeathsig() -> Result<(), String> {
+        let ppid_before = unsafe { libc::getppid() };
+        // SAFETY: prctl with a constant option; affects only this process.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+            return Err(format!(
+                "prctl(PR_SET_PDEATHSIG): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if unsafe { libc::getppid() } != ppid_before {
+            return Err("sandbox middle process died during setup".into());
+        }
         Ok(())
     }
 
@@ -558,12 +617,20 @@ mod containment {
 
     /// Pure-allow syscall list: Catalyst WorkspaceWrite tier
     /// (`profile/syscalls.rs` READONLY ∪ WORKSPACE_WRITE additions) plus a
-    /// small documented availability set (`futex`, `clock_getres`,
-    /// `sched_getaffinity`, `restart_syscall`, `access`, `getpgrp`,
-    /// `setpgid`, `getgroups`, `setsid`, `umask`) — read-only or
-    /// strictly-self-scoped calls modern glibc/dash/python expect to
-    /// succeed; blocking them buys no privilege containment and risks
-    /// spurious EPERM failures (dash aborts on `getpgrp` EPERM).
+    /// small documented availability set — read-only or strictly-self-scoped
+    /// calls modern runtimes expect to succeed; blocking them buys no
+    /// privilege containment:
+    ///   - `getpgrp`/`setpgid`/`getgroups`/`setsid`/`umask`: dash aborts on
+    ///     `getpgrp` EPERM.
+    ///   - `poll`/`ppoll`/`select`/`pselect6` + `epoll_*` + `eventfd2` +
+    ///     `sched_yield`: Rust std's `sanitize_standard_fds` calls
+    ///     `libc::abort()` when `poll(2)` fails with anything but
+    ///     EINTR/EINVAL/EAGAIN/ENOMEM (observed as silent SIGABRT of every
+    ///     Rust binary under the filter), and tokio reactors need the epoll
+    ///     family.
+    ///   - `futex`/`clock_getres`/`sched_getaffinity`/`restart_syscall`/
+    ///     `access`: glibc/python startup expectations.
+    ///
     /// Network syscalls are NOT here; they are appended only when
     /// `net_deny == false`. Everything unlisted fails with EPERM.
     const SECCOMP_PURE_ALLOW: &[&str] = &[
@@ -602,6 +669,8 @@ mod containment {
         "getpgrp",
         "setpgid",
         "getgroups",
+        "getresuid",
+        "getresgid",
         "setsid",
         "umask",
         // Signals
@@ -621,6 +690,11 @@ mod containment {
         // NO_NEW_PRIVS is sticky and disables ptrace escalation vectors)
         "prctl",
         "arch_prctl",
+        // seccomp(2): needed so the stacked clone3→ENOSYS overlay below can
+        // be installed AFTER the main filter. Installing filters can only
+        // ever RESTRICT the calling process further (no unfilter exists),
+        // so this is safe to allow.
+        "seccomp",
         // Exit
         "exit",
         "exit_group",
@@ -630,9 +704,27 @@ mod containment {
         "statx",
         "fstat",
         "lstat",
+        "stat",
         "faccessat",
         "faccessat2",
         "access",
+        // Legacy glibc wrappers still map to these plain syscalls
+        // (e.g. readlink(3) -> SYS_readlink, so python's getpath and
+        // coreutils `ls -l` fail with EPERM without it). All are pure
+        // reads or path operations whose policy Landlock already gates.
+        "readlink",
+        "open",
+        "unlink",
+        "rename",
+        "renameat",
+        "mkdir",
+        "rmdir",
+        "link",
+        "symlink",
+        "chown",
+        "pipe",
+        "getrlimit",
+        "setrlimit",
         "readlinkat",
         "fstatfs",
         "statfs",
@@ -668,6 +760,20 @@ mod containment {
         "utimensat",
         // Pipes
         "pipe2",
+        // FD multiplexing (Rust std init aborts on poll EPERM; tokio needs
+        // the epoll family; all are read-only readiness probes)
+        "poll",
+        "ppoll",
+        "select",
+        "pselect6",
+        "epoll_create",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_wait",
+        "epoll_pwait",
+        "epoll_pwait2",
+        "eventfd2",
+        "sched_yield",
         // Working directory
         "fchdir",
         "chdir",
@@ -728,13 +834,14 @@ mod containment {
         // openat unconditional: FS write policy is enforced by Landlock.
         filter_rules.push(json!({ "syscall": "openat" }));
 
-        // fcntl narrowed to safe cmds (+F_SETFD: own-fd flag flips only).
+        // fcntl narrowed to safe cmds: own-fd flag/query flips only.
         for cmd in [
             libc::F_GETFL,
             libc::F_SETFL,
             libc::F_DUPFD,
             libc::F_DUPFD_CLOEXEC,
             libc::F_SETFD,
+            libc::F_GETFD,
         ] {
             filter_rules.push(json!({
                 "syscall": "fcntl",
@@ -747,8 +854,17 @@ mod containment {
             }));
         }
 
-        // ioctl narrowed to safe requests.
-        for req in [libc::TIOCGWINSZ, libc::FIOCLEX, libc::FIONCLEX] {
+        // ioctl narrowed to safe requests: fd-flag flips and READ-ONLY tty
+        // queries (TCGETS/TCGETS2/TIOCGPGRP — CPython's FileIO isatty check
+        // aborts imports with PermissionError without them).
+        for req in [
+            libc::TIOCGWINSZ,
+            libc::FIOCLEX,
+            libc::FIONCLEX,
+            libc::TCGETS,
+            libc::TCGETS2,
+            libc::TIOCGPGRP,
+        ] {
             filter_rules.push(json!({
                 "syscall": "ioctl",
                 "args": [{
@@ -789,6 +905,22 @@ mod containment {
 
     /// Compile the spec for this arch and apply it to the calling thread.
     /// Must be the LAST containment step (Catalyst ordering).
+    ///
+    /// Installs TWO stacked BPF programs:
+    ///   1. the main Catalyst-style allowlist (mismatch = `EPERM`);
+    ///   2. a tiny overlay mapping `clone3` → `ENOSYS` while allowing every
+    ///      other syscall to fall through.
+    ///
+    /// Why the overlay: seccompiler cannot express per-rule actions, but the
+    /// kernel evaluates stacked filters NEWEST-first and takes the first
+    /// non-ALLOW verdict. glibc's `pthread_create` calls `clone3`, whose
+    /// flags live behind a pointer seccomp cannot dereference, and glibc
+    /// only falls back to inspectable `clone(2)` when clone3 fails with
+    /// ENOSYS — an EPERM aborts thread creation outright (observed as
+    /// silent "failed to spawn thread" failures under the bare EPERM
+    /// filter). With the overlay, clone3 returns ENOSYS → glibc retries via
+    /// clone(2) → the main filter's masked_eq rule still blocks any
+    /// CLONE_NEW* namespace bits.
     fn install_seccomp(net_deny: bool) -> Result<(), String> {
         let arch: seccompiler::TargetArch = std::env::consts::ARCH
             .try_into()
@@ -801,7 +933,25 @@ mod containment {
         let prog = map
             .get("main_thread")
             .ok_or_else(|| "seccomp compiled map missing 'main_thread'".to_string())?;
-        seccompiler::apply_filter(prog).map_err(|e| format!("seccomp apply_filter: {e}"))
+        seccompiler::apply_filter(prog).map_err(|e| format!("seccomp apply_filter: {e}"))?;
+
+        // Overlay: newest filter, consulted first (see fn doc).
+        use seccompiler::{SeccompAction, SeccompFilter};
+        let mut overlay_rules = std::collections::BTreeMap::new();
+        overlay_rules.insert(libc::SYS_clone3, Vec::new());
+        let overlay = SeccompFilter::new(
+            overlay_rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::ENOSYS as u32),
+            arch,
+        )
+        .map_err(|e| format!("seccomp clone3 overlay build: {e}"))?;
+        let overlay_prog: seccompiler::BpfProgram = overlay
+            .try_into()
+            .map_err(|e| format!("seccomp clone3 overlay compile: {e}"))?;
+        seccompiler::apply_filter(&overlay_prog)
+            .map_err(|e| format!("seccomp clone3 overlay apply: {e}"))?;
+        Ok(())
     }
 }
 
@@ -898,6 +1048,408 @@ mod tests {
         _assert_send_sync::<SandboxConfig>();
         _assert_send_sync::<SandboxOutcome>();
         _assert_send_sync::<SandboxError>();
+    }
+
+    // ------------------------------------------------------------------
+    // Behavioral containment tests (audit P0, Gate-0 corrected semantics).
+    //
+    // Honesty policy: if the kernel cannot provide Landlock or unprivileged
+    // user namespaces, tests SKIP with a clear message instead of
+    // fake-passing. All tests run as a NORMAL USER (not root).
+    // ------------------------------------------------------------------
+
+    /// Returns a human-readable skip reason when kernel containment is not
+    /// available in this environment.
+    fn containment_skip_reason() -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            if super::containment::landlock_abi_version() == 0 {
+                return Some(
+                    "SKIP: kernel lacks Landlock ABI (needs Linux >= 5.13) \
+                     — cannot verify FS containment honestly"
+                        .into(),
+                );
+            }
+            if !super::containment::unprivileged_userns_available() {
+                return Some(
+                    "SKIP: unprivileged user namespaces disabled (sysctl) \
+                     — cannot verify namespace containment honestly"
+                        .into(),
+                );
+            }
+        }
+        None
+    }
+
+    fn behavior_config(fs_allow: Vec<PathBuf>) -> SandboxConfig {
+        SandboxConfig {
+            fs_allow,
+            net_deny: true,
+            mem_limit_mb: 512,
+            cpu_timeout_secs: 30,
+        }
+    }
+
+    /// Inert unless dispatched by another test via env vars. Re-executing the
+    /// test binary lets the child perform a LITERAL `std::fs::write` /
+    /// `std::fs::read` / `TcpListener::bind` inside (or outside) the sandbox.
+    /// Result is printed as `CHILD-*-OK` / `CHILD-*-ERR:<kind>` and turned
+    /// into an exit code the parent asserts on.
+    #[test]
+    fn sandbox_child_payload_op() {
+        let Ok(op) = std::env::var("KITTY_SANDBOX_CHILD_OP") else {
+            return; // normal suite run: this test is a no-op witness
+        };
+        let target = std::env::var("KITTY_SANDBOX_CHILD_PATH").unwrap_or_default();
+        match op.as_str() {
+            "write" => match std::fs::write(&target, b"x") {
+                Ok(()) => {
+                    println!("CHILD-WRITE-OK {target}");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("CHILD-WRITE-ERR kind={:?} {e}", e.kind());
+                    std::process::exit(3);
+                }
+            },
+            "read" => match std::fs::read(&target) {
+                Ok(_) => {
+                    println!("CHILD-READ-OK {target}");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("CHILD-READ-ERR kind={:?} {e}", e.kind());
+                    std::process::exit(3);
+                }
+            },
+            "net" => match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(l) => {
+                    drop(l);
+                    println!("CHILD-NET-OK");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("CHILD-NET-ERR kind={:?} {e}", e.kind());
+                    std::process::exit(3);
+                }
+            },
+            other => panic!("unknown child op: {other}"),
+        }
+    }
+
+    /// Spawn this test binary re-entrant, running ONLY the payload test.
+    /// When `sandboxed` is Some, containment is armed on the child first.
+    async fn dispatch_child(
+        op: &str,
+        target: &Path,
+        sandboxed: Option<&Sandbox>,
+    ) -> std::process::Output {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut cmd = tokio::process::Command::new(exe);
+        cmd.args([
+            "--exact",
+            "sandbox::tests::sandbox_child_payload_op",
+            "--nocapture",
+            "--quiet",
+        ])
+        .env("KITTY_SANDBOX_CHILD_OP", op)
+        .env("KITTY_SANDBOX_CHILD_PATH", target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        if let Some(sb) = sandboxed {
+            sb.apply(&mut cmd).expect("apply must arm containment");
+        }
+        cmd.output().await.expect("dispatch child payload")
+    }
+
+    fn child_stdout(out: &std::process::Output) -> String {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn is_running_as_root() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: getuid(2) is a trivial, async-signal-safe syscall with
+            // no memory effects; the unsafe block wraps only the FFI call.
+            unsafe { libc::getuid() == 0 }
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    /// AUDIT P0 CORE ASSERTION (Gate-0 corrected).
+    ///
+    /// Landlock containment proof with a proper negative control:
+    ///
+    /// 1. NEGATIVE CONTROL — the SAME `std::fs::write` operation executed
+    ///    WITHOUT sandbox activation on a DAC-writable path OUTSIDE
+    ///    `fs_allow` SUCCEEDS. This proves any subsequent denial is caused
+    ///    by the sandbox, not by discretionary access control.
+    /// 2. SANDBOXED — the identical write to that same path FAILS with
+    ///    PermissionDenied (Landlock grants writes only under allow-roots).
+    /// 3. LITERAL AUDIT TARGET — sandboxed `std::fs::write("/etc/passwd")`
+    ///    FAILS. Note: /etc/passwd is root-owned 0644, so for a non-root
+    ///    user DAC alone would also deny it; the causal attribution for the
+    ///    sandbox capability therefore rests on steps 1+2, while step 3
+    ///    satisfies the literal audit requirement.
+    #[tokio::test]
+    async fn deny_etc_passwd_write_with_negative_control() {
+        if let Some(reason) = containment_skip_reason() {
+            println!("{reason}");
+            return;
+        }
+        // (1) Negative control: unsandboxed write outside fs_allow succeeds.
+        let outside = tempfile::tempdir().expect("tempdir");
+        let victim = outside.path().join("kitty_probe.txt");
+        let ctl = dispatch_child("write", &victim, None).await;
+        let ctl_out = child_stdout(&ctl);
+        println!("negative-control (unsandboxed): {ctl_out}");
+        assert!(
+            ctl.status.success() && ctl_out.contains("CHILD-WRITE-OK"),
+            "negative control FAILED — plain write was already denied \
+             (status={:?}, out={ctl_out}); environment cannot attribute \
+             denial to the sandbox, skipping honest verification",
+            ctl.status.code()
+        );
+
+        // (2) Same write, sandboxed, allow-root elsewhere -> Landlock deny.
+        let allow_root = tempfile::tempdir().expect("tempdir");
+        let sb = Sandbox::new(behavior_config(vec![allow_root.path().to_path_buf()]));
+        let out = dispatch_child("write", &victim, Some(&sb)).await;
+        let out_txt = child_stdout(&out);
+        println!(
+            "sandboxed (outside fs_allow): status={:?} code={:?} signal={:?} stderr={}",
+            out.status,
+            out.status.code(),
+            {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    out.status.signal()
+                }
+                #[cfg(not(unix))]
+                None::<i32>
+            },
+            String::from_utf8_lossy(&out.stderr)
+        );
+        println!("sandboxed (outside fs_allow) stdout: {out_txt}");
+        assert!(
+            !out.status.success(),
+            "CONTAINMENT BROKEN: write outside fs_allow succeeded inside sandbox"
+        );
+        assert!(
+            out_txt.contains("CHILD-WRITE-ERR kind=PermissionDenied"),
+            "expected PermissionDenied from Landlock, got: {out_txt}"
+        );
+
+        // (3) Literal audit target: sandboxed write to /etc/passwd denied.
+        let out2 = dispatch_child("write", Path::new("/etc/passwd"), Some(&sb)).await;
+        let out2_txt = child_stdout(&out2);
+        println!("sandboxed (/etc/passwd): {out2_txt}");
+        assert!(
+            !out2.status.success(),
+            "CONTAINMENT BROKEN: sandboxed std::fs::write(\"/etc/passwd\") succeeded"
+        );
+        assert!(
+            out2_txt.contains("CHILD-WRITE-ERR"),
+            "expected write error evidence, got: {out2_txt}"
+        );
+    }
+
+    /// DOCUMENTATION TEST (audit Gate-0 correction) — do NOT cite this as
+    /// containment evidence.
+    ///
+    /// `/etc/shadow` is mode 0640 root:shadow. A normal user's read-deny on
+    /// it is DISCRETIONARY ACCESS CONTROL, not a sandbox capability: the
+    /// kernel denies the read even with the sandbox completely inactive.
+    /// This test proves that claim empirically (the unsandboxed read fails
+    /// too, and the file mode carries no group/other read bits), so nobody
+    /// later mistakes a shadow-read failure for Landlock enforcement.
+    #[test]
+    fn shadow_read_deny_is_dac_not_containment() {
+        if is_running_as_root() {
+            println!("SKIP: running as root — DAC deny on /etc/shadow does not apply");
+            return;
+        }
+        // Empirical proof of the doc claim: WITHOUT any sandbox, the read is
+        // already denied by plain DAC.
+        match std::fs::read("/etc/shadow") {
+            Err(e) => println!(
+                "unsandboxed read /etc/shadow -> {:?} ({e}) — this is DAC, \
+                 NOT sandbox containment evidence",
+                e.kind()
+            ),
+            Ok(_) => panic!(
+                "environment changed: /etc/shadow readable by non-root; \
+                 the DAC documentation claim no longer holds"
+            ),
+        }
+        // File-mode evidence for the 0640 root:shadow claim (best effort —
+        // metadata itself is world-readable even when contents are not).
+        if let Ok(meta) = std::fs::metadata("/etc/shadow") {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = meta.permissions().mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "/etc/shadow mode {mode:o} unexpectedly grants group/other access"
+                );
+                println!(
+                    "/etc/shadow mode: {:o} (root:shadow DAC profile)",
+                    mode & 0o7777
+                );
+            }
+        }
+    }
+
+    /// RLIMIT_AS enforcement: allocating 2 GB inside the 512 MB sandbox must
+    /// fail abnormally. Deliberately does NOT pin a specific signal — the
+    /// allocator may abort (SIGABRT), get killed, or exit nonzero depending
+    /// on libc/python behavior; only `success == false` is asserted.
+    #[tokio::test]
+    async fn rlimit_as_512mb_blocks_2gb_alloc() {
+        if let Some(reason) = containment_skip_reason() {
+            println!("{reason}");
+            return;
+        }
+        // Honest dependency probe: python3 provides a deterministic 2GB alloc.
+        let has_python = tokio::process::Command::new("sh")
+            .args(["-c", "command -v python3"])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_python {
+            println!("SKIP: python3 not available — cannot drive deterministic 2GB allocation");
+            return;
+        }
+        let allow_root = tempfile::tempdir().expect("tempdir");
+        let sb = Sandbox::new(behavior_config(vec![allow_root.path().to_path_buf()]));
+        let outcome = sb
+            .run(
+                "sh",
+                &["-c", "python3 -c 'b = bytearray(2 * 1024 ** 3)'"],
+                None,
+            )
+            .await
+            .expect("contained run must execute");
+        println!(
+            "rlimit outcome: success={} exit_code={:?} signal={:?} stderr={}",
+            outcome.success,
+            outcome.exit_code,
+            outcome.signal,
+            outcome.stderr.trim()
+        );
+        assert!(
+            !outcome.success,
+            "2GB allocation inside RLIMIT_AS=512MB sandbox must fail abnormally"
+        );
+    }
+
+    /// Kernel-state evidence captured into the test log: the sandboxed child
+    /// must show `NoNewPrivs: 1` (prctl set during containment arming) and
+    /// `Seccomp: 2` (a BPF filter is installed in filter mode).
+    #[tokio::test]
+    async fn proc_status_shows_nonewprivs_and_seccomp_filter() {
+        if let Some(reason) = containment_skip_reason() {
+            println!("{reason}");
+            return;
+        }
+        let allow_root = tempfile::tempdir().expect("tempdir");
+        let sb = Sandbox::new(behavior_config(vec![allow_root.path().to_path_buf()]));
+        let outcome = sb
+            .run("cat", &["/proc/self/status"], None)
+            .await
+            .expect("contained run must execute");
+        assert!(
+            outcome.success,
+            "cat /proc/self/status failed inside sandbox"
+        );
+        println!("--- sandboxed /proc/self/status ---\n{}", outcome.stdout);
+
+        let field = |name: &str| {
+            outcome
+                .stdout
+                .lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .map(str::to_string)
+        };
+        assert_eq!(
+            field("NoNewPrivs:").as_deref(),
+            Some("1"),
+            "NoNewPrivs must be set inside the sandbox"
+        );
+        assert_eq!(
+            field("Seccomp:").as_deref(),
+            Some("2"),
+            "Seccomp mode 2 (filter) expected inside the sandbox"
+        );
+    }
+
+    /// net_deny: binding a TCP socket succeeds unsandboxed (negative
+    /// control) and fails with EPERM inside the sandbox (socket(2) omitted
+    /// from the seccomp allowlist).
+    #[tokio::test]
+    async fn net_bind_denied_sandboxed_allowed_unsandboxed() {
+        if let Some(reason) = containment_skip_reason() {
+            println!("{reason}");
+            return;
+        }
+        // Negative control: unsandboxed ephemeral bind works.
+        let ctl = dispatch_child("net", Path::new("-"), None).await;
+        let ctl_out = child_stdout(&ctl);
+        println!("negative-control (unsandboxed bind): {ctl_out}");
+        if !(ctl.status.success() && ctl_out.contains("CHILD-NET-OK")) {
+            println!(
+                "SKIP: host denies unsandboxed ephemeral binds (status={:?}) \
+                 — cannot attribute denial to sandbox honestly",
+                ctl.status.code()
+            );
+            return;
+        }
+        // Sandboxed bind must fail (socket(2) omitted from the allowlist).
+        let allow_root = tempfile::tempdir().expect("tempdir");
+        let sb = Sandbox::new(behavior_config(vec![allow_root.path().to_path_buf()]));
+        let out = dispatch_child("net", Path::new("-"), Some(&sb)).await;
+        let out_txt = child_stdout(&out);
+        println!("sandboxed bind: {out_txt}");
+        assert!(
+            !out.status.success(),
+            "CONTAINMENT BROKEN: TCP bind succeeded inside net_deny sandbox"
+        );
+        assert!(
+            out_txt.contains("CHILD-NET-ERR"),
+            "expected socket denial evidence, got: {out_txt}"
+        );
+    }
+
+    /// Exec-error propagation: spawning a nonexistent binary surfaces ENOENT
+    /// to the parent as an Err from spawn (std's CLOEXEC exec-error pipe —
+    /// the same pattern Catalyst hand-rolls in runner/imp.rs).
+    #[tokio::test]
+    async fn exec_failure_propagates_to_parent() {
+        if let Some(reason) = containment_skip_reason() {
+            println!("{reason}");
+            return;
+        }
+        let allow_root = tempfile::tempdir().expect("tempdir");
+        let sb = Sandbox::new(behavior_config(vec![allow_root.path().to_path_buf()]));
+        let err = sb
+            .run("/nonexistent/kitty-probe-binary", &[], None)
+            .await
+            .expect_err("exec of missing binary must propagate an error");
+        match err {
+            SandboxError::Io(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "expected ENOENT propagated from the exec-error channel"
+            ),
+            other => panic!("expected SandboxError::Io, got: {other}"),
+        }
     }
 }
 
