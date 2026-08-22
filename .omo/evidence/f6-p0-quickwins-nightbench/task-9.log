@@ -1,0 +1,77 @@
+# Task 9 — QW embedding e2e real episodes.db (f6-p0-quickwins-nightbench)
+
+Date: 2026-08-21
+Scope: crates/kitty-memory/** ONLY (kitty-harness lane untouched)
+
+## 1. Test `embedding_blob_migration_and_recall` (crates/kitty-memory/src/embedding.rs)
+
+Upgraded from NamedTempFile smoke to full e2e against a REAL sqlite file:
+
+- DB: `<tempdir>/episodes.db` created via `EpisodeStore::open` — NEVER the live
+  `~/.kitty/episodes.db` (tempdir only; asserted in code comment).
+- Production schema semantics: `EpisodeStore::open` now sets
+  `PRAGMA journal_mode=WAL` + `PRAGMA busy_timeout=5000` right after
+  `Connection::open`, matching Catalyst apohara-episodic/store.rs:68 pattern.
+  Test probes a second raw connection and asserts journal_mode == "wal".
+- Session 1: insert 6 episodes WITH 384-dim embedding BLOBs
+  (`save_with_embedding`). Target inserted FIRST (oldest) so recency cannot
+  explain top-1. Embeddings are deterministic splitmix64 random unit vectors
+  (network-free; no fastembed model download in tests).
+- Session 2: drop store (clean WAL shutdown) → reopen same file = migration
+  path over existing table; `ensure_embedding_column` duplicate-column no-op;
+  count preserved; blake3 content hash stable across reopen and equal to
+  recomputed `Episode::compute_hash`; BLOB roundtrip exact.
+- Recall: `recall_hybrid(paraphrased_query, Some(&query_emb), 3)` with query
+  "websocket gateway drops connection intermittently" vs target goal "fix
+  flaky websocket reconnect loop in gateway service" → assert top-1 id ==
+  target.id and goal contains "websocket". Comment in test states hybrid is
+  NOT asserted superior in general — losing honestly is acceptable.
+
+## 2. blake3 incremental deltas
+
+episodic.rs computes blake3 for episode id/hash only. NO incremental blake3
+delta path for embeddings exists → skipped silently per task spec (nothing
+invented). The migration test covers the existing blake3 id/hash path across
+close/reopen instead.
+
+## 3. Verification commands + results
+
+Command: cargo test -p kitty-memory --features embedding
+Result: test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+(includes embedding::tests::embedding_blob_migration_and_recall ... ok)
+Doc-tests: 0 passed.
+
+Command: cargo test -p kitty-memory --features embedding embedding_blob_migration_and_recall
+Result: ok. 1 passed; 0 failed; 24 filtered out.
+Real tempdir DB file on disk confirmed by probe connection reading
+journal_mode=wal from <tempdir>/episodes.db during the test.
+
+## 4. Recall comparison — HONEST REPORTING (synthetic, NOT a product metric)
+
+Harness: benches/ab_recall.py run as-is (script has NO --limit flag; it is a
+fixed 12-query fixture). This is the SYNTHETIC toy corpus (12 handcrafted
+episodes, 3-dim toy embeddings constructed so hybrid wins) — explicitly NOT a
+product metric and not labeled as one anywhere in this deliverable.
+
+Numbers as measured:
+- Hybrid RRF k=60 top-1 correct: 12/12 queries
+- Jaccard top-1 correct: 2/12 queries
+- Strict win (hybrid top-1 correct AND Jaccard not): 10/12 = 83.3%
+- Lenient win (hybrid rank better): 12/12 = 100.0%
+- Script verdict: PASS 83.3% > 60% threshold; RRF sanity OK
+
+Honesty caveats published with these numbers:
+- Fixture is synthetic and hybrid-favorable by construction; these numbers
+  must never be quoted as product recall.
+- Hybrid losing to lexical on real data remains an acceptable outcome; no
+  merge gate depends on hybrid winning.
+
+## 5. Files changed
+
+- crates/kitty-memory/src/episodic.rs: EpisodeStore::open now sets WAL +
+  busy_timeout 5000 (production semantics).
+- crates/kitty-memory/src/embedding.rs: embedding_blob_migration_and_recall
+  rewritten as tempdir e2e (WAL probe, blob inserts, close/reopen migration,
+  hash stability, hybrid paraphrase recall).
+
+Cargo.lock: NOT modified, NOT committed.

@@ -239,6 +239,11 @@ pub struct EpisodeStore {
 impl EpisodeStore {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // Production DB semantics (Catalyst apohara-episodic/store.rs:68):
+        // WAL so readers don't block the single writer; busy_timeout 5s so a
+        // concurrent cross-session writer blocks instead of erroring.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS episodes (
                 id TEXT PRIMARY KEY,
