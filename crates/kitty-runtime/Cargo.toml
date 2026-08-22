@@ -17,7 +17,15 @@ zeroize = { version = "1.8", features = ["derive"] }
 [features]
 default = []
 llama = ["dep:llama-cpp-2"]
+# GPU offload for the gbnf-probe measurement (needs Vulkan SDK headers +
+# glslc at build time; RTX 2060S on this machine).
+llama-vulkan = ["llama", "llama-cpp-2/vulkan"]
 
 [dependencies.llama-cpp-2]
 version = "0.1.154"
 optional = true
+
+[[bin]]
+name = "gbnf-probe"
+path = "src/bin/gbnf_probe.rs"
+required-features = ["llama"]

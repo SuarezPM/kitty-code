@@ -1,0 +1,68 @@
+{
+  "profile": "tiny",
+  "limit": 50,
+  "method": "empirical",
+  "model": "qwen2.5-coder-7b-q4_k_m.gguf",
+  "model_path": "/home/thelinconx/.kitty/models/qwen2.5-coder-7b-q4_k_m.gguf",
+  "mechanism": "kitty-runtime gbnf-probe binary: llama-cpp-2 direct GGUF decode, LlamaSampler::grammar_lazy triggers ['{\"name\"'] + json_schema_to_grammar (same construction as LlamaCppClient), dist sampler, Qwen chat template",
+  "max_tokens_per_prompt": 256,
+  "seed_base": 42,
+  "gpu_layers": 999,
+  "decode_duration_s": 74.2,
+  "gate_threshold": 95.0,
+  "with_grammar_valid_pct": 94.0,
+  "with_grammar_lazy": {
+    "total_tool_calls": 50,
+    "valid_tool_calls": 47,
+    "invalid_tool_calls": 3,
+    "valid_pct": 94.0
+  },
+  "without_grammar_baseline": {
+    "total_tool_calls": 50,
+    "valid_tool_calls": 47,
+    "invalid_tool_calls": 3,
+    "valid_pct": 94.0
+  },
+  "post_hoc_valid_pct": 94.0,
+  "delta_pp": 0.0,
+  "verdict": "BELOW_GATE_empirical",
+  "invalid_examples_with_grammar": [
+    {
+      "index": 12,
+      "text": "{\"name\":\"Write\",\"arguments\":{\"path\":\"/tmp/kitty_gbnf_12/solution.py\",\"content\"}}"
+    },
+    {
+      "index": 26,
+      "text": "{\"name\": \"Edit\", \"arguments\": {\"path\": \"/tmp/kitty_gbnf_26/main.rs\", \"hash\": \"a26b\", \"new\": \"let fixed_26 = true;\"}"
+    },
+    {
+      "index": 34,
+      "text": "{\"name\": \"Edit\", \"arguments\": {\"path\": \"/tmp/kitty_gbnf_34/main.rs\", \"hash\": \"a34b\", \"new\": \"let fixed_34 = true;\"}"
+    }
+  ],
+  "invalid_examples_without_grammar": [
+    {
+      "index": 12,
+      "text": "{\"name\":\"Write\",\"arguments\":{\"path\":\"/tmp/kitty_gbnf_12/solution.py\",\"content\"}}"
+    },
+    {
+      "index": 26,
+      "text": "{\"name\": \"Edit\", \"arguments\": {\"path\": \"/tmp/kitty_gbnf_26/main.rs\", \"hash\": \"a26b\", \"new\": \"let fixed_26 = true;\"}"
+    },
+    {
+      "index": 34,
+      "text": "{\"name\": \"Edit\", \"arguments\": {\"path\": \"/tmp/kitty_gbnf_34/main.rs\", \"hash\": \"a34b\", \"new\": \"let fixed_34 = true;\"}"
+    }
+  ],
+  "note": "empirical: every number comes from real GGUF decode through the production grammar_lazy sampler; nothing simulated or forced",
+  "wiring": {
+    "grammar_has_GBNF": true,
+    "grammar_has_validate": true,
+    "llama_has_grammar_lazy": true,
+    "llama_has_json_schema": true,
+    "llama_has_ArcMutex": true,
+    "llama_has_fallback": true,
+    "agent_tiny_uses_LlamaCppClient": false,
+    "agent_tiny_uses_GrammarClient": true
+  }
+}

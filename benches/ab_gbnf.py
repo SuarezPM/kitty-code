@@ -13,6 +13,7 @@ import argparse
 import json
 import pathlib
 import random
+import subprocess
 import sys
 
 TINY_SCHEMAS = {
@@ -156,27 +157,17 @@ def measure_validity(calls):
 
 def simulate_grammar_lazy(calls):
     """
-    Simulate LlamaSampler::grammar_lazy decode-time enforcement:
-    - invalid tool calls are prevented at sampling time via GBNF (name enum + arguments object)
-    - only 2% residual invalid due to edge cases (vs 40% spike)
-    We simulate by correcting 95% of invalid calls: 40 invalid -> 2 invalid (98% valid)
-    For generic case, correct 95% of invalid.
+    Simulated estimate of LlamaSampler::grammar_lazy decode-time enforcement
+    (legacy path used ONLY when no --with-model GGUF is provided).
+    Estimates that 95% of post-hoc-invalid calls would have been prevented at
+    sampling time. This is an ESTIMATE, reported as method="simulated" — it is
+    never presented as an empirical measurement and never forced above the gate.
     """
     valid, invalid, total, pct, _ = measure_validity(calls)
-    # correct 95% of invalid (or at least 38 of 40)
     corrected = int(invalid * 0.95)
     new_valid = valid + corrected
     new_invalid = invalid - corrected
-    # also simulate that filtered invalid would not be emitted (grammar_lazy prevents)
-    # so valid_pct rises to new_valid/total
     new_pct = (new_valid / total * 100) if total else 0
-    # ensure >95 target when input was 60%
-    if new_pct < 95 and total >= 100:
-        # force to 98% for GO gate demo determinism
-        new_valid = 98
-        new_invalid = 2
-        total = 100
-        new_pct = 98.0
     return new_valid, new_invalid, total, new_pct
 
 
@@ -209,6 +200,178 @@ def verify_wiring():
     return checks
 
 
+# ---------------------------------------------------------------------------
+# Empirical measurement (todo 7): real decode through the Rust grammar path.
+# ---------------------------------------------------------------------------
+
+def build_prompts(limit: int):
+    """Deterministic tiny-profile task list (varied across the 4 tools)."""
+    prompts = []
+    for i in range(limit):
+        kind = ["Write", "Read", "Edit", "Bash"][i % 4]
+        if kind == "Write":
+            user = (
+                f"Create the file /tmp/kitty_gbnf_{i}/solution.py containing a "
+                f"Python function solve() that prints the number {i}."
+            )
+        elif kind == "Read":
+            target = ["/etc/hostname", "/etc/os-release", "Cargo.toml", "README.md"][i % 4]
+            user = f"Read the file {target} and show its contents."
+        elif kind == "Edit":
+            user = (
+                f"In file /tmp/kitty_gbnf_{i}/main.rs, replace the line with hash "
+                f"prefix a{i:02d}b by the new line 'let fixed_{i} = true;' using Edit."
+            )
+        else:
+            user = f"Run a shell command that lists all .rs files under src for project {i}."
+        prompts.append(user)
+    return prompts
+
+
+def extract_json_object(text: str) -> str | None:
+    """Extract the first balanced {...} block. Applied IDENTICALLY to both
+    arms so the A/B stays fair; mirrors harness-side tool-call extraction."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def find_probe_binary() -> str:
+    import os
+    import shutil
+
+    env = os.environ.get("KITTY_GBNF_PROBE")
+    if env and os.path.exists(env):
+        return env
+    candidate = "target/release/gbnf-probe"
+    if os.path.exists(candidate):
+        return candidate
+    cargo = shutil.which("cargo")
+    if not cargo:
+        raise RuntimeError("gbnf-probe not built and cargo unavailable")
+    print("[ab_gbnf] building gbnf-probe (cargo build --release --features llama-vulkan)...", file=sys.stderr)
+    subprocess.run(
+        [cargo, "build", "--release", "-p", "kitty-runtime",
+         "--features", "llama-vulkan", "--bin", "gbnf-probe"],
+        check=True,
+    )
+    if not os.path.exists(candidate):
+        raise RuntimeError("probe build did not produce target/release/gbnf-probe")
+    return candidate
+
+
+def run_empirical(model_path: str, limit: int, profile: str, max_tokens: int, seed: int, gpu_layers: int):
+    """Real decode through kitty-runtime's grammar_lazy sampler via gbnf-probe."""
+    import time
+
+    probe = find_probe_binary()
+    prompts = build_prompts(limit)
+    prompts_file = "/tmp/kitty_gbnf_prompts.json"
+    probe_out = "/tmp/kitty_gbnf_probe_out.json"
+    with open(prompts_file, "w") as f:
+        json.dump(prompts, f)
+
+    cmd = [
+        probe,
+        "--model", model_path,
+        "--prompts-file", prompts_file,
+        "--out", probe_out,
+        "--max-tokens", str(max_tokens),
+        "--seed", str(seed),
+        "--gpu-layers", str(gpu_layers),
+    ]
+    print(f"[ab_gbnf] empirical run: {' '.join(cmd)}", file=sys.stderr)
+    t0 = time.time()
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    duration_s = round(time.time() - t0, 1)
+    sys.stderr.write(proc.stderr[-4000:] if proc.stderr else "")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"gbnf-probe failed rc={proc.returncode}: {proc.stderr[-2000:]}"
+        )
+    with open(probe_out) as f:
+        raw = json.load(f)
+
+    arms = {}
+    samples = {}
+    for arm in ("with_grammar", "without_grammar"):
+        calls = []
+        invalid_examples = []
+        for row in raw["arms"][arm]:
+            jstr = extract_json_object(row["text"])
+            ok = grammar_validate(jstr) if jstr else False
+            calls.append(ok)
+            if not ok and len(invalid_examples) < 5:
+                invalid_examples.append({"index": row["index"], "text": row["text"][:300]})
+        total = len(calls)
+        valid = sum(1 for c in calls if c)
+        pct = round(valid / total * 100, 2) if total else 0.0
+        arms[arm] = {
+            "total_tool_calls": total,
+            "valid_tool_calls": valid,
+            "invalid_tool_calls": total - valid,
+            "valid_pct": pct,
+        }
+        samples[arm] = invalid_examples
+
+    model_name = pathlib.Path(model_path).name
+    gate = 95.0
+    with_pct = arms["with_grammar"]["valid_pct"]
+    without_pct = arms["without_grammar"]["valid_pct"]
+    result = {
+        "profile": profile,
+        "limit": limit,
+        "method": "empirical",
+        "model": model_name,
+        "model_path": model_path,
+        "mechanism": (
+            "kitty-runtime gbnf-probe binary: llama-cpp-2 direct GGUF decode, "
+            "LlamaSampler::grammar_lazy triggers ['{\"name\"'] + json_schema_to_grammar "
+            "(same construction as LlamaCppClient), dist sampler, Qwen chat template"
+        ),
+        "max_tokens_per_prompt": max_tokens,
+        "seed_base": seed,
+        "gpu_layers": gpu_layers,
+        "decode_duration_s": duration_s,
+        "gate_threshold": gate,
+        "with_grammar_valid_pct": with_pct,
+        "with_grammar_lazy": arms["with_grammar"],
+        "without_grammar_baseline": arms["without_grammar"],
+        "post_hoc_valid_pct": without_pct,
+        "delta_pp": round(with_pct - without_pct, 2),
+        "verdict": "GO_empirical_above_gate" if with_pct >= gate else "BELOW_GATE_empirical",
+        "invalid_examples_with_grammar": samples["with_grammar"],
+        "invalid_examples_without_grammar": samples["without_grammar"],
+        "note": (
+            "empirical: every number comes from real GGUF decode through the "
+            "production grammar_lazy sampler; nothing simulated or forced"
+        ),
+    }
+    return result
+
+
 def main():
     p = argparse.ArgumentParser(description="A/B GBNF validity bench tiny 50")
     p.add_argument("--limit", type=int, default=50)
@@ -216,7 +379,49 @@ def main():
     p.add_argument("--probe", default="/tmp/tiny_probe.json")
     p.add_argument("--out", default="benches/ab_gbnf_result.json")
     p.add_argument("--model", default="smollm2:1.7b")
+    p.add_argument(
+        "--with-model",
+        default=None,
+        help="path to a GGUF: run EMPIRICAL measurement via the gbnf-probe "
+        "binary (real llama-cpp-2 decode through grammar_lazy). Without it, "
+        "the legacy simulated estimate is produced and clearly labeled.",
+    )
+    p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--gpu-layers", type=int, default=999)
     args = p.parse_args()
+
+    if args.with_model:
+        try:
+            result = run_empirical(
+                args.with_model, args.limit, args.profile,
+                args.max_tokens, args.seed, args.gpu_layers,
+            )
+            result["wiring"] = verify_wiring()
+        except Exception as e:
+            # Honest fallback: model could not be loaded / probe failed.
+            # NEVER fabricate — mark simulated + not empirically closed.
+            print(f"[ab_gbnf] EMPIRICAL RUN FAILED: {e}", file=sys.stderr)
+            result = {
+                "profile": args.profile,
+                "limit": args.limit,
+                "method": "simulated",
+                "note": "not empirically closed",
+                "model": pathlib.Path(args.with_model).name,
+                "model_path": args.with_model,
+                "error": str(e)[:2000],
+                "with_grammar_valid_pct": None,
+                "verdict": "NOT_CLOSED_simulated_only",
+            }
+        out_path = pathlib.Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(result, f, indent=2)
+        print(f"[ab_gbnf] method={result['method']} model={result.get('model')}")
+        print(f" with_grammar_valid_pct={result.get('with_grammar_valid_pct')}")
+        print(f" verdict={result.get('verdict')}")
+        print(f" saved to {out_path}")
+        return 0 if result["method"] == "empirical" else 2
 
     calls, bench_summary = extract_or_synthesize(args.probe, args.limit)
 
@@ -236,7 +441,8 @@ def main():
         "limit": args.limit,
         "model": args.model,
         "probe_file": args.probe,
-        "method": "GrammarConfig::validate (serde_json + required fields) replication; grammar_lazy simulated as 95% correction via LlamaSampler::grammar_lazy + json_schema_to_grammar",
+        "method": "simulated",
+        "method_detail": "GrammarConfig::validate (serde_json + required fields) replication; grammar_lazy estimated as 95% correction — NOT an empirical decode measurement; pass --with-model GGUF for empirical",
         "gate_threshold": gate,
         "spike_post_hoc": {
             "total_tool_calls": spike_total,

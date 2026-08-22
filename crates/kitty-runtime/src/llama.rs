@@ -85,6 +85,25 @@ fn build_grammar_lazy_sampler(
     Ok(sampler)
 }
 
+/// Public entry point for the `gbnf-probe` binary: builds the same
+/// grammar_lazy sampler chain used by [`LlamaCppClient`]
+/// (`json_schema_to_grammar` + trigger `{"name"`), so the empirical
+/// measurement exercises the exact production sampler construction.
+#[cfg(feature = "llama")]
+pub fn grammar_lazy_sampler_for(
+    model: &LlamaModel,
+    tools: &[ToolDefinition],
+) -> std::result::Result<LlamaSampler, String> {
+    build_grammar_lazy_sampler(model, tools)
+}
+
+/// Public GBNF string for the tool set (diagnostic full-grammar arm of
+/// `gbnf-probe`): same conversion path as [`tool_schemas_to_gbnf`].
+#[cfg(feature = "llama")]
+pub fn tool_schemas_to_gbnf_pub(tools: &[ToolDefinition]) -> String {
+    tool_schemas_to_gbnf(tools)
+}
+
 // ---------------------------------------------------------------------------
 // Inner state protected by Arc<Mutex> for Send/Sync
 // ---------------------------------------------------------------------------

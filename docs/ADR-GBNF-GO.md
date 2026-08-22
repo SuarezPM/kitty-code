@@ -1,7 +1,73 @@
 # ADR-GBNF-GO — Verdict GO para Grammar Enforcement GBNF
 
-**Status:** Accepted — GO
+**Status:** Amended 2026-08-21 (evening) — empirical measurement REVERSES the GO. See "Amendment: empirical measurement" below.
 **Date:** 2026-08-21
+**Deciders:** kitty-harness / kitty-runtime
+**Scope:** `crates/kitty-runtime/src/grammar.rs`, `crates/kitty-runtime/src/client.rs`, `Cargo.toml`
+**Relacionado:** `docs/STRATEGY.md` F6.4 ADR-005, `crates/kitty-runtime/src/grammar.rs:6` SPIKE defer, `grammar::tests::test_gbnf_spike_documented`
+
+---
+
+## Amendment: empirical measurement (2026-08-21 evening) — GO REVERSED
+
+The original verdict below was based on a SIMULATED estimate (a Python script
+that "corrected" 95% of invalid calls and forced the result to 98%). That
+simulation has been removed (`benches/ab_gbnf.py` legacy path now labels
+itself `method: simulated` and never forces numbers). The claim "98%" was
+never measured and must not be cited.
+
+### What was actually measured
+
+Real decode through our production sampler construction
+(`LlamaSampler::grammar_lazy`, trigger `{"name"`, `json_schema_to_grammar`,
+same code path as `LlamaCppClient`) via the new `gbnf-probe` binary
+(`crates/kitty-runtime/src/bin/gbnf_probe.rs`, feature `llama-vulkan`),
+direct GGUF load of **qwen2.5-coder-7b-q4_k_m.gguf** (true identity,
+bartowski Qwen2.5-Coder-7B-Instruct Q4_K_M), Vulkan offload on RTX 2060S:
+
+| arm | valid / total | valid_pct |
+|---|---|---|
+| without_grammar (baseline) | 47 / 50 | **94.0%** |
+| with_grammar_lazy | 47 / 50 | **94.0%** |
+
+Artifacts: `benches/ab_gbnf_result.json` (canonical run, max_tokens=128),
+`benches/ab_gbnf_result_maxtok256.json` (max_tokens=256 diagnostic — same
+result, ruling out budget truncation), `.omo/evidence/f6-p0-quickwins-nightbench/task-7.log`.
+
+### Findings
+
+1. **94.0% < 95% gate — the GO condition is NOT met empirically.** The gate
+   stays open; nobody may quote 98%.
+2. **The lazy trigger never fired:** all 50 generations are byte-identical
+   between the grammar and no-grammar arms. With Qwen2.5 tokenization the
+   literal trigger word `{"name"` does not activate llama.cpp's lazy-grammar
+   matcher in this build (llama-cpp-sys-2 0.1.154), so `grammar_lazy`
+   currently degrades to unconstrained decoding. The 94% is the model's
+   native tool-call JSON ability, not grammar enforcement.
+3. The 3 failures are early-EOS truncations (`{"name":"Write",...,"content"}}`
+   cut before a value), which post-hoc validation correctly rejects.
+4. Diagnostic attempt to constrain from token 0 (`LlamaSampler::grammar`)
+   crashes inside vendored llama.cpp (`GGML_ASSERT(!stacks.empty())`,
+   llama-grammar.cpp:940) — upstream library issue, not investigated further
+   here.
+
+### Consequences of the amendment
+
+- `method: "empirical"` artifacts report `verdict:
+  BELOW_GATE_empirical`. Nothing is marked PASSED.
+- Engineering follow-up (before any GO re-decision): fix trigger activation
+  (try `grammar_lazy_patterns` with a whitespace-tolerant regex such as
+  `\{\s*"name"`, or pass explicit trigger tokens, or prefill the grammar)
+  and re-measure with this probe. Until then the spike
+  (`GrammarConfig::validate` post-hoc) remains the only enforcement layer.
+- The original analysis below is preserved for the audit trail; its 98%
+  figure is superseded by the measurements above.
+
+---
+
+## Original verdict (simulated — SUPERSEDED)
+
+
 **Deciders:** kitty-harness / kitty-runtime
 **Scope:** `crates/kitty-runtime/src/grammar.rs`, `crates/kitty-runtime/src/client.rs`, `Cargo.toml`
 **Relacionado:** `docs/STRATEGY.md` F6.4 ADR-005, `crates/kitty-runtime/src/grammar.rs:6` SPIKE defer, `grammar::tests::test_gbnf_spike_documented`
