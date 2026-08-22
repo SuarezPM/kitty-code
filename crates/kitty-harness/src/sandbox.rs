@@ -6,7 +6,7 @@
 //!
 //! | Layer | Mechanism | Origin |
 //! |---|---|---|
-//! | FS writes outside `fs_allow` | Landlock ruleset: read/execute everywhere, write only under allow-roots | plan (`AccessFs::from_all(ABI)`) |
+//! | FS writes outside `fs_allow` | Landlock ruleset: read/execute everywhere, write only under allow-roots; handled rights follow the kernel ABI up to V3 (gates `truncate(2)` since ABI v3, see [`containment::apply_landlock`]) | plan (`AccessFs::from_all(ABI)`) |
 //! | Syscalls | seccomp-bpf, default `EPERM`, conditional `openat`/`fcntl`/`ioctl`/`clone` rules | Catalyst `profile/linux.rs:110-187` |
 //! | PID/mount/user isolation | `unshare(CLONE_NEWUSER\|CLONE_NEWNS\|CLONE_NEWPID)` + uid/gid map writes | Catalyst `namespace.rs:52` |
 //! | Memory | `RLIMIT_AS = mem_limit_mb * 1 MiB` | Catalyst `runner/imp.rs` |
@@ -31,10 +31,14 @@
 //!   on the grandchild guarantees that killing the middle (timeout /
 //!   `Child::kill`) kills the workload too. Trade-off: signal identity is
 //!   flattened to `128 + signal` exit codes in [`SandboxOutcome`] (the
-//!   middle cannot transmit wait-signals verbatim).
+//!   middle cannot transmit wait-signals verbatim). The middle also closes
+//!   every inherited descriptor above stderr before waiting: it never
+//!   execs, so std's CLOEXEC exec-error channel would otherwise stay open
+//!   and the parent's `spawn()` block until the workload finishes (see
+//!   [`containment::close_inherited_fds`]).
 //! - Direct cross-process signaling is additionally covered by the seccomp
-//!   allowlist: `kill`/`tkill`/`ptrace`/`pidfd_*` are not allowlisted, so
-//!   they fail with `EPERM`.
+//!   allowlist: `kill`/`tkill`/`tgkill`/`ptrace`/`pidfd_*` are not
+//!   allowlisted, so they fail with `EPERM`.
 //!
 //! Fail-closed policy: [`Sandbox::apply`] returns an error instead of arming
 //! a partial sandbox when the kernel lacks Landlock or unprivileged user
@@ -71,13 +75,53 @@ pub struct SandboxConfig {
     pub cpu_timeout_secs: u64,
 }
 
+/// Default `RLIMIT_AS` in MiB. Fine for interactive laptop use; compile-heavy
+/// workloads need more (see [`SandboxConfig::new`]).
+pub const DEFAULT_MEM_LIMIT_MB: u64 = 512;
+
+/// Parse a `KITTY_SANDBOX_MEM_MB` value. Accepts positive integers with
+/// optional surrounding whitespace; anything else (zero, negative, garbage)
+/// is rejected so the caller can fall back to the default.
+pub fn parse_mem_limit_mb(raw: &str) -> Option<u64> {
+    let v = raw.trim().parse::<u64>().ok()?;
+    (v > 0).then_some(v)
+}
+
+/// Authoritative memory-limit override: `KITTY_SANDBOX_MEM_MB`, when set to
+/// a valid positive integer, replaces [`DEFAULT_MEM_LIMIT_MB`] at config
+/// build time.
+///
+/// Why this must be overridable: `RLIMIT_AS` caps **virtual** address space,
+/// not RSS. rustc / javac / the JVM reserve multi-GiB of VA at startup and
+/// abort under a 512 MiB cap even though actual resident usage stays small.
+/// Bench contexts should therefore set `KITTY_SANDBOX_MEM_MB=4096` (or
+/// higher); the default stays conservative for laptop use.
+fn mem_limit_from_env() -> Option<u64> {
+    let raw = std::env::var("KITTY_SANDBOX_MEM_MB").ok()?;
+    match parse_mem_limit_mb(&raw) {
+        Some(mb) => Some(mb),
+        None => {
+            tracing::warn!(
+                value = %raw,
+                "KITTY_SANDBOX_MEM_MB is not a positive integer; using default"
+            );
+            None
+        }
+    }
+}
+
 impl SandboxConfig {
+    /// Build a config allowing writes under `workspace` and `/tmp`.
+    ///
+    /// `mem_limit_mb` resolution order: valid `KITTY_SANDBOX_MEM_MB` env
+    /// (authoritative — bench contexts should set ≥4096 for compile-heavy
+    /// tasks) → [`DEFAULT_MEM_LIMIT_MB`].
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         let ws = workspace.into();
         Self {
             fs_allow: vec![ws, PathBuf::from("/tmp")],
             net_deny: true,
-            mem_limit_mb: 512,
+            mem_limit_mb: mem_limit_from_env().unwrap_or(DEFAULT_MEM_LIMIT_MB),
             cpu_timeout_secs: 30,
         }
     }
@@ -148,8 +192,8 @@ impl Sandbox {
     /// runs in the forked child just before exec (`pre_exec`); a failure to
     /// establish containment fails the spawn instead of degrading silently.
     ///
-    /// Keep calling `Guard::check_chain` BEFORE this — guard policy first,
-    /// kernel containment second.
+    /// Callers (`ToolRegistry::execute_bash`) must run `Guard::check_chain`
+    /// BEFORE this — guard policy first, kernel containment second.
     pub fn apply(&self, cmd: &mut tokio::process::Command) -> Result<(), SandboxError> {
         cmd.env("KITTY_SANDBOX_MEM_MB", self.config.mem_limit_mb.to_string());
         cmd.env(
@@ -310,6 +354,20 @@ where
     (String::from_utf8_lossy(&buf).into_owned(), truncated)
 }
 
+/// Cheap parent-side probe: can this kernel provide full containment
+/// (Landlock + unprivileged user namespaces)? Used to skip behavioral tests
+/// honestly instead of fake-passing, and available to callers that want to
+/// pre-flight before arming a sandbox.
+#[cfg(target_os = "linux")]
+pub fn containment_available() -> bool {
+    containment::landlock_abi_version() > 0 && containment::unprivileged_userns_available()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn containment_available() -> bool {
+    false
+}
+
 fn normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
@@ -438,6 +496,10 @@ mod containment {
             }
             nix::unistd::ForkResult::Parent { child } => {
                 use nix::sys::wait::{waitpid, WaitStatus};
+                // Release the exec-error write-end BEFORE waiting so the
+                // parent's spawn() unblocks immediately (see
+                // `close_inherited_fds` for the full rationale).
+                close_inherited_fds();
                 let code = match waitpid(child, None) {
                     Ok(WaitStatus::Exited(_, c)) => c,
                     Ok(WaitStatus::Signaled(_, sig, _)) => 128 + (sig as i32),
@@ -469,6 +531,46 @@ mod containment {
             return Err("sandbox middle process died during setup".into());
         }
         Ok(())
+    }
+
+    /// Close every inherited descriptor above stderr in the middle process.
+    ///
+    /// Why this matters: std reports child exec failures over a CLOEXEC
+    /// pipe/socket whose write-end the parent blocks on (read/recvfrom)
+    /// until ALL copies are closed. Under the double-fork topology the
+    /// middle process is std's direct child and it never execs — it waits
+    /// for the grandchild. Its copy of the exec-error write-end therefore
+    /// survived until the WORKLOAD finished, so the parent's `spawn()`
+    /// blocked for the entire workload duration (observed: a
+    /// `tokio::time::timeout` wrapped around spawn+wait never fired because
+    /// the runtime thread sat inside `spawn()`'s blocking recvfrom).
+    ///
+    /// Closing fds > 2 here releases the write-end as soon as the grandchild
+    /// is forked; the parent's spawn returns immediately and std attributes
+    /// the (non-)error of the direct child exactly as designed. The
+    /// grandchild is unaffected: fd tables are independent, and its own
+    /// copies are CLOEXEC and close at execve.
+    fn close_inherited_fds() {
+        let Ok(mut dir) = std::fs::read_dir("/proc/self/fd") else {
+            return;
+        };
+        let mut fds: Vec<i32> = Vec::new();
+        for entry in dir.by_ref().flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                if let Ok(fd) = name.parse::<i32>() {
+                    if fd > 2 {
+                        fds.push(fd);
+                    }
+                }
+            }
+        }
+        drop(dir);
+        for fd in fds {
+            // SAFETY: close(2) on descriptor numbers collected from
+            // /proc/self/fd. The middle process needs no descriptors to
+            // waitpid(2) the grandchild and _exit(2).
+            unsafe { libc::close(fd) };
+        }
     }
 
     fn set_no_new_privs() -> Result<(), String> {
@@ -535,15 +637,44 @@ mod containment {
             .map_err(|e| format!("write {path}: {e}"))
     }
 
-    /// Landlock ruleset: handle ALL V1 FS accesses, grant read/execute on `/`
-    /// and read-write only under each resolved allow-root. Fails closed when
-    /// the result would not be fully enforced.
+    /// Landlock ruleset: handle every FS access the running kernel supports
+    /// (capped at ABI V3), grant read/execute on `/` and read-write only
+    /// under each resolved allow-root. Fails closed when the result would
+    /// not be fully enforced.
+    ///
+    /// Why NOT pin `ABI::V1`: `LANDLOCK_ACCESS_FS_TRUNCATE` exists since
+    /// kernel ABI v3. With V1 rights handled, `truncate(2)`/`ftruncate(2)`
+    /// were not gated by Landlock at all, so a sandboxed child could zero
+    /// any DAC-writable file outside `fs_allow` via path-based truncate —
+    /// the seccomp entries for those syscalls are unconditional by design.
+    /// We therefore probe the kernel ABI (same syscall the crate uses) and
+    /// handle V3 rights whenever the kernel reports ≥ 3, with an exact V1/V2
+    /// fallback for older kernels. The cap stays at V3 (not the highest known
+    /// ABI) so we never enable deny-by-default rights this profile has not
+    /// been tested against.
+    ///
+    /// REFER side-effect (fail-closed, accepted): handling ABI ≥ V2 turns on
+    /// `LANDLOCK_ACCESS_FS_REFER`, which is deny-by-default for reparenting
+    /// renames/links. Renames *within* a single allow-root are unaffected;
+    /// cross-root renames between separately-bound roots (`/tmp` ↔ workspace)
+    /// may newly fail because no common parent hierarchy grants REFER.
+    /// Failing closed on that exotic operation is preferable to leaving
+    /// truncate(2) ungated.
     fn apply_landlock(allow_roots: &[PathBuf]) -> Result<(), String> {
         use landlock::{
             Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
             RulesetStatus, ABI,
         };
-        let abi = ABI::V1;
+        let kernel_abi = landlock_abi_version();
+        if kernel_abi == 0 {
+            return Err("Landlock ABI unavailable (needs Linux >= 5.13)".into());
+        }
+        let abi = if kernel_abi >= 3 {
+            ABI::V3
+        } else {
+            // Exact fallback for kernels between 5.13 and 6.1.
+            ABI::from(kernel_abi as i32)
+        };
         let all = AccessFs::from_all(abi);
         let read_only = AccessFs::from_read(abi);
 
@@ -664,7 +795,6 @@ mod containment {
         "getcwd",
         "prlimit64",
         "sched_getaffinity",
-        "tgkill",
         // Process group / session info (self-scoped; dash needs getpgrp)
         "getpgrp",
         "setpgid",
@@ -744,14 +874,17 @@ mod containment {
         "pwrite64",
         "writev",
         "pwritev2",
-        // Path mutation (path-level policy comes from Landlock above)
+        // Path mutation (path-level policy comes from Landlock above, which
+        // handles TRUNCATE since kernel ABI v3 — see `apply_landlock`. On
+        // ABI < 3 kernels these remain only DAC-gated: accepted, documented
+        // limitation of the V1/V2 fallback.)
         "creat",
         "mkdirat",
         "unlinkat",
         "renameat2",
         "linkat",
         "symlinkat",
-        // Truncation
+        // Truncation (gated at path level by Landlock TRUNCATE on ABI >= 3)
         "ftruncate",
         "truncate",
         // Metadata
@@ -1122,6 +1255,22 @@ mod tests {
                     std::process::exit(3);
                 }
             },
+            "truncate" => {
+                // libc::truncate(2) directly — the syscall behind the former
+                // ABI::V1 TRUNCATE bypass (Gate-3 finding 2).
+                let c = std::ffi::CString::new(target.as_str()).expect("path without NUL");
+                // SAFETY: `c` is a valid NUL-terminated string; truncate(2)
+                // only touches the file it names.
+                let rc = unsafe { libc::truncate(c.as_ptr(), 0) };
+                if rc == 0 {
+                    println!("CHILD-TRUNCATE-OK {target}");
+                    std::process::exit(0);
+                } else {
+                    let e = std::io::Error::last_os_error();
+                    println!("CHILD-TRUNCATE-ERR kind={:?} {e}", e.kind());
+                    std::process::exit(3);
+                }
+            }
             "net" => match std::net::TcpListener::bind("127.0.0.1:0") {
                 Ok(l) => {
                     drop(l);
@@ -1254,6 +1403,65 @@ mod tests {
         assert!(
             out2_txt.contains("CHILD-WRITE-ERR"),
             "expected write error evidence, got: {out2_txt}"
+        );
+    }
+
+    /// Gate-3 fix: Landlock must gate `truncate(2)` outside `fs_allow`.
+    ///
+    /// Under the former `ABI::V1` pinning, `LANDLOCK_ACCESS_FS_TRUNCATE`
+    /// (kernel ABI v3) was not handled while seccomp allowlists
+    /// `truncate`/`ftruncate` unconditionally — a sandboxed child could zero
+    /// any DAC-writable file outside `fs_allow`. Negative control proves the
+    /// denial is caused by the sandbox, not by DAC.
+    #[tokio::test]
+    async fn truncate_outside_fs_allow_denied_with_negative_control() {
+        if let Some(reason) = containment_skip_reason() {
+            println!("{reason}");
+            return;
+        }
+        // The fix requires kernel ABI >= 3; on older kernels TRUNCATE cannot
+        // be handled at all (documented V1/V2 fallback limitation).
+        #[cfg(target_os = "linux")]
+        if super::containment::landlock_abi_version() < 3 {
+            println!(
+                "SKIP: Landlock ABI < 3 — TRUNCATE cannot be handled on this \
+                 kernel (documented fallback limitation)"
+            );
+            return;
+        }
+
+        let outside = tempfile::tempdir().expect("tempdir");
+        let victim = outside.path().join("victim.txt");
+
+        // (1) Negative control: unsandboxed libc::truncate(2) on a user-owned
+        // file OUTSIDE fs_allow succeeds.
+        std::fs::write(&victim, b"data").expect("seed victim");
+        let ctl = dispatch_child("truncate", &victim, None).await;
+        let ctl_out = child_stdout(&ctl);
+        println!("negative-control (unsandboxed truncate): {ctl_out}");
+        assert!(
+            ctl.status.success() && ctl_out.contains("CHILD-TRUNCATE-OK"),
+            "negative control FAILED — plain truncate was already denied \
+             (status={:?}, out={ctl_out}); environment cannot attribute \
+             denial to the sandbox",
+            ctl.status.code()
+        );
+
+        // (2) Same truncate, sandboxed with an allow-root elsewhere -> deny.
+        std::fs::write(&victim, b"data").expect("re-seed victim");
+        let allow_root = tempfile::tempdir().expect("tempdir");
+        let sb = Sandbox::new(behavior_config(vec![allow_root.path().to_path_buf()]));
+        let out = dispatch_child("truncate", &victim, Some(&sb)).await;
+        let out_txt = child_stdout(&out);
+        println!("sandboxed truncate (outside fs_allow): {out_txt}");
+        assert!(
+            !out.status.success(),
+            "CONTAINMENT BROKEN: libc::truncate outside fs_allow succeeded \
+             inside sandbox (TRUNCATE bypass)"
+        );
+        assert!(
+            out_txt.contains("CHILD-TRUNCATE-ERR"),
+            "expected truncate denial evidence, got: {out_txt}"
         );
     }
 
@@ -1507,6 +1715,16 @@ mod pure {
             "kill must never be allowlisted"
         );
         assert!(
+            !denied.iter().any(|s| s == "tkill"),
+            "tkill must never be allowlisted"
+        );
+        // Gate-3 finding 4: tgkill was removed from the allowlist so the
+        // module docs ("kill/tkill/tgkill not allowlisted") match reality.
+        assert!(
+            !denied.iter().any(|s| s == "tgkill"),
+            "tgkill must never be allowlisted"
+        );
+        assert!(
             !denied.iter().any(|s| s == "ptrace"),
             "ptrace must never be allowlisted"
         );
@@ -1514,6 +1732,21 @@ mod pure {
         let allowed = names(false);
         assert!(allowed.iter().any(|s| s == "socket"));
         assert!(allowed.iter().any(|s| s == "connect"));
+    }
+
+    #[test]
+    fn parse_mem_limit_mb_accepts_positive_integers_only() {
+        // Gate-3 finding 3: KITTY_SANDBOX_MEM_MB is the authoritative input;
+        // the parser must accept valid values and reject everything else so
+        // the config can fall back to DEFAULT_MEM_LIMIT_MB.
+        assert_eq!(super::parse_mem_limit_mb("512"), Some(512));
+        assert_eq!(super::parse_mem_limit_mb("4096"), Some(4096));
+        assert_eq!(super::parse_mem_limit_mb(" 2048 "), Some(2048));
+        assert_eq!(super::parse_mem_limit_mb("0"), None);
+        assert_eq!(super::parse_mem_limit_mb("-1"), None);
+        assert_eq!(super::parse_mem_limit_mb("abc"), None);
+        assert_eq!(super::parse_mem_limit_mb(""), None);
+        assert_eq!(super::parse_mem_limit_mb("12.5"), None);
     }
 
     #[test]

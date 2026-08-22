@@ -1,0 +1,98 @@
+=== task 5: Landlock+seccomp real (commit evidence) ===
+vie 21 ago 2026 21:02:34 -03
+
+== cargo build -p kitty-harness ==
+   Compiling kitty-harness v0.1.0 (/home/thelinconx/Proyectos/Kitty-Code/crates/kitty-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.49s
+build-exit: 0
+
+== cargo clippy -p kitty-harness --all-targets --all-features -- -D warnings ==
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.18s
+clippy-exit: 0
+
+== grep -c println! sandbox.rs ==
+0
+
+== acceptance greps ==
+seccompiler: 4
+landlock: 17
+CLONE_NEWUSER: 3
+RLIMIT_AS: 4
+MAX_OUTPUT_BYTES: 10
+
+== cargo test -p kitty-harness --lib sandbox (smoke) ==
+test sandbox::pure::seccomp_net_deny_toggles_socket_rules ... ok
+test sandbox::tests::sandbox_env_hints_set ... ok
+test sandbox::tests::apply_wraps_command ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 215 filtered out; finished in 0.00s
+
+
+== FINAL ACCEPTANCE (post commit 2) ==
+vie 21 ago 2026 21:41:34 -03
+kernel: 7.1.8-1-cachyos
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.19s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s
+println-outside-cfg(test): 0
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 215 filtered out; finished in 0.04s
+
+
+## Gate-3 remediation
+sáb 22 ago 2026 (sesión 21:55–02:05 -03) — fixes for Oracle Gate-3 findings 1-4 on d3e3f55+1e98e02
+
+### Finding 1 [HIGH] — sandbox wired into execute_bash
+- ToolRegistry now holds `bash_sandbox: Option<Sandbox>`; `new`/`with_timeout`/`with_read_limit`
+  arm `Sandbox::new(SandboxConfig::new(cwd))`. Builders: `with_workspace`, `with_sandbox`, `without_sandbox`.
+- execute_bash: Guard::check_chain FIRST, then `sb.apply(&mut cmd)` (ordering per sandbox.rs contract).
+- SandboxError::Unsupported/Setup → ToolError::Sandbox with actionable message (fail-closed: command NOT executed).
+- Spawn failure while armed → ToolError::Sandbox hinting blocked user namespaces + KITTY_SANDBOX=off opt-out.
+- Loud opt-out: env KITTY_SANDBOX=off honored ONLY when set; tracing::warn EVERY activation.
+- Test: tools::bash_write_outside_workspace_denied_by_sandbox_with_negative_control
+  (Guard-passing `cp` outside fs_allow FAILS sandboxed + victim untouched; succeeds without sandbox).
+
+### Finding 2 [HIGH] — Landlock TRUNCATE bypass closed
+- apply_landlock no longer pins ABI::V1. Probes kernel ABI (landlock_create_ruleset VERSION probe):
+  >=3 → ABI::V3 rights (adds REFER v2 + TRUNCATE v3); V1/V2 exact fallback for older kernels;
+  cap at V3 so untested deny-by-default rights (ioctl_dev v5, etc.) stay off. Kernel here reports ABI 9.
+- seccomp truncate/ftruncate entries stay unconditional (needed inside allow-roots); path-level policy
+  now actually comes from Landlock on ABI>=3. ABI<3 kernels remain DAC-only for truncate (documented limitation).
+- REFER side-effect documented at apply_landlock: cross-root renames (/tmp <-> workspace) may newly fail — fail-closed, accepted.
+- Test: sandbox::truncate_outside_fs_allow_denied_with_negative_control
+  (libc::truncate(2) via re-entrant child payload op "truncate"; unsandboxed control OK, sandboxed → CHILD-TRUNCATE-ERR).
+
+### Finding 3 [MEDIUM] — RLIMIT_AS configurable
+- KITTY_SANDBOX_MEM_MB is now the AUTHORITATIVE input, parsed at SandboxConfig build
+  (parse_mem_limit_mb: positive integers only; invalid → tracing::warn + DEFAULT_MEM_LIMIT_MB=512).
+- Doc: bench contexts should set >=4096 (rustc/javac/JVM reserve multi-GB VIRTUAL address space; RLIMIT_AS caps VA not RSS).
+- Test: sandbox::pure::parse_mem_limit_mb_accepts_positive_integers_only.
+
+### Finding 4 [LOW] — tgkill removed from seccomp allowlist
+- Dropped from SECCOMP_PURE_ALLOW; module docs updated to "kill/tkill/tgkill/ptrace/pidfd_*" (docs match reality).
+- Pure test extended: tgkill AND tkill asserted absent from the allowlist.
+
+### BONUS FIX (discovered by new wiring, blocking finding 1)
+- Double-fork middle process held std's exec-error channel open until the WORKLOAD finished:
+  parent spawn() blocked for the entire command duration and tokio::time::timeout around
+  spawn+wait NEVER fired (strace: runtime thread stuck in recvfrom(13) for 10s of `sleep 10`).
+- Fix: middle closes all inherited fds >2 before waitpid (containment::close_inherited_fds);
+  grandchild unaffected (independent fd tables, CLOEXEC copies close at execve).
+- Regression test: tools::bash_timeout_still_fires_under_sandbox (sleep 10 under 1s budget → timed-out result ~1s).
+
+### Validation
+- cargo test -p kitty-harness --lib: 236 passed / 0 failed (was 232; +4 new tests)
+- cargo clippy -p kitty-harness --all-targets --all-features -- -D warnings: clean
+- grep println! outside #[cfg(test)] in sandbox.rs: 0
+- No existing test weakened; Cargo.lock untouched.
+
+### Harbor smoke k1 (compile-ish task polyglot_python_phone-number; hello-world does NOT exist in aider-polyglot)
+Outcome A — default (sandbox armed), run /tmp/harbor-gate3-smoke/2026-08-21__22-30-13:
+  userns available in-container? NO. Direct evidence:
+    docker run --rm ubuntu:22.04 unshare -Ur → "unshare failed: Operation not permitted"
+    BUT sysctls look permissive inside container (max_user_namespaces=191771, unprivileged_userns_clone=1)
+    → parent preflight passes, real unshare(CLONE_NEWUSER) in child blocked by Docker default seccomp profile
+    → bash tool failed with EINVAL (os error 22) x3 before the actionable-message fix.
+Outcome B — explicit opt-out (--ae KITTY_SANDBOX=off), run /tmp/harbor-gate3-smoke-off/2026-08-21__22-39-48:
+  LOUD warning logged on every activation (6/6): "KITTY_SANDBOX=off: Bash command runs WITHOUT kernel containment (explicit opt-out)"
+  Zero bash tool failures; agent loop ran full session (17m53s). Reward 0.0 both runs = model capability, not infra.
+RECOMMENDATION for tonight's bench queue: pass --ae KITTY_SANDBOX=off to harbor (or fix docker runtime userns);
+without it every Bash call fails closed inside default-profile containers.

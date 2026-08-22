@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::guard::{Guard, GuardVerdict};
 use crate::hashline::HashlineEditor;
 use crate::parser::ParsedToolCall;
+use crate::sandbox::{Sandbox, SandboxConfig, SandboxError};
 
 #[derive(Error, Debug)]
 pub enum ToolError {
@@ -28,6 +29,9 @@ pub enum ToolError {
 
     #[error("Bash command blocked: {0}")]
     BashBlocked(String),
+
+    #[error("Sandbox error: {0}")]
+    Sandbox(String),
 
     #[error("Tool not found: {0}")]
     NotFound(String),
@@ -66,6 +70,15 @@ pub struct ToolRegistry {
     bash_timeout_secs: u64,
     /// Max lines for Read tool output (F3.1). Default: 300.
     max_read_lines: usize,
+    /// Kernel containment armed on every Bash child before spawn
+    /// (`None` only when explicitly disabled — see [`Self::without_sandbox`]).
+    bash_sandbox: Option<Sandbox>,
+}
+
+/// Default Bash-sandbox allowlist root: the process working directory
+/// (the workspace, for kitty-cli usage).
+fn default_workspace_root() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 impl ToolRegistry {
@@ -81,6 +94,7 @@ impl ToolRegistry {
             hashline: HashlineEditor::new(),
             bash_timeout_secs,
             max_read_lines: 300,
+            bash_sandbox: Some(Sandbox::new(SandboxConfig::new(default_workspace_root()))),
         }
     }
 
@@ -92,7 +106,28 @@ impl ToolRegistry {
             hashline: HashlineEditor::new(),
             bash_timeout_secs: 60,
             max_read_lines,
+            bash_sandbox: Some(Sandbox::new(SandboxConfig::new(default_workspace_root()))),
         }
+    }
+
+    /// Rebuild the Bash sandbox with `root` as the FS allowlist workspace.
+    pub fn with_workspace(mut self, root: impl Into<PathBuf>) -> Self {
+        self.bash_sandbox = Some(Sandbox::new(SandboxConfig::new(root)));
+        self
+    }
+
+    /// Inject a fully-configured [`Sandbox`] (custom policy / tests).
+    pub fn with_sandbox(mut self, sb: Sandbox) -> Self {
+        self.bash_sandbox = Some(sb);
+        self
+    }
+
+    /// Explicitly disable kernel containment for Bash children. Every
+    /// activation still logs; prefer the loud per-spawn `KITTY_SANDBOX=off`
+    /// opt-out when the disable decision is environmental.
+    pub fn without_sandbox(mut self) -> Self {
+        self.bash_sandbox = None;
+        self
     }
 
     /// Execute a parsed tool call.
@@ -352,6 +387,14 @@ impl ToolRegistry {
     /// that outlives `bash_timeout_secs` is killed and reported as a failed
     /// tool result (`success: false`), never as a fatal error propagating out
     /// of the agent loop.
+    ///
+    /// Containment is layered: `Guard::check_chain` (policy) runs first, then
+    /// `Sandbox::apply` arms Landlock/seccomp/namespaces/RLIMIT_AS on the
+    /// child just before exec. Sandbox setup failures are fail-closed: the
+    /// command is NOT executed and a [`ToolError::Sandbox`] with an actionable
+    /// message is returned. Setting `KITTY_SANDBOX=off` in the environment
+    /// disables containment explicitly — loudly logged on every activation,
+    /// never silent.
     async fn execute_bash(&self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
         let command = args
             .get("command")
@@ -378,23 +421,67 @@ impl ToolRegistry {
             }
         }
 
+        // Kernel containment AFTER guard policy (ordering contract documented
+        // at `Sandbox::apply`). `KITTY_SANDBOX=off` is honored ONLY when set;
+        // every activation logs a warning so an unsandboxed run is never
+        // silent.
+        let sandbox: Option<&Sandbox> =
+            match (&self.bash_sandbox, std::env::var("KITTY_SANDBOX").as_deref()) {
+                (Some(_), Ok("off")) => {
+                    tracing::warn!(
+                        "KITTY_SANDBOX=off: Bash command runs WITHOUT kernel \
+                         containment (explicit opt-out)"
+                    );
+                    None
+                }
+                (sb_opt, _) => sb_opt.as_ref(),
+            };
+
         // Execute the command with a timeout. `kill_on_drop(true)` guarantees
         // the child is killed if the future is cancelled by the timeout.
         let timeout = Duration::from_secs(self.bash_timeout_secs);
         let run = async {
-            let child = tokio::process::Command::new("sh")
-                .arg("-c")
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c")
                 .arg(command)
                 .kill_on_drop(true)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
-            child.wait_with_output().await
+                .stderr(Stdio::piped());
+            if let Some(sb) = sandbox {
+                sb.apply(&mut cmd).map_err(|e| match e {
+                    SandboxError::Unsupported(_) | SandboxError::Setup(_) => {
+                        ToolError::Sandbox(format!(
+                            "{e}; command NOT executed (fail-closed). Fix the host \
+                             (needs Linux >= 5.13 with unprivileged user namespaces) \
+                             or set KITTY_SANDBOX=off to disable containment explicitly"
+                        ))
+                    }
+                    other => ToolError::Sandbox(other.to_string()),
+                })?;
+            }
+            // When containment is armed, a spawn failure usually means the
+            // kernel refused the namespace/seccomp chain at exec time even
+            // though the cheap preflight passed (e.g. Docker's default
+            // seccomp profile blocks unshare(CLONE_NEWUSER) while the sysctl
+            // files still look permissive). Surface that as an actionable
+            // sandbox error instead of a bare errno.
+            let child = cmd.spawn().map_err(|e| {
+                if sandbox.is_some() {
+                    ToolError::Sandbox(format!(
+                        "spawn failed while arming containment: {e}. This host \
+                         or container likely blocks user namespaces; set \
+                         KITTY_SANDBOX=off to disable containment explicitly"
+                    ))
+                } else {
+                    ToolError::Io(e)
+                }
+            })?;
+            child.wait_with_output().await.map_err(ToolError::Io)
         };
 
         let output = match tokio::time::timeout(timeout, run).await {
             Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(e.into()),
+            Ok(Err(e)) => return Err(e),
             Err(_elapsed) => {
                 // Timed out: the child was killed by kill_on_drop when the
                 // future was dropped. Report as a failed tool result.
@@ -768,6 +855,40 @@ mod tests {
         assert!(!result.retry);
     }
 
+    /// Gate-3 wiring regression: the sandbox must not defeat the Bash
+    /// timeout. The double-fork middle process used to hold std's exec-error
+    /// channel open until the workload finished, so `spawn()` blocked the
+    /// runtime thread and `tokio::time::timeout` never fired (observed with
+    /// `sleep 10` under a 1s budget: success after 10s instead of a timed-out
+    /// result at ~1s).
+    #[tokio::test]
+    async fn bash_timeout_still_fires_under_sandbox() {
+        if !crate::sandbox::containment_available() {
+            println!(
+                "SKIP: kernel containment unavailable (Landlock/userns) — \
+                 cannot verify sandbox wiring honestly"
+            );
+            return;
+        }
+        let started = std::time::Instant::now();
+        let registry = ToolRegistry::with_timeout(1);
+        let args = serde_json::json!({"command": "sleep 10"});
+        let result = registry.execute_bash(&args).await.unwrap();
+        let elapsed = started.elapsed();
+        println!("sandboxed timeout test elapsed: {elapsed:?}");
+        assert!(!result.success, "sleep must be killed, got: {}", result.output);
+        assert!(
+            result.output.contains("timed out"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout must fire near the 1s budget, took {elapsed:?} — \
+             spawn is blocking on the sandbox exec-error channel"
+        );
+    }
+
     #[test]
     fn glob_finds_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -991,5 +1112,72 @@ mod tests {
         let args = serde_json::json!({"command": "echo hi | tee"});
         let result = registry.execute_bash(&args).await.unwrap();
         assert!(result.success);
+    }
+
+    /// Gate-3 finding 1: execute_bash must arm kernel containment. A
+    /// Guard-passing command (`cp`, no redirect/substitution) that writes
+    /// OUTSIDE the sandbox fs_allow must FAIL under execute_bash, while the
+    /// SAME command succeeds without the sandbox (negative control proving
+    /// the denial comes from Landlock, not DAC).
+    #[tokio::test]
+    async fn bash_write_outside_workspace_denied_by_sandbox_with_negative_control() {
+        if !crate::sandbox::containment_available() {
+            println!(
+                "SKIP: kernel containment unavailable (Landlock/userns) — \
+                 cannot verify sandbox wiring honestly"
+            );
+            return;
+        }
+        if std::env::var("KITTY_SANDBOX").as_deref() == Ok("off") {
+            println!("SKIP: KITTY_SANDBOX=off set — containment intentionally disabled");
+            return;
+        }
+
+        // Source inside the allow-root; victim OUTSIDE any allow-root
+        // (fs_allow below deliberately excludes both tempdirs' parents).
+        let allow_root = tempfile::tempdir().unwrap();
+        let source = allow_root.path().join("src.txt");
+        std::fs::write(&source, "payload").unwrap();
+        let victim_dir = tempfile::tempdir().unwrap();
+        let victim = victim_dir.path().join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+
+        let sb = Sandbox::new(crate::sandbox::SandboxConfig {
+            fs_allow: vec![allow_root.path().to_path_buf()],
+            net_deny: true,
+            mem_limit_mb: 512,
+            cpu_timeout_secs: 30,
+        });
+        let registry = ToolRegistry::new().with_sandbox(sb);
+
+        let command = format!("cp {} {}", source.display(), victim.display());
+        let args = serde_json::json!({ "command": command });
+
+        // Sandboxed: cp opens the destination O_WRONLY|O_TRUNC -> needs
+        // WriteFile (+Truncate) rights outside fs_allow -> Landlock denies.
+        let result = registry.execute_bash(&args).await.unwrap();
+        println!("sandboxed cp result: success={} output={}", result.success, result.output);
+        assert!(
+            !result.success,
+            "CONTAINMENT BROKEN: Guard-passing write outside fs_allow \
+             succeeded under execute_bash"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"original",
+            "victim file must be untouched by the denied write"
+        );
+
+        // Negative control: identical command WITHOUT sandbox succeeds.
+        let plain = ToolRegistry::new().without_sandbox();
+        let ctl = plain.execute_bash(&args).await.unwrap();
+        println!("negative-control cp result: success={} output={}", ctl.success, ctl.output);
+        assert!(
+            ctl.success,
+            "negative control FAILED — plain cp was already denied \
+             (output: {}); denial cannot be attributed to the sandbox",
+            ctl.output
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"payload");
     }
 }
