@@ -252,10 +252,7 @@ mod tests {
         let reopened: Vec<Episode> = store.recall_recent(distractor_goals.len() + 1).unwrap();
         let t = reopened.iter().find(|e| e.id == target.id).unwrap();
         assert_eq!(t.hash, target.hash);
-        assert_eq!(
-            t.hash,
-            Episode::compute_hash(&target.goal, &target.outcome)
-        );
+        assert_eq!(t.hash, Episode::compute_hash(&target.goal, &target.outcome));
 
         // BLOB roundtrip after reopen
         let emb_back = store.get_embedding(&target.id).unwrap().unwrap();

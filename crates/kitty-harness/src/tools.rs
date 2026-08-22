@@ -425,17 +425,19 @@ impl ToolRegistry {
         // at `Sandbox::apply`). `KITTY_SANDBOX=off` is honored ONLY when set;
         // every activation logs a warning so an unsandboxed run is never
         // silent.
-        let sandbox: Option<&Sandbox> =
-            match (&self.bash_sandbox, std::env::var("KITTY_SANDBOX").as_deref()) {
-                (Some(_), Ok("off")) => {
-                    tracing::warn!(
-                        "KITTY_SANDBOX=off: Bash command runs WITHOUT kernel \
+        let sandbox: Option<&Sandbox> = match (
+            &self.bash_sandbox,
+            std::env::var("KITTY_SANDBOX").as_deref(),
+        ) {
+            (Some(_), Ok("off")) => {
+                tracing::warn!(
+                    "KITTY_SANDBOX=off: Bash command runs WITHOUT kernel \
                          containment (explicit opt-out)"
-                    );
-                    None
-                }
-                (sb_opt, _) => sb_opt.as_ref(),
-            };
+                );
+                None
+            }
+            (sb_opt, _) => sb_opt.as_ref(),
+        };
 
         // Execute the command with a timeout. `kill_on_drop(true)` guarantees
         // the child is killed if the future is cancelled by the timeout.
@@ -876,7 +878,11 @@ mod tests {
         let result = registry.execute_bash(&args).await.unwrap();
         let elapsed = started.elapsed();
         println!("sandboxed timeout test elapsed: {elapsed:?}");
-        assert!(!result.success, "sleep must be killed, got: {}", result.output);
+        assert!(
+            !result.success,
+            "sleep must be killed, got: {}",
+            result.output
+        );
         assert!(
             result.output.contains("timed out"),
             "got: {}",
@@ -1156,7 +1162,10 @@ mod tests {
         // Sandboxed: cp opens the destination O_WRONLY|O_TRUNC -> needs
         // WriteFile (+Truncate) rights outside fs_allow -> Landlock denies.
         let result = registry.execute_bash(&args).await.unwrap();
-        println!("sandboxed cp result: success={} output={}", result.success, result.output);
+        println!(
+            "sandboxed cp result: success={} output={}",
+            result.success, result.output
+        );
         assert!(
             !result.success,
             "CONTAINMENT BROKEN: Guard-passing write outside fs_allow \
@@ -1171,7 +1180,10 @@ mod tests {
         // Negative control: identical command WITHOUT sandbox succeeds.
         let plain = ToolRegistry::new().without_sandbox();
         let ctl = plain.execute_bash(&args).await.unwrap();
-        println!("negative-control cp result: success={} output={}", ctl.success, ctl.output);
+        println!(
+            "negative-control cp result: success={} output={}",
+            ctl.success, ctl.output
+        );
         assert!(
             ctl.success,
             "negative control FAILED — plain cp was already denied \

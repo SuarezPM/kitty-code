@@ -153,7 +153,8 @@ fn generate(
             .add(*t, i as i32, &[0], last)
             .map_err(|e| format!("batch add prompt: {e:?}"))?;
     }
-    ctx.decode(&mut batch).map_err(|e| format!("prefill: {e:?}"))?;
+    ctx.decode(&mut batch)
+        .map_err(|e| format!("prefill: {e:?}"))?;
 
     // Same per-prompt seed across arms keeps the A/B comparable up to the
     // point where the lazy grammar starts constraining.
@@ -174,8 +175,7 @@ fn generate(
     };
 
     let mut out = String::new();
-    let mut n_cur = tokens.len() as i32;
-    for _ in 0..max_tokens {
+    for (gen_idx, _) in (0..max_tokens).enumerate() {
         let idx = batch.n_tokens() - 1;
         let token = sampler.sample(&ctx, idx);
         sampler.accept(token);
@@ -191,10 +191,10 @@ fn generate(
         }
         batch.clear();
         batch
-            .add(token, n_cur, &[0], true)
+            .add(token, tokens.len() as i32 + gen_idx as i32, &[0], true)
             .map_err(|e| format!("batch add gen: {e:?}"))?;
-        n_cur += 1;
-        ctx.decode(&mut batch).map_err(|e| format!("decode: {e:?}"))?;
+        ctx.decode(&mut batch)
+            .map_err(|e| format!("decode: {e:?}"))?;
     }
     Ok(out)
 }
@@ -242,7 +242,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--max-tokens" => {
                 i += 1;
-                max_tokens = need("--max-tokens", i)?.parse().map_err(|e| format!("{e}"))?;
+                max_tokens = need("--max-tokens", i)?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
             }
             "--seed" => {
                 i += 1;
@@ -250,7 +252,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--gpu-layers" => {
                 i += 1;
-                gpu_layers = need("--gpu-layers", i)?.parse().map_err(|e| format!("{e}"))?;
+                gpu_layers = need("--gpu-layers", i)?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
             }
             "--n-ctx" => {
                 i += 1;
@@ -280,8 +284,8 @@ fn run() -> Result<(), String> {
     let args = parse_args()?;
     let prompts_raw = std::fs::read_to_string(&args.prompts_file)
         .map_err(|e| format!("read {}: {e}", args.prompts_file.display()))?;
-    let prompts: Vec<String> = serde_json::from_str(&prompts_raw)
-        .map_err(|e| format!("parse prompts file: {e}"))?;
+    let prompts: Vec<String> =
+        serde_json::from_str(&prompts_raw).map_err(|e| format!("parse prompts file: {e}"))?;
     if prompts.is_empty() {
         return Err("prompts file is empty".into());
     }
@@ -296,7 +300,10 @@ fn run() -> Result<(), String> {
     let mparams = LlamaModelParams::default().with_n_gpu_layers(args.gpu_layers);
     let model = LlamaModel::load_from_file(&backend, &args.model, &mparams)
         .map_err(|e| format!("GGUF load failed: {e:?}"))?;
-    eprintln!("[gbnf-probe] model loaded; decoding {} prompts", prompts.len());
+    eprintln!(
+        "[gbnf-probe] model loaded; decoding {} prompts",
+        prompts.len()
+    );
 
     // Default arms: production lazy grammar + unconstrained baseline.
     let arm_list: Vec<GrammarArm> = match &args.arms {
@@ -341,8 +348,11 @@ fn run() -> Result<(), String> {
         "n_ctx": args.n_ctx,
         "arms": arms,
     });
-    std::fs::write(&args.out, serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("write {}: {e}", args.out.display()))?;
+    std::fs::write(
+        &args.out,
+        serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("write {}: {e}", args.out.display()))?;
     eprintln!("[gbnf-probe] wrote {}", args.out.display());
     Ok(())
 }

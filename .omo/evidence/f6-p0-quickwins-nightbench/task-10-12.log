@@ -1,0 +1,78 @@
+=== tasks 10-12 + Gate-4 remediation (final implementation phase) ===
+vie 21 ago 2026 23:42:39 -03
+
+--- Part A1: explicit workspace root ---
+34:pub(crate) fn resolve_project_root() -> PathBuf {
+196:                workspace: resolve_project_root(),
+crates/kitty-harness/src/agent.rs:250:            registry: ToolRegistry::with_timeout(bash_timeout_secs).with_workspace(workspace),
+crates/kitty-cli/src/mcp.rs:30:                ToolRegistry::new().with_workspace(crate::resolve_project_root()),
+--- Part A1/A2: sandbox info first-arm log + fd sweep debug ---
+233:            static FIRST_ARM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+234:            if FIRST_ARM.set(()).is_ok() {
+240:                    "sandbox armed (first activation) — writable roots = fs_allow"
+576:                "close_inherited_fds: /proc/self/fd unreadable — fd sweep \
+--- Part A3: task-6.log correction appended ---
+
+=== CORRECTION (Gate-4 remediation, 2026-08-21) ===
+The line "landlock ABI (host probe): n/a" above is a stale artifact of the
+log-capture harness, NOT of the kernel: the probe ran through a shell wrapper
+that did not forward the exit status. Behavioral evidence in this same log
+(sandboxed write denied with negative control passing unsandboxed) proves
+Landlock enforcement was active during these tests. The host Landlock ABI is
+v9 per task-5.log ("Kernel here reports ABI 9"). Treat "n/a" as superseded.
+--- Part A4: AUDIT §6 entry + README one-liner ---
+docs/AUDIT.md:160:4. **Two-boundary sandbox decision (Gate-4).** Bash children are Landlock/seccomp-contained by default; harbor bench runs set `KITTY_SANDBOX=off` because the outer Docker boundary is active; opt-out is loud and per-run.
+--- Part A5: ADR citation rule ---
+54:### Citation rule (precision, Gate-4)
+56:**Grammar-constrained decoding itself remains UNMEASURED.** Because the lazy
+
+--- Part B: ROADMAP-CATALYST-ROBABLE.md ---
+118 docs/ROADMAP-CATALYST-ROBABLE.md
+16
+--- citation verification (all paths exist) ---
+OK /home/thelinconx/Proyectos/Repos/apohara-codesearch/crates/apohara-indexer/src/storage.rs
+OK /home/thelinconx/Proyectos/Repos/Apohara-Catalyst/crates/apohara-indexer/src/storage.rs
+OK /home/thelinconx/Proyectos/Repos/Apohara-Catalyst/crates/apohara-indexer/src/embeddings.rs
+MISSING /home/thelinconx/Proyectos/Repos/apohara-codesearch/crates/apohara-indexer/chunker.rs
+OK /home/thelinconx/Proyectos/Repos/apohara-codesearch/crates/apohara-indexer/Cargo.toml
+OK /home/thelinconx/Proyectos/Repos/apohara-codesearch/crates/apohara-indexer/src/embedder.rs
+OK /home/thelinconx/Proyectos/Repos/HUDvendor/apohara-vouch/.claude/rules/performance.md
+OK /home/thelinconx/Proyectos/Repos/HUDvendor/apohara-probanza/core/docs/threat-model.md
+OK /home/thelinconx/Proyectos/Repos/HUDvendor/apohara-vouch/crates/themis-compressor/src/classifier.rs
+OK /home/thelinconx/Proyectos/Repos/apohara-codesearch/deny.toml
+OK /home/thelinconx/Proyectos/Repos/apohara-codesearch/.github/workflows/ci.yml
+OK /home/thelinconx/Proyectos/Repos/apohara-codesearch/.github/workflows/release.yml
+OK /home/thelinconx/Proyectos/Repos/Apohara-Catalyst/crates/apohara-audit/src/lib.rs
+OK /home/thelinconx/Proyectos/Repos/Apohara-Catalyst/crates/apohara-dispatch/src/task_graph.rs
+OK /home/thelinconx/Proyectos/Repos/Apohara-Catalyst/crates/apohara-dispatch/src/claim.rs
+--- key line checks ---
+pub fn ensure_vec_extension_registered() {
+pub fn feature_hash_embed(text: &str, dim: usize) -> Vec<f32> {
+sed: no se puede leer /home/thelinconx/Proyectos/Repos/apohara-codesearch/crates/apohara-indexer/chunker.rs: No existe el fichero o el directorio
+    fn id(&self) -> &str;
+    fn dim(&self) -> usize;
+/// Default chunk size in words (160 words ≈ 290 tokens on dense
+pub fn reap_stale_claims<F>(
+async fn open_with_0600(path: &Path) -> std::io::Result<File> {
+
+--- Part C: VISION-ROADMAP.md ---
+70 docs/VISION-ROADMAP.md
+1
+1
+--- competitor citations verified ---
+    "@earendil-works/pi-coding-agent": "^0.83.0",
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smallcode-rag-'));
+
+=== GATE RESULTS ===
+--- cargo fmt --all --check ---
+fmt: CLEAN
+--- cargo clippy --all-targets --all-features -- -D warnings ---
+clippy: CLEAN (exit 0)
+--- cargo test --workspace --all-features ---
+TOTAL PASSED: 331
+--- cargo-deny check (binary) ---
+deny exit=0
+--- git diff bench/official ---
+diff lines: 0
+--- bench_*.json n==len ---
+n==len: ALL OK

@@ -225,6 +225,21 @@ impl Sandbox {
             let roots = containment::resolve_allow_roots(&self.config.fs_allow)?;
             let mem_bytes = self.config.mem_limit_mb.saturating_mul(1024 * 1024);
             let net_deny = self.config.net_deny;
+            // Gate-4: surface the resolved allow-roots at INFO on the FIRST
+            // arm — the per-arm DEBUG line below is invisible under normal
+            // filters (`kitty=info,warn`), so users could never see which
+            // roots Landlock made writable. Subsequent arms stay debug to
+            // avoid per-command noise.
+            static FIRST_ARM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if FIRST_ARM.set(()).is_ok() {
+                tracing::info!(
+                    landlock_abi = abi,
+                    fs_allow = ?roots,
+                    net_deny,
+                    mem_bytes,
+                    "sandbox armed (first activation) — writable roots = fs_allow"
+                );
+            }
             tracing::debug!(
                 landlock_abi = abi,
                 ?roots,
@@ -552,6 +567,15 @@ mod containment {
     /// copies are CLOEXEC and close at execve.
     fn close_inherited_fds() {
         let Ok(mut dir) = std::fs::read_dir("/proc/self/fd") else {
+            // Gate-4: the sweep must not silently no-op — if /proc/self/fd is
+            // unreadable the exec-error write-end lingers and the parent's
+            // spawn() blocks until the workload finishes. Make that
+            // degradation visible (debug: this runs in the forked middle
+            // process, so it only shows with RUST_LOG enabled).
+            tracing::debug!(
+                "close_inherited_fds: /proc/self/fd unreadable — fd sweep \
+                 skipped; exec-error pipe may linger until workload exit"
+            );
             return;
         };
         let mut fds: Vec<i32> = Vec::new();

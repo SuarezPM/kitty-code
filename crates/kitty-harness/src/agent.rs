@@ -236,6 +236,10 @@ impl Agent {
         });
         // Read before moving `config` into the struct (no Copy).
         let bash_timeout_secs = config.bash_timeout_secs;
+        // Gate-4: the Bash-sandbox FS allow-root must follow the configured
+        // workspace explicitly — never silently inherit the process cwd
+        // (launching from `$HOME` would otherwise make all of HOME writable).
+        let workspace = config.workspace.clone();
 
         Self {
             client,
@@ -243,7 +247,7 @@ impl Agent {
             messages: Vec::new(),
             tools,
             budget,
-            registry: ToolRegistry::with_timeout(bash_timeout_secs),
+            registry: ToolRegistry::with_timeout(bash_timeout_secs).with_workspace(workspace),
             parser: ToolCallParser::new(),
             thinking_budget,
             quality_monitor,

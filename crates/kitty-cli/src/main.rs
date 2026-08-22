@@ -23,6 +23,39 @@ fn default_db_path() -> String {
     format!("{}/.kitty/episodes.db", home)
 }
 
+/// Resolve the project root used as the Bash-sandbox FS allow-root (Gate-4).
+///
+/// Walks up from the launch directory to the nearest ancestor containing a
+/// project marker, so `kitty run` launched from a subdirectory scopes writes
+/// to the actual project instead of that subdirectory. Falls back to the
+/// launch directory itself only when NO marker exists anywhere above — and
+/// says so loudly, because a silent `$HOME`-wide Landlock allow-root is the
+/// exact failure mode this resolution exists to prevent.
+pub(crate) fn resolve_project_root() -> PathBuf {
+    const MARKERS: &[&str] = &[
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+        "go.mod",
+    ];
+    let start = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut dir: Option<&std::path::Path> = Some(start.as_path());
+    while let Some(d) = dir {
+        if MARKERS.iter().any(|m| d.join(m).exists()) {
+            return d.to_path_buf();
+        }
+        dir = d.parent();
+    }
+    warn!(
+        cwd = %start.display(),
+        "no project marker (.git/Cargo.toml/package.json/pyproject.toml/setup.py/go.mod) \
+         found at or above CWD — sandbox fs_allow falls back to CWD itself"
+    );
+    start
+}
+
 #[derive(Parser)]
 #[command(name = "kitty")]
 #[command(about = "Local coding agent for ornith:9B on consumer GPUs")]
@@ -158,6 +191,9 @@ async fn main() -> Result<()> {
             };
             let base_config = AgentConfig {
                 model: cli.model.clone(),
+                // Gate-4: explicit project root for the Bash sandbox allow-root
+                // (and bootstrap detection) — never the implicit process cwd.
+                workspace: resolve_project_root(),
                 enable_knowledge: cli.knowledge,
                 knowledge_config: KnowledgeConfig {
                     enabled: cli.knowledge,

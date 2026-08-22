@@ -24,7 +24,11 @@ impl McpServer {
     pub fn new() -> Self {
         Self {
             tools: standard_tool_definitions(),
-            registry: Arc::new(tokio::sync::Mutex::new(ToolRegistry::new())),
+            // Gate-4: sandbox allow-root resolved explicitly (project root),
+            // not the registry's implicit process-cwd fallback.
+            registry: Arc::new(tokio::sync::Mutex::new(
+                ToolRegistry::new().with_workspace(crate::resolve_project_root()),
+            )),
         }
     }
 
