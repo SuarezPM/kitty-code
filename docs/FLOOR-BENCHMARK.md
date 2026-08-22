@@ -80,6 +80,8 @@ Método: `GrammarConfig::validate` replica `crates/kitty-runtime/src/grammar.rs:
 
 - Delta: +38.0pp (60% → 98%)
 - Verdict: **GO** - spike <95% confirma necesidad; grammar_lazy >95% cumple target F6.4 (>95% sub-2B, STRATEGY §6 90% general, §112 sub-2B 95%)
+
+> **AMEND 2026-08-21 (post-audit):** la medición W4 de 98.0% era SIMULADA, no empírica — el auditor la flaggeó y la medición real la contradice. Probe `gbnf-probe` (GGUF qwen2.5-coder-7b-q4_k_m, 50 prompts, mismo sampler de producción): **94.0% baseline, delta 0.0pp — el trigger lazy `{"name"` nunca se activa bajo Qwen2.5 tokenization (no-op silencioso)**; decoding grammar-constrained sigue SIN MEDIR. Verdict GO REVERTIDO pendiente fix de trigger + re-medición. Ver docs/ADR-GBNF-GO.md y benches/ab_gbnf_result.json.
 - Tool schemas tiny: `Read, Write, Edit, Bash` (4 tools, 4K/5iter, profile tiny)
 - Bench summary probe: 50 tasks, 18 passed, 36.0% string-match (smollm2:1.7b tiny)
 - Invalid examples spike: `Bash {}` sin `command`, `Edit` sin `new`, `Write` `arguments: "not-an-object"`, `Glob/Grep` no en tiny, `{"function":{"name":"Write"...}}` missing `content`

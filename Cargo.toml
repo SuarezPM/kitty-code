@@ -66,7 +66,9 @@ tempfile = "3"
 rand = "0.8"
 llama-cpp-2 = "0.1.154"
 
-# F6.4 ADR-005 llama.cpp GBNF real adapter — GO gate passed (valid_pct 60 <95), now wired.
+# F6.4 ADR-005 llama.cpp GBNF real adapter — wiring done; GO REVERTED 2026-08-21
+# (empirical 94.0% baseline via gbnf-probe; lazy trigger {"name" is a no-op under
+# Qwen2.5 tokenization — see docs/ADR-GBNF-GO.md).
 # LlamaSampler::grammar + json_schema_to_grammar + grammar_lazy trigger ["{\"name\""] avoids HTTP 400.
 
 [profile.release]
