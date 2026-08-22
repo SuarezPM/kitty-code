@@ -38,6 +38,7 @@ MODEL_ENV_VAR = "KITTY_BENCH_MODEL"
 PROFILE_ENV_VAR = "KITTY_BENCH_PROFILE"
 OLLAMA_URL_ENV_VAR = "KITTY_OLLAMA_URL"
 BINARY_ENV_VAR = "KITTY_BENCH_BINARY"
+TIMEOUT_ENV_VAR = "KITTY_OLLAMA_TIMEOUT_SECS"
 
 CONTAINER_BINARY_PATH = "/usr/local/bin/kitty-cli"
 CONTAINER_LOG_PATH = "/logs/agent/kitty.txt"
@@ -110,8 +111,9 @@ class KittyAgent(BaseInstalledAgent):
             f"{self._gateway_detection_snippet()}; fi"
         )
         env_log = (
-            "printf 'model=%s\\nprofile=%s\\nollama_url=%s\\n' "
+            "printf 'model=%s\\nprofile=%s\\nollama_url=%s\\ntimeout_secs=%s\\n' "
             f"\"${{{MODEL_ENV_VAR}}}\" \"${{{PROFILE_ENV_VAR}}}\" \"$URL\" "
+            f"\"${{{TIMEOUT_ENV_VAR}:-unset}}\" "
             f"> {CONTAINER_ENV_LOG_PATH}"
         )
         return (
@@ -141,11 +143,15 @@ class KittyAgent(BaseInstalledAgent):
         model = self._get_env(MODEL_ENV_VAR) or DEFAULT_MODEL
         profile = self._get_env(PROFILE_ENV_VAR) or DEFAULT_PROFILE
 
+        # Read bench-control vars from harbor's env sources (--ae lands in
+        # _extra_env, NOT os.environ) and re-add the prefix that
+        # _get_env_prefixed strips. Falls back to os.environ via _env_sources.
+        kitty_env = {
+            f"KITTY_{k}": v for k, v in self._get_env_prefixed("KITTY_").items()
+        }
         forwarded_env: dict[str, str] = sanitize_env(
             {
-                # Forward bench-control vars (e.g. KITTY_OLLAMA_TIMEOUT_SECS) that
-                # harbor injects into this adapter's own environment via --ae.
-                **{k: v for k, v in os.environ.items() if k.startswith("KITTY_")},
+                **kitty_env,
                 MODEL_ENV_VAR: model,
                 PROFILE_ENV_VAR: profile,
                 **self.extra_env,
