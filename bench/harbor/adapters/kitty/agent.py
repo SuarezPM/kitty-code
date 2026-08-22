@@ -19,6 +19,7 @@ instance. Design notes:
 
 from __future__ import annotations
 
+import os
 import shlex
 from pathlib import Path
 from typing import Any, override
@@ -142,6 +143,9 @@ class KittyAgent(BaseInstalledAgent):
 
         forwarded_env: dict[str, str] = sanitize_env(
             {
+                # Forward bench-control vars (e.g. KITTY_OLLAMA_TIMEOUT_SECS) that
+                # harbor injects into this adapter's own environment via --ae.
+                **{k: v for k, v in os.environ.items() if k.startswith("KITTY_")},
                 MODEL_ENV_VAR: model,
                 PROFILE_ENV_VAR: profile,
                 **self.extra_env,
