@@ -25,5 +25,14 @@ toml = "0.8"
 default = []
 embedding = ["kitty-memory/embedding"]
 
+# Real Linux containment (audit P0): Landlock FS whitelist + seccomp-bpf
+# fail-closed allowlist + user/mount/PID namespaces. Versions matched to the
+# verified Apohara Catalyst reference implementation.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.30", features = ["sched", "user"] }
+seccompiler = { version = "0.5", features = ["json"] }
+landlock = "0.4"
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -29,5 +29,5 @@ pub use model_profile::ModelProfile;
 pub use plugin::{HelloPlugin, Plugin, PluginError, PluginRegistry, TwoToolPlugin};
 pub use quality_monitor::{QualityConfig, QualityMonitor};
 pub use router::{ToolCategory, ToolRouter};
-pub use sandbox::{Sandbox, SandboxConfig, SandboxError};
+pub use sandbox::{Sandbox, SandboxConfig, SandboxError, SandboxOutcome};
 pub use thinking_budget::ThinkingBudget;
