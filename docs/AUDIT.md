@@ -157,10 +157,11 @@ Recorded from the 2026-08-21 kitty harbor-adapter smokes (Oracle Gate 1 requirem
 1. **Guard limitation (Write-on-existing-file).** Kitty's Guard blocks Write on an existing file unless the Edit tool is used. This stalled ornith:9b on tasks requiring file modification during smoke k1.
 2. **Thinking-budget mismatch.** ornith-1.5:9b repeatedly overran the medium profile thinking budget (1024 tokens, set by the earlier bench-ab knee decision tuned on ornith:9b). Its numbers are NOT budget-comparable to ornith:9b's.
 3. **Context-length dependency.** kitty-cli does not send `num_ctx`; benchmarks require server-side `OLLAMA_CONTEXT_LENGTH=16384` (host prereq documented in `bench/harbor/adapters/kitty/README.md`). Without it Ollama truncates prompts at the 4096 default → empty responses.
+4. **Two-boundary sandbox decision (Gate-4).** Bash children are Landlock/seccomp-contained by default; harbor bench runs set `KITTY_SANDBOX=off` because the outer Docker boundary is active; opt-out is loud and per-run.
 
 ### Approved night strategy (pre-registered)
 
-Oracle-full runs go first: TB2-89 (`harbor run -p bench/official/terminal-bench-2 -a oracle -k 1`) and polyglot-225 (`harbor run -p bench/official/aider-harbor/aider-polyglot -a oracle -k 1`) — the re-audit gate #3 requirement. Kitty runs are SAMPLED, not full, with a pre-registered first-N selection rule: `-l N` takes the FIRST N tasks in dataset order, no post-hoc cherry-picking — `-l 50` with ornith:9b → `bench_polyglot_kitty_l50.json`, `-l 15` with ornith-1.5:9b → `bench_polyglot_kitty15_l15.json`.
+Oracle-full runs go first: TB2-89 (`harbor run -p bench/official/terminal-bench-2 -a oracle -k 1`) and polyglot-225 (`harbor run -p bench/official/aider-harbor/aider-polyglot -a oracle -k 1`) — the re-audit gate #3 requirement. Kitty runs are SAMPLED, not full, with a pre-registered first-N selection rule: `-l N` takes the FIRST N tasks in dataset order, no post-hoc cherry-picking — `-l 50` with ornith:9b → `bench_polyglot_kitty_ornith9b_l50.json`, `-l 15` with ornith-1.5:9b → `bench_polyglot_kitty_ornith15b_l15.json`. Every run must pass the errored-trials gate (`n_errored_trials <= 10%` of N checked via result.json stats — harbor exits 0 even when trials error).
 
 ---
 

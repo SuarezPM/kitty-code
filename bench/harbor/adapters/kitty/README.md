@@ -91,3 +91,9 @@ Env forwarded to the kitty process is filtered with the Catalyst
 the container shell to unset any secret-looking variables the image or
 orchestrator injected — notably `KITTY_CLOUD_API_KEY`, so trials can never
 trigger paid cloud fallback.
+
+## Sandbox boundary
+
+Bash children are Landlock/seccomp-contained by default; harbor bench runs set
+`KITTY_SANDBOX=off` because the outer Docker boundary is active; opt-out is
+loud and per-run.

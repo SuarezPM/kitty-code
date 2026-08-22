@@ -15,6 +15,7 @@ __pycache__/
 /bench_*.json
 /week0_*.json
 results/
+/jobs/
 
 # --- Local state ---
 .slim/

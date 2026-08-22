@@ -51,6 +51,16 @@ result, ruling out budget truncation), `.omo/evidence/f6-p0-quickwins-nightbench
    llama-grammar.cpp:940) — upstream library issue, not investigated further
    here.
 
+### Citation rule (precision, Gate-4)
+
+**Grammar-constrained decoding itself remains UNMEASURED.** Because the lazy
+constraint never activated under Qwen2.5 tokenization (finding 2), the two
+arms measured the same thing twice: baseline model capability. The correct
+reading of `94.0% vs 94.0%` is "baseline = 94.0%, grammar effect = not
+observed / not yet active" — **nobody may cite 94% as "GBNF works at 94%"**
+or as any grammar-attributed number. A grammar-effect figure does not exist
+until the trigger-activation fix lands and the arms diverge.
+
 ### Consequences of the amendment
 
 - `method: "empirical"` artifacts report `verdict:
