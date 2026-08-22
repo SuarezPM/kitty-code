@@ -423,6 +423,17 @@ pub fn run_tui(model: &str, url: &str, context_window: usize) -> Result<()> {
     result
 }
 
+/// Empty-q policy: q quits only when the input is empty and no agent run
+/// is active; otherwise the q is typed into the prompt.
+fn apply_q_policy(app: &mut App) -> bool {
+    if app.input.is_empty() && !app.is_running {
+        true
+    } else {
+        app.push_char('q');
+        false
+    }
+}
+
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut app: App,
@@ -442,10 +453,8 @@ fn run_app(
                 if key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Char('q') => {
-                            if app.input.is_empty() && !app.is_running {
+                            if apply_q_policy(&mut app) {
                                 return Ok(());
-                            } else {
-                                app.push_char('q');
                             }
                         }
                         KeyCode::Esc => return Ok(()),
@@ -741,5 +750,118 @@ mod tests {
         assert!(app.messages.is_empty());
         assert_eq!(app.scroll_offset, 0);
         assert!(!app.is_running);
+    }
+
+    // --- TestBackend snapshot tests ---
+
+    use ratatui::backend::TestBackend;
+
+    /// Join each backend buffer row into a String for content assertions.
+    fn rows_of(backend: &TestBackend) -> Vec<String> {
+        let buf = backend.buffer();
+        let w = buf.area.width as usize;
+        buf.content
+            .chunks(w)
+            .map(|row| row.iter().map(|c| c.symbol().to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn testbackend_cjk_wide_char_renders_unsliced() {
+        let mut app = App::new("m", "u", 100);
+        // Event path: KeyCode::Char(c) lands in push_char for wide chars too.
+        app.push_char('你');
+        app.push_char('好');
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        // Must not panic on double-width input.
+        term.draw(|f| ui(f, &app)).unwrap();
+
+        let buf = term.backend().buffer();
+        let w = buf.area.width as usize;
+        let flat: Vec<&str> = buf.content.iter().map(|c| c.symbol()).collect();
+        let pos_you = flat.iter().position(|s| *s == "你").expect("你 rendered");
+        let pos_hao = flat.iter().position(|s| *s == "好").expect("好 rendered");
+        // Double-width honored: each CJK char advances exactly 2 columns,
+        // with a blank skip cell between glyphs (no overwrite/mis-slice).
+        assert_eq!(pos_hao - pos_you, 2);
+        assert_eq!(pos_hao % w - pos_you % w, 2, "same row, no wrap split");
+        for skip in [pos_you + 1, pos_hao + 1] {
+            assert!(
+                flat[skip].is_empty() || flat[skip].chars().all(|c| c.is_whitespace()),
+                "skip cell must hold no glyph"
+            );
+        }
+        // Cursor block lands after the wide input on the same prompt row.
+        let cursor = flat.iter().position(|s| *s == "▌").expect("cursor");
+        assert_eq!(cursor / w, pos_you / w);
+        assert!(cursor > pos_hao);
+    }
+
+    #[test]
+    fn empty_q_policy_quits_only_when_input_empty() {
+        // Non-empty input: q must NOT quit — it types into the prompt.
+        let mut app = App::new("m", "u", 100);
+        app.push_char('h');
+        assert!(!apply_q_policy(&mut app));
+        assert_eq!(app.input, "hq");
+        // Running agent with empty input: still no quit.
+        let mut app = App::new("m", "u", 100);
+        app.is_running = true;
+        assert!(!apply_q_policy(&mut app));
+        assert_eq!(app.input, "q");
+        // Empty idle input: q quits.
+        let mut app = App::new("m", "u", 100);
+        assert!(apply_q_policy(&mut app));
+    }
+
+    #[test]
+    fn history_draft_restore_and_viewport_inner_h_slice() {
+        let mut app = App::new("m", "u", 100);
+        // A previously sent prompt lives in history...
+        app.input = "earlier prompt".to_string();
+        assert!(app.take_input());
+        // ...and an unsent draft is typed afterwards.
+        app.input = "draft question".to_string();
+        // Up-arrow: history entry restored into input, draft preserved.
+        app.history_up();
+        assert_eq!(app.input, "earlier prompt");
+        assert_eq!(app.draft, "draft question");
+
+        // Fill the conversation past one viewport (15 messages total).
+        for i in 0..14 {
+            app.input = format!("msg{i:02}");
+            assert!(app.take_input());
+        }
+        assert_eq!(app.messages.len(), 15);
+        app.scroll_offset = 0;
+
+        let (w, h) = (80u16, 20u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| ui(f, &app)).unwrap();
+
+        // Restored draft is visible in the prompt area.
+        let rows = rows_of(term.backend());
+        assert!(rows.iter().any(|r| r.contains("earlier prompt")));
+
+        // Viewport math: conversation chunk = h - status(3) - input(3),
+        // inner_h = chunk height - 2 borders = h - 8 = 12 rows.
+        let inner_h = (h - 8) as usize;
+        let joined: String = rows.concat();
+        // Slice starts at offset 0: message idx0 ("earlier prompt") plus
+        // msg00..msg10 fill exactly inner_h items; msg11+ stay clipped.
+        let visible_markers = (0..14)
+            .filter(|i| joined.contains(&format!("msg{i:02}")))
+            .count();
+        assert_eq!(
+            visible_markers + 1,
+            inner_h,
+            "viewport shows exactly inner_h = height-2 items"
+        );
+        for i in 11..14 {
+            assert!(
+                !joined.contains(&format!("msg{i:02}")),
+                "msg{i:02} must be outside the visible slice"
+            );
+        }
     }
 }

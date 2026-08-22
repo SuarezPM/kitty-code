@@ -1,0 +1,14 @@
+# Task 8 — QW TUI TestBackend snapshots (2026-08-21T22:02:08-03:00)
+
+## cargo test -p kitty-cli --features tui
+test tui::tests::empty_q_policy_quits_only_when_input_empty ... ok
+test tui::tests::testbackend_cjk_wide_char_renders_unsliced ... ok
+test tui::tests::history_draft_restore_and_viewport_inner_h_slice ... ok
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  -> tui::tests: 17/17 (14 existing + 3 new); crate total 34 passed
+
+## cargo clippy -p kitty-cli --features tui --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+
+## grep -c TestBackend crates/kitty-cli/src/tui.rs
+5
