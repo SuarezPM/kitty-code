@@ -4,6 +4,10 @@
 //! - Write-guard: refuses Write on existing files (force Edit).
 //! - Read-before-edit guard: refuses Edit if file not read this session.
 //! - Bash: sanitize command, block dangerous patterns via Guard.
+//!
+//! Edit supports two protocols:
+//! - Hash-snapshot: `{path, hash, new[, line]}` — line-hash based (default).
+//! - Str-replace (aider-compatible): `{path, old_string, new_string[, replace_all]}`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -191,7 +195,12 @@ impl ToolRegistry {
         })
     }
 
-    /// Execute an Edit tool call (hashline-based).
+    /// Execute an Edit tool call.
+    ///
+    /// Two protocols:
+    /// - Str-replace (aider-compatible): args contain `old_string` (+ `new_string`,
+    ///   optional `replace_all`). Matches exact text in the current file content.
+    /// - Hash-snapshot: args contain `hash` (+ `new`, optional `line`).
     fn execute_edit(&mut self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
         let path =
             args.get("path")
@@ -200,6 +209,13 @@ impl ToolRegistry {
                     tool: "Edit".to_string(),
                     reason: "missing 'path'".to_string(),
                 })?;
+
+        let path_buf = PathBuf::from(path);
+
+        // Aider-compatible str_replace mode takes precedence when old_string is present.
+        if let Some(old_string) = args.get("old_string").and_then(|v| v.as_str()) {
+            return self.execute_edit_str_replace(path, &path_buf, old_string, args);
+        }
 
         let old_hash =
             args.get("hash")
@@ -236,11 +252,14 @@ impl ToolRegistry {
                 .edit_by_hash_and_line(&path_buf, old_hash, line, new_content)
             {
                 Ok(new_file_content) => {
+                    let before = std::fs::read_to_string(&path_buf)?;
                     std::fs::write(&path_buf, &new_file_content)?;
                     self.hashline.read_file(&path_buf)?;
+                    let mut output = format!("Edit applied to {path} (line {line})");
+                    output.push_str(&self.build_edit_feedback(path, &path_buf, &before, &new_file_content));
                     Ok(ToolResult {
                         success: true,
-                        output: format!("Edit applied to {path} (line {line})"),
+                        output,
                         retry: false,
                     })
                 }
@@ -255,12 +274,15 @@ impl ToolRegistry {
             // Normal path — prefix match
             match self.hashline.edit_by_hash(&path_buf, old_hash, new_content) {
                 Ok(new_file_content) => {
+                    let before = std::fs::read_to_string(&path_buf)?;
                     std::fs::write(&path_buf, &new_file_content)?;
                     // Re-read to get updated hashes
                     self.hashline.read_file(&path_buf)?;
+                    let mut output = format!("Edit applied to {path}");
+                    output.push_str(&self.build_edit_feedback(path, &path_buf, &before, &new_file_content));
                     Ok(ToolResult {
                         success: true,
-                        output: format!("Edit applied to {path}"),
+                        output,
                         retry: false,
                     })
                 }
@@ -323,6 +345,138 @@ impl ToolRegistry {
                 retry: true,
             })
         }
+    }
+
+    /// Str-replace Edit mode (aider-compatible).
+    ///
+    /// Requires a prior Read this session (same read-before-edit invariant as
+    /// the hash protocol). Matches exact occurrences of `old_string` in the
+    /// current file content: 0 matches → error with hint to Read first;
+    /// >1 match without `replace_all` → error asking for more context.
+    ///
+    /// CRLF handling (kilocode-style): `\r\n` is normalized to `\n` for
+    /// matching, and restored on write when the original file used CRLF.
+    fn execute_edit_str_replace(
+        &mut self,
+        path: &str,
+        path_buf: &Path,
+        old_string: &str,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult, ToolError> {
+        let new_string =
+            args.get("new_string")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidArgs {
+                    tool: "Edit".to_string(),
+                    reason: "missing 'new_string' (required alongside 'old_string')".to_string(),
+                })?;
+
+        let replace_all = args
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Read-before-edit guard — same invariant as the hash protocol
+        if self.hashline.get_snapshot(path_buf).is_none() {
+            return Err(ToolError::EditBlocked(path.to_string()));
+        }
+
+        let before_raw = std::fs::read_to_string(path_buf)?;
+        let had_crlf = before_raw.contains("\r\n");
+        let normalize = |s: &str| s.replace("\r\n", "\n");
+        let before = normalize(&before_raw);
+        let old_n = normalize(old_string);
+        let new_n = normalize(new_string);
+
+        let count = before.matches(&old_n).count();
+        if count == 0 {
+            return Ok(ToolResult {
+                success: false,
+                output: format!(
+                    "old_string not found in {path}. \
+                     Read the file first, then pass the exact text from it \
+                     (whitespace and indentation matter)."
+                ),
+                retry: false,
+            });
+        }
+        if count > 1 && !replace_all {
+            return Ok(ToolResult {
+                success: false,
+                output: format!(
+                    "old_string matches {count} locations in {path}. \
+                     Provide more surrounding context to make it unique, \
+                     or set replace_all=true."
+                ),
+                retry: false,
+            });
+        }
+
+        let after_n = if replace_all {
+            before.replace(&old_n, &new_n)
+        } else {
+            before.replacen(&old_n, &new_n, 1)
+        };
+        // Restore original line endings on write
+        let after = if had_crlf {
+            after_n.replace('\n', "\r\n")
+        } else {
+            after_n
+        };
+
+        std::fs::write(path_buf, &after)?;
+        self.hashline.read_file(path_buf)?;
+
+        let mut output = format!("Edit applied to {path}");
+        output.push_str(&self.build_edit_feedback(path, path_buf, &before, &after));
+        Ok(ToolResult {
+            success: true,
+            output,
+            retry: false,
+        })
+    }
+
+    /// Feedback appended after every successful edit (either protocol):
+    /// unified diff snippet (capped), re-show of the edited region (±10
+    /// lines), and — when `KITTY_EDIT_CHECK=1` — a cheap syntax check.
+    fn build_edit_feedback(
+        &self,
+        path: &str,
+        path_buf: &Path,
+        before: &str,
+        after: &str,
+    ) -> String {
+        let mut out = String::new();
+
+        let diff = unified_diff(before, after, 40);
+        if !diff.is_empty() {
+            out.push_str("\n\n--- Diff ---\n");
+            out.push_str(&diff);
+        }
+
+        if let Some(center) = first_changed_line(before, after) {
+            if let Some(snapshot) = self.hashline.get_snapshot(path_buf) {
+                let start = center.saturating_sub(10).max(1);
+                let end = (center + 10).min(snapshot.lines.len());
+                if start <= end {
+                    out.push_str(&format!("\n\n--- {path} lines {start}-{end} ---\n"));
+                    out.push_str(&reshow_region(&snapshot.lines, center, 10));
+                }
+            }
+        }
+
+        if edit_check_enabled() {
+            if let Some(check) = run_extension_check(path_buf) {
+                out.push_str(&format!("\n\n--- Check ({}) ---\n", check.label));
+                if check.passed {
+                    out.push_str("OK");
+                } else {
+                    out.push_str(&format!("FAILED:\n{}", truncate_lines(&check.detail, 10)));
+                }
+            }
+        }
+
+        out
     }
 
     /// Execute a Write tool call.
@@ -635,6 +789,295 @@ impl ToolRegistry {
     }
 }
 
+/// Whether per-edit syntax checks are enabled (`KITTY_EDIT_CHECK=1`).
+/// Off by default: checks cost a subprocess per edit; benchmarks opt in.
+fn edit_check_enabled() -> bool {
+    std::env::var("KITTY_EDIT_CHECK").as_deref() == Ok("1")
+}
+
+/// Outcome of a cheap post-edit syntax check.
+struct CheckOutcome {
+    label: String,
+    passed: bool,
+    detail: String,
+}
+
+/// Map a file extension to a cheap syntax checker and run it.
+///
+/// Returns `None` when no checker maps to the extension or the checker
+/// binary cannot be spawned. For `.go` we use `gofmt -e` and treat any
+/// stderr output as failure (gofmt's exit status alone is not reliable
+/// across versions for parse errors).
+fn run_extension_check(path: &Path) -> Option<CheckOutcome> {
+    let ext = path.extension()?.to_str()?;
+    let display = path.display().to_string();
+    let (label, program, args): (&str, &str, Vec<String>) = match ext {
+        "py" => ("python3 -m py_compile", "python3", vec!["-m".into(), "py_compile".into(), display]),
+        "js" | "ts" => ("node --check", "node", vec!["--check".into(), display]),
+        "sh" => ("bash -n", "bash", vec!["-n".into(), display]),
+        "go" => ("gofmt -e", "gofmt", vec!["-e".into(), display]),
+        _ => return None,
+    };
+
+    let output = std::process::Command::new(program).args(&args).output().ok()?;
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let passed = if ext == "go" {
+        output.status.success() && stderr.trim().is_empty()
+    } else {
+        output.status.success()
+    };
+    Some(CheckOutcome {
+        label: label.to_string(),
+        passed,
+        detail: stderr,
+    })
+}
+
+/// 1-based line number in `after` of the first line that differs from
+/// `before` (center for the re-show block). `None` when identical.
+fn first_changed_line(before: &str, after: &str) -> Option<usize> {
+    let b: Vec<&str> = before.lines().collect();
+    let a: Vec<&str> = after.lines().collect();
+    for (i, (x, y)) in b.iter().zip(a.iter()).enumerate() {
+        if x != y {
+            return Some(i + 1);
+        }
+    }
+    if b.len() != a.len() {
+        return Some(b.len().min(a.len()) + 1);
+    }
+    None
+}
+
+/// Format up to ±`radius` lines around `center` (1-based) from an updated
+/// snapshot using the same `LINE:HASH|content` format as Read, so the model
+/// can chain hash edits without re-reading the whole file.
+fn reshow_region(lines: &[crate::hashline::LineHash], center: usize, radius: usize) -> String {
+    let start = center.saturating_sub(radius).max(1);
+    let end = (center + radius).min(lines.len());
+    if start > end {
+        return String::new();
+    }
+    lines[start - 1..end]
+        .iter()
+        .map(|l| {
+            format!(
+                "{}:{}|{}",
+                l.line_num,
+                &l.hash[..8.min(l.hash.len())],
+                l.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// difflib-style unified diff between two texts (line-based, LCS).
+/// Hunks carry up to 3 context lines; total emitted lines are capped at
+/// `max_lines` (a truncation marker is appended when exceeded).
+fn unified_diff(before: &str, after: &str, max_lines: usize) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum OpKind {
+        Same,
+        Del,
+        Add,
+    }
+
+    let a: Vec<&str> = before.lines().collect();
+    let b: Vec<&str> = after.lines().collect();
+    if a == b {
+        return String::new();
+    }
+
+    const CTX: usize = 3;
+    // LCS table is O(n*m); cap input size and fall back to a single
+    // prefix/suffix-trimmed hunk for oversized files.
+    const LCS_CAP: usize = 600;
+    if a.len() > LCS_CAP || b.len() > LCS_CAP {
+        return oversized_hunk(&a, &b, CTX, max_lines);
+    }
+    let (n, m) = (a.len(), b.len());
+    let w = m + 1;
+    let mut dp = vec![0u32; (n + 1) * w];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i * w + j] = if a[i] == b[j] {
+                dp[(i + 1) * w + j + 1] + 1
+            } else {
+                dp[(i + 1) * w + j].max(dp[i * w + j + 1])
+            };
+        }
+    }
+    let mut ops: Vec<(OpKind, &str)> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            ops.push((OpKind::Same, a[i]));
+            i += 1;
+            j += 1;
+        } else if dp[(i + 1) * w + j] >= dp[i * w + j + 1] {
+            ops.push((OpKind::Del, a[i]));
+            i += 1;
+        } else {
+            ops.push((OpKind::Add, b[j]));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push((OpKind::Del, a[i]));
+        i += 1;
+    }
+    while j < m {
+        ops.push((OpKind::Add, b[j]));
+        j += 1;
+    }
+
+    // Absolute line numbers per op index.
+    let old_no = |idx: usize| -> usize { ops[..idx].iter().filter(|(k, _)| *k != OpKind::Add).count() };
+    let new_no = |idx: usize| -> usize { ops[..idx].iter().filter(|(k, _)| *k != OpKind::Del).count() };
+
+    let mut out = String::new();
+    let mut emitted = 0usize;
+    let mut k = 0usize;
+    while k < ops.len() {
+        if ops[k].0 == OpKind::Same {
+            k += 1;
+            continue;
+        }
+        // Hunk start: back up context lines.
+        let start = k.saturating_sub(CTX);
+        // Hunk end: first run of more than CTX consecutive Same ops.
+        let mut end = k;
+        let mut run = 0usize;
+        while end < ops.len() {
+            if ops[end].0 == OpKind::Same {
+                run += 1;
+                if run > CTX {
+                    break;
+                }
+            } else {
+                run = 0;
+            }
+            end += 1;
+        }
+
+        let slice = &ops[start..end];
+        let old_count = slice.iter().filter(|(kd, _)| *kd != OpKind::Add).count();
+        let new_count = slice.iter().filter(|(kd, _)| *kd != OpKind::Del).count();
+        let o_start = old_no(start) + 1;
+        let n_start = new_no(start) + 1;
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            if old_count == 0 { o_start - 1 } else { o_start },
+            old_count,
+            if new_count == 0 { n_start - 1 } else { n_start },
+            new_count
+        ));
+        emitted += 1;
+        if emitted >= max_lines {
+            out.push_str("... (diff truncated)\n");
+            return out;
+        }
+        for (kind, line) in slice {
+            let prefix = match kind {
+                OpKind::Same => ' ',
+                OpKind::Del => '-',
+                OpKind::Add => '+',
+            };
+            out.push(prefix);
+            out.push_str(line);
+            out.push('\n');
+            emitted += 1;
+            if emitted >= max_lines {
+                out.push_str("... (diff truncated)\n");
+                return out;
+            }
+        }
+        k = end;
+    }
+    out
+}
+
+/// Single-hunk diff for oversized files (LCS table would be too large):
+/// prefix/suffix-trimmed middle with bounded context. Line numbers are
+/// computed from the true offsets, unlike the LCS path.
+fn oversized_hunk(a: &[&str], b: &[&str], ctx: usize, max_lines: usize) -> String {
+    let mut p = 0usize;
+    while p < a.len() && p < b.len() && a[p] == b[p] {
+        p += 1;
+    }
+    let mut s = 0usize;
+    while s < a.len() - p && s < b.len() - p && a[a.len() - 1 - s] == b[b.len() - 1 - s] {
+        s += 1;
+    }
+
+    let lead = p.min(ctx);
+    let trail = s.min(ctx);
+    let dels = &a[p..a.len() - s];
+    let adds = &b[p..b.len() - s];
+
+    let old_start = p + 1 - lead; // 1-based first old line shown
+    let new_start = p + 1 - lead; // 1-based first new line shown
+    let old_count = lead + dels.len() + trail;
+    let new_count = lead + adds.len() + trail;
+
+    let mut out = format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@\n");
+    let mut emitted = 1usize;
+    if emitted >= max_lines {
+        out.push_str("... (diff truncated)\n");
+        return out;
+    }
+    for line in &a[p - lead..p] {
+        out.push(' ');
+        out.push_str(line);
+        out.push('\n');
+        emitted += 1;
+    }
+    for line in dels {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+        emitted += 1;
+        if emitted >= max_lines {
+            out.push_str("... (diff truncated)\n");
+            return out;
+        }
+    }
+    for line in adds {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+        emitted += 1;
+        if emitted >= max_lines {
+            out.push_str("... (diff truncated)\n");
+            return out;
+        }
+    }
+    for line in &a[a.len() - s..a.len() - s + trail] {
+        out.push(' ');
+        out.push_str(line);
+        out.push('\n');
+        emitted += 1;
+        if emitted >= max_lines {
+            out.push_str("... (diff truncated)\n");
+            return out;
+        }
+    }
+    out
+}
+
+/// Keep at most `max` lines of `text`.
+fn truncate_lines(text: &str, max: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max {
+        text.trim_end().to_string()
+    } else {
+        let mut kept: Vec<String> = lines[..max].iter().map(|s| s.to_string()).collect();
+        kept.push(format!("... ({} more lines)", lines.len() - max));
+        kept.join("\n")
+    }
+}
+
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
@@ -660,7 +1103,8 @@ pub fn standard_tool_definitions() -> Vec<kitty_runtime::ToolDefinition> {
         ),
         kitty_runtime::ToolDefinition::new(
             "Edit",
-            "Edit a file by line hash (from Read output). Refuses if file changed since read.",
+            "To modify an existing file: Read it, then use Edit with old_string/new_string \
+             (exact text copied from the file). Never use Write on existing files.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -668,25 +1112,37 @@ pub fn standard_tool_definitions() -> Vec<kitty_runtime::ToolDefinition> {
                         "type": "string",
                         "description": "File path to edit"
                     },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to replace, copied from the file (str_replace mode). Include enough surrounding lines to be unique."
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text for old_string"
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence of old_string instead of failing on multiple matches (default false)"
+                    },
                     "hash": {
                         "type": "string",
-                        "description": "Line hash from Read output (8-char prefix or full hash)"
+                        "description": "Alternative line-hash mode: line hash from Read output"
                     },
                     "new": {
                         "type": "string",
-                        "description": "New content for the line"
+                        "description": "Line-hash mode: new content for the line"
                     },
                     "line": {
                         "type": "integer",
-                        "description": "Line number to disambiguate when hash prefix matches multiple lines"
+                        "description": "Line-hash mode: line number to disambiguate when hash prefix matches multiple lines"
                     }
                 },
-                "required": ["path", "hash", "new"]
+                "required": ["path"]
             }),
         ),
         kitty_runtime::ToolDefinition::new(
             "Write",
-            "Write a new file. Blocked on existing files — use Edit instead.",
+            "Create a NEW file. Never use Write on existing files — to modify an existing file: Read it, then use Edit with old_string/new_string.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1191,5 +1647,290 @@ mod tests {
             ctl.output
         );
         assert_eq!(std::fs::read(&victim).unwrap(), b"payload");
+    }
+
+    // ---- Edit str_replace mode (aider-compatible) ----
+
+    #[test]
+    fn str_replace_success_single_match() {
+        let f = temp_file("alpha\nbeta\ngamma");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "beta",
+            "new_string": "BETA"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(result.success, "got: {}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            "alpha\nBETA\ngamma"
+        );
+    }
+
+    #[test]
+    fn str_replace_not_found_error_message() {
+        let f = temp_file("alpha\nbeta");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "MISSING",
+            "new_string": "x"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("old_string not found"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.to_lowercase().contains("read"),
+            "must hint to Read first, got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn str_replace_multiple_matches_error_without_replace_all() {
+        let f = temp_file("same\nsame\nother");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "same",
+            "new_string": "different"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("matches 2 locations"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("more surrounding context"),
+            "got: {}",
+            result.output
+        );
+        // File untouched
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "same\nsame\nother");
+    }
+
+    #[test]
+    fn str_replace_replace_all_success() {
+        let f = temp_file("same\nmid\nsame");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "same",
+            "new_string": "uniq",
+            "replace_all": true
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(result.success, "got: {}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            "uniq\nmid\nuniq"
+        );
+    }
+
+    #[test]
+    fn str_replace_crlf_preserved() {
+        let f = temp_file("alpha\r\nbeta\r\ngamma");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "beta",
+            "new_string": "BETA"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(result.success, "got: {}", result.output);
+        let on_disk = std::fs::read_to_string(f.path()).unwrap();
+        assert_eq!(on_disk, "alpha\r\nBETA\r\ngamma", "CRLF must be preserved");
+    }
+
+    #[test]
+    fn str_replace_multiline_old_string() {
+        let f = temp_file("fn a() {\n    old();\n}\n");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "fn a() {\n    old();\n}",
+            "new_string": "fn a() {\n    new();\n}"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(result.success, "got: {}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            "fn a() {\n    new();\n}\n"
+        );
+    }
+
+    #[test]
+    fn str_replace_blocked_without_read() {
+        let f = temp_file("alpha\nbeta");
+        let mut registry = ToolRegistry::new();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "alpha",
+            "new_string": "A"
+        });
+        let err = registry.execute_edit(&args).unwrap_err();
+        assert!(matches!(err, ToolError::EditBlocked(_)));
+    }
+
+    #[test]
+    fn str_replace_output_has_diff_and_reshow() {
+        let f = temp_file("l1\nl2\nl3\nl4\nl5");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "l3",
+            "new_string": "L3"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("--- Diff ---"), "got: {}", result.output);
+        assert!(result.output.contains("-l3"), "got: {}", result.output);
+        assert!(result.output.contains("+L3"), "got: {}", result.output);
+        // Re-show block: tagged lines around the change (Read-style format)
+        assert!(result.output.contains("|l2"), "re-show context missing, got: {}", result.output);
+        assert!(result.output.contains("|L3"), "re-show edited line missing, got: {}", result.output);
+        assert!(result.output.contains("|l4"), "re-show context missing, got: {}", result.output);
+    }
+
+    #[test]
+    fn hash_edit_output_includes_diff_and_reshow() {
+        // Feedback block applies to BOTH modes; hash protocol must keep working.
+        let f = temp_file("hello\nworld");
+        let mut registry = ToolRegistry::new();
+        let read_res = registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let hash = read_res
+            .output
+            .lines()
+            .next()
+            .unwrap()
+            .split(':')
+            .nth(1)
+            .unwrap()
+            .split('|')
+            .next()
+            .unwrap()
+            .to_string();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "hash": hash,
+            "new": "HELLO"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(result.success, "hash protocol broken: {}", result.output);
+        assert!(result.output.contains("--- Diff ---"), "got: {}", result.output);
+        assert!(result.output.contains("+HELLO"), "got: {}", result.output);
+        assert!(result.output.contains("|world"), "re-show missing, got: {}", result.output);
+    }
+
+    #[test]
+    fn edit_check_disabled_by_default() {
+        if std::env::var("KITTY_EDIT_CHECK").as_deref() == Ok("1") {
+            println!("SKIP: KITTY_EDIT_CHECK=1 set in ambient environment");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script.py");
+        std::fs::write(&path, "x = 1\nbroken(\n").unwrap(); // syntactically invalid
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": path.to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "old_string": "x = 1",
+            "new_string": "x = 2"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(result.success);
+        assert!(
+            !result.output.contains("--- Check ("),
+            "check must be off by default, got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn extension_check_pass_and_fail_python() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let ok = dir.path().join("good.py");
+            std::fs::write(&ok, "x = 1\n").unwrap();
+            let passed = run_extension_check(&ok).unwrap();
+            assert!(passed.passed, "valid .py must pass, got: {}", passed.detail);
+
+            let bad = dir.path().join("bad.py");
+            std::fs::write(&bad, "def f(:\n").unwrap();
+            let failed = run_extension_check(&bad).unwrap();
+            assert!(!failed.passed, "invalid .py must fail");
+        } else {
+            println!("SKIP: python3 unavailable");
+        }
+    }
+
+    #[test]
+    fn extension_check_bash_n() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("good.sh");
+        std::fs::write(&ok, "echo hi\n").unwrap();
+        assert!(run_extension_check(&ok).unwrap().passed);
+
+        let bad = dir.path().join("bad.sh");
+        std::fs::write(&bad, "if then fi\n").unwrap();
+        assert!(!run_extension_check(&bad).unwrap().passed);
+    }
+
+    #[test]
+    fn unified_diff_basic_and_noop() {
+        assert_eq!(unified_diff("a\nb\n", "a\nb\n", 40), "");
+        let d = unified_diff("a\nb\nc\n", "a\nX\nc\n", 40);
+        assert!(d.contains("@@"), "got: {d}");
+        assert!(d.contains("-b\n"), "got: {d}");
+        assert!(d.contains("+X\n"), "got: {d}");
+        assert!(d.contains(" a\n"), "context line, got: {d}");
+    }
+
+    #[test]
+    fn unified_diff_caps_output() {
+        let old: String = (0..100).map(|i| format!("line{i}\n")).collect();
+        let new: String = (0..100).map(|i| format!("ln{i}\n")).collect();
+        let d = unified_diff(&old, &new, 40);
+        let emitted = d.lines().count();
+        assert!(emitted <= 41, "cap exceeded: {emitted} lines");
+        assert!(d.contains("diff truncated"));
     }
 }
