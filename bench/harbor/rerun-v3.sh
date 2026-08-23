@@ -54,6 +54,31 @@ while [ -f "$ST/status" ] && [ "$(cat "$ST/status")" != "QUEUE_V2_COMPLETE" ]; d
 done
 log "cola v2 completa — procediendo"
 
+# G2-F4: re-validar tras la espera — el árbol puede ensuciarse durante la
+# ventana de hasta 12h (pistas paralelas mutan este mismo working tree)
+if [ -n "$(git status --porcelain crates Cargo.toml Cargo.lock rust-toolchain.toml)" ]; then
+  echo "DIRTY_TREE" > "$ST/status-v3"
+  log "FATAL: arbol se ensucio durante la espera: $(git status --porcelain crates Cargo.toml Cargo.lock rust-toolchain.toml | tr '\n' '; ')"
+  exit 1
+fi
+# G2-F4: pin de contenido — lo merged debe CONTENER el estado revisado
+# (777d21f: impl Tier 3+4+7 + guards G2) y solo puede diferir de él en el
+# propio script de entrega (evolución del delivery no toca lo validado).
+# NOTA: igualdad exacta de tip es imposible (el pin viviría dentro del
+# commit que pinea — auto-referencia SHA); esto preserva la intención.
+REVIEWED_SHA="777d21fe054fd45b3ad8ae3b0d534b57abe357dd"
+if ! git merge-base --is-ancestor "$REVIEWED_SHA" levers/tier-3-4-7; then
+  echo "BRANCH_MOVED" > "$ST/status-v3"
+  log "FATAL: $REVIEWED_SHA ya no es ancestro de la rama (rebase/revert durante la espera)"
+  exit 1
+fi
+STRAY=$(git diff --name-only "$REVIEWED_SHA" levers/tier-3-4-7 | grep -v '^bench/harbor/rerun-v3\.sh$' || true)
+if [ -n "$STRAY" ]; then
+  echo "BRANCH_MOVED" > "$ST/status-v3"
+  log "FATAL: la rama difiere del estado revisado fuera del script de entrega: $(echo "$STRAY" | tr '\n' '; ')"
+  exit 1
+fi
+
 # 2. Merge rama de palancas a main
 if ! git checkout main >> "$LOG" 2>&1; then
   echo "MERGE_FAILED" > "$ST/status-v3"; log "FATAL: checkout main falló (¿working tree sucio?)"; exit 1
