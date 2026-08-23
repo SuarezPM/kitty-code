@@ -13,6 +13,16 @@
 //! as cleartext only at the HTTP transport boundary via
 //! [`SecretString::expose`]. Env vars forwarded to child processes should be
 //! filtered through [`is_secret_env_name`] / [`sanitize_env`].
+//!
+//! # Qwen reasoning normalization (E3)
+//!
+//! Qwen-family models on OpenAI-compatible endpoints return reasoning in a
+//! provider-specific `reasoning_content` message field. [`CloudMessage`]
+//! parses it and maps it into [`Message::thinking`] — stored separately and
+//! NEVER merged into assistant `content`, so it is not fed back into the
+//! conversation as if it were user-visible text (opencode
+//! `openaiCompatible[field]` transform pattern; see also
+//! `crate::client::should_disable_thinking` for the request side).
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -216,6 +226,10 @@ struct CloudMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
+    /// E3 qwen reasoning normalization: provider-specific reasoning field,
+    /// parsed into [`Message::thinking`] (never merged into `content`).
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<CloudToolCall>>,
 }
@@ -434,7 +448,9 @@ impl CloudClient {
             message: Message {
                 role: cm.role,
                 content: cm.content,
-                thinking: None,
+                // E3: reasoning_content is stored separately as `thinking`
+                // and never fed back as assistant content.
+                thinking: cm.reasoning_content,
                 tool_calls,
             },
             done: true,
@@ -855,5 +871,44 @@ mod tests {
                 ("KITTY_BENCH_MODEL".to_string(), "ornith:9b".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn cloud_reasoning_content_normalized_into_thinking_not_content() {
+        // E3: qwen-family OpenAI-compat responses carry reasoning in the
+        // provider-specific `reasoning_content` field. It must land in
+        // Message.thinking and NEVER in content.
+        let body = serde_json::json!({
+            "id": "chatcmpl-1",
+            "model": "qwen3-32b",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "final visible answer",
+                    "reasoning_content": "chain of thought here"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let parsed: CloudChatResponse = serde_json::from_value(body).unwrap();
+        let cm = parsed.choices.into_iter().next().unwrap().message;
+        assert_eq!(cm.content.as_deref(), Some("final visible answer"));
+        assert_eq!(
+            cm.reasoning_content.as_deref(),
+            Some("chain of thought here")
+        );
+        // The mapping performed by chat_inner: reasoning → thinking field.
+        let msg = Message {
+            role: cm.role,
+            content: cm.content,
+            thinking: cm.reasoning_content,
+            tool_calls: None,
+        };
+        assert_eq!(msg.thinking.as_deref(), Some("chain of thought here"));
+        assert_eq!(msg.content.as_deref(), Some("final visible answer"));
+        // Serialized history keeps them apart (thinking is a separate field).
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["thinking"], "chain of thought here");
+        assert_eq!(json["content"], "final visible answer");
     }
 }

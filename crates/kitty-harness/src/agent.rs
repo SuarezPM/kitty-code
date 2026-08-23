@@ -951,19 +951,41 @@ impl Agent {
             },
         );
 
+        let options = Some(self.request_options(&messages));
         self.client
-            .chat(&self.config.model, messages, Some(self.tools.clone()))
+            .chat_with_options(
+                &self.config.model,
+                messages,
+                Some(self.tools.clone()),
+                options,
+            )
             .await
             .context("Retry LLM call without thinking failed")
+    }
+
+    /// E3 dynamic max-output cap: request only as much output as still fits
+    /// the context window (`context_limit − estimated_input − 1024`, floor
+    /// 256), preventing the "requested 8192 output but prompt 24577" failure
+    /// class on small local models. Input estimated conservatively at
+    /// chars/4 via [`kitty_runtime::client::estimate_input_tokens`].
+    fn request_options(&self, messages: &[Message]) -> kitty_runtime::client::RequestOptions {
+        let est = kitty_runtime::client::estimate_input_tokens(messages);
+        let num_predict =
+            kitty_runtime::client::dynamic_max_output(self.config.context_window, est);
+        kitty_runtime::client::RequestOptions {
+            num_predict: Some(num_predict),
+            ..Default::default()
+        }
     }
 
     /// Make an LLM call and handle the response.
     async fn llm_call(&self) -> Result<ChatResponse> {
         self.client
-            .chat(
+            .chat_with_options(
                 &self.config.model,
                 self.messages.clone(),
                 Some(self.tools.clone()),
+                Some(self.request_options(&self.messages)),
             )
             .await
             .context("LLM call failed")
@@ -980,12 +1002,14 @@ impl Agent {
         });
 
         // Call without tools to force text response
+        let options = Some(self.request_options(&messages));
         let response = self
             .client
-            .chat(
+            .chat_with_options(
                 &self.config.model,
                 messages,
                 None, // No tools — forces text
+                options,
             )
             .await
             .context("Force response LLM call failed")?;
@@ -1045,18 +1069,16 @@ impl Agent {
         );
 
         // Ask the model to summarize
+        let summary_messages = vec![Message {
+            role: "user".to_string(),
+            content: Some(summary_prompt),
+            thinking: None,
+            tool_calls: None,
+        }];
+        let options = Some(self.request_options(&summary_messages));
         let summary = self
             .client
-            .chat(
-                &self.config.model,
-                vec![Message {
-                    role: "user".to_string(),
-                    content: Some(summary_prompt),
-                    thinking: None,
-                    tool_calls: None,
-                }],
-                None,
-            )
+            .chat_with_options(&self.config.model, summary_messages, None, options)
             .await
             .context("Compaction summary LLM call failed")?;
 
@@ -1349,9 +1371,8 @@ mod tests {
             model: &'a str,
             messages: Vec<Message>,
             tools: Option<Vec<ToolDefinition>>,
-        ) -> Pin<
-            Box<dyn Future<Output = kitty_runtime::Result<ChatResponse>> + Send + 'a>,
-        > {
+        ) -> Pin<Box<dyn Future<Output = kitty_runtime::Result<ChatResponse>> + Send + 'a>>
+        {
             Box::pin(async move {
                 *self.last_messages.lock().unwrap() = Some(messages.clone());
                 self.inner.chat(model, messages, tools).await

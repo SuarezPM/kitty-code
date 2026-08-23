@@ -5,6 +5,31 @@
 //! raised for heavy bench workloads via `KITTY_OLLAMA_TIMEOUT_SECS`
 //! (invalid/missing value falls back to the default). The same variable also
 //! overrides [`crate::cloud::CloudClient`], whose own default is 120s.
+//!
+//! # Qwen thinking/reasoning normalization (E3)
+//!
+//! Qwen-family "think" models emit reasoning either server-side (Ollama's
+//! `message.thinking`) or as an OpenAI-compat `reasoning_content` field.
+//! Handling is deterministic and requires zero model intelligence:
+//!
+//! - Request side: when `KITTY_NO_THINK=1` **or** the model id contains
+//!   "think", [`OllamaClient`] sends `"think": false` in `/api/chat`
+//!   ([`should_disable_thinking`]), asking the server not to reason.
+//! - Response side: reasoning is parsed into [`Message::thinking`] — stored
+//!   separately and NEVER merged back into assistant `content`. On the
+//!   OpenAI-compat path ([`crate::cloud::CloudClient`]) the provider-specific
+//!   `reasoning_content` field is normalized into `thinking`, so it never
+//!   leaks back into the conversation as if it were user-visible text
+//!   (opencode `openaiCompatible[field]` transform pattern).
+//!
+//! # Dynamic max-output cap (E3)
+//!
+//! Requesting a fixed large output budget on a nearly-full context window
+//! fails server-side ("requested 8192 output but prompt 24577"). The harness
+//! caps requested output via [`dynamic_max_output`] =
+//! `context_limit − estimated_input − 1024` (floor 256), estimating input
+//! conservatively at chars/4 via [`estimate_input_tokens`], and passes it
+//! through [`ChatClient::chat_with_options`] (honored by [`OllamaClient`]).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -21,6 +46,27 @@ use crate::tools::ToolDefinition;
 /// (default 120s). Invalid or missing values fall back to each default.
 pub const ENV_TIMEOUT_SECS: &str = "KITTY_OLLAMA_TIMEOUT_SECS";
 
+/// Env flag (E3): when set to exactly `1`, thinking mode is disabled for
+/// qwen-family models regardless of the model id.
+pub const ENV_NO_THINK: &str = "KITTY_NO_THINK";
+
+/// Pure predicate behind [`should_disable_thinking`] — testable without
+/// process-env mutation.
+///
+/// Thinking is disabled when `no_think_env == Some("1")` or the model id
+/// contains "think" (case-insensitive; matches qwen think variants).
+#[must_use]
+pub fn should_disable_thinking_with(no_think_env: Option<&str>, model: &str) -> bool {
+    no_think_env == Some("1") || model.to_ascii_lowercase().contains("think")
+}
+
+/// Whether thinking mode should be disabled for `model`: true when
+/// `KITTY_NO_THINK=1` or the model id contains "think".
+#[must_use]
+pub fn should_disable_thinking(model: &str) -> bool {
+    should_disable_thinking_with(std::env::var(ENV_NO_THINK).ok().as_deref(), model)
+}
+
 /// Default request timeout for [`OllamaClient`] — 5 min, sized for long
 /// reasoning generations on consumer GPUs.
 pub const DEFAULT_OLLAMA_TIMEOUT_SECS: u64 = 300;
@@ -34,6 +80,53 @@ pub const DEFAULT_OLLAMA_TIMEOUT_SECS: u64 = 300;
 pub fn parse_timeout_secs(raw: Option<&str>, default: u64) -> u64 {
     raw.and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic max-output cap (E3)
+// ---------------------------------------------------------------------------
+
+/// Token headroom reserved between prompt and generated output so the sum
+/// always fits the context window.
+pub const OUTPUT_RESERVE_TOKENS: usize = 1024;
+/// Floor for the capped output size — small but still usable.
+pub const MIN_OUTPUT_TOKENS: i32 = 256;
+
+/// Conservative input-token estimate over a conversation: chars/4 across
+/// message content, thinking, and serialized tool-call arguments.
+#[must_use]
+pub fn estimate_input_tokens(messages: &[Message]) -> usize {
+    let mut chars = 0usize;
+    for m in messages {
+        if let Some(c) = m.content.as_deref() {
+            chars += c.len();
+        }
+        if let Some(t) = m.thinking.as_deref() {
+            chars += t.len();
+        }
+        if let Some(calls) = &m.tool_calls {
+            for tc in calls {
+                chars += tc.function.name.len();
+                chars += serde_json::to_string(&tc.function.arguments)
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+            }
+        }
+    }
+    chars.div_ceil(4)
+}
+
+/// Cap the requested output tokens so prompt + output fit the context window:
+/// `context_limit − estimated_input_tokens − 1024`, floored at 256.
+///
+/// Prevents the "requested 8192 output but prompt 24577" failure class on
+/// small local models.
+#[must_use]
+pub fn dynamic_max_output(context_limit: usize, estimated_input_tokens: usize) -> i32 {
+    context_limit
+        .saturating_sub(estimated_input_tokens)
+        .saturating_sub(OUTPUT_RESERVE_TOKENS)
+        .max(MIN_OUTPUT_TOKENS as usize) as i32
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +145,22 @@ pub trait ChatClient: Send + Sync {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>>;
+
+    /// Chat with explicit request options (e.g., a capped `num_predict` from
+    /// [`dynamic_max_output`]).
+    ///
+    /// Default implementation IGNORES the options and delegates to
+    /// [`ChatClient::chat`], keeping existing backends source-compatible;
+    /// [`OllamaClient`] overrides it and honors them.
+    fn chat_with_options<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        _options: Option<RequestOptions>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
+        Box::pin(async move { self.chat(model, messages, tools).await })
+    }
 
     fn count_tokens<'a>(
         &'a self,
@@ -144,9 +253,14 @@ pub struct ChatRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<RequestOptions>,
+    /// E3 qwen thinking normalization: `Some(false)` serializes as
+    /// `"think": false` (Ollama) to disable thinking server-side; `None`
+    /// leaves the field out entirely (server default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct RequestOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
@@ -240,6 +354,9 @@ impl OllamaClient {
     }
 
     /// Send a chat completion request (non-streaming).
+    ///
+    /// E3: when [`should_disable_thinking`] is true for `model`, the request
+    /// carries `"think": false` so qwen-family models skip reasoning.
     pub async fn chat(
         &self,
         model: &str,
@@ -247,12 +364,18 @@ impl OllamaClient {
         tools: Option<Vec<ToolDefinition>>,
         options: Option<RequestOptions>,
     ) -> Result<ChatResponse> {
+        let think = if should_disable_thinking(model) {
+            Some(false)
+        } else {
+            None
+        };
         let request = ChatRequest {
             model: model.to_string(),
             messages,
             tools,
             stream: Some(false),
             options,
+            think,
         };
 
         let url = format!("{}/api/chat", self.base_url);
@@ -348,6 +471,16 @@ impl ChatClient for OllamaClient {
         tools: Option<Vec<ToolDefinition>>,
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
         Box::pin(async move { OllamaClient::chat(self, model, messages, tools, None).await })
+    }
+
+    fn chat_with_options<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: Option<RequestOptions>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
+        Box::pin(async move { OllamaClient::chat(self, model, messages, tools, options).await })
     }
 
     fn count_tokens<'a>(
@@ -507,10 +640,12 @@ mod tests {
             tools: None,
             stream: Some(false),
             options: None,
+            think: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(!json.as_object().unwrap().contains_key("tools"));
         assert!(!json.as_object().unwrap().contains_key("options"));
+        assert!(!json.as_object().unwrap().contains_key("think"));
     }
 
     #[test]
@@ -618,5 +753,71 @@ mod tests {
         assert_eq!(parse_timeout_secs(Some("900"), 300), 900);
         assert_eq!(parse_timeout_secs(Some("42"), 120), 42);
         assert_eq!(parse_timeout_secs(Some(" 600 "), 300), 600);
+    }
+
+    #[test]
+    fn should_disable_thinking_pure_predicate() {
+        // Default: thinking stays on
+        assert!(!should_disable_thinking_with(None, "qwen3:8b"));
+        assert!(!should_disable_thinking_with(Some("0"), "qwen3:8b"));
+        // KITTY_NO_THINK=1 disables regardless of model id
+        assert!(should_disable_thinking_with(Some("1"), "ornith:9b"));
+        assert!(should_disable_thinking_with(Some("1"), ""));
+        // Model id containing "think" (case-insensitive) disables
+        assert!(should_disable_thinking_with(None, "Qwen3-Thinking"));
+        assert!(should_disable_thinking_with(None, "qwen3:8b-think"));
+        // Other values than "1" don't count as enabled flag
+        assert!(!should_disable_thinking_with(Some("yes"), "llama3"));
+    }
+
+    #[test]
+    fn chat_request_serializes_think_false_when_set() {
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![],
+            tools: None,
+            stream: None,
+            options: None,
+            think: Some(false),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["think"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn dynamic_max_output_caps_and_floors() {
+        // 16K ctx with ~12K input → 16384 − 12288 − 1024 = 3072
+        assert_eq!(dynamic_max_output(16384, 12288), 3072);
+        // Nearly-full context floors at 256 instead of requesting an
+        // impossible output budget
+        assert_eq!(dynamic_max_output(16384, 16000), MIN_OUTPUT_TOKENS);
+        // Input larger than the context saturates to the floor too
+        assert_eq!(dynamic_max_output(4096, 9000), MIN_OUTPUT_TOKENS);
+        // Zero-input small context: 4096 − 0 − 1024 = 3072
+        assert_eq!(dynamic_max_output(4096, 0), 3072);
+    }
+
+    #[test]
+    fn estimate_input_tokens_conservative_chars_per_four() {
+        // 8 chars → 2 tokens
+        assert_eq!(estimate_input_tokens(&[Message::user("12345678")]), 2);
+        // Empty conversation → 0
+        let empty: Vec<Message> = vec![];
+        assert_eq!(estimate_input_tokens(&empty), 0);
+        // Tool-call arguments are counted (name + serialized args)
+        let m = Message {
+            role: "assistant".into(),
+            content: None,
+            thinking: None,
+            tool_calls: Some(vec![ToolCall {
+                id: None,
+                function: ToolCallFunction {
+                    name: "Read".into(),
+                    arguments: serde_json::json!({"path": "abcd"}),
+                },
+            }]),
+        };
+        // args JSON is {"path":"abcd"} = 15 chars + name 4 = 19 → ceil(19/4)=5
+        assert_eq!(estimate_input_tokens(&[m]), 5);
     }
 }
