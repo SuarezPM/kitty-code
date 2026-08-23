@@ -8,6 +8,11 @@
 //! Edit supports two protocols:
 //! - Hash-snapshot: `{path, hash, new[, line]}` — line-hash based (default).
 //! - Str-replace (aider-compatible): `{path, old_string, new_string[, replace_all]}`.
+//!
+//! CRLF note: line-ending normalization in str_replace mode is FILE-GLOBAL —
+//! matching is done LF-normalized and, if the file on disk uses CRLF, ALL
+//! line endings are restored uniformly on write. A mixed LF/CRLF file comes
+//! out uniform after an edit (all-CRLF or all-LF), never mixed.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -214,7 +219,26 @@ impl ToolRegistry {
 
         // Aider-compatible str_replace mode takes precedence when old_string is present.
         if let Some(old_string) = args.get("old_string").and_then(|v| v.as_str()) {
-            return self.execute_edit_str_replace(path, &path_buf, old_string, args);
+            // E-G1b: empty old_string would match everywhere — fail fast
+            // before any occurrence counting or file IO.
+            if old_string.is_empty() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: "old_string must not be empty".to_string(),
+                    retry: false,
+                });
+            }
+            let mut result = self.execute_edit_str_replace(path, &path_buf, old_string, args)?;
+            // E-G1a: dual-mode args — when both old_string and hash are
+            // provided, str_replace wins and the hash is silently ignored;
+            // surface that explicitly so the model can correct its args.
+            if args.get("hash").and_then(|v| v.as_str()).is_some() {
+                result.output = format!(
+                    "note: hash ignored; str_replace mode active\n{}",
+                    result.output
+                );
+            }
+            return Ok(result);
         }
 
         let old_hash =
@@ -1695,6 +1719,59 @@ mod tests {
             "must hint to Read first, got: {}",
             result.output
         );
+    }
+
+    // ---- E-G1 low findings ----
+
+    #[test]
+    fn edit_dual_mode_args_notes_hash_ignored() {
+        // E-G1a: when BOTH old_string and hash are provided, str_replace mode
+        // wins and the output must say the hash was ignored.
+        let f = temp_file("alpha\nbeta\ngamma");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "beta",
+            "new_string": "BETA",
+            "hash": "deadbeef"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(result.success, "got: {}", result.output);
+        assert!(
+            result
+                .output
+                .starts_with("note: hash ignored; str_replace mode active"),
+            "got: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            "alpha\nBETA\ngamma"
+        );
+    }
+
+    #[test]
+    fn edit_empty_old_string_fails_immediately() {
+        // E-G1b: empty old_string must fail before occurrence counting /
+        // file IO (an empty needle would match everywhere).
+        let f = temp_file("alpha\nbeta");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "",
+            "new_string": "x"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(!result.success);
+        assert_eq!(result.output, "old_string must not be empty");
+        // File untouched
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "alpha\nbeta");
     }
 
     #[test]

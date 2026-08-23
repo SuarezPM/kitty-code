@@ -1827,8 +1827,7 @@ mod tests {
     fn truncate_large_output_spills_to_disk_with_pointer() {
         let _g = env_lock();
         let tmp = tempfile::tempdir().unwrap();
-        let prev =
-            std::env::var(ENV_TRUNCATION_DIR).ok();
+        let prev = std::env::var(ENV_TRUNCATION_DIR).ok();
         std::env::set_var(ENV_TRUNCATION_DIR, tmp.path());
 
         // >50KB triggers spill
@@ -1916,10 +1915,7 @@ mod tests {
 
     #[test]
     fn qwen_stance_overlay_pure_predicate() {
-        assert_eq!(
-            model_stance_overlay("qwen3:8b"),
-            Some(QWEN_STANCE_OVERLAY)
-        );
+        assert_eq!(model_stance_overlay("qwen3:8b"), Some(QWEN_STANCE_OVERLAY));
         assert_eq!(
             model_stance_overlay("Qwen2.5-Coder-7B"),
             Some(QWEN_STANCE_OVERLAY)
@@ -1953,10 +1949,7 @@ mod tests {
         agent2.run_bootstrap();
         agent2.preflight("hi");
         assert!(
-            !agent2
-                .messages
-                .iter()
-                .any(|m| m.role == "system"),
+            !agent2.messages.iter().any(|m| m.role == "system"),
             "non-qwen model must not get the stance overlay"
         );
     }
