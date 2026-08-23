@@ -23,15 +23,15 @@ If you compare numbers across grading methods, you are comparing different thing
 
 ## 2. Consumer vs Vendor: Official Benchmarks (Harbor verifier)
 
-Oracle proves the stack is healthy. Consumer (ornith:9b) on official verifier is N/A until the custom adapter exists, so the best proxy is the homemade smoketest documented with a warning.
+Oracle proves the stack is healthy. Consumer (ornith:9b) on the official verifier ran for the first time on 2026-08-22 via the custom adapter (partial/early-cut, §2.3); before that date the best proxy was the homemade smoketest documented with a warning.
 
 ### 2.1 Aider Polyglot 225 (official, `bench/official/aider-harbor/aider-polyglot`)
 
 | Column | Value | Source |
 |--------|-------|--------|
 | **Oracle (Vendor ceiling)** | **15/15 100% mean 1.0** n_errors 0, 5m06s — `method: harbor-verifier`, smoke subset n=15 of 225 | `benches/bench_polyglot_oracle_smoke15.json` smoketest + `.omo/evidence/f6-remaining-tracks-opt-order/harbor_polyglot_oracle_15_result.json` |
-| **Full-225 projection (NOT measured)** | oracle copies solution ⇒ full run expected to hold ceiling if stack stays healthy; est. 0.7h at n=2, 20.4s/task — projection only, not a result | same file `estimation` |
-| **Consumer (ornith:9b) official verifier** | **N/A, no harbor adapter for kitty** | `benches/bench_polyglot_ornith_smoke15.json:harbor_note` |
+| **Full-225 projection (NOT measured)** | oracle copies solution ⇒ full run expected to hold ceiling if stack stays healthy; est. 0.7h at n=2, 20.4s/task — projection only, not a result. **SUPERSEDED 2026-08-22: measured 225/225 (§2.3)** | same file `estimation` |
+| **Consumer (ornith:9b) official verifier** | adapter live since 2026-08-22 — partial run measured (§2.3) | `benches/bench_polyglot_kitty_ornith9b_partial42.json` |
 | **Consumer proxy (homemade string-match)** | **13/15 86.7%** — `method: simulated` (smoke subset; any full-225 figure is a projection, not a result), 207s, avg 13.8s/task | `benches/bench_polyglot_ornith_smoke15.json` smoketest + `estimation` |
 | **Grading** | Oracle = `harbor-verifier-unit-tests`, Consumer proxy = `string-match-homemade NOT comparable` |  |
 | **Verdict** | Infra healthy. Do NOT compare 86.7% homemade to 100% oracle unit-test. |  |
@@ -54,9 +54,9 @@ jq '.passed, .total, .rate_pct' /tmp/bench_polyglot_ornith_limit15.json
 | Column | Value | Source |
 |--------|-------|--------|
 | **Oracle (Vendor ceiling)** | **5/5 100% mean 1.0** n_errors 0, 3m19s on `adaptive-rejection-sampler` x5 — `method: harbor-verifier`, smoke: single task, k=5 attempts (full suite NOT measured) | `benches/bench_tb2_oracle_ars_k5.json` smoketest + `/tmp/harbor-tb2-smoke/2026-08-21__06-05-11/result.json` |
-| **Full-89 projection (NOT measured)** | oracle copies solution ⇒ full run expected to hold ceiling if stack stays healthy; est. 0.49h at n=2 (0.99h seq) — projection only, not a result | same file `estimation` |
-| **Gate 9.2%** | **PASSED** on smoke basis only (single-task k=5); full-suite gate measurement pending night run | `bench_tb2_oracle_ars_k5.json:gate` |
-| **Consumer (ornith:9b) official verifier** | **N/A, no harbor adapter for kitty** | `benches/bench_tb2_ornith_smoke15.json` grading note |
+| **Full-89 projection (NOT measured)** | oracle copies solution ⇒ full run expected to hold ceiling if stack stays healthy; est. 0.49h at n=2 (0.99h seq) — projection only, not a result. **SUPERSEDED 2026-08-22: measured 81/89 91.01% (§2.3)** | same file `estimation` |
+| **Gate 9.2%** | **PASSED** on smoke basis only (single-task k=5); full-suite gate measurement pending night run — **CLOSED 2026-08-22: oracle 91.01% >> 9.2% (§2.3)** | `bench_tb2_oracle_ars_k5.json:gate` |
+| **Consumer (ornith:9b) official verifier** | adapter live since 2026-08-22; TB2 via adapter pending first kitty run (polyglot ran, §2.3) | `benches/bench_polyglot_kitty_ornith9b_partial42.json` |
 | **Consumer proxy (homemade) builtin shell** | **8/8 100%** avg 12.5s/task, gate passed — `method: simulated` | `benches/bench_tb2_ornith9b_builtin8.json` + `bench_tb2_ornith_smoke15.json:smoketest_builtin` |
 | **Consumer proxy (homemade) file_ops** | **2/15 13.3%** (~12/89 projected, NOT measured), gate 13.3% > 9.2% PASSED (barely) — `method: simulated` | `benches/bench_tb2_ornith_smoke15.json` + `benches/bench_tb2_ornith9b_fileops15.json` |
 | **Grading** | Oracle = `harbor-verifier-unit-tests`, Consumer proxy = `string-match-homemade NOT comparable` |  |
@@ -77,6 +77,20 @@ Notes:
 
 * Full 225 and full 89 oracle were not run as long blocks (would be 0.7h + 0.49h at n=2, spec said 15-24h at n=1 with heavy env builds). Smoketest 15/15 and 5/5 with mean 1.0 proves Harbor + Docker healthy; because oracle is deterministic (copy solution), a full-suite run is expected to hold the ceiling — that expectation is a stack health gate, not a measured vendor claim or result. The approved night oracle-full runs close this gap.
 * First 5 alphabetic TB2 tasks gave 3/5 60% with oracle due to 2 flaky upstream tasks (`build-cython-ext` 1/11 pyknotid failure, `build-pmars` 4/4). Retrying with a known-good task (`adaptive-rejection-sampler` x5) gives 5/5 100%.
+
+### 2.3 Night bench 2026-08-22 (measured, canonical artifacts)
+
+Measured full suites (oracle baselines; closes re-audit condition #3):
+
+* **Polyglot-oracle: 225/225 mean 1.0**, 0 errors — `benches/bench_polyglot_oracle_full225.json`
+* **TB2-oracle: 81/89 mean 0.9101 (91.01%)**, 1 AgentTimeoutError env-error disclosed in the denominator (`caffe-cifar-10`) — `benches/bench_tb2_oracle_full89.json`. Oracle ceiling on TB2 is NOT 100%.
+
+Kitty consumer runs (official verifier via adapter, first ever):
+
+* **ornith:9b polyglot l50 `_partialN` (partial42)**: 11.90% computed (5/42); harbor-reported mean 0.1; env-compromised gate FAIL → two-strike abort. Limitations: AgentTimeoutError at task level plus empty responses above 16K ctx; HTTP-layer timeout fix (900s) verified working. — `benches/bench_polyglot_kitty_ornith9b_partial42.json`
+* **ornith-1.5:9b polyglot l15 early-cut, directional-only**: 0 passes in evaluated subset; `agent_timeout_multiplier: 3` confound; NOT comparable to R3. — `benches/bench_polyglot_kitty_ornith15b_l15_earlycut.json`
+
+Full night narrative (run table, gate v3 incident, north star ladder): see `docs/AUDIT.md` section 2.3.
 
 ---
 
