@@ -1,0 +1,28 @@
+{
+  "id": "00000000-0000-4000-8000-000000000002",
+  "started_at": "2026-08-22T00:00:00",
+  "finished_at": "2026-08-22T01:30:00",
+  "updated_at": "2026-08-22T01:30:00",
+  "n_total_trials": 33,
+  "stats": {
+    "n_completed_trials": 5,
+    "n_errored_trials": 28,
+    "n_running_trials": 0,
+    "n_pending_trials": 0,
+    "n_cancelled_trials": 0,
+    "n_retries": 0,
+    "evals": {
+      "agent__dataset": {
+        "n_trials": 33,
+        "n_errors": 28,
+        "metrics": [{ "mean": 0.15 }],
+        "reward_stats": {
+          "reward": {
+            "1.0": ["task-a", "task-b", "task-c", "task-d", "task-e"],
+            "0.0": ["task-f"]
+          }
+        }
+      }
+    }
+  }
+}
