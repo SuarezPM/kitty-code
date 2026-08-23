@@ -42,10 +42,10 @@ const FUZZY_MAX_DISTANCE: usize = 2;
 /// during empty-args recovery (~8K total window).
 const RECOVERY_WINDOW_HALF_BYTES: usize = 4 * 1024;
 
-/// Cap (in chars) for late/recovery text scans: tool-call markers appear near
+/// Cap (in bytes) for late/recovery text scans: tool-call markers appear near
 /// the end of streamed buffers, so scanning unbounded content is an O(n) hot
 /// spot on long conversations.
-const RECOVER_SCAN_MAX_CHARS: usize = 32_000;
+const RECOVER_SCAN_MAX_BYTES: usize = 32_000;
 
 /// Maximum accepted tool-name length for inline-name payloads (`NAME{json}`).
 const MAX_INLINE_NAME_LEN: usize = 64;
@@ -431,7 +431,7 @@ impl ToolCallParser {
     /// Parse Gemma channel-tagged intent fragments such as
     /// `<|channel|>commentary to=WebSearch <|message|>{"query":"x"}<|im_end|>`
     /// (also `tool=` / `name=`, tags possibly without pipes). Scanned within
-    /// the last [`RECOVER_SCAN_MAX_CHARS`] chars only; the leftmost candidate
+    /// the last [`RECOVER_SCAN_MAX_BYTES`] bytes only; the leftmost candidate
     /// whose message payload is a non-empty JSON object wins.
     fn parse_channel_tagged_forms(&self, content: &str) -> Vec<ParsedToolCall> {
         let tail = recover_scan_tail(content);
@@ -454,7 +454,7 @@ impl ToolCallParser {
     }
 
     /// Parse loose Gemma `call:NAME{json}` fragments. Scanned within the last
-    /// [`RECOVER_SCAN_MAX_CHARS`] chars only; every well-formed occurrence
+    /// [`RECOVER_SCAN_MAX_BYTES`] bytes only; every well-formed occurrence
     /// yields a call (names are canonicalized by the fuzzy layer afterwards).
     fn parse_loose_call_forms(&self, content: &str) -> Vec<ParsedToolCall> {
         let tail = recover_scan_tail(content);
@@ -531,7 +531,7 @@ impl ToolCallParser {
     /// Empty-args recovery: find a known tool name mentioned in the text and
     /// scan a bounded window around the mention for a JSON object to use as
     /// its arguments. The scan is capped to the last
-    /// [`RECOVER_SCAN_MAX_CHARS`] chars: tool-call markers appear near the end
+    /// [`RECOVER_SCAN_MAX_BYTES`] bytes: tool-call markers appear near the end
     /// of streamed buffers, so scanning unbounded content is an O(n) hot spot.
     fn recover_missing_arguments(&self, content: &str) -> Option<ParsedToolCall> {
         // All indices below index into the tail slice.
@@ -896,16 +896,18 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
-/// Last [`RECOVER_SCAN_MAX_CHARS`] chars of `content` (char-boundary safe).
+/// Last [`RECOVER_SCAN_MAX_BYTES`] bytes of `content` (char-boundary safe).
 fn recover_scan_tail(content: &str) -> &str {
     let start =
-        floor_char_boundary(content, content.len().saturating_sub(RECOVER_SCAN_MAX_CHARS));
+        floor_char_boundary(content, content.len().saturating_sub(RECOVER_SCAN_MAX_BYTES));
     &content[start..]
 }
 
 /// From a `to=NAME`-style match at `pos`, find the next `<|message|>` /
 /// `<message>` tag within [`MESSAGE_TAG_LOOKAHEAD_BYTES`] and parse the first
-/// balanced JSON object after it. Requires a non-empty JSON object payload.
+/// balanced JSON object after it. The TAG lookup is bounded, but the payload
+/// scan runs on the unbounded remainder so large arguments are not clipped.
+/// Requires a non-empty JSON object payload.
 fn channel_payload_after_target(
     tail: &str,
     pos: usize,
@@ -920,7 +922,9 @@ fn channel_payload_after_target(
         .into_iter()
         .chain(window.find("<message>").map(|rel| (rel, "<message>".len())))
         .min_by_key(|&(rel, _)| rel)?;
-    let after = &window[tag_rel + tag_len..];
+    // Convert to an absolute offset in `tail`, then scan the UNBOUNDED
+    // remainder for the payload — only the tag lookup is window-bounded.
+    let after = &tail[pos + tag_rel + tag_len..];
     let (s, e) = *balanced_spans(after, '{', '}')
         .iter()
         .min_by_key(|&&(s, _)| s)?;
@@ -1556,6 +1560,23 @@ some text here
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Grep");
         assert_eq!(calls[0].arguments["pattern"], "fn main");
+    }
+
+    #[test]
+    fn parse_channel_tagged_large_payload_beyond_lookahead_window() {
+        // The JSON payload closes well beyond MESSAGE_TAG_LOOKAHEAD_BYTES
+        // after the target match — only the TAG lookup may be window-bounded,
+        // the payload must still parse in full.
+        let body = "x".repeat(250);
+        let input = format!(
+            r#"<|channel|>commentary tool=Write <|message|>{{"path":"src/main.rs","content":"{body}"}}<|im_end|>"#
+        );
+        let parser = ToolCallParser::new();
+        let calls = parser.parse(&input);
+        assert_eq!(calls.len(), 1, "payload >200B must not be clipped");
+        assert_eq!(calls[0].name, "Write");
+        assert_eq!(calls[0].arguments["path"], "src/main.rs");
+        assert_eq!(calls[0].arguments["content"], body);
     }
 
     #[test]

@@ -99,6 +99,10 @@ impl ModelProfile {
 /// (`ornith:9b=24`, `ornith-1.5=16`) are mechanism-first guesses, NOT tuned
 /// numbers. Re-tune via bench-ab (or override at runtime with
 /// [`ENV_MODEL_TURN_CAPS`]) before treating them as authoritative.
+///
+/// A matching entry replaces the profile default even when it RAISES it
+/// (e.g. tiny profile's deliberate 5 → 24 for `ornith:9b`); use the env
+/// override to escape that without recompiling.
 static MODEL_TURN_CAPS: &[(&str, usize)] = &[("ornith:9b", 24), ("ornith-1.5", 16)];
 
 /// Env override for per-model turn caps.
