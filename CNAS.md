@@ -19,7 +19,7 @@ This is an honest-by-construction document. The following are **not** claimed:
 
 - **Aider Polyglot scores.** "KittyQuiz-225" is a homemade 225-exercise coding quiz with string-match grading. It is NOT the official Aider Polyglot benchmark. Results are NOT comparable.
 - **Terminal-Bench 2.0 scores.** "KittyShell-89" is a homemade 89-task terminal quiz. It is NOT the official Terminal-Bench 2.0 benchmark. No Docker, no Harbor. Results are NOT comparable.
-- **Official benchmark status.** Official Aider Polyglot and TB2 oracle verified via Harbor smoke runs only (polyglot n=15 subset, TB2 single-task k=5) at 100%; full suites NOT yet measured (night oracle-full runs pending). Kitty + ornith:9b via Harbor verifier NOT yet run (needs custom adapter), reported as homemade proxy with warning. See `docs/AUDIT.md`.
+- **Official benchmark status.** Official Aider Polyglot and TB2 oracle ceilings are MEASURED at full scale (2026-08-22 night bench): polyglot-oracle **225/225 mean 1.0**; TB2-oracle **81/89 mean 0.9101 (91.01%)**, 1 env-error disclosed — closes re-audit condition #3. Kitty adapter RAN on the official verifier: ornith:9b polyglot l50 `_partialN` **partial42** (11.90% computed 5/42 / 0.1 harbor-reported; env-compromised gate FAIL → two-strike abort); ornith-1.5:9b l15 early-cut directional-only (**0 passes in evaluated subset**, `agent_timeout_multiplier:3` confound vs R3 — NOT comparable). Not closed consumer rates; see `docs/AUDIT.md` §2.3.
 - **Frontier-level reasoning**: ornith:9b is a small local model. It does not match GPT-4/Claude on complex multi-step reasoning.
 - **Long-context capability**: 16K effective context is small. No retrieval-augmented generation (RAG) yet.
 - **Production readiness**: This is a research harness, not a production system.
@@ -32,10 +32,10 @@ This is an honest-by-construction document. The following are **not** claimed:
 
 | Official Benchmark | Target | Status |
 |-------------------|--------|--------|
-| Aider Polyglot (official) Harbor verifier | beat 45.56% | Oracle 15/15 100% verified, ornith proxy 13/15 86.7% homemade N/A official adapter pending |
-| Terminal-Bench 2.0 (official) Harbor verifier | beat 9.2% on 8GB | Oracle 5/5 100% verified, ornith proxies 8/8 100% builtin + 2/15 13.3% file_ops both >9.2% PASSED homemade |
+| Aider Polyglot (official) Harbor verifier | beat 45.56% | Oracle FULL 225/225 100% measured (`benches/bench_polyglot_oracle_full225.json`); kitty ornith:9b `_partialN` ~11.9% (`benches/bench_polyglot_kitty_ornith9b_partial42.json`) — target NOT met, run not closed |
+| Terminal-Bench 2.0 (official) Harbor verifier | beat 9.2% on 8GB | Oracle FULL 81/89 91.01% measured (`benches/bench_tb2_oracle_full89.json`) — infra ceiling proven; closed kitty run pending |
 
-See `docs/AUDIT.md` section 2 for Consumer vs Vendor table. Official rates with kitty + ornith:9b via Harbor verifier require custom adapter (not present yet).
+See `docs/AUDIT.md` section 2 for Consumer vs Vendor table. The custom adapter EXISTS and ran (2026-08-22): `benches/bench_polyglot_kitty_ornith9b_partial42.json`, `benches/bench_polyglot_kitty_ornith15b_l15_earlycut.json`.
 
 ---
 
@@ -43,10 +43,10 @@ See `docs/AUDIT.md` section 2 for Consumer vs Vendor table. Official rates with 
 
 | Benchmark | Vendor/Oracle ceiling (Harbor verifier) | Consumer ornith:9b Q4_K_M 8GB (this harness) | Grading |
 |-----------|------------------------------------------|----------------------------------------------|---------|
-| **Aider Polyglot 225** | **15/15 100%** harbor-verifier smoke 5m06s (n=15 of 225; full suite NOT measured) | **13/15 86.7%** homemade string-match smoke (`method: simulated`; full-225 projections are not results) | Oracle verifier, Consumer homemade NOT comparable |
-| **Terminal-Bench 2.0 89** | **5/5 100%** harbor-verifier smoke 3m19s, single task `adaptive-rejection-sampler` x5 (full suite NOT measured); gate 9.2% provisionally met on smoke basis | **8/8 100% builtin** + **2/15 13.3% file_ops** (~12/89 projected, NOT measured; >9.2% PASSED homemade, `method: simulated`) | Oracle verifier, Consumer homemade NOT comparable |
+| **Aider Polyglot 225** | **225/225 100% mean 1.0** FULL suite measured 2026-08-22, ~33 min, 0 errors (`benches/bench_polyglot_oracle_full225.json`) | **~11.9% (5/42), `_partialN`** first-N l50, env-compromised gate FAIL → two-strike abort (`benches/bench_polyglot_kitty_ornith9b_partial42.json`); ornith-1.5:9b l15 early-cut 0/11 directional-only, NOT comparable to R3 (`bench_polyglot_kitty_ornith15b_l15_earlycut.json`) | Oracle and Consumer BOTH `harbor-verifier-unit-tests` (adapter live since c4547e1 chain) |
+| **Terminal-Bench 2.0 89** | **81/89 mean 0.9101 (91.01%)** FULL suite measured 2026-08-22, ~57 min, 1 env-error disclosed — oracle ceiling is NOT 100% on this suite (`benches/bench_tb2_oracle_full89.json`); gate 9.2% closed at infra level | TB2 via adapter: pending first kitty run (polyglot ran 2026-08-22); historical homemade proxies: **8/8 builtin** + **2/15 file_ops** (`method: simulated`, NOT comparable) | Oracle verifier vs homemade proxies NOT comparable |
 
-Sources: `benches/bench_polyglot_oracle_smoke15.json` + `harbor_polyglot_oracle_15_result.json` mean 1.0, `benches/bench_tb2_oracle_ars_k5.json` + `/tmp/harbor-tb2-smoke/.../result.json` mean 1.0, `benches/bench_polyglot_ornith_smoke15.json` 13/15, `benches/bench_tb2_ornith9b*.json` + `benches/bench_tb2_ornith_smoke15.json` 8/8 and 2/15. Evidence `.omo/evidence/f6-remaining-tracks-opt-order/task-24-polyglot.log`, `task-25.log`. Full 225/89 not run yet (night oracle-full runs pending); smoketests prove stack healthy; projections are not results.
+Sources (night bench 2026-08-22, canonical): `benches/bench_tb2_oracle_full89.json`, `benches/bench_polyglot_oracle_full225.json`, `benches/bench_polyglot_kitty_ornith9b_partial42.json`, `benches/bench_polyglot_kitty_ornith15b_l15_earlycut.json` (raw `result.json` under gitignored `jobs/2026-08-22__*`). Historical smokes: `benches/bench_polyglot_oracle_smoke15.json` + `harbor_polyglot_oracle_15_result.json` mean 1.0, `benches/bench_tb2_oracle_ars_k5.json` + `/tmp/harbor-tb2-smoke/.../result.json` mean 1.0, `benches/bench_polyglot_ornith_smoke15.json` 13/15, `benches/bench_tb2_ornith9b*.json` + `benches/bench_tb2_ornith_smoke15.json` 8/8 and 2/15. Gate v3 fixture-validated: `bash tests/fixtures/gate-selftest.sh`.
 
 Repro gate (harbor verifier smokes):
 
@@ -58,7 +58,7 @@ sudo env PATH=$HOME/.local/bin:$PATH harbor run -p bench/official/terminal-bench
 jq '.stats.evals["oracle__terminal-bench-2"].metrics[0].mean' /tmp/harbor-tb2-smoke/*/result.json  # 1.0
 ```
 
-> **Honesty:** Do NOT compare 86.7% / 13.3% homemade proxy to 100% oracle verifier. Different grading. See `docs/AUDIT.md` section 1.
+> **Honesty:** Do NOT compare 86.7% / 13.3% homemade proxy to measured oracle verifier rates (polyglot 100%, TB2 91.01%). Different grading. See `docs/AUDIT.md` section 1.
 
 ---
 
