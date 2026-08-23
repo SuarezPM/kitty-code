@@ -270,6 +270,12 @@ impl Agent {
             config.bash_timeout_secs = p.bash_timeout_secs;
             config.compact_threshold = p.compact_threshold;
         }
+        // Tier 4: per-model-id iteration cap overrides the profile default
+        // (env-tunable via KITTY_MODEL_TURN_CAPS, static table otherwise).
+        // Post-construction `config_mut()` overrides still win: they run later.
+        if let Some(cap) = crate::model_profile::turn_cap_for_model(&config.model) {
+            config.max_iterations = cap;
+        }
         // Filter tools by profile subset (tiny → 4 tools, medium/large → 6)
         let tools: Vec<ToolDefinition> = {
             let subset = config.profile.tool_subset;
@@ -744,7 +750,11 @@ impl Agent {
 
         // E3 truncation-to-disk: oversized outputs are persisted in full and
         // replaced by a head+tail excerpt with a pointer to the file.
-        let output = truncate_tool_output(result.output);
+        // Tier 3 read-guard: cap at min(fixed 50KB, remaining-budget-derived
+        // cap) so a big tool result cannot overflow the window between
+        // compaction checks.
+        let budget_cap = effective_output_cap(self.budget.remaining());
+        let output = truncate_tool_output(result.output, TRUNCATION_MAX_BYTES.min(budget_cap));
 
         self.push_message(Message {
             role: "tool".to_string(),
@@ -1197,6 +1207,9 @@ impl Agent {
 const TRUNCATION_MAX_BYTES: usize = 50 * 1024;
 /// Tool outputs with more than this many LINES are persisted to disk (E3).
 const TRUNCATION_MAX_LINES: usize = 2000;
+/// Floor (bytes) for the ctx-aware output cap, so a nearly-exhausted context
+/// budget still returns a useful excerpt instead of an always-truncated stub.
+const MIN_OUTPUT_BUDGET_BYTES: usize = 2048;
 /// Head excerpt size (chars) returned for truncated outputs.
 const TRUNCATION_HEAD_CHARS: usize = 2000;
 /// Tail excerpt size (chars) returned for truncated outputs.
@@ -1268,16 +1281,21 @@ fn tail_chars(s: &str, n: usize) -> &str {
     }
 }
 
-/// E3 truncation-to-disk: when a tool output exceeds 50 KB or 2000 lines,
-/// write the FULL output to `<truncation_dir>/<ulid>.txt` and return a
-/// head+tail excerpt (first 2000 + last 1000 chars) plus a pointer hint so
-/// the model can re-read the file if needed.
+/// E3 truncation-to-disk: when a tool output exceeds `max_bytes` bytes or
+/// 2000 lines, write the FULL output to `<truncation_dir>/<ulid>.txt` and
+/// return a head+tail excerpt (first 2000 + last 1000 chars) plus a pointer
+/// hint so the model can re-read the file if needed.
+///
+/// Tier 3: callers derive `max_bytes` from the remaining context budget
+/// (see [`effective_output_cap`] and the call site in
+/// `execute_and_push_tool_result`) so a large-but-under-50KB Read cannot
+/// overflow a small window between compaction checks.
 ///
 /// Best-effort: if the directory cannot be created or the file written, the
 /// excerpt is still returned with an explicit "unavailable" marker instead
 /// of failing the tool call.
-fn truncate_tool_output(output: String) -> String {
-    let over_bytes = output.len() > TRUNCATION_MAX_BYTES;
+fn truncate_tool_output(output: String, max_bytes: usize) -> String {
+    let over_bytes = output.len() > max_bytes;
     let over_lines = output.lines().count() > TRUNCATION_MAX_LINES;
     if !over_bytes && !over_lines {
         return output;
@@ -1299,6 +1317,14 @@ fn truncate_tool_output(output: String) -> String {
         ),
         None => format!("{head}\n...\n{tail}\n[truncated: full output unavailable]"),
     }
+}
+
+/// Tier 3 read-guard: effective byte cap for a single tool output given the
+/// remaining context budget in tokens. Uses the project-wide chars≈bytes/4
+/// heuristic (consistent with `ContextBudget::estimate_tokens`) and floors
+/// at [`MIN_OUTPUT_BUDGET_BYTES`].
+fn effective_output_cap(remaining_tokens: usize) -> usize {
+    remaining_tokens.saturating_mul(4).max(MIN_OUTPUT_BUDGET_BYTES)
 }
 
 #[cfg(test)]
@@ -1395,11 +1421,10 @@ mod tests {
     }
 
     /// Serialize env-mutating tests (cargo runs them on parallel threads).
+    /// Delegates to the crate-wide lock in `model_profile` so env tests in
+    /// both modules exclude each other (they share one test binary).
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap()
+        crate::model_profile::test_env_lock()
     }
 
     #[test]
@@ -1791,7 +1816,7 @@ mod tests {
 
     #[test]
     fn truncate_small_output_passthrough() {
-        let out = truncate_tool_output("small output".to_string());
+        let out = truncate_tool_output("small output".to_string(), TRUNCATION_MAX_BYTES);
         assert_eq!(out, "small output");
     }
 
@@ -1832,7 +1857,7 @@ mod tests {
 
         // >50KB triggers spill
         let big = "x".repeat(60 * 1024);
-        let out = truncate_tool_output(big.clone());
+        let out = truncate_tool_output(big.clone(), TRUNCATION_MAX_BYTES);
         assert!(
             out.contains("[truncated: full output at "),
             "expected truncation pointer, got tail: {}",
@@ -1852,13 +1877,167 @@ mod tests {
 
         // >2000 lines also triggers spill
         let many_lines = "line\n".repeat(2500);
-        let out2 = truncate_tool_output(many_lines);
+        let out2 = truncate_tool_output(many_lines, TRUNCATION_MAX_BYTES);
         assert!(out2.contains("[truncated: full output at "));
 
         if let Some(v) = prev {
             std::env::set_var(ENV_TRUNCATION_DIR, v);
         } else {
             std::env::remove_var(ENV_TRUNCATION_DIR);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier 3: ctx-aware output cap (read-guard trimming)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn effective_output_cap_scales_and_floors() {
+        // Healthy budget: chars ≈ bytes/4 heuristic scales linearly.
+        assert_eq!(effective_output_cap(16384), 16384 * 4);
+        // Tiny / exhausted budgets floor at MIN_OUTPUT_BUDGET_BYTES.
+        assert_eq!(effective_output_cap(0), MIN_OUTPUT_BUDGET_BYTES);
+        assert_eq!(effective_output_cap(100), MIN_OUTPUT_BUDGET_BYTES); // 400 < 2048
+        // Saturating: huge remaining tokens cannot overflow usize.
+        assert_eq!(effective_output_cap(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn truncate_under_both_caps_passthrough() {
+        // Under the injected byte cap AND the fixed line cap → untouched.
+        let out = truncate_tool_output("hello world".to_string(), TRUNCATION_MAX_BYTES);
+        assert_eq!(out, "hello world");
+        let lines = "l\n".repeat(TRUNCATION_MAX_LINES); // exactly at the line cap
+        let out2 = truncate_tool_output(lines.clone(), TRUNCATION_MAX_BYTES);
+        assert_eq!(out2, lines);
+    }
+
+    #[test]
+    fn truncate_exceeding_small_injected_budget_spills() {
+        let _g = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var(ENV_TRUNCATION_DIR).ok();
+        std::env::set_var(ENV_TRUNCATION_DIR, tmp.path());
+
+        // 10KB exceeds a SMALL injected cap even though the fixed 50KB
+        // threshold would not fire — exactly the Tier 3 overflow class.
+        let medium = "y".repeat(10 * 1024);
+        let out = truncate_tool_output(medium.clone(), 4096);
+        assert!(
+            out.contains("[truncated: full output at "),
+            "expected spill pointer under small budget cap"
+        );
+        assert!(out.starts_with(&"y".repeat(TRUNCATION_HEAD_CHARS)));
+        let path = out
+            .lines()
+            .last()
+            .unwrap()
+            .trim_start_matches("[truncated: full output at ")
+            .trim_end_matches(']');
+        assert_eq!(std::fs::read_to_string(path).unwrap().len(), medium.len());
+
+        if let Some(v) = prev {
+            std::env::set_var(ENV_TRUNCATION_DIR, v);
+        } else {
+            std::env::remove_var(ENV_TRUNCATION_DIR);
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_truncated_by_remaining_budget() {
+        let _g = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var(ENV_TRUNCATION_DIR).ok();
+        std::env::set_var(ENV_TRUNCATION_DIR, tmp.path());
+
+        // 10KB file: passes the old fixed-50KB guard, must still spill when
+        // the remaining context budget is (near) zero.
+        let file_path = tmp.path().join("big.txt");
+        std::fs::write(&file_path, "z".repeat(10 * 1024)).unwrap();
+
+        let mock = MockClient::new(vec![]);
+        let cfg = AgentConfig {
+            workspace: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(mock, cfg);
+        let max = agent.budget().max();
+        agent.budget_mut().consume(max); // remaining → 0
+
+        agent
+            .process_response(
+                "p",
+                tool_call_response(
+                    "Read",
+                    serde_json::json!({"path": file_path.to_string_lossy()}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let last = agent.messages.last().unwrap();
+        assert_eq!(last.role, "tool");
+        let content = last.content.as_deref().unwrap();
+        assert!(
+            content.contains("[truncated:"),
+            "expected budget-driven truncation, got tail: {}",
+            &content[content.len().saturating_sub(120)..]
+        );
+
+        if let Some(v) = prev {
+            std::env::set_var(ENV_TRUNCATION_DIR, v);
+        } else {
+            std::env::remove_var(ENV_TRUNCATION_DIR);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier 4: per-model turn cap applied in new_inner
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn turn_cap_applied_per_model_in_new_inner() {
+        let _g = env_lock();
+        let prev = std::env::var(crate::model_profile::ENV_MODEL_TURN_CAPS).ok();
+        std::env::remove_var(crate::model_profile::ENV_MODEL_TURN_CAPS);
+
+        // Matching model id → static-table cap overrides the profile default.
+        let client = OllamaClient::new("http://localhost:11434");
+        let cfg = AgentConfig {
+            model: "ornith:9b".to_string(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let agent = Agent::new(client, cfg);
+        assert_eq!(agent.config().max_iterations, 24);
+
+        // Prefix semantics hold through Agent construction too.
+        let client = OllamaClient::new("http://localhost:11434");
+        let cfg = AgentConfig {
+            model: "ornith-1.5-instruct".to_string(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let agent = Agent::new(client, cfg);
+        assert_eq!(agent.config().max_iterations, 16);
+
+        // Non-matching model keeps the profile default (medium → 20).
+        let client = OllamaClient::new("http://localhost:11434");
+        let cfg = AgentConfig {
+            model: "qwen3:8b".to_string(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let agent = Agent::new(client, cfg);
+        assert_eq!(
+            agent.config().max_iterations,
+            ModelProfile::medium().max_iterations
+        );
+
+        if let Some(v) = prev {
+            std::env::set_var(crate::model_profile::ENV_MODEL_TURN_CAPS, v);
+        } else {
+            std::env::remove_var(crate::model_profile::ENV_MODEL_TURN_CAPS);
         }
     }
 

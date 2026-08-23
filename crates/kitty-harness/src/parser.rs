@@ -21,6 +21,8 @@
 //! - Fuzzy tool-name mapping: case-insensitive + Levenshtein ≤ 2 against the
 //!   known tool set (see [`ToolCallParser::with_known_tools`]).
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 /// A parsed tool call with name and arguments.
@@ -39,6 +41,24 @@ const FUZZY_MAX_DISTANCE: usize = 2;
 /// Half-size (in bytes) of the text window scanned around a tool-name mention
 /// during empty-args recovery (~8K total window).
 const RECOVERY_WINDOW_HALF_BYTES: usize = 4 * 1024;
+
+/// Cap (in chars) for late/recovery text scans: tool-call markers appear near
+/// the end of streamed buffers, so scanning unbounded content is an O(n) hot
+/// spot on long conversations.
+const RECOVER_SCAN_MAX_CHARS: usize = 32_000;
+
+/// Maximum accepted tool-name length for inline-name payloads (`NAME{json}`).
+const MAX_INLINE_NAME_LEN: usize = 64;
+
+/// Key prefixes introducing the target tool in Gemma channel-tagged forms.
+const CHANNEL_TARGET_KEYS: [&str; 3] = ["to=", "tool=", "name="];
+
+/// How far (in bytes) past a channel target (`to=NAME`) to look for the
+/// following `<|message|>` / `<message>` tag.
+const MESSAGE_TAG_LOOKAHEAD_BYTES: usize = 200;
+
+/// Marker introducing the loose Gemma `call:NAME{json}` fragment form.
+const LOOSE_CALL_MARKER: &str = "call:";
 
 /// Parser for tool calls from model output.
 pub struct ToolCallParser {
@@ -123,18 +143,25 @@ impl ToolCallParser {
 
     /// Internal parsing logic without diagnostics side-effects.
     ///
+    /// Content is first normalized for Gemma quote-token artifacts
+    /// ([`normalize_gemma_quote_tokens`]).
+    ///
     /// Layer order (first-match wins for the tagged/marker forms; the original
     /// XML + fenced-block union semantics are preserved):
     /// 1. `<|tool_call|>` special tags
+    ///    1b. asymmetric `<|tool_call>` opener (Gemma 4 wild variant)
     /// 2. `[TOOL_CALLS]` marker
     /// 3. `<tool_call>` XML blocks
     /// 4. ```json / ```tool fenced blocks
     /// 5. `<json>` blocks
     /// 6. standalone JSON (fence-stripped, repaired)
     /// 7. `<think>` embedded content
+    ///    7b. Gemma channel-tagged / loose `call:NAME{json}` fragments (tail 32K)
     /// 8. empty-args recovery (nearby JSON attached to a mentioned tool)
     /// 9. fuzzy canonicalization of tool names
     fn parse_internal(&self, content: &str) -> Vec<ParsedToolCall> {
+        let content = normalize_gemma_quote_tokens(content);
+        let content: &str = content.as_ref();
         let mut results = Vec::new();
 
         // 1. `<|tool_call|>` special-tag form (Qwen-style templates).
@@ -149,6 +176,13 @@ impl ToolCallParser {
                     "</tool_call>",
                 ],
             ));
+        }
+
+        // 1b. Asymmetric `<|tool_call>` opener (Gemma 4 wild variant, no
+        //     trailing pipe). Must run after the symmetric form because
+        //     `<|tool_call>` is a prefix of `<|tool_call|>`.
+        if results.is_empty() {
+            results.extend(self.parse_asymmetric_tool_calls(content));
         }
 
         // 2. `[TOOL_CALLS]` marker (Mistral-style array or single object).
@@ -180,6 +214,15 @@ impl ToolCallParser {
             }
         }
 
+        // 7b. Gemma channel-tagged and loose `call:NAME{json}` fragments
+        //     (late recovery, scanned within the tail of the content only).
+        if results.is_empty() {
+            results.extend(self.parse_channel_tagged_forms(content));
+        }
+        if results.is_empty() {
+            results.extend(self.parse_loose_call_forms(content));
+        }
+
         // 8. Empty-args recovery: every extracted call lacks usable arguments
         //    (or nothing was extracted at all) — look for a JSON payload near
         //    a tool-name mention.
@@ -206,6 +249,21 @@ impl ToolCallParser {
         opener: &str,
         closers: &[&str],
     ) -> Vec<ParsedToolCall> {
+        self.parse_delimited_calls_with(content, opener, closers, |payload| {
+            self.parse_tool_call_json(payload)
+        })
+    }
+
+    /// Like [`Self::parse_delimited_calls`], with a pluggable payload parser
+    /// (the asymmetric Gemma layer accepts inline-name payloads in addition
+    /// to JSON envelopes).
+    fn parse_delimited_calls_with(
+        &self,
+        content: &str,
+        opener: &str,
+        closers: &[&str],
+        parse_payload: impl Fn(&str) -> Option<ParsedToolCall>,
+    ) -> Vec<ParsedToolCall> {
         let mut results = Vec::new();
         let mut search_start = 0;
 
@@ -230,7 +288,7 @@ impl ToolCallParser {
                 None => (&content[inner_start..], content.len(), false),
             };
 
-            if let Some(tc) = self.parse_tool_call_json(inner.trim()) {
+            if let Some(tc) = parse_payload(inner.trim()) {
                 results.push(tc);
             }
             if !closed {
@@ -338,6 +396,88 @@ impl ToolCallParser {
         Some(content[inner_start..inner_start + end].trim())
     }
 
+    /// Parse the asymmetric Gemma 4 opener `<|tool_call>` (no trailing pipe).
+    /// The payload may be a JSON envelope or the inline-name form `NAME{json}`;
+    /// closers seen in the wild: `<tool_call|>`, `<|end_tool_call|>`,
+    /// `</tool_call>`.
+    fn parse_asymmetric_tool_calls(&self, content: &str) -> Vec<ParsedToolCall> {
+        const OPENER: &str = "<|tool_call>";
+        const CLOSERS: [&str; 3] = ["<tool_call|>", "<|end_tool_call|>", "</tool_call>"];
+        self.parse_delimited_calls_with(content, OPENER, &CLOSERS, |payload| {
+            self.parse_tool_call_json(payload)
+                .or_else(|| self.parse_inline_name_payload(payload))
+        })
+    }
+
+    /// Parse the inline-name payload form `NAME{json}` (Gemma 4): the trimmed
+    /// prefix before the first balanced `{...}` object is the tool name. The
+    /// prefix must be non-empty, ≤ [`MAX_INLINE_NAME_LEN`] chars, and word-like.
+    fn parse_inline_name_payload(&self, payload: &str) -> Option<ParsedToolCall> {
+        let brace = payload.find('{')?;
+        let (s, e) = *balanced_spans(payload, '{', '}')
+            .iter()
+            .find(|&&(s, _)| s == brace)?;
+        let name = payload[..brace].trim();
+        if !is_word_like(name) || name.len() > MAX_INLINE_NAME_LEN {
+            return None;
+        }
+        let arguments = parse_lenient_value(&payload[s..=e])?;
+        Some(ParsedToolCall {
+            name: name.to_string(),
+            arguments,
+        })
+    }
+
+    /// Parse Gemma channel-tagged intent fragments such as
+    /// `<|channel|>commentary to=WebSearch <|message|>{"query":"x"}<|im_end|>`
+    /// (also `tool=` / `name=`, tags possibly without pipes). Scanned within
+    /// the last [`RECOVER_SCAN_MAX_CHARS`] chars only; the leftmost candidate
+    /// whose message payload is a non-empty JSON object wins.
+    fn parse_channel_tagged_forms(&self, content: &str) -> Vec<ParsedToolCall> {
+        let tail = recover_scan_tail(content);
+        let mut candidates: Vec<(usize, &str)> = Vec::new();
+        for tool in &self.known_tools {
+            for key in CHANNEL_TARGET_KEYS {
+                let needle = format!("{key}{tool}");
+                if let Some(pos) = find_word_bounded(tail, &needle) {
+                    candidates.push((pos, tool));
+                }
+            }
+        }
+        candidates.sort_by_key(|&(pos, _)| pos);
+        for (pos, tool) in candidates {
+            if let Some(call) = channel_payload_after_target(tail, pos, tool) {
+                return vec![call];
+            }
+        }
+        Vec::new()
+    }
+
+    /// Parse loose Gemma `call:NAME{json}` fragments. Scanned within the last
+    /// [`RECOVER_SCAN_MAX_CHARS`] chars only; every well-formed occurrence
+    /// yields a call (names are canonicalized by the fuzzy layer afterwards).
+    fn parse_loose_call_forms(&self, content: &str) -> Vec<ParsedToolCall> {
+        let tail = recover_scan_tail(content);
+        let bytes = tail.as_bytes();
+        let mut results = Vec::new();
+        let mut search = 0;
+        while let Some(rel) = tail[search..].find(LOOSE_CALL_MARKER) {
+            let abs = search + rel;
+            search = abs + LOOSE_CALL_MARKER.len();
+            // Require a word boundary before `call` (skip e.g. `recall:`).
+            if abs > 0 && (bytes[abs - 1].is_ascii_alphanumeric() || bytes[abs - 1] == b'_') {
+                continue;
+            }
+            if let Some((name, arguments)) = parse_loose_call_payload(&tail[search..]) {
+                results.push(ParsedToolCall {
+                    name: name.to_string(),
+                    arguments,
+                });
+            }
+        }
+        results
+    }
+
     /// Try to parse a JSON string as a tool call.
     /// Handles: {"name":"...","arguments":{...}}, {"function":{"name":...}},
     /// and {"tool":"...","parameters":{...}}.
@@ -390,8 +530,13 @@ impl ToolCallParser {
 
     /// Empty-args recovery: find a known tool name mentioned in the text and
     /// scan a bounded window around the mention for a JSON object to use as
-    /// its arguments.
+    /// its arguments. The scan is capped to the last
+    /// [`RECOVER_SCAN_MAX_CHARS`] chars: tool-call markers appear near the end
+    /// of streamed buffers, so scanning unbounded content is an O(n) hot spot.
     fn recover_missing_arguments(&self, content: &str) -> Option<ParsedToolCall> {
+        // All indices below index into the tail slice.
+        let content = recover_scan_tail(content);
+
         let (pos, tool) = self.find_tool_mention(content)?;
 
         let w_start =
@@ -622,6 +767,16 @@ fn is_identifier_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// True when `s` is a non-empty identifier-style word: ASCII alphanumeric /
+/// underscore, starting with a letter or underscore.
+fn is_word_like(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if is_identifier_start(c) => chars.all(is_identifier_continue),
+        _ => false,
+    }
+}
+
 /// Byte ranges `(start, end)` inclusive of every balanced `open...close` span,
 /// ignoring delimiters inside double-quoted strings.
 fn balanced_spans(text: &str, open: char, close: char) -> Vec<(usize, usize)> {
@@ -670,6 +825,22 @@ fn strip_code_fences(s: &str) -> &str {
     };
     let body = body.strip_suffix("```").unwrap_or(body);
     body.trim()
+}
+
+/// Normalize Gemma tokenizer artifacts where `<|"|>` / `<|'|>` appear in place
+/// of plain quote characters inside tool-call payloads. Returns a borrowed
+/// slice unchanged (zero allocation) when no token is present.
+fn normalize_gemma_quote_tokens(content: &str) -> Cow<'_, str> {
+    const DOUBLE_TOKEN: &str = "<|\"|>";
+    const SINGLE_TOKEN: &str = "<|'|>";
+    if !content.contains(DOUBLE_TOKEN) && !content.contains(SINGLE_TOKEN) {
+        return Cow::Borrowed(content);
+    }
+    Cow::Owned(
+        content
+            .replace(DOUBLE_TOKEN, "\"")
+            .replace(SINGLE_TOKEN, "'"),
+    )
 }
 
 /// True when `args` is null, non-object, or an empty object — i.e. unusable.
@@ -723,6 +894,64 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// Last [`RECOVER_SCAN_MAX_CHARS`] chars of `content` (char-boundary safe).
+fn recover_scan_tail(content: &str) -> &str {
+    let start =
+        floor_char_boundary(content, content.len().saturating_sub(RECOVER_SCAN_MAX_CHARS));
+    &content[start..]
+}
+
+/// From a `to=NAME`-style match at `pos`, find the next `<|message|>` /
+/// `<message>` tag within [`MESSAGE_TAG_LOOKAHEAD_BYTES`] and parse the first
+/// balanced JSON object after it. Requires a non-empty JSON object payload.
+fn channel_payload_after_target(
+    tail: &str,
+    pos: usize,
+    tool: &str,
+) -> Option<ParsedToolCall> {
+    let window_end =
+        ceil_char_boundary(tail, (pos + MESSAGE_TAG_LOOKAHEAD_BYTES).min(tail.len()));
+    let window = &tail[pos..window_end];
+    let (tag_rel, tag_len) = window
+        .find("<|message|>")
+        .map(|rel| (rel, "<|message|>".len()))
+        .into_iter()
+        .chain(window.find("<message>").map(|rel| (rel, "<message>".len())))
+        .min_by_key(|&(rel, _)| rel)?;
+    let after = &window[tag_rel + tag_len..];
+    let (s, e) = *balanced_spans(after, '{', '}')
+        .iter()
+        .min_by_key(|&&(s, _)| s)?;
+    let Value::Object(map) = parse_lenient_value(&after[s..=e])? else {
+        return None;
+    };
+    if map.is_empty() {
+        return None;
+    }
+    Some(ParsedToolCall {
+        name: tool.to_string(),
+        arguments: Value::Object(map),
+    })
+}
+
+/// Parse the payload following a `call:` marker: optional whitespace, a word
+/// (the raw tool name), optional whitespace, then one balanced `{...}` JSON
+/// object. Returns `(name, arguments)`; `None` when the shape does not match
+/// or the JSON cannot be parsed.
+fn parse_loose_call_payload(rest: &str) -> Option<(&str, Value)> {
+    let rest = rest.trim_start();
+    let name_end = rest
+        .find(|c: char| !is_identifier_continue(c))
+        .unwrap_or(rest.len());
+    if name_end == 0 {
+        return None;
+    }
+    let name = &rest[..name_end];
+    let rest = rest[name_end..].trim_start();
+    let (s, e) = *balanced_spans(rest, '{', '}').iter().find(|&&(s, _)| s == 0)?;
+    Some((name, parse_lenient_value(&rest[s..=e])?))
 }
 
 /// Classic two-row Levenshtein edit distance.
@@ -1265,5 +1494,139 @@ some text here
         assert_eq!(find_word_bounded("my_Read var", "Read"), None);
         assert_eq!(find_word_bounded("READS many", "Read"), None);
         assert_eq!(find_word_bounded("READ:", "read"), Some(0));
+    }
+
+    // --- Tier 7 recovery gaps: Gemma variants ---
+
+    #[test]
+    fn parse_gemma_quote_tokens_normalized() {
+        let parser = ToolCallParser::new();
+        let input = r#"<|tool_call|>{"name":<|'|>Read<|'|>,"arguments":{"path":<|"|>foo.rs<|"|>}}<|end|>"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["path"], "foo.rs");
+    }
+
+    #[test]
+    fn parse_asymmetric_opener_json_envelope() {
+        let parser = ToolCallParser::new();
+        let input = r#"<|tool_call>{"name":"Edit","arguments":{"path":"a.rs"}}<|end_tool_call|>"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Edit");
+        assert_eq!(calls[0].arguments["path"], "a.rs");
+    }
+
+    #[test]
+    fn parse_asymmetric_opener_inline_name() {
+        let parser = ToolCallParser::new();
+        let input = r#"<|tool_call>read{"path":"a.rs"}<tool_call|>"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read", "inline raw name must be canonicalized");
+        assert_eq!(calls[0].arguments["path"], "a.rs");
+    }
+
+    #[test]
+    fn parse_loose_call_form() {
+        let parser = ToolCallParser::new();
+        let input = r#"thought dump call:Bash{"command":"ls"} end"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].arguments["command"], "ls");
+    }
+
+    #[test]
+    fn parse_channel_tagged_to_variant() {
+        let parser = ToolCallParser::new();
+        let input = r#"<|channel|>commentary to=Read <|message|>{"path":"a.rs"}<|im_end|>"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["path"], "a.rs");
+    }
+
+    #[test]
+    fn parse_channel_tagged_tool_variant_without_pipes() {
+        let parser = ToolCallParser::new();
+        let input = r#"<channel>commentary tool=Grep <message>{"pattern":"fn main"}</message>"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Grep");
+        assert_eq!(calls[0].arguments["pattern"], "fn main");
+    }
+
+    #[test]
+    fn loose_call_without_braces_yields_nothing() {
+        let parser = ToolCallParser::new();
+        let input = "I should call:Bash soon, after the tests finish.";
+        let calls = parser.parse(input);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn channel_tag_without_message_payload_yields_nothing() {
+        let parser = ToolCallParser::new();
+        let input = "<|channel|>commentary to=Bash <|im_end|>";
+        let calls = parser.parse(input);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn asymmetric_closer_without_opener_yields_nothing() {
+        let parser = ToolCallParser::new();
+        let input = "junk <tool_call|> not json </tool_call|> trailing";
+        let calls = parser.parse(input);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn symmetric_layer_takes_precedence_over_asymmetric() {
+        let parser = ToolCallParser::new();
+        // Two complete symmetric calls: only layer 1's closer set (`<|end|>`)
+        // can split these; the asymmetric layer would see one unclosed blob.
+        let input = r#"<|tool_call|>{"name":"Read","arguments":{"path":"a.rs"}}<|end|>
+<|tool_call|>{"name":"Bash","arguments":{"command":"ls"}}<|end|>"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[1].name, "Bash");
+    }
+
+    #[test]
+    fn recover_scan_tail_allows_marker_in_last_32k() {
+        let parser = ToolCallParser::new();
+        let filler = "x".repeat(33_000);
+        let marker = r#"call:Bash{"command":"ls"}"#;
+        let input = format!("{filler}\n{marker}");
+        let calls = parser.parse(&input);
+        assert_eq!(calls.len(), 1, "marker inside the 32K tail must parse");
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].arguments["command"], "ls");
+    }
+
+    #[test]
+    fn recover_scan_tail_drops_marker_beyond_tail() {
+        let parser = ToolCallParser::new();
+        let filler = "x".repeat(40_000);
+        let marker = r#"call:Bash{"command":"ls"}"#;
+        let input = format!("{marker}{filler}");
+        let calls = parser.parse(&input);
+        assert!(calls.is_empty(), "marker beyond the 32K tail must not parse");
+    }
+
+    #[test]
+    fn empty_args_recovery_bounded_to_last_32k() {
+        let parser = ToolCallParser::new();
+        let filler = "x".repeat(33_000);
+        let args = r#"{"path":"a.rs"}"#;
+        let input = format!("I will use Read now. {args}{filler}");
+        let calls = parser.parse(&input);
+        assert!(
+            calls.is_empty(),
+            "mention beyond the 32K tail must not drive recovery"
+        );
     }
 }

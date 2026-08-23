@@ -90,6 +90,71 @@ impl ModelProfile {
     }
 }
 
+// ── Per-model turn caps (Tier 4) ───────────────────────────────────
+
+/// Per-model-id iteration caps, matched by plain `starts_with` prefix
+/// (first matching entry wins).
+///
+/// PROVISIONAL PLACEHOLDERS pending bench-ab validation: the values below
+/// (`ornith:9b=24`, `ornith-1.5=16`) are mechanism-first guesses, NOT tuned
+/// numbers. Re-tune via bench-ab (or override at runtime with
+/// [`ENV_MODEL_TURN_CAPS`]) before treating them as authoritative.
+static MODEL_TURN_CAPS: &[(&str, usize)] = &[("ornith:9b", 24), ("ornith-1.5", 16)];
+
+/// Env override for per-model turn caps.
+///
+/// Format: comma-separated `prefix=N` pairs, e.g.
+/// `KITTY_MODEL_TURN_CAPS="ornith:9b=24,ornith-1.5=16"`. Entries are parsed
+/// leniently (invalid ones skipped silently); the first entry whose prefix
+/// matches the model id wins; when the variable is set but nothing matches,
+/// the static [`MODEL_TURN_CAPS`] table applies.
+pub const ENV_MODEL_TURN_CAPS: &str = "KITTY_MODEL_TURN_CAPS";
+
+/// Iteration cap for `model_id`, if one is configured.
+///
+/// Resolution order:
+/// 1. [`ENV_MODEL_TURN_CAPS`] (read at call time — this runs once per agent
+///    construction, so the env read is cheap): first prefix match wins.
+/// 2. Static [`MODEL_TURN_CAPS`] table: first prefix match wins.
+/// 3. `None` — caller keeps the profile default.
+pub fn turn_cap_for_model(model_id: &str) -> Option<usize> {
+    if let Ok(spec) = std::env::var(ENV_MODEL_TURN_CAPS) {
+        for entry in spec.split(',') {
+            let Some((prefix, cap)) = entry.split_once('=') else {
+                continue;
+            };
+            let prefix = prefix.trim();
+            if prefix.is_empty() {
+                continue;
+            }
+            let Ok(cap) = cap.trim().parse::<usize>() else {
+                continue;
+            };
+            if model_id.starts_with(prefix) {
+                return Some(cap);
+            }
+        }
+    }
+    for (prefix, cap) in MODEL_TURN_CAPS {
+        if model_id.starts_with(prefix) {
+            return Some(*cap);
+        }
+    }
+    None
+}
+
+/// Crate-wide lock serializing env-mutating unit tests (cargo runs test
+/// threads in parallel inside a single test binary, and every module's test
+/// mod shares that binary). Used by this module's tests; `agent.rs` tests
+/// delegate their `env_lock` here so both modules exclude each other.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +214,82 @@ mod tests {
         let a = ModelProfile::from_cli("tiny") as *const _;
         let b = ModelProfile::tiny() as *const _;
         assert_eq!(a, b);
+    }
+
+    // ── Tier 4: per-model turn caps ────────────────────────────────
+
+    /// Run `f` with `ENV_MODEL_TURN_CAPS` set to `val` (or removed when
+    /// `None`), restoring the previous value afterwards.
+    fn with_env_turn_caps(val: Option<&str>, f: impl FnOnce()) {
+        let _g = test_env_lock();
+        let prev = std::env::var(ENV_MODEL_TURN_CAPS).ok();
+        match val {
+            Some(v) => std::env::set_var(ENV_MODEL_TURN_CAPS, v),
+            None => std::env::remove_var(ENV_MODEL_TURN_CAPS),
+        }
+        f();
+        match prev {
+            Some(v) => std::env::set_var(ENV_MODEL_TURN_CAPS, v),
+            None => std::env::remove_var(ENV_MODEL_TURN_CAPS),
+        }
+    }
+
+    #[test]
+    fn turn_cap_static_table_hit() {
+        with_env_turn_caps(None, || {
+            assert_eq!(turn_cap_for_model("ornith:9b"), Some(24));
+            assert_eq!(turn_cap_for_model("ornith-1.5"), Some(16));
+        });
+    }
+
+    #[test]
+    fn turn_cap_prefix_semantics() {
+        with_env_turn_caps(None, || {
+            // Prefix match, not exact equality: suffixes still resolve.
+            assert_eq!(turn_cap_for_model("ornith:9b-custom"), Some(24));
+            assert_eq!(turn_cap_for_model("ornith-1.5-instruct-q4"), Some(16));
+            // Non-matching ids → None (caller keeps profile default).
+            assert_eq!(turn_cap_for_model("qwen3:8b"), None);
+            assert_eq!(turn_cap_for_model("ornith"), None);
+            assert_eq!(turn_cap_for_model(""), None);
+        });
+    }
+
+    #[test]
+    fn turn_cap_env_override_valid() {
+        with_env_turn_caps(Some("qwen3:8b=7"), || {
+            assert_eq!(turn_cap_for_model("qwen3:8b"), Some(7));
+            // Env present but no matching prefix → falls through to static table.
+            assert_eq!(turn_cap_for_model("ornith:9b"), Some(24));
+        });
+    }
+
+    #[test]
+    fn turn_cap_env_mixed_valid_and_invalid_entries() {
+        with_env_turn_caps(Some("garbage,qwen3:8b=abc,=42,ornith-1.5= 16 ,qwen3:8b=7"), || {
+            // "garbage" (no '='), "qwen3:8b=abc" (bad number) and "=42"
+            // (empty prefix) are skipped silently; valid entries still apply.
+            assert_eq!(turn_cap_for_model("ornith-1.5-x"), Some(16));
+            assert_eq!(turn_cap_for_model("qwen3:8b"), Some(7));
+        });
+    }
+
+    #[test]
+    fn turn_cap_env_empty_string_falls_through_to_static() {
+        with_env_turn_caps(Some(""), || {
+            assert_eq!(turn_cap_for_model("ornith:9b"), Some(24));
+            assert_eq!(turn_cap_for_model("qwen3:8b"), None);
+        });
+    }
+
+    #[test]
+    fn turn_cap_env_precedence_over_static_table() {
+        with_env_turn_caps(Some("ornith:9b=99"), || {
+            assert_eq!(turn_cap_for_model("ornith:9b"), Some(99));
+        });
+        // First matching env prefix wins over later ones.
+        with_env_turn_caps(Some("ornith=5,ornith:9b=8"), || {
+            assert_eq!(turn_cap_for_model("ornith:9b"), Some(5));
+        });
     }
 }
