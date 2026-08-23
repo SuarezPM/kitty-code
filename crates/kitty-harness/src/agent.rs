@@ -127,6 +127,83 @@ pub fn should_fail_fast(streak: u8) -> bool {
     streak >= MAX_EMPTY_STREAK
 }
 
+// ---------------------------------------------------------------------------
+// E3 deterministic guards (zero model intelligence required)
+// ---------------------------------------------------------------------------
+
+/// Doom-loop guard: identical tool+args executions before a corrective nudge.
+const DOOM_LOOP_NUDGE_AT: usize = 3;
+/// Doom-loop guard: identical tool+args executions before fail-fast abort.
+const DOOM_LOOP_FAIL_AT: usize = 6;
+/// System nudge injected when the doom-loop streak reaches [`DOOM_LOOP_NUDGE_AT`].
+const DOOM_LOOP_NUDGE_MSG: &str =
+    "Loop detected: same tool+args 3×. Change approach or provide a different strategy.";
+/// E3 step cap: injected as a trailing user message on the final iteration so
+/// the model wraps up instead of being cut mid-action (opencode
+/// MAX_STEPS_PROMPT pattern).
+const MAX_STEPS_PROMPT: &str =
+    "FINAL ITERATION: summarize progress and deliver your best result now.";
+
+/// Verdict returned by [`DoomLoopGuard::record`] after one tool execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoomLoopVerdict {
+    /// No repetition pattern (or streak below the nudge threshold).
+    Fresh,
+    /// Streak reached [`DOOM_LOOP_NUDGE_AT`] — inject the corrective nudge.
+    Nudge,
+    /// Streak reached [`DOOM_LOOP_FAIL_AT`] — fail fast.
+    Fail,
+}
+
+/// Deterministic doom-loop detector over executed tools.
+///
+/// Tracks the last tool execution as a `(tool name, serialized args)` key and
+/// counts consecutive identical executions. A different key resets the streak.
+#[derive(Debug, Default)]
+struct DoomLoopGuard {
+    last_key: Option<String>,
+    streak: usize,
+}
+
+impl DoomLoopGuard {
+    /// Record one tool execution and return the resulting verdict.
+    fn record(&mut self, name: &str, args: &serde_json::Value) -> DoomLoopVerdict {
+        let serialized = serde_json::to_string(args).unwrap_or_default();
+        let key = format!("{name}\u{0}{serialized}");
+        if self.last_key.as_deref() == Some(key.as_str()) {
+            self.streak += 1;
+        } else {
+            self.last_key = Some(key);
+            self.streak = 1;
+        }
+        if self.streak >= DOOM_LOOP_FAIL_AT {
+            DoomLoopVerdict::Fail
+        } else if self.streak >= DOOM_LOOP_NUDGE_AT {
+            DoomLoopVerdict::Nudge
+        } else {
+            DoomLoopVerdict::Fresh
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// E3: proven stance overlay for Qwen-family models, which tend to hedge and
+/// ask permission instead of acting (cheetahclaws-proven). Appended to the
+/// system prompt when the model id contains "qwen".
+pub const QWEN_STANCE_OVERLAY: &str = "Communicate by executing: treat user requests as direct tool instructions. Do not ask permission. Do not narrate plans without acting.";
+
+/// Returns the stance overlay for `model`, if any (currently qwen-family only).
+fn model_stance_overlay(model: &str) -> Option<&'static str> {
+    if model.to_ascii_lowercase().contains("qwen") {
+        Some(QWEN_STANCE_OVERLAY)
+    } else {
+        None
+    }
+}
+
 /// The core agent loop.
 pub struct Agent {
     client: Box<dyn ChatClient>,
@@ -146,6 +223,8 @@ pub struct Agent {
     memory_store: Option<EpisodeStore>,
     /// Consecutive empty responses in the current turn (fail-fast §6).
     empty_response_streak: u8,
+    /// E3 deterministic doom-loop detector over executed tools.
+    doom_loop: DoomLoopGuard,
     /// 2-stage tool router (affirmation guard, stateful).
     router: ToolRouter,
     contract: Option<Contract>,
@@ -256,6 +335,7 @@ impl Agent {
             bootstrap_done: false,
             memory_store,
             empty_response_streak: 0,
+            doom_loop: DoomLoopGuard::default(),
             router: ToolRouter::new(),
             contract: None,
         }
@@ -323,6 +403,8 @@ impl Agent {
     pub async fn run(&mut self, user_prompt: &str) -> Result<String> {
         // Fase 0 remediation: reset empty streak per run (prevents cross-run contamination)
         self.empty_response_streak = 0;
+        // E3: reset the deterministic doom-loop detector per run as well.
+        self.doom_loop.reset();
         // Bootstrap: detect workspace on first turn
         self.run_bootstrap();
 
@@ -353,7 +435,9 @@ impl Agent {
         for iteration in 0..self.config.max_iterations {
             debug!(iteration, "Agent loop iteration");
 
-            // Check context budget before LLM call
+            // Check context budget before LLM call. Compaction fires when the
+            // tracked usage reaches the compaction threshold (default 80% of
+            // the context limit — `ContextBudget::DEFAULT_THRESHOLD`).
             if self.budget.should_compact() {
                 self.trigger_compaction().await?;
             }
@@ -363,6 +447,13 @@ impl Agent {
                 return self
                     .force_response("Context limit reached. Please start a new conversation.")
                     .await;
+            }
+
+            // E3 step cap: on the final iteration, tell the model to wrap up
+            // now instead of being cut mid-action (runs exactly once, since
+            // `iteration + 1 == max_iterations` matches a single iteration).
+            if iteration + 1 == self.config.max_iterations {
+                self.push_message(Message::user(MAX_STEPS_PROMPT)).await;
             }
 
             // LLM call
@@ -510,31 +601,8 @@ impl Agent {
                         continue;
                     }
 
-                    // F2.2: Tool errors become failed results, never abort.
-                    let result = match self.registry.execute(tc).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!(error = %e, name = tc.name, "Tool execution failed");
-                            crate::tools::ToolResult {
-                                success: false,
-                                output: format!("Tool '{}' failed: {e}", tc.name),
-                                retry: false,
-                            }
-                        }
-                    };
-                    debug!(name = tc.name, success = result.success, "Tool executed");
-
-                    // Push tool result (F2.3: push handles tokens)
-                    self.push_message(Message {
-                        role: "tool".to_string(),
-                        content: Some(result.output.clone()),
-                        thinking: None,
-                        tool_calls: None,
-                    })
-                    .await;
-
                     // If retry requested, the file changed — break to re-read
-                    if result.retry {
+                    if self.execute_and_push_tool_result(tc).await? {
                         break;
                     }
                 }
@@ -627,25 +695,7 @@ impl Agent {
         if !parsed.is_empty() {
             // There are tool calls in the text, process them
             for tc in &parsed {
-                // F2.2: Handle tool errors gracefully
-                let result = match self.registry.execute(tc).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(error = %e, name = tc.name, "Tool execution failed (XML)");
-                        crate::tools::ToolResult {
-                            success: false,
-                            output: format!("Tool '{}' failed: {e}", tc.name),
-                            retry: false,
-                        }
-                    }
-                };
-                self.push_message(Message {
-                    role: "tool".to_string(),
-                    content: Some(result.output.clone()),
-                    thinking: None,
-                    tool_calls: None,
-                })
-                .await;
+                self.execute_and_push_tool_result(tc).await?;
             }
             return Ok(()); // Process tool results next iteration
         }
@@ -660,6 +710,76 @@ impl Agent {
         self.save_episode(user_prompt, &text, true);
 
         Ok(())
+    }
+
+    /// Execute one tool call and push its result message (shared by the
+    /// native tool_calls path and the XML-in-text path).
+    ///
+    /// Applies the E3 deterministic guards around every execution:
+    /// - doom-loop detection (3× identical → system nudge, 6× → fail-fast),
+    /// - truncation-to-disk for oversized outputs.
+    ///
+    /// F2.2: tool errors become failed result messages, never aborts (except
+    /// the doom-loop fail-fast, which is an explicit loop-level abort).
+    /// Returns `true` when the caller should break and re-read (retry).
+    async fn execute_and_push_tool_result(&mut self, tc: &ParsedToolCall) -> Result<bool> {
+        // F2.2: Tool errors become failed results, never abort.
+        let result = match self.registry.execute(tc).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, name = tc.name, "Tool execution failed");
+                crate::tools::ToolResult {
+                    success: false,
+                    output: format!("Tool '{}' failed: {e}", tc.name),
+                    retry: false,
+                }
+            }
+        };
+        debug!(name = tc.name, success = result.success, "Tool executed");
+
+        // E3 doom-loop guard — deterministic repetition detector. The result
+        // message is pushed FIRST so history stays consistent even on the
+        // fail-fast verdict (F2.5 ordering: results before corrective msgs).
+        let doom = self.doom_loop.record(&tc.name, &tc.arguments);
+
+        // E3 truncation-to-disk: oversized outputs are persisted in full and
+        // replaced by a head+tail excerpt with a pointer to the file.
+        let output = truncate_tool_output(result.output);
+
+        self.push_message(Message {
+            role: "tool".to_string(),
+            content: Some(output),
+            thinking: None,
+            tool_calls: None,
+        })
+        .await;
+
+        match doom {
+            DoomLoopVerdict::Fail => {
+                anyhow::bail!(
+                    "Doom loop: tool '{}' executed {}× consecutively with identical arguments",
+                    tc.name,
+                    DOOM_LOOP_FAIL_AT
+                );
+            }
+            DoomLoopVerdict::Nudge => {
+                warn!(
+                    name = tc.name,
+                    streak = self.doom_loop.streak,
+                    "Doom loop detected, injecting corrective nudge"
+                );
+                self.push_message(Message {
+                    role: "system".to_string(),
+                    content: Some(DOOM_LOOP_NUDGE_MSG.to_string()),
+                    thinking: None,
+                    tool_calls: None,
+                })
+                .await;
+            }
+            DoomLoopVerdict::Fresh => {}
+        }
+
+        Ok(result.retry)
     }
 
     /// Count tokens of `text` using the model's real tokenizer when the
@@ -767,11 +887,16 @@ impl Agent {
         files
     }
 
-    /// Preflight: inject workspace context
+    /// Preflight: inject workspace context + model stance overlay.
+    ///
+    /// The system message leads the conversation. When the model id contains
+    /// "qwen", the E3 [`QWEN_STANCE_OVERLAY`] is appended (or emitted alone)
+    /// so Qwen-family models act instead of hedging.
     fn preflight(&mut self, _user_prompt: &str) {
+        let mut system_msg = String::new();
         if let Some(result) = self.bootstrap.result() {
             if !result.hint.is_empty() {
-                let system_msg = format!(
+                system_msg = format!(
                     "Workspace detected: {}. Available build commands: {}",
                     result
                         .project_types
@@ -786,14 +911,22 @@ impl Agent {
                         .collect::<Vec<_>>()
                         .join("; ")
                 );
-                // Insert as first system context
-                self.messages.push(Message {
-                    role: "system".to_string(),
-                    content: Some(system_msg),
-                    thinking: None,
-                    tool_calls: None,
-                });
             }
+        }
+        if let Some(overlay) = model_stance_overlay(&self.config.model) {
+            if !system_msg.is_empty() {
+                system_msg.push_str("\n\n");
+            }
+            system_msg.push_str(overlay);
+        }
+        if !system_msg.is_empty() {
+            // Insert as first system context
+            self.messages.push(Message {
+                role: "system".to_string(),
+                content: Some(system_msg),
+                thinking: None,
+                tool_calls: None,
+            });
         }
     }
 
@@ -881,17 +1014,34 @@ impl Agent {
 
         let old_messages: Vec<Message> = self.messages.drain(..split_at).collect();
 
-        // Build a summary prompt
-        let old_text: String = old_messages
+        // Token accounting must reflect what actually left the conversation,
+        // so `freed` is computed from the PRE-prune text.
+        let freed_text: String = old_messages
             .iter()
             .filter_map(|m| m.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // E3 deterministic prune: tool-result messages older than the last 4
+        // exchanges (everything drained above) get their content erased BEFORE
+        // the summarizer LLM sees them — survives even a weak/dumb summarizer
+        // model, because the erasure is deterministic, not model-dependent.
+        let summary_source: String = old_messages
+            .iter()
+            .map(|m| {
+                if m.role == "tool" {
+                    "[tool output pruned]"
+                } else {
+                    m.content.as_deref().unwrap_or("")
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
         let summary_prompt = format!(
             "Summarize the key decisions, code changes, and context from this conversation \
              segment. Be concise — only include information needed for ongoing work:\n\n{}",
-            old_text
+            summary_source
         );
 
         // Ask the model to summarize
@@ -915,7 +1065,7 @@ impl Agent {
             .content
             .unwrap_or_else(|| "[compaction summary unavailable]".to_string());
 
-        let freed = ContextBudget::estimate_tokens(&old_text);
+        let freed = ContextBudget::estimate_tokens(&freed_text);
         let needed = ContextBudget::estimate_tokens(&summary_text) + 100;
 
         // Record compaction
@@ -1017,10 +1167,124 @@ impl Agent {
     }
 }
 
+// ---------------------------------------------------------------------------
+// E3 truncation-to-disk
+// ---------------------------------------------------------------------------
+
+/// Tool outputs larger than this many BYTES are persisted to disk (E3).
+const TRUNCATION_MAX_BYTES: usize = 50 * 1024;
+/// Tool outputs with more than this many LINES are persisted to disk (E3).
+const TRUNCATION_MAX_LINES: usize = 2000;
+/// Head excerpt size (chars) returned for truncated outputs.
+const TRUNCATION_HEAD_CHARS: usize = 2000;
+/// Tail excerpt size (chars) returned for truncated outputs.
+const TRUNCATION_TAIL_CHARS: usize = 1000;
+/// Env override for the truncation spill directory.
+pub const ENV_TRUNCATION_DIR: &str = "KITTY_TRUNCATION_DIR";
+
+/// Directory where full oversized tool outputs are spilled.
+///
+/// Defaults to `.kitty/truncation` under the process cwd; override with
+/// `KITTY_TRUNCATION_DIR`. Created lazily on first spill.
+///
+/// Retention: spill files are scratch data — safe to delete after 7 days.
+/// There is no automatic purge yet; cleanup is manual
+/// (`find .kitty/truncation -mtime +7 -delete`).
+fn truncation_dir() -> std::path::PathBuf {
+    std::env::var(ENV_TRUNCATION_DIR)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(".kitty/truncation"))
+}
+
+/// Generate a ULID: 26-char Crockford base32, canonical layout — 48-bit ms
+/// timestamp in the high bits + 80 bits of entropy sourced from the
+/// nanosecond clock mixed with a process-local counter (no external crate).
+fn generate_ulid() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ms = now.as_millis();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+    // 80-bit entropy space: subsec nanos (30 bits) << 32 | monotonic counter,
+    // masked to exactly 80 bits so the ULID layout stays canonical.
+    let random: u128 = ((now.subsec_nanos() as u128) << 50)
+        | ((counter & 0xFFFF) << 34)
+        | ((ms & 0x3FF) << 24)
+        | (counter & 0xFFFFFF);
+    let value: u128 = (ms << 80) | (random & ((1u128 << 80) - 1));
+
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut out = [b'0'; 26];
+    let mut v = value;
+    for i in (0..26).rev() {
+        out[i] = ALPHABET[(v & 31) as usize];
+        v >>= 5;
+    }
+    String::from_utf8(out.to_vec()).unwrap_or_else(|_| "0".repeat(26))
+}
+
+/// First `n` chars of `s`, char-boundary safe.
+fn head_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+/// Last `n` chars of `s`, char-boundary safe.
+fn tail_chars(s: &str, n: usize) -> &str {
+    let total = s.chars().count();
+    if total <= n {
+        return s;
+    }
+    let skip = total - n;
+    match s.char_indices().nth(skip) {
+        Some((idx, _)) => &s[idx..],
+        None => s,
+    }
+}
+
+/// E3 truncation-to-disk: when a tool output exceeds 50 KB or 2000 lines,
+/// write the FULL output to `<truncation_dir>/<ulid>.txt` and return a
+/// head+tail excerpt (first 2000 + last 1000 chars) plus a pointer hint so
+/// the model can re-read the file if needed.
+///
+/// Best-effort: if the directory cannot be created or the file written, the
+/// excerpt is still returned with an explicit "unavailable" marker instead
+/// of failing the tool call.
+fn truncate_tool_output(output: String) -> String {
+    let over_bytes = output.len() > TRUNCATION_MAX_BYTES;
+    let over_lines = output.lines().count() > TRUNCATION_MAX_LINES;
+    if !over_bytes && !over_lines {
+        return output;
+    }
+
+    let dir = truncation_dir();
+    let head = head_chars(&output, TRUNCATION_HEAD_CHARS);
+    let tail = tail_chars(&output, TRUNCATION_TAIL_CHARS);
+
+    let persisted = std::fs::create_dir_all(&dir)
+        .ok()
+        .map(|_| dir.join(format!("{}.txt", generate_ulid())))
+        .filter(|path| std::fs::write(path, &output).is_ok());
+
+    match persisted {
+        Some(path) => format!(
+            "{head}\n...\n{tail}\n[truncated: full output at {}]",
+            path.display()
+        ),
+        None => format!("{head}\n...\n{tail}\n[truncated: full output unavailable]"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kitty_runtime::{ChatResponse, Message, MockClient, OllamaClient};
+    use std::future::Future;
+    use std::pin::Pin;
 
     fn dummy_agent() -> Agent {
         let client = OllamaClient::new("http://localhost:11434");
@@ -1039,6 +1303,82 @@ mod tests {
             eval_count: None,
             eval_duration: None,
         }
+    }
+
+    /// A ChatResponse carrying one native tool call.
+    fn tool_call_response(name: &str, args: serde_json::Value) -> ChatResponse {
+        ChatResponse {
+            model: "test-model".into(),
+            message: Message {
+                role: "assistant".into(),
+                content: None,
+                thinking: None,
+                tool_calls: Some(vec![kitty_runtime::ToolCall {
+                    id: None,
+                    function: kitty_runtime::ToolCallFunction {
+                        name: name.to_string(),
+                        arguments: args,
+                    },
+                }]),
+            },
+            done: true,
+            eval_count: None,
+            eval_duration: None,
+        }
+    }
+
+    /// Test double that captures the most recent chat request (for asserting
+    /// what the summarizer LLM actually receives during compaction).
+    struct CapturingClient {
+        inner: MockClient,
+        last_messages: std::sync::Arc<std::sync::Mutex<Option<Vec<Message>>>>,
+    }
+
+    impl CapturingClient {
+        fn new(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                inner: MockClient::new(responses),
+                last_messages: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
+    }
+
+    impl ChatClient for CapturingClient {
+        fn chat<'a>(
+            &'a self,
+            model: &'a str,
+            messages: Vec<Message>,
+            tools: Option<Vec<ToolDefinition>>,
+        ) -> Pin<
+            Box<dyn Future<Output = kitty_runtime::Result<ChatResponse>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                *self.last_messages.lock().unwrap() = Some(messages.clone());
+                self.inner.chat(model, messages, tools).await
+            })
+        }
+
+        fn count_tokens<'a>(
+            &'a self,
+            model: &'a str,
+            text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = kitty_runtime::Result<usize>> + Send + 'a>> {
+            self.inner.count_tokens(model, text)
+        }
+
+        fn health_check<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = kitty_runtime::Result<()>> + Send + 'a>> {
+            self.inner.health_check()
+        }
+    }
+
+    /// Serialize env-mutating tests (cargo runs them on parallel threads).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
     }
 
     #[test]
@@ -1298,5 +1638,305 @@ mod tests {
     fn gate3_dummy_12() {
         let x = 12;
         assert_eq!(x, 12);
+    }
+
+    // -----------------------------------------------------------------------
+    // E3: doom-loop guard (deterministic, zero model intelligence)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn doom_loop_guard_nudges_at_three_and_fails_at_six() {
+        let mut guard = DoomLoopGuard::default();
+        let args = serde_json::json!({"path": "a.rs"});
+        // 1st and 2nd identical executions — no verdict
+        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Fresh);
+        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Fresh);
+        // 3rd consecutive identical → nudge
+        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Nudge);
+        // 4th / 5th → still nudge territory (nudge fires at exactly 3)
+        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Nudge);
+        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Nudge);
+        // 6th consecutive identical → fail fast
+        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Fail);
+    }
+
+    #[test]
+    fn doom_loop_guard_resets_on_different_tool_or_args() {
+        let mut guard = DoomLoopGuard::default();
+        let a = serde_json::json!({"path": "a.rs"});
+        let b = serde_json::json!({"path": "b.rs"});
+        assert_eq!(guard.record("Read", &a), DoomLoopVerdict::Fresh);
+        assert_eq!(guard.record("Read", &a), DoomLoopVerdict::Fresh);
+        // Different args reset the streak
+        assert_eq!(guard.record("Read", &b), DoomLoopVerdict::Fresh);
+        assert_eq!(guard.record("Read", &b), DoomLoopVerdict::Fresh);
+        // Two more with `b` → 3rd consecutive of `b` nudges
+        assert_eq!(guard.record("Read", &b), DoomLoopVerdict::Nudge);
+        // Different tool resets too
+        assert_eq!(guard.record("Grep", &b), DoomLoopVerdict::Fresh);
+    }
+
+    #[tokio::test]
+    async fn process_response_doom_loop_nudges_then_fails_fast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("doom.txt");
+        std::fs::write(&file_path, "content").unwrap();
+
+        let mock = MockClient::new(vec![]);
+        let cfg = AgentConfig {
+            workspace: tmp.path().to_path_buf(),
+            quality_config: QualityConfig {
+                loop_threshold: 100, // disable quality ToolLoop so only the doom guard fires
+            },
+            ..Default::default()
+        };
+        let mut agent = Agent::new(mock, cfg);
+
+        let response = tool_call_response(
+            "Read",
+            serde_json::json!({"path": file_path.to_string_lossy()}),
+        );
+
+        // Executions 1-2: no nudge
+        for _ in 0..2 {
+            agent.process_response("p", response.clone()).await.unwrap();
+        }
+        assert!(!agent
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some(DOOM_LOOP_NUDGE_MSG)));
+
+        // Execution 3: system nudge injected after the tool result
+        agent.process_response("p", response.clone()).await.unwrap();
+        let last = agent.messages.last().unwrap();
+        assert_eq!(last.role, "system");
+        assert_eq!(last.content.as_deref(), Some(DOOM_LOOP_NUDGE_MSG));
+
+        // Executions 4-5: still nudge-only
+        for _ in 0..2 {
+            agent.process_response("p", response.clone()).await.unwrap();
+        }
+
+        // Execution 6: fail-fast error aborts the loop
+        let err = agent.process_response("p", response).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Doom loop"),
+            "expected doom-loop fail-fast, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // E3: step cap (MAX_STEPS_PROMPT)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn max_steps_prompt_injected_on_final_iteration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("step.txt");
+        std::fs::write(&file_path, "x").unwrap();
+
+        let mock = MockClient::new(vec![
+            tool_call_response(
+                "Read",
+                serde_json::json!({"path": file_path.to_string_lossy()}),
+            ),
+            dummy_response("working on it"),
+            dummy_response("final answer"),
+        ]);
+        let cfg = AgentConfig {
+            workspace: tmp.path().to_path_buf(),
+            max_iterations: 2,
+            ..Default::default()
+        };
+        let mut agent = Agent::new(mock, cfg);
+        // new_inner syncs caps from the profile; use the bench-override path
+        // so this test controls the iteration cap directly.
+        agent.config_mut().max_iterations = 2;
+        let out = agent.run("do the thing").await.unwrap();
+        assert_eq!(out, "final answer");
+
+        // The trailing user message must be in history exactly once.
+        let count = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user" && m.content.as_deref() == Some(MAX_STEPS_PROMPT))
+            .count();
+        assert_eq!(count, 1, "MAX_STEPS_PROMPT must be injected exactly once");
+    }
+
+    // -----------------------------------------------------------------------
+    // E3: truncation-to-disk
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_small_output_passthrough() {
+        let out = truncate_tool_output("small output".to_string());
+        assert_eq!(out, "small output");
+    }
+
+    #[test]
+    fn head_tail_chars_are_char_boundary_safe() {
+        let s = "héllo wörld 日本語のテキスト";
+        let head = head_chars(s, 5);
+        assert!(s.starts_with(head));
+        let tail = tail_chars(s, 4);
+        assert!(s.ends_with(tail));
+        // No panics on multibyte boundaries; full round trip covers the string
+        let total = s.chars().count();
+        assert_eq!(
+            format!("{}{}", head_chars(s, total - 2), tail_chars(s, 2)),
+            s
+        );
+    }
+
+    #[test]
+    fn generate_ulid_is_canonical_shape_and_unique() {
+        let a = generate_ulid();
+        let b = generate_ulid();
+        assert_eq!(a.len(), 26);
+        assert!(
+            a.chars()
+                .all(|c| "0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(c)),
+            "ULID must be Crockford base32, got {a}"
+        );
+        assert_ne!(a, b, "consecutive ULIDs must differ (counter entropy)");
+    }
+
+    #[test]
+    fn truncate_large_output_spills_to_disk_with_pointer() {
+        let _g = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev =
+            std::env::var(ENV_TRUNCATION_DIR).ok();
+        std::env::set_var(ENV_TRUNCATION_DIR, tmp.path());
+
+        // >50KB triggers spill
+        let big = "x".repeat(60 * 1024);
+        let out = truncate_tool_output(big.clone());
+        assert!(
+            out.contains("[truncated: full output at "),
+            "expected truncation pointer, got tail: {}",
+            &out[out.len().saturating_sub(200)..]
+        );
+        assert!(out.starts_with(&"x".repeat(TRUNCATION_HEAD_CHARS)));
+        assert!(out.contains(&"x".repeat(TRUNCATION_TAIL_CHARS)));
+        // Full output persisted on disk
+        let path = out
+            .lines()
+            .last()
+            .unwrap()
+            .trim_start_matches("[truncated: full output at ")
+            .trim_end_matches(']');
+        let persisted = std::fs::read_to_string(path).unwrap();
+        assert_eq!(persisted.len(), big.len());
+
+        // >2000 lines also triggers spill
+        let many_lines = "line\n".repeat(2500);
+        let out2 = truncate_tool_output(many_lines);
+        assert!(out2.contains("[truncated: full output at "));
+
+        if let Some(v) = prev {
+            std::env::set_var(ENV_TRUNCATION_DIR, v);
+        } else {
+            std::env::remove_var(ENV_TRUNCATION_DIR);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // E3: deterministic prune before compaction summarization
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn compaction_prunes_tool_outputs_before_summary_llm() {
+        let capturing = CapturingClient::new(vec![dummy_response("summary text")]);
+        let last_messages = capturing.last_messages.clone();
+        let cfg = AgentConfig {
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(capturing, cfg);
+
+        // 8 messages so split_at = len - 4 = 4; the bulky tool result sits at
+        // index 1 (older than the last 4 exchanges).
+        agent.messages.push(Message::user("goal"));
+        agent.messages.push(Message::tool_result(
+            "TOOL_OUTPUT_MARKER_HUGE_OUTPUT_SHOULD_BE_PRUNED",
+        ));
+        agent.messages.push(Message::assistant("noted"));
+        agent.messages.push(Message::user("keep going"));
+        agent.messages.push(Message::assistant("a"));
+        agent.messages.push(Message::user("b"));
+        agent.messages.push(Message::assistant("c"));
+        agent.messages.push(Message::user("d"));
+
+        agent.trigger_compaction().await.unwrap();
+
+        let captured = last_messages.lock().unwrap().clone().unwrap();
+        let prompt = captured[0].content.as_deref().unwrap();
+        assert!(
+            prompt.contains("[tool output pruned]"),
+            "summarizer must see pruned placeholders, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("TOOL_OUTPUT_MARKER"),
+            "tool output must be erased BEFORE the summarizer LLM call"
+        );
+        // Summary inserted as leading system message
+        assert!(agent.messages[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("[Context Summary]"));
+    }
+
+    // -----------------------------------------------------------------------
+    // E3: qwen stance overlay
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn qwen_stance_overlay_pure_predicate() {
+        assert_eq!(
+            model_stance_overlay("qwen3:8b"),
+            Some(QWEN_STANCE_OVERLAY)
+        );
+        assert_eq!(
+            model_stance_overlay("Qwen2.5-Coder-7B"),
+            Some(QWEN_STANCE_OVERLAY)
+        );
+        assert_eq!(model_stance_overlay("ornith:9b"), None);
+        assert_eq!(model_stance_overlay("llama3"), None);
+    }
+
+    #[tokio::test]
+    async fn preflight_appends_qwen_stance_to_system_prompt() {
+        // Default model is qwen3:8b → overlay present even without bootstrap hint.
+        let mut agent = dummy_agent();
+        agent.run_bootstrap();
+        agent.preflight("hi");
+        let first = agent.messages.first().expect("system message pushed");
+        assert_eq!(first.role, "system");
+        let content = first.content.as_deref().unwrap();
+        assert!(
+            content.contains(QWEN_STANCE_OVERLAY),
+            "qwen model must get stance overlay, got: {content}"
+        );
+
+        // Non-qwen model without bootstrap hint → no system message.
+        let client = OllamaClient::new("http://localhost:11434");
+        let cfg = AgentConfig {
+            model: "ornith:9b".to_string(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let mut agent2 = Agent::new(client, cfg);
+        agent2.run_bootstrap();
+        agent2.preflight("hi");
+        assert!(
+            !agent2
+                .messages
+                .iter()
+                .any(|m| m.role == "system"),
+            "non-qwen model must not get the stance overlay"
+        );
     }
 }
