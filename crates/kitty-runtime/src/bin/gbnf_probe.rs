@@ -1,8 +1,10 @@
 //! gbnf-probe — empirical GBNF measurement harness (plan todo 7 / ADR-GBNF-GO).
 //!
-//! Loads a GGUF via llama-cpp-2 and decodes every prompt TWICE:
-//!   1. `with_grammar`   — the production sampler chain
-//!      [`LlamaSampler::grammar_lazy`] + trigger `{"name"` built through
+//! Loads a GGUF via llama-cpp-2 and decodes every prompt once per arm:
+//!   1. `with_grammar_lazy`   — the production sampler chain
+//!      [`LlamaSampler::grammar_lazy`] (word trigger `{"name"` +
+//!      tokenizer-derived token-ID triggers) + `json_schema_to_grammar`
+//!      over a oneOf of per-tool schemas, built through
 //!      `kitty_runtime::llama::grammar_lazy_sampler_for` (identical to what
 //!      `LlamaCppClient` uses), followed by a dist sampler.
 //!   2. `without_grammar` — dist-only baseline.
@@ -11,14 +13,30 @@
 //! the same `GrammarConfig::validate` semantics as the spike. Nothing here
 //! fabricates numbers: whatever decode produces is what gets reported.
 //!
+//! NOTE: `LlamaSampler::sample` already accepts the sampled token into every
+//! sampler of the chain (llama.cpp `llama_sampler_sample`). Never call
+//! `accept` again in the generation loop — double-accepting mangles lazy
+//! trigger buffers and crashes constrained grammars (task E4 finding).
+//!
 //! Usage:
 //!   gbnf-probe --model PATH.gguf --prompts-file prompts.json --out out.json \
 //!              [--max-tokens 128] [--seed 42] [--gpu-layers 999] [--n-ctx 2048]
+//!
+//! Diagnostics (task E4, ADR-GBNF-GO trigger fix):
+//!   --diag-tokens        vocab-only load; prints how THIS tokenizer splits
+//!                        the trigger phrases + derived trigger token IDs.
+//!   --arms canary-word   lazy grammar `root ::= "{\"name\""` + word trigger;
+//!                        output truncates to exactly `{"name"` IFF fired.
+//!   --arms canary-tok    same canary grammar with token-ID triggers only.
+//!   --arms lazytok       production grammar, token-ID triggers only.
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
-use kitty_runtime::llama::grammar_lazy_sampler_for;
+use kitty_runtime::llama::{
+    build_lazy_sampler_with, derive_trigger_tokens_pub, grammar_lazy_sampler_for,
+    tool_schemas_to_gbnf_pub,
+};
 use kitty_runtime::tools::ToolDefinition;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -89,18 +107,37 @@ fn qwen_prompt(user_msg: &str) -> String {
 /// Which grammar constraint an arm uses.
 #[derive(Clone, Copy, PartialEq)]
 enum GrammarArm {
-    /// Production wiring: LlamaSampler::grammar_lazy, trigger `{"name"`.
+    /// Production wiring: LlamaSampler::grammar_lazy, word trigger `{"name"`
+    /// + tokenizer-derived token-ID triggers.
     Lazy,
+    /// Diagnostic: production grammar, token-ID triggers ONLY (no words) —
+    /// isolates the token-trigger contribution.
+    LazyTok,
+    /// Fire-canary: lazy grammar whose root is exactly the literal
+    /// `{"name"`. If the trigger fires, the replayed prefix completes the
+    /// only rule, every stack empties and llama.cpp allows ONLY EOG — so a
+    /// fired run truncates to exactly `{"name"`. Natural long output means
+    /// the trigger never fired.
+    CanaryWord,
+    /// Same canary grammar, token-ID triggers only.
+    CanaryTok,
     /// Diagnostic: grammar constrained from the very first token.
     Full,
     /// Baseline: unconstrained dist sampling.
     Off,
 }
 
+/// Canary grammar: root is exactly the trigger literal. Once triggered and
+/// replayed, the rule completes and only EOG tokens remain allowed.
+const CANARY_GRAMMAR: &str = "root ::= \"{\\\"name\\\"\"\n";
+
 impl GrammarArm {
     fn parse(s: &str) -> Option<Self> {
         match s {
             "lazy" => Some(Self::Lazy),
+            "lazytok" => Some(Self::LazyTok),
+            "canary-word" => Some(Self::CanaryWord),
+            "canary-tok" => Some(Self::CanaryTok),
             "full" => Some(Self::Full),
             "off" => Some(Self::Off),
             _ => None,
@@ -109,6 +146,9 @@ impl GrammarArm {
     fn name(self) -> &'static str {
         match self {
             Self::Lazy => "with_grammar_lazy",
+            Self::LazyTok => "with_grammar_lazy_tok",
+            Self::CanaryWord => "canary_word_trigger",
+            Self::CanaryTok => "canary_token_triggers",
             Self::Full => "with_grammar_full",
             Self::Off => "without_grammar",
         }
@@ -160,7 +200,7 @@ fn generate(
     // point where the lazy grammar starts constraining.
     let mut sampler = match arm {
         GrammarArm::Full => {
-            let grammar = kitty_runtime::llama::tool_schemas_to_gbnf_pub(&bench_tools());
+            let grammar = tool_schemas_to_gbnf_pub(&bench_tools());
             LlamaSampler::chain_simple([
                 LlamaSampler::grammar(model, &grammar, "root")
                     .map_err(|e| format!("grammar: {e:?}"))?,
@@ -171,14 +211,46 @@ fn generate(
             grammar_lazy_sampler_for(model, &bench_tools())?,
             LlamaSampler::dist(seed),
         ]),
+        GrammarArm::LazyTok => {
+            let grammar = tool_schemas_to_gbnf_pub(&bench_tools());
+            let toks = derive_trigger_tokens_pub(model);
+            eprintln!("[gbnf-probe] lazytok trigger tokens: {toks:?}");
+            LlamaSampler::chain_simple([
+                build_lazy_sampler_with(model, &grammar, &[], &toks)?,
+                LlamaSampler::dist(seed),
+            ])
+        }
+        GrammarArm::CanaryWord => LlamaSampler::chain_simple([
+            build_lazy_sampler_with(
+                model,
+                CANARY_GRAMMAR,
+                &["{\"name\"".to_string()],
+                &[],
+            )?,
+            LlamaSampler::dist(seed),
+        ]),
+        GrammarArm::CanaryTok => {
+            let toks = derive_trigger_tokens_pub(model);
+            eprintln!("[gbnf-probe] canary-tok trigger tokens: {toks:?}");
+            LlamaSampler::chain_simple([
+                build_lazy_sampler_with(model, CANARY_GRAMMAR, &[], &toks)?,
+                LlamaSampler::dist(seed),
+            ])
+        }
         GrammarArm::Off => LlamaSampler::chain_simple([LlamaSampler::dist(seed)]),
     };
 
     let mut out = String::new();
     for (gen_idx, _) in (0..max_tokens).enumerate() {
         let idx = batch.n_tokens() - 1;
+        // LlamaSampler::sample == llama_sampler_sample: it APPLIES the chain
+        // AND ACCEPTS the chosen token into every sampler in the chain
+        // (llama-sampler.cpp llama_sampler_sample, final line). An explicit
+        // `sampler.accept(token)` here would double-accept: lazy-grammar
+        // trigger pieces get duplicated (`{"{"namename"...`) so word triggers
+        // can never match, and constrained grammars get fed each token twice,
+        // driving stacks empty -> GGML_ASSERT(!stacks.empty()) crash.
         let token = sampler.sample(&ctx, idx);
-        sampler.accept(token);
         if model.is_eog_token(token) {
             break;
         }
@@ -201,13 +273,14 @@ fn generate(
 
 struct Args {
     model: PathBuf,
-    prompts_file: PathBuf,
+    prompts_file: Option<PathBuf>,
     out: PathBuf,
     max_tokens: u32,
     seed: u32,
     gpu_layers: u32,
     n_ctx: u32,
     arms: Option<String>,
+    diag_tokens: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -220,6 +293,7 @@ fn parse_args() -> Result<Args, String> {
     let mut gpu_layers = 999u32;
     let mut n_ctx = 2048u32;
     let mut arms_arg: Option<String> = None;
+    let mut diag_tokens = false;
     let mut i = 0usize;
     while i < args.len() {
         let need = |name: &str, i: usize| -> Result<String, String> {
@@ -235,6 +309,9 @@ fn parse_args() -> Result<Args, String> {
             "--prompts-file" => {
                 i += 1;
                 prompts_file = Some(PathBuf::from(need("--prompts-file", i)?));
+            }
+            "--diag-tokens" => {
+                diag_tokens = true;
             }
             "--out" => {
                 i += 1;
@@ -270,20 +347,73 @@ fn parse_args() -> Result<Args, String> {
     }
     Ok(Args {
         model: model.ok_or("--model is required")?,
-        prompts_file: prompts_file.ok_or("--prompts-file is required")?,
+        prompts_file,
         out,
         max_tokens,
         seed,
         gpu_layers,
         n_ctx,
         arms: arms_arg,
+        diag_tokens,
     })
+}
+
+/// Tokenizer ground truth: how does THIS model split the trigger phrases?
+/// Vocab-only load, prints JSON `{ phrase: [{id, piece}...] }` plus the
+/// derived production trigger-token IDs.
+fn run_diag_tokens(args: &Args) -> Result<(), String> {
+    let backend = LlamaBackend::init().map_err(|e| format!("backend init: {e:?}"))?;
+    let mparams = LlamaModelParams::default().with_vocab_only(true);
+    let model = LlamaModel::load_from_file(&backend, &args.model, &mparams)
+        .map_err(|e| format!("GGUF load failed: {e:?}"))?;
+
+    let phrases = [
+        "{\"name\"",
+        "{\"name\": \"Read\"",
+        "{\"",
+        "{",
+        " {",
+        "\n{",
+        "{\"name\":\"Read\",\"arguments\":{\"path\":\"x\"}}",
+    ];
+    let mut report = serde_json::Map::new();
+    for p in phrases {
+        let ids = model
+            .str_to_token(p, AddBos::Never)
+            .map_err(|e| format!("tokenize {p:?}: {e:?}"))?;
+        let rows: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|t| {
+                let piece = model
+                    .token_to_piece_bytes(*t, 512, true, None)
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_else(|_| "<err>".into());
+                serde_json::json!({ "id": t.0, "piece": piece })
+            })
+            .collect();
+        report.insert(p.to_string(), serde_json::Value::Array(rows));
+    }
+    let derived: Vec<i32> = derive_trigger_tokens_pub(&model).iter().map(|t| t.0).collect();
+    let out = serde_json::json!({
+        "model_file": args.model.display().to_string(),
+        "tokenizations": report,
+        "derived_trigger_token_ids": derived,
+    });
+    println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
+    Ok(())
 }
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    let prompts_raw = std::fs::read_to_string(&args.prompts_file)
-        .map_err(|e| format!("read {}: {e}", args.prompts_file.display()))?;
+    if args.diag_tokens {
+        return run_diag_tokens(&args);
+    }
+    let prompts_file = args
+        .prompts_file
+        .as_ref()
+        .ok_or("--prompts-file is required (or use --diag-tokens)")?;
+    let prompts_raw =
+        std::fs::read_to_string(prompts_file).map_err(|e| format!("read {}: {e}", prompts_file.display()))?;
     let prompts: Vec<String> =
         serde_json::from_str(&prompts_raw).map_err(|e| format!("parse prompts file: {e}"))?;
     if prompts.is_empty() {

@@ -1,10 +1,79 @@
 # ADR-GBNF-GO — Verdict GO para Grammar Enforcement GBNF
 
-**Status:** Amended 2026-08-21 (evening) — empirical measurement REVERSES the GO. See "Amendment: empirical measurement" below.
+**Status:** Amended 2026-08-23 — trigger activation FIXED (root cause found); re-measurement pending. See "Amendment: trigger fires" below. The 2026-08-21 reversal and its citation rule remain in force.
 **Date:** 2026-08-21
 **Deciders:** kitty-harness / kitty-runtime
-**Scope:** `crates/kitty-runtime/src/grammar.rs`, `crates/kitty-runtime/src/client.rs`, `Cargo.toml`
+**Scope:** `crates/kitty-runtime/src/llama.rs`, `crates/kitty-runtime/src/bin/gbnf_probe.rs`, `Cargo.toml`
 **Relacionado:** `docs/STRATEGY.md` F6.4 ADR-005, `crates/kitty-runtime/src/grammar.rs:6` SPIKE defer, `grammar::tests::test_gbnf_spike_documented`
+
+---
+
+## Amendment: trigger fires (2026-08-23, task E4)
+
+### Root cause of the 2026-08-21 "trigger never fired" finding
+
+The probe's generation loop called `sampler.accept(token)` right after
+`sampler.sample(&ctx, idx)`. In llama.cpp, `llama_sampler_sample` **already
+accepts** the sampled token into every sampler of the chain
+(`llama-sampler.cpp`, final line of the function; llama-cpp-2 doc: "Sample and
+accept"). The extra accept duplicated every decoded piece inside the lazy
+grammar's trigger buffer (`{"{"namename":": …`), so the word trigger `{"name"`
+could never appear contiguously and the lazy grammar stayed a silent no-op.
+The same double-feed explains the earlier full-grammar crash
+(`GGML_ASSERT(!stacks.empty())`, old finding 4): force-fed duplicates drive
+grammar stacks empty. **The night-bench arms measured baseline twice because
+the measurement instrument was broken, not because lazy grammars are inert.**
+
+### What changed
+
+1. `gbnf_probe.rs`: removed the redundant `accept` (root fix), added
+   diagnostic arms (`canary-word`, `canary-tok`, `lazytok`) and
+   `--diag-tokens` (tokenizer ground truth).
+2. `llama.rs`: production lazy sampler now passes BOTH the legacy word
+   trigger `{"name"` AND tokenizer-derived token-ID triggers (`{"` = 4913,
+   `{` = 90 for Qwen2.5-Coder) — tokenization-independent by construction.
+   Derivation is pure and unit-tested.
+3. `llama.rs` grammar upgrade: once the trigger fired, the old combined-enum
+   grammar left `arguments` untyped (per-tool required fields unenforced;
+   first firing A/B scored 30% validity). `tool_schemas_to_gbnf` now emits a
+   `oneOf` over per-tool schemas (const name + real parameter properties +
+   required), falling back to the combined-enum grammar if conversion fails.
+
+### Measurement (10 prompts, qwen2.5-coder-7b-q4_k_m, Vulkan, seed 42)
+
+| arm | valid / total | valid_pct |
+|---|---|---|
+| without_grammar (baseline) | 10 / 10 | 100.0% |
+| with_grammar_lazy (fixed) | 10 / 10 | 100.0% |
+
+Generations DIFFER between arms on **10/10** prompts → the trigger fires and
+the grammar constrains decode-time sampling. Validity holds at baseline.
+Evidence: `.omo/evidence/f6-p0-quickwins-nightbench/task-e4.log`.
+
+### New known limitation (vendored llama.cpp 0.1.154)
+
+This vendored llama.cpp treats a SATISFIED grammar as an error:
+`std::runtime_error("Unexpected empty grammar stack after accepting piece")`
+on the accept path and `GGML_ASSERT(!stacks.empty())` on the apply path.
+Grammars that fully complete mid-generation are a latent crash class until an
+upgrade of `llama-cpp-sys-2`. The production oneOf grammar survived all 10
+completions in this run; canary experiments that complete by design do crash.
+
+### Consequences
+
+- Trigger activation is no longer the blocker; the 2026-08-21 findings 2 and 4
+  are superseded by this amendment (root causes identified and fixed).
+- Re-measurement at the full 50-prompt scale is required before any GO
+  re-decision.
+
+### Citation rule (precision, Gate-4) — UNCHANGED
+
+**Grammar-constrained decoding remains UNMEASURED at scale.** The 10-prompt
+run above is a smoke verification of trigger activation, not a validity
+verdict. Nobody may cite any percentage from this ADR as "GBNF works at X%"
+until the 50-prompt re-measurement lands and is recorded here. The correct
+current reading: "trigger fires; 10/10 smoke A/B diverges with validity at
+baseline".
 
 ---
 

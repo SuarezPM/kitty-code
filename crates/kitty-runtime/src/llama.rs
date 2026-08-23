@@ -12,40 +12,48 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 #[cfg(feature = "llama")]
 use llama_cpp_2::model::params::LlamaModelParams;
 #[cfg(feature = "llama")]
-use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::model::{AddBos, LlamaModel};
 #[cfg(feature = "llama")]
 use llama_cpp_2::sampling::LlamaSampler;
+#[cfg(feature = "llama")]
+use llama_cpp_2::token::LlamaToken;
 
 // ---------------------------------------------------------------------------
 // Helpers — grammar conversion without blocking on GGUF
 // ---------------------------------------------------------------------------
 
 /// Build a GBNF string from tool schemas.
-/// Uses `json_schema_to_grammar` per-tool, falls back to `GrammarConfig::to_gbnf`.
+/// Uses `json_schema_to_grammar` over a `oneOf` of per-tool schemas (exact
+/// tool name + typed `arguments` with required fields), so decode-time
+/// enforcement matches `GrammarConfig::validate` semantics. Falls back to the
+/// looser combined-enum grammar, then to `GrammarConfig::to_gbnf`.
 #[cfg(feature = "llama")]
 fn tool_schemas_to_gbnf(tools: &[ToolDefinition]) -> String {
     if tools.is_empty() {
         return "root ::= \"null\"\n".to_string();
     }
-    // Per-tool conversion: each ToolDefinition -> JSON schema -> GBNF via json_schema_to_grammar
-    // This ensures GrammarConfig.to_gbnf is replaced by json_schema_to_grammar per tool (task 22).
-    let mut per_tool_ok = 0usize;
-    for t in tools {
-        let wrapped = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "const": t.function.name.clone() },
-                "arguments": t.function.parameters.clone()
-            },
-            "required": ["name", "arguments"]
-        });
-        let schema_str = wrapped.to_string();
-        if llama_cpp_2::json_schema_to_grammar(&schema_str).is_ok() {
-            per_tool_ok += 1;
-        }
+    // oneOf over per-tool wrapped schemas: each alternative pins `name` to a
+    // const and carries the tool's real parameter schema (properties +
+    // required), so missing/mistyped arguments are masked at sample time.
+    let alts: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "const": t.function.name.clone() },
+                    "arguments": t.function.parameters.clone()
+                },
+                "required": ["name", "arguments"]
+            })
+        })
+        .collect();
+    let one_of = serde_json::json!({ "oneOf": alts });
+    if let Ok(g) = llama_cpp_2::json_schema_to_grammar(&one_of.to_string()) {
+        return g;
     }
-    // If at least one per-tool conversion succeeded, prefer the combined grammar via json_schema_to_grammar
-    // (combined enum schema) — still exercised per-tool above, but combined is the sampler input.
+    // Fallback: combined enum-name grammar. Weaker — `arguments` is an
+    // untyped object, so per-tool required fields are NOT enforced.
     let combined = serde_json::json!({
         "type": "object",
         "properties": {
@@ -54,16 +62,56 @@ fn tool_schemas_to_gbnf(tools: &[ToolDefinition]) -> String {
         },
         "required": ["name", "arguments"]
     });
-    let schema_str = combined.to_string();
-    // llama_cpp_2 exposes json_schema_to_grammar at crate root
-    match llama_cpp_2::json_schema_to_grammar(&schema_str) {
-        Ok(g) => {
-            // Ensure per-tool path was exercised; if none succeeded, still return g
-            let _ = per_tool_ok;
-            g
-        }
+    match llama_cpp_2::json_schema_to_grammar(&combined.to_string()) {
+        Ok(g) => g,
         Err(_) => crate::grammar::GrammarConfig::from_tools(tools.to_vec()).to_gbnf(),
     }
+}
+
+/// Phrases that mark the start of a tool-call JSON object, longest first.
+/// Used both as lazy-grammar word triggers (byte-exact fast path) and to
+/// derive token-ID triggers that survive any BPE split of the phrase.
+#[cfg(any(feature = "llama", test))]
+const TRIGGER_PHRASES: &[&str] = &["{\"name\"", "{\"", "{"];
+
+/// Pure derivation of trigger token IDs from a tokenizer lookup.
+///
+/// A token-ID trigger fires the moment that exact token appears in the
+/// generated stream — immune to BPE splitting by construction. For each
+/// [`TRIGGER_PHRASES`] entry we take the FIRST token of its tokenization
+/// (the JSON-object opener); duplicates are dropped preserving order.
+/// Ungated so it is unit-testable without a GGUF.
+#[cfg(any(feature = "llama", test))]
+fn trigger_tokens_from_lookup<F>(mut tokenize: F) -> Vec<i32>
+where
+    F: FnMut(&str) -> Option<Vec<i32>>,
+{
+    let mut out: Vec<i32> = Vec::new();
+    for phrase in TRIGGER_PHRASES {
+        if let Some(ids) = tokenize(phrase) {
+            if let Some(&first) = ids.first() {
+                if !out.contains(&first) {
+                    out.push(first);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Derive trigger tokens with the loaded model's own tokenizer.
+#[cfg(feature = "llama")]
+fn derive_trigger_tokens(model: &LlamaModel) -> Vec<LlamaToken> {
+    trigger_tokens_from_lookup(|s| {
+        model
+            .str_to_token(s, AddBos::Never)
+            .ok()
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| ids.iter().map(|t| t.0).collect())
+    })
+    .into_iter()
+    .map(LlamaToken)
+    .collect()
 }
 
 #[cfg(feature = "llama")]
@@ -72,23 +120,53 @@ fn build_grammar_lazy_sampler(
     tools: &[ToolDefinition],
 ) -> std::result::Result<LlamaSampler, String> {
     let grammar = tool_schemas_to_gbnf(tools);
-    // grammar_lazy triggers only when model starts a tool call (prefix "{")
-    // We use the `common` feature's grammar_lazy with word trigger.
-    // Signature: grammar_lazy(model, grammar_str, root, trigger_words, trigger_tokens)
-    // Keep trigger minimal to avoid HTTP pitfall: do NOT send grammar+tools together,
-    // instead lazy grammar activates on "{" prefix.
+    // Lazy grammar activates only when the model starts a tool-call object.
+    // Two complementary trigger mechanisms (llama.cpp matches either):
+    //   - trigger_words: byte-exact match on accumulated decoded text.
+    //     Empirically NEVER fired under Qwen2.5-Coder (ADR-GBNF-GO finding 2:
+    //     50/50 generations byte-identical between arms), kept as fast path.
+    //   - trigger_tokens: exact token IDs derived from this model's tokenizer
+    //     via [`derive_trigger_tokens`] — fires on the first `{`/`{"` token,
+    //     which llama.cpp feeds into the grammar as the object opener.
     let trigger_words = vec!["{\"name\"".to_string()];
-    let trigger_tokens: Vec<llama_cpp_2::token::LlamaToken> = vec![];
-    let sampler =
-        LlamaSampler::grammar_lazy(model, &grammar, "root", &trigger_words, &trigger_tokens)
-            .map_err(|e| format!("{e:?}"))?;
-    Ok(sampler)
+    let trigger_tokens = derive_trigger_tokens(model);
+    build_lazy_sampler_with(model, &grammar, &trigger_words, &trigger_tokens)
+}
+
+/// Low-level lazy sampler construction: arbitrary grammar + explicit word and
+/// token triggers. Shared by the production path and the gbnf-probe canary
+/// arms so diagnostics exercise the same wiring.
+///
+/// # Double-accept hazard
+/// `LlamaSampler::sample` already accepts the sampled token into every
+/// sampler of the chain (llama.cpp `llama_sampler_sample`). Callers driving a
+/// generation loop must NOT call `accept` again: duplicated pieces mangle
+/// lazy-trigger buffers (word triggers never match) and force-fed duplicates
+/// crash constrained grammars (`Unexpected empty grammar stack` /
+/// `GGML_ASSERT(!stacks.empty())`). This was the root cause of the E4
+/// night-bench false negative.
+#[cfg(feature = "llama")]
+pub fn build_lazy_sampler_with(
+    model: &LlamaModel,
+    grammar: &str,
+    trigger_words: &[String],
+    trigger_tokens: &[LlamaToken],
+) -> std::result::Result<LlamaSampler, String> {
+    LlamaSampler::grammar_lazy(model, grammar, "root", trigger_words, trigger_tokens)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Trigger-token derivation for diagnostics (`gbnf-probe --diag-tokens`).
+#[cfg(feature = "llama")]
+pub fn derive_trigger_tokens_pub(model: &LlamaModel) -> Vec<LlamaToken> {
+    derive_trigger_tokens(model)
 }
 
 /// Public entry point for the `gbnf-probe` binary: builds the same
 /// grammar_lazy sampler chain used by [`LlamaCppClient`]
-/// (`json_schema_to_grammar` + trigger `{"name"`), so the empirical
-/// measurement exercises the exact production sampler construction.
+/// (`json_schema_to_grammar` + word trigger `{"name"` + tokenizer-derived
+/// token-ID triggers), so the empirical measurement exercises the exact
+/// production sampler construction.
 #[cfg(feature = "llama")]
 pub fn grammar_lazy_sampler_for(
     model: &LlamaModel,
@@ -407,5 +485,36 @@ mod tests {
             src.contains("grammar_lazy"),
             "must use grammar_lazy trigger, not grammar+tools"
         );
+    }
+
+    #[test]
+    fn trigger_tokens_derive_from_first_token_of_each_phrase() {
+        // Mock vocab mapping: `{"name"` splits into 3 tokens whose first is
+        // the same id as the `{"` opener; `{` has its own id.
+        let ids = trigger_tokens_from_lookup(|s| match s {
+            "{\"name\"" => Some(vec![7, 42, 43]),
+            "{\"" => Some(vec![7]),
+            "{" => Some(vec![9]),
+            _ => None,
+        });
+        assert_eq!(ids, vec![7, 9], "firsts only, deduped, order preserved");
+    }
+
+    #[test]
+    fn trigger_tokens_empty_when_tokenizer_yields_nothing() {
+        let ids = trigger_tokens_from_lookup(|_s| None);
+        assert!(ids.is_empty(), "no tokenizer data -> no triggers");
+    }
+
+    #[test]
+    fn trigger_tokens_single_token_phrase_counts_as_first() {
+        // Whole phrase is one BPE token: that single id must be the trigger.
+        let ids = trigger_tokens_from_lookup(|s| match s {
+            "{\"name\"" => Some(vec![1234]),
+            "{\"" => Some(vec![7]),
+            "{" => Some(vec![9]),
+            _ => None,
+        });
+        assert_eq!(ids, vec![1234, 7, 9]);
     }
 }
