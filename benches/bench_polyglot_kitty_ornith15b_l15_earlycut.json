@@ -1,0 +1,86 @@
+{
+  "suite": "aider-polyglot-official",
+  "method": "harbor-verifier",
+  "agent": "kitty (bench/harbor/adapters/kitty KittyAgent)",
+  "model": "ornith-1.5:9b",
+  "dataset": "aider-polyglot@1.0",
+  "path": "bench/official/aider-harbor/aider-polyglot",
+  "grading": "harbor-verifier-unit-tests",
+  "early_cut": true,
+  "limit": 15,
+  "selection_rule": "pre-registered first-N dataset order (-l 15), no post-hoc cherry-picking",
+  "n_evaluated": 11,
+  "n_total_trials": 11,
+  "passed": 0,
+  "reward_zero": 11,
+  "mean": 0,
+  "agent_timeout_multiplier": 3,
+  "exceptions": {
+    "RewardFileNotFoundError": [
+      "polyglot_cpp_queen-attack__XbUhWCw",
+      "polyglot_cpp_phone-number__gN2dNxN",
+      "polyglot_cpp_kindergarten-garden__JL4SE2L"
+    ],
+    "UnknownApiError": [
+      "polyglot_javascript_space-age__scSCMrd",
+      "polyglot_javascript_grep__FKrZSUu"
+    ],
+    "AgentTimeoutError": [
+      "polyglot_javascript_rectangles__D2gWYEP"
+    ],
+    "CancelledError": [
+      "polyglot_cpp_clock__qbTjprG"
+    ]
+  },
+  "exception_counts": {
+    "RewardFileNotFoundError": 3,
+    "UnknownApiError": 2,
+    "AgentTimeoutError": 1,
+    "CancelledError": 1
+  },
+  "rewards": {
+    "1.0": [],
+    "0.0": [
+      "polyglot_go_error-handling__HfQTenr",
+      "polyglot_go_pig-latin__RoAAyxj",
+      "polyglot_go_say__Bs8XNFA",
+      "polyglot_java_alphametics__2qQKd8p",
+      "polyglot_java_phone-number__M53fzfn",
+      "polyglot_javascript_grep__FKrZSUu",
+      "polyglot_javascript_rectangles__D2gWYEP",
+      "polyglot_javascript_space-age__scSCMrd",
+      "polyglot_javascript_wordy__VnVbCvy",
+      "polyglot_python_list-ops__5aqeD6k",
+      "polyglot_rust_acronym__Yo9epDk"
+    ]
+  },
+  "harbor_top_level_stats": {
+    "n_completed_trials": 15,
+    "n_errored_trials": 7,
+    "n_cancelled_trials": 1
+  },
+  "gate_v3_verdict": "FAIL env-comprometido (7/(15+7) > 10%) -> cut by user authorization before completion",
+  "consistency": {
+    "reward_buckets_sum": 11,
+    "equals_n_total_trials": true
+  },
+  "source_job_dir": "jobs/2026-08-22__21-02-52",
+  "result_json": "jobs/2026-08-22__21-02-52/result.json",
+  "attempt": "4/4",
+  "attempt_lineage": "night bench 2026-08-22 run 4/4; re-run after R3 abort with agent_timeout_multiplier:3 changed vs R3",
+  "env": {
+    "KITTY_SANDBOX": "off",
+    "KITTY_OLLAMA_TIMEOUT_SECS": "900"
+  },
+  "harbor_version": "0.21.0",
+  "started_at": "2026-08-22T21:02:52.388976",
+  "finished_at": null,
+  "timestamp": "2026-08-22T21:02:52.388976",
+  "note": "cut by user authorization; agent_timeout_multiplier:3 differs from R3; NOT comparable to R3; 0 passes in evaluated subset",
+  "limitations": [
+    "early-cut: finished_at is null in harbor result.json; run did not close empirically",
+    "agent_timeout_multiplier=3 confound vs R3 (default): any delta vs R3 is NOT attributable to the harness or model alone",
+    "directional-only: 0/11 evaluated subset passed; no rate claim beyond the subset",
+    "2 UnknownApiError + 3 RewardFileNotFoundError + 1 AgentTimeoutError + 1 CancelledError in harbor accounting"
+  ]
+}

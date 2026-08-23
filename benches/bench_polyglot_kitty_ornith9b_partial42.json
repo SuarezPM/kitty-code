@@ -1,0 +1,142 @@
+{
+  "suite": "aider-polyglot-official",
+  "method": "harbor-verifier",
+  "agent": "kitty (bench/harbor/adapters/kitty KittyAgent)",
+  "model": "ornith:9b",
+  "dataset": "aider-polyglot@1.0",
+  "path": "bench/official/aider-harbor/aider-polyglot",
+  "grading": "harbor-verifier-unit-tests",
+  "_partial_n": true,
+  "limit": 50,
+  "selection_rule": "pre-registered first-N dataset order (-l 50), no post-hoc cherry-picking",
+  "n_ran": 42,
+  "n_total_trials": 42,
+  "passed": 5,
+  "reward_zero": 37,
+  "mean_partial": 0.11904761904761904,
+  "mean_harbor_reported": 0.1,
+  "rate_pct_evaluated": 11.904761904761903,
+  "errored_trials_harbor_accounting": 28,
+  "exceptions": {
+    "RewardFileNotFoundError": [
+      "polyglot_cpp_queen-attack__M3uDzXw",
+      "polyglot_cpp_phone-number__MsztDvW",
+      "polyglot_cpp_kindergarten-garden__8YKSkPy",
+      "polyglot_cpp_clock__LTkMuWG",
+      "polyglot_cpp_dnd-character__hjg7gkv"
+    ],
+    "NonZeroAgentExitCodeError": [
+      "polyglot_javascript_rectangles__GSRWWbB",
+      "polyglot_javascript_react__PfrZBzb",
+      "polyglot_rust_forth__ThqMhHT"
+    ],
+    "VerifierTimeoutError": [
+      "polyglot_java_alphametics__9HKaA7H"
+    ],
+    "AgentTimeoutError": [
+      "polyglot_java_bowling__7QsiEAC",
+      "polyglot_java_go-counting__2LJ7tCG",
+      "polyglot_python_react__d4aWasJ",
+      "polyglot_python_two-bucket__swb7fkA",
+      "polyglot_javascript_promises__YXjGLwy",
+      "polyglot_java_pig-latin__3ZbDBB5",
+      "polyglot_go_variable-length-quan__pepy6Cr",
+      "polyglot_cpp_grade-school__ZAdePoF",
+      "polyglot_java_mazy-mice__sd9ZShZ",
+      "polyglot_go_bowling__4wFSVC6",
+      "polyglot_javascript_zebra-puzzle__tZNmFyx",
+      "polyglot_javascript_rest-api__ePKwoNd",
+      "polyglot_go_poker__UgjUxDK",
+      "polyglot_cpp_parallel-letter-fre__YFayiD6",
+      "polyglot_go_pov__KaEuGAF",
+      "polyglot_javascript_twelve-days__UTQLUwZ",
+      "polyglot_rust_robot-name__nC3beNg",
+      "polyglot_javascript_ocr-numbers__TtfWNhQ",
+      "polyglot_go_alphametics__hoW9jgC"
+    ]
+  },
+  "exception_counts": {
+    "RewardFileNotFoundError": 5,
+    "NonZeroAgentExitCodeError": 3,
+    "VerifierTimeoutError": 1,
+    "AgentTimeoutError": 19
+  },
+  "rewards": {
+    "1.0": [
+      "polyglot_javascript_phone-number__qrcazk8",
+      "polyglot_javascript_promises__YXjGLwy",
+      "polyglot_javascript_rectangles__GSRWWbB",
+      "polyglot_javascript_space-age__EgpBNQu",
+      "polyglot_rust_acronym__YmmmxCr"
+    ],
+    "0.0": [
+      "polyglot_go_alphametics__hoW9jgC",
+      "polyglot_go_bowling__4wFSVC6",
+      "polyglot_go_error-handling__FQC9dET",
+      "polyglot_go_palindrome-products__jXkYX3P",
+      "polyglot_go_pig-latin__ZF3yELh",
+      "polyglot_go_poker__UgjUxDK",
+      "polyglot_go_pov__KaEuGAF",
+      "polyglot_go_protein-translation__dPp5ZNZ",
+      "polyglot_go_say__bTJ83vi",
+      "polyglot_go_variable-length-quan__pepy6Cr",
+      "polyglot_go_wordy__HdticV8",
+      "polyglot_java_bowling__7QsiEAC",
+      "polyglot_java_circular-buffer__FibpnuS",
+      "polyglot_java_connect__BPBLUvS",
+      "polyglot_java_go-counting__2LJ7tCG",
+      "polyglot_java_mazy-mice__sd9ZShZ",
+      "polyglot_java_phone-number__ZnCjc8q",
+      "polyglot_java_pig-latin__3ZbDBB5",
+      "polyglot_java_state-of-tic-tac-t__p6jEZjB",
+      "polyglot_java_word-search__xFQPRA2",
+      "polyglot_javascript_grep__PvFWowt",
+      "polyglot_javascript_ocr-numbers__TtfWNhQ",
+      "polyglot_javascript_react__PfrZBzb",
+      "polyglot_javascript_rest-api__ePKwoNd",
+      "polyglot_javascript_simple-linke__gvHgdET",
+      "polyglot_javascript_transpose__7Pz9vGZ",
+      "polyglot_javascript_twelve-days__UTQLUwZ",
+      "polyglot_javascript_wordy__S3uYezy",
+      "polyglot_javascript_zebra-puzzle__tZNmFyx",
+      "polyglot_python_beer-song__syzVgEb",
+      "polyglot_python_forth__Ap56o7V",
+      "polyglot_python_grep__53X7TMP",
+      "polyglot_python_list-ops__LTQ5euP",
+      "polyglot_python_react__d4aWasJ",
+      "polyglot_python_two-bucket__swb7fkA",
+      "polyglot_rust_forth__ThqMhHT",
+      "polyglot_rust_robot-name__nC3beNg"
+    ]
+  },
+  "harbor_top_level_stats": {
+    "n_completed_trials": 50,
+    "n_errored_trials": 28
+  },
+  "gate_v3_verdict": "FAIL env-comprometido (28/(50+28) > 10%) -> aborted per two-strike protocol -> _partialN",
+  "consistency": {
+    "reward_buckets_sum": 42,
+    "equals_n_total_trials": true
+  },
+  "source_job_dir": "jobs/2026-08-22__15-57-35",
+  "result_json": "jobs/2026-08-22__15-57-35/result.json",
+  "attempt": "3/3",
+  "prior_attempts_superseded": "timeout-fix chain (a170123 KITTY_OLLAMA_TIMEOUT_SECS configurable -> 5dbe3f3 adapter forwards KITTY_* env -> c4547e1 adapter lee KITTY_* de _extra_env)",
+  "timeout_fix_commit": "c4547e1",
+  "env": {
+    "KITTY_SANDBOX": "off",
+    "KITTY_OLLAMA_TIMEOUT_SECS": "900"
+  },
+  "harbor_version": "0.21.0",
+  "started_at": "2026-08-22T15:57:35.574676",
+  "finished_at": "2026-08-22T20:50:08.226043",
+  "timestamp": "2026-08-22T20:50:08.226043",
+  "note": "not empirically closed: aborted per two-strike protocol (AgentTimeoutError task-level + empty responses >16K ctx); HTTP timeout fix 900s verified working (0 timeouts)",
+  "limitations": [
+    "partial first-N=50 of 225; NOT a full-suite estimate without confidence treatment",
+    "19 AgentTimeoutError are task-level time limits, distinct from the fixed HTTP layer (KITTY_OLLAMA_TIMEOUT_SECS=900 produced 0 HTTP/empty-response timeouts)",
+    "5 RewardFileNotFoundError = verifier could not read reward file (harness/verifier interaction, not graded capability)",
+    "harbor top-level counters (completed=50, errored=28) double-count vs eval-level n_trials=42; canonical outcome count here is the reward-bucket sum 42",
+    "agent_timeout_multiplier not set (default) - differs from R4, runs NOT comparable"
+  ]
+}
