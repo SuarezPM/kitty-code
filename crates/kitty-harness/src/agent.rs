@@ -52,8 +52,6 @@ pub struct AgentConfig {
     pub context_window: usize,
     /// Compaction threshold (0.0-1.0). Default: 0.8.
     pub compact_threshold: f32,
-    /// Maximum reasoning tokens (thinking budget cap). None = no cap.
-    pub max_thinking_tokens: Option<usize>,
     /// Whether knowledge injection is enabled.
     pub enable_knowledge: bool,
     /// Knowledge configuration.
@@ -87,7 +85,6 @@ impl Default for AgentConfig {
             max_iterations: 20,
             context_window: 16384,
             compact_threshold: 0.8,
-            max_thinking_tokens: Some(2048),
             enable_knowledge: false,
             knowledge_config: KnowledgeConfig::default(),
             quality_config: QualityConfig::default(),
@@ -109,7 +106,6 @@ impl AgentConfig {
         self.profile = p;
         self.context_window = p.context_window;
         self.max_iterations = p.max_iterations;
-        self.max_thinking_tokens = p.max_thinking_tokens;
         self.bash_timeout_secs = p.bash_timeout_secs;
         self.compact_threshold = p.compact_threshold;
         // dedup: with_profile and new_inner both enforce tiny→grammar for CLI vs direct Agent::new callers
@@ -211,6 +207,19 @@ fn model_stance_overlay(model: &str) -> Option<&'static str> {
     }
 }
 
+/// Effective per-turn thinking-token cap for a [`ThinkingMode`].
+///
+/// Budget(n) caps at n (exceeding retries once without thinking — FASE D);
+/// On stays UNCAPPED (a reasoning-trained model must never be forced off
+/// mid-session by a budget trip); Off is enforced on the wire via
+/// `"think": false` in request_options (no cap needed).
+fn per_turn_thinking_cap(mode: ThinkingMode) -> Option<usize> {
+    match mode {
+        ThinkingMode::Budget(n) => Some(n as usize),
+        ThinkingMode::On | ThinkingMode::Off => None,
+    }
+}
+
 /// The core agent loop.
 pub struct Agent {
     client: Box<dyn ChatClient>,
@@ -273,7 +282,6 @@ impl Agent {
             let p = config.profile;
             config.context_window = p.context_window;
             config.max_iterations = p.max_iterations;
-            config.max_thinking_tokens = p.max_thinking_tokens;
             config.bash_timeout_secs = p.bash_timeout_secs;
             config.compact_threshold = p.compact_threshold;
         }
@@ -282,9 +290,16 @@ impl Agent {
         // turn-cap override; env KITTY_MODEL_TURN_CAPS + KITTY_NO_THINK apply
         // inside the resolver). Post-construction `config_mut()` overrides
         // still win: they run later.
-        let tuning = ModelTuning::resolve_from_env(&config.model);
+        //
+        // G2-FIX2: only overwrite max_iterations when a per-model turn-cap
+        // entry ACTUALLY matched (exact table hit or env spec hit). Family/
+        // default resolution carries no cap authority and must not stomp
+        // deliberate profile presets (tiny's invariant 4K/5iter/4tools).
+        let (tuning, cap_matched) = ModelTuning::resolve_from_env_with_cap_hit(&config.model);
         config.tuning = tuning;
-        config.max_iterations = config.tuning.max_iterations;
+        if cap_matched {
+            config.max_iterations = config.tuning.max_iterations;
+        }
         // Filter tools by profile subset (tiny → 4 tools, medium/large → 6)
         let tools: Vec<ToolDefinition> = {
             let subset = config.profile.tool_subset;
@@ -315,17 +330,12 @@ impl Agent {
         let mut budget = ContextBudget::new(config.context_window);
         budget.set_threshold(config.compact_threshold);
         let tool_names: Vec<String> = tools.iter().map(|t| t.function.name.clone()).collect();
-        // F2: per-turn thinking policy comes from the resolved model profile.
-        // Budget(n) seeds the FASE D cap (exceeding it retries once without
-        // thinking); On stays UNCAPPED — a reasoning-trained model must never
-        // be forced off mid-session by a budget trip; Off is enforced on the
-        // wire via `"think": false` in request_options (no cap needed).
-        let per_turn_thinking_cap = match config.tuning.thinking {
-            ThinkingMode::Budget(n) => Some(n as usize),
-            ThinkingMode::On | ThinkingMode::Off => None,
-        };
+        // F2/G2-FIX3: per-turn thinking policy comes from the resolved model
+        // profile. This is only the INITIAL seed — `run()` re-seeds from the
+        // CURRENT `config.tuning.thinking` on every call, so post-construction
+        // mutations (CLI/bench A/B thinking axis) take effect.
         let thinking_budget = ThinkingBudget::new(
-            per_turn_thinking_cap,
+            per_turn_thinking_cap(config.tuning.thinking),
             None, // No session cap by default
         );
         let quality_monitor = QualityMonitor::new(config.quality_config.clone(), tool_names);
@@ -452,6 +462,13 @@ impl Agent {
         })
         .await;
 
+        // G2-FIX3: re-seed the per-turn thinking cap from the CURRENT
+        // tuning before every run — the CLI/bench thinking axis mutates
+        // `config_mut().tuning.thinking` AFTER construction, and that must
+        // reach the live budget tracker (the old max_thinking_tokens field
+        // was dead-stored and silently ignored).
+        self.thinking_budget
+            .set_per_turn_cap(per_turn_thinking_cap(self.config.tuning.thinking));
         // Reset thinking budget for this turn
         self.thinking_budget.reset_turn();
 
@@ -1625,6 +1642,121 @@ mod tests {
     /// both modules exclude each other (they share one test binary).
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::model_profile::test_env_lock()
+    }
+
+    /// Run `f` with the tuning-relevant env vars cleared (restored
+    /// afterwards) so profile-resolution tests are hermetic.
+    fn with_clean_tuning_env(f: impl FnOnce()) {
+        let _g = env_lock();
+        let vars = [
+            (
+                crate::model_profile::ENV_MODEL_TURN_CAPS,
+                std::env::var(crate::model_profile::ENV_MODEL_TURN_CAPS).ok(),
+            ),
+            (
+                kitty_runtime::client::ENV_NO_THINK,
+                std::env::var(kitty_runtime::client::ENV_NO_THINK).ok(),
+            ),
+        ];
+        for (key, _) in &vars {
+            std::env::remove_var(key);
+        }
+        f();
+        for (key, prev) in &vars {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn profile_preset_iterations_survive_family_default() {
+        with_clean_tuning_env(|| {
+            // G2-FIX2 good case: unknown model → family/default resolution has
+            // NO cap authority → tiny's deliberate 5-iteration invariant must
+            // survive (the old code stomped it to 20).
+            let cfg = AgentConfig {
+                model: "unknown-model:7b".into(),
+                profile: ModelProfile::tiny(),
+                ..Default::default()
+            };
+            let agent = Agent::new(MockClient::new(vec![]), cfg);
+            assert_eq!(agent.config().max_iterations, 5);
+            // Tuning still carries its family default internally…
+            assert_eq!(agent.config().tuning.max_iterations, 20);
+            // …and sampling/thinking fields apply regardless.
+            assert_eq!(agent.config().tuning.thinking, ThinkingMode::Budget(2048));
+        });
+    }
+
+    #[test]
+    fn exact_turn_cap_still_overrides_profile_preset() {
+        with_clean_tuning_env(|| {
+            // Good case: exact Tier-4 table hit RAISES tiny's 5 → 24 for
+            // ornith:9b (the original unified behavior must keep working).
+            let cfg = AgentConfig {
+                model: "ornith:9b".into(),
+                profile: ModelProfile::tiny(),
+                ..Default::default()
+            };
+            let agent = Agent::new(MockClient::new(vec![]), cfg);
+            assert_eq!(agent.config().max_iterations, 24);
+            assert_eq!(agent.config().tuning.max_iterations, 24);
+            assert_eq!(agent.config().tuning.thinking, ThinkingMode::On);
+        });
+    }
+
+    #[tokio::test]
+    async fn thinking_budget_reseeded_from_tuning_at_run_start() {
+        // G2-FIX3 good case: post-construction mutation of tuning.thinking —
+        // exactly what the CLI/bench A/B thinking axis does — reaches the LIVE
+        // tracker through run()'s lazy seeding. Script: max_iterations=1 so
+        // the bounded loop consumes one response and exhaustion's forced
+        // extraction consumes the second.
+        let mut agent = Agent::new(
+            MockClient::new(vec![dummy_response("ok"), dummy_response("final")]),
+            AgentConfig::default(),
+        );
+        agent.config_mut().max_iterations = 1;
+        agent.config_mut().tuning.thinking = ThinkingMode::Budget(512);
+        let out = agent.run("hi").await.unwrap();
+        assert_eq!(out, "final");
+        assert_eq!(agent.thinking_budget().per_turn_cap(), Some(512));
+
+        // Control: On maps to NO cap — reasoning-trained models are never
+        // force-capped into a thinking-off retry.
+        let mut agent = Agent::new(
+            MockClient::new(vec![dummy_response("ok"), dummy_response("final")]),
+            AgentConfig::default(),
+        );
+        agent.config_mut().max_iterations = 1;
+        agent.config_mut().tuning.thinking = ThinkingMode::On;
+        let _ = agent.run("hi").await.unwrap();
+        assert_eq!(agent.thinking_budget().per_turn_cap(), None);
+    }
+
+    #[test]
+    fn no_think_env_forces_thinking_off_and_request_flag() {
+        let _g = env_lock();
+        let key = kitty_runtime::client::ENV_NO_THINK;
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, "1");
+        let agent = Agent::new(
+            MockClient::new(vec![]),
+            AgentConfig {
+                model: "ornith:9b".into(),
+                ..Default::default()
+            },
+        );
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        // KITTY_NO_THINK wins over the ornith profile's ThinkingMode::On…
+        assert_eq!(agent.config().tuning.thinking, ThinkingMode::Off);
+        // …and reaches the wire as think:false on every request.
+        assert_eq!(agent.request_options(&[]).think, Some(false));
     }
 
     #[test]

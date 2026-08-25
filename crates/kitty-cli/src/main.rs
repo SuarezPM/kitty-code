@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use kitty_harness::agent::{Agent, AgentConfig};
 use kitty_harness::knowledge::KnowledgeConfig;
 use kitty_harness::tools::standard_tool_definitions;
-use kitty_harness::ModelProfile;
+use kitty_harness::{ModelProfile, ThinkingMode};
 use kitty_memory::{Episode, EpisodeStore};
 use kitty_runtime::OllamaClient;
 use std::path::PathBuf;
@@ -230,7 +230,10 @@ async fn main() -> Result<()> {
                 agent.config_mut().max_iterations = cli.max_iterations;
             }
             if cli.thinking_budget != 2048 {
-                agent.config_mut().max_thinking_tokens = Some(cli.thinking_budget);
+                // G2-FIX3: tuning.thinking is the LIVE thinking axis — the
+                // agent re-seeds its budget tracker from it at every run().
+                agent.config_mut().tuning.thinking =
+                    ThinkingMode::Budget(cli.thinking_budget as u32);
             }
             if cli.bash_timeout != 60 {
                 agent.config_mut().bash_timeout_secs = cli.bash_timeout;
@@ -948,7 +951,10 @@ async fn run_one_bench(
         agent.budget_mut().set_max(cfg.context_window);
     }
     if cfg.thinking_budget != 2048 {
-        agent.config_mut().max_thinking_tokens = Some(cfg.thinking_budget);
+        // G2-FIX3: tuning.thinking is the LIVE thinking axis — the agent
+        // re-seeds its budget tracker from it at every run(). This is what
+        // makes bench-ab A/B arms actually differ.
+        agent.config_mut().tuning.thinking = ThinkingMode::Budget(cfg.thinking_budget as u32);
     }
     if cfg.bash_timeout != 60 {
         agent.config_mut().bash_timeout_secs = cfg.bash_timeout;

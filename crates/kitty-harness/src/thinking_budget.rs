@@ -37,6 +37,18 @@ impl ThinkingBudget {
         }
     }
 
+    /// Replace the per-turn cap (G2-FIX3 lazy-seeding channel: the agent
+    /// re-applies the CURRENT `config.tuning.thinking` before every run so
+    /// post-construction mutations take effect).
+    pub fn set_per_turn_cap(&mut self, cap: Option<usize>) {
+        self.per_turn_cap = cap;
+    }
+
+    /// The active per-turn cap, if any.
+    pub fn per_turn_cap(&self) -> Option<usize> {
+        self.per_turn_cap
+    }
+
     /// Record thinking tokens from an LLM response.
     /// Returns `Err` if the turn or session cap is exceeded.
     pub fn record(&mut self, tokens: usize) -> Result<(), ThinkingBudgetError> {
@@ -116,6 +128,20 @@ mod tests {
         let budget = ThinkingBudget::default();
         assert!(budget.is_enabled());
         assert_eq!(budget.per_turn_cap, Some(2048));
+    }
+
+    #[test]
+    fn set_and_read_per_turn_cap_roundtrip() {
+        // Good: seeding a cap takes effect immediately.
+        let mut budget = ThinkingBudget::new(None, None);
+        assert_eq!(budget.per_turn_cap(), None);
+        budget.set_per_turn_cap(Some(512));
+        assert_eq!(budget.per_turn_cap(), Some(512));
+        // Bad input tolerated: clearing the cap removes enforcement entirely.
+        budget.set_per_turn_cap(None);
+        assert_eq!(budget.per_turn_cap(), None);
+        budget.record(10_000).unwrap();
+        assert!(!budget.is_turn_exceeded());
     }
 
     #[test]

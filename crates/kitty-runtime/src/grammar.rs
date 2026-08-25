@@ -164,6 +164,35 @@ impl<C: ChatClient> GrammarClient<C> {
     pub fn inner(&self) -> &C {
         &self.inner
     }
+
+    /// Post-hoc GBNF validation of a response's tool_calls (strict mode only;
+    /// non-strict passes through unchanged). Shared by BOTH transport paths —
+    /// [`ChatClient::chat`] and [`ChatClient::chat_with_options`] — so the
+    /// options path cannot bypass the filter (G2 finding 1: the agent calls
+    /// exclusively through chat_with_options).
+    fn apply_strict_filter(&self, mut resp: ChatResponse) -> ChatResponse {
+        if self.grammar.strict {
+            if let Some(calls) = resp.message.tool_calls.take() {
+                let filtered: Vec<crate::client::ToolCall> = calls
+                    .into_iter()
+                    .filter(|tc| {
+                        let json = serde_json::json!({
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        })
+                        .to_string();
+                        self.grammar.validate(&json)
+                    })
+                    .collect();
+                resp.message.tool_calls = if filtered.is_empty() {
+                    None
+                } else {
+                    Some(filtered)
+                };
+            }
+        }
+        resp
+    }
 }
 
 impl<C: ChatClient> ChatClient for GrammarClient<C> {
@@ -174,33 +203,14 @@ impl<C: ChatClient> ChatClient for GrammarClient<C> {
         tools: Option<Vec<ToolDefinition>>,
     ) -> Pin<Box<dyn Future<Output = crate::error::Result<ChatResponse>> + Send + 'a>> {
         Box::pin(async move {
-            let mut resp = self.inner.chat(model, messages, tools).await?;
-            if self.grammar.strict {
-                if let Some(calls) = resp.message.tool_calls.take() {
-                    let filtered: Vec<crate::client::ToolCall> = calls
-                        .into_iter()
-                        .filter(|tc| {
-                            let json = serde_json::json!({
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            })
-                            .to_string();
-                            self.grammar.validate(&json)
-                        })
-                        .collect();
-                    if !filtered.is_empty() {
-                        resp.message.tool_calls = Some(filtered);
-                    } else {
-                        resp.message.tool_calls = None;
-                    }
-                }
-            }
-            Ok(resp)
+            let resp = self.inner.chat(model, messages, tools).await?;
+            Ok(self.apply_strict_filter(resp))
         })
     }
 
-    /// F2: forward request options (num_ctx, num_predict, think, …) to the
-    /// inner client — the default trait impl would silently drop them.
+    /// F2/G2-FIX1: forward request options (num_ctx, num_predict, think, …)
+    /// to the inner client — the default trait impl would silently drop them
+    /// — while STILL applying the strict filter via [`Self::apply_strict_filter`].
     fn chat_with_options<'a>(
         &'a self,
         model: &'a str,
@@ -209,9 +219,11 @@ impl<C: ChatClient> ChatClient for GrammarClient<C> {
         options: Option<crate::client::RequestOptions>,
     ) -> Pin<Box<dyn Future<Output = crate::error::Result<ChatResponse>> + Send + 'a>> {
         Box::pin(async move {
-            self.inner
+            let resp = self
+                .inner
                 .chat_with_options(model, messages, tools, options)
-                .await
+                .await?;
+            Ok(self.apply_strict_filter(resp))
         })
     }
 
@@ -408,5 +420,100 @@ mod tests {
         // non-strict should not filter
         assert!(out.message.tool_calls.is_some());
         assert_eq!(out.message.tool_calls.unwrap().len(), 1);
+    }
+
+    /// Regression test (G2 finding 1): the agent calls exclusively through
+    /// `chat_with_options`; that path must still apply the strict GBNF filter.
+    #[tokio::test]
+    async fn chat_with_options_path_filters_invalid_tool_calls() {
+        use crate::client::{Message, MockClient, RequestOptions, ToolCall, ToolCallFunction};
+
+        let tools = sample_tools();
+        let grammar = GrammarConfig::from_tools(tools.clone());
+        // BAD fixture: unknown tool + missing required arg — both must go.
+        let calls = vec![
+            ToolCall {
+                id: None,
+                function: ToolCallFunction {
+                    name: "NotATool".to_string(),
+                    arguments: serde_json::json!({"path": "/tmp/x"}),
+                },
+            },
+            ToolCall {
+                id: None,
+                function: ToolCallFunction {
+                    name: "Read".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+            },
+        ];
+        let resp = ChatResponse {
+            model: "test".into(),
+            message: Message {
+                role: "assistant".into(),
+                content: None,
+                thinking: None,
+                tool_calls: Some(calls),
+            },
+            done: true,
+            eval_count: None,
+            eval_duration: None,
+            prompt_eval_count: None,
+        };
+        let client = GrammarClient::new(MockClient::new(vec![resp]), grammar);
+        let out = client
+            .chat_with_options(
+                "test",
+                vec![Message::user("hi")],
+                Some(tools),
+                Some(RequestOptions::default()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.message.tool_calls.is_none(),
+            "invalid tool_calls must be filtered on the options path"
+        );
+    }
+
+    /// Good fixture: a valid tool call passes the options path unharmed.
+    #[tokio::test]
+    async fn chat_with_options_path_passes_valid_tool_calls() {
+        use crate::client::{Message, MockClient, RequestOptions, ToolCall, ToolCallFunction};
+
+        let tools = sample_tools();
+        let grammar = GrammarConfig::from_tools(tools.clone());
+        let resp = ChatResponse {
+            model: "test".into(),
+            message: Message {
+                role: "assistant".into(),
+                content: None,
+                thinking: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: None,
+                    function: ToolCallFunction {
+                        name: "Write".to_string(),
+                        arguments: serde_json::json!({"path": "/tmp/x", "content": "hi"}),
+                    },
+                }]),
+            },
+            done: true,
+            eval_count: None,
+            eval_duration: None,
+            prompt_eval_count: None,
+        };
+        let client = GrammarClient::new(MockClient::new(vec![resp]), grammar);
+        let out = client
+            .chat_with_options(
+                "test",
+                vec![Message::user("hi")],
+                Some(tools),
+                Some(RequestOptions::default()),
+            )
+            .await
+            .unwrap();
+        let calls = out.message.tool_calls.expect("valid call must survive");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "Write");
     }
 }

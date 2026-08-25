@@ -387,6 +387,11 @@ pub struct RequestOptions {
     pub top_k: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_predict: Option<i32>,
+    /// Context window override. HARNESS-OWNED: callers must leave this unset —
+    /// [`OllamaClient`] injects the session-fixed window resolved once from
+    /// `KITTY_NUM_CTX` / [`DEFAULT_NUM_CTX`]. Setting it here would alternate
+    /// values across requests and reload the model server-side (guarded by a
+    /// `debug_assert` in [`OllamaClient::build_chat_request`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<i32>,
     /// Caller-side thinking override (F2): `Some(false)` forces `"think":
@@ -540,11 +545,14 @@ impl OllamaClient {
         let response: ChatResponse = resp.json().await?;
         if let Some(count) = response.prompt_eval_count {
             if prompt_near_capacity(count, num_ctx) {
+                // G2 finding 5: with truncate:false, ≥95% means the NEXT
+                // oversized request will fail audibly — recommend action now.
                 warn!(
                     prompt_eval_count = count,
                     num_ctx,
-                    "prompt nearly filled the context window (>=95%); \
-                     earlier turns were likely truncated server-side"
+                    "prompt nearly filled the context window (>=95%); with truncate:false the \
+                     NEXT oversized request will fail with ContextOverflow — compact now or \
+                     raise KITTY_NUM_CTX"
                 );
             }
         }
@@ -564,9 +572,19 @@ impl OllamaClient {
         options: Option<RequestOptions>,
     ) -> ChatRequest {
         let mut opts = options.unwrap_or_default();
+        // G2-FIX4: guard session-fixing against caller injection — a caller
+        // that set its own num_ctx would alternate values across requests and
+        // reload the model server-side. Debug builds trap this; release keeps
+        // the caller-explicit value (documented on RequestOptions::num_ctx).
+        let caller_num_ctx = opts.num_ctx;
         // Fixed per-session window: never alternate values across requests.
         opts.num_ctx
             .get_or_insert(i32::try_from(self.num_ctx).unwrap_or(i32::MAX));
+        debug_assert!(
+            caller_num_ctx.is_none() || caller_num_ctx == opts.num_ctx,
+            "callers must not inject their own num_ctx: the session-fixed \
+             context window is harness-owned (set KITTY_NUM_CTX instead)"
+        );
         let think = match opts.think {
             Some(false) => Some(false),
             _ => {

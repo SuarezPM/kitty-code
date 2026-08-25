@@ -222,6 +222,33 @@ impl ModelTuning {
         no_think_env: Option<&str>,
         turn_caps_env: Option<&str>,
     ) -> Self {
+        Self::resolve_inner(model_id, no_think_env, turn_caps_env).0
+    }
+
+    /// Like [`Self::resolve`] but also reports whether a per-model turn-cap
+    /// entry (env spec hit or static exact-table hit) actually matched.
+    ///
+    /// G2 finding 2: family/default resolution must NOT stomp deliberate
+    /// profile presets — the agent loop only overwrites
+    /// `config.max_iterations` when this returns `true`.
+    ///
+    /// Returns `(tuning, cap_matched)`.
+    #[must_use]
+    pub fn resolve_with_cap_hit(
+        model_id: &str,
+        no_think_env: Option<&str>,
+        turn_caps_env: Option<&str>,
+    ) -> (Self, bool) {
+        Self::resolve_inner(model_id, no_think_env, turn_caps_env)
+    }
+
+    /// Shared implementation behind [`Self::resolve`] /
+    /// [`Self::resolve_with_cap_hit`].
+    fn resolve_inner(
+        model_id: &str,
+        no_think_env: Option<&str>,
+        turn_caps_env: Option<&str>,
+    ) -> (Self, bool) {
         let lower = model_id.to_ascii_lowercase();
         let mut tuning = if lower.contains("ornith") {
             Self::ornith_family()
@@ -231,29 +258,37 @@ impl ModelTuning {
             Self::default_profile()
         };
         // Unified Tier-4 caps: env override first, static prefix table next;
-        // both beat the family/default value computed above.
-        if let Some(cap) = turn_cap_from_env_spec(turn_caps_env, model_id)
-            .or_else(|| turn_cap_static_for(model_id))
-        {
+        // both beat the family/default value computed above. The match flag
+        // lets callers preserve profile presets otherwise.
+        let matched = turn_cap_from_env_spec(turn_caps_env, model_id)
+            .or_else(|| turn_cap_static_for(model_id));
+        if let Some(cap) = matched {
             tuning.max_iterations = cap;
         }
         // KITTY_NO_THINK=1 overrides any profile's thinking mode.
         if no_think_env == Some("1") {
             tuning.thinking = ThinkingMode::Off;
         }
-        tuning
+        (tuning, matched.is_some())
     }
 
-    /// Convenience wrapper reading both env vars at call time.
+    /// Convenience wrapper reading both env vars at call time, also reporting
+    /// whether a turn-cap entry matched ([`Self::resolve_with_cap_hit`]).
     #[must_use]
-    pub fn resolve_from_env(model_id: &str) -> Self {
-        Self::resolve(
+    pub fn resolve_from_env_with_cap_hit(model_id: &str) -> (Self, bool) {
+        Self::resolve_inner(
             model_id,
             std::env::var(kitty_runtime::client::ENV_NO_THINK)
                 .ok()
                 .as_deref(),
             std::env::var(ENV_MODEL_TURN_CAPS).ok().as_deref(),
         )
+    }
+
+    /// Convenience wrapper reading both env vars at call time.
+    #[must_use]
+    pub fn resolve_from_env(model_id: &str) -> Self {
+        Self::resolve_from_env_with_cap_hit(model_id).0
     }
 }
 
@@ -530,6 +565,29 @@ mod tests {
         assert_eq!(t.max_iterations, 24);
         let t = ModelTuning::resolve("qwen3:8b", None, Some("garbage,qwen3=abc,=4"));
         assert_eq!(t.max_iterations, 20);
+    }
+
+    #[test]
+    fn tuning_cap_hit_flag_reports_exact_and_env_matches_only() {
+        // Good: exact table hit and env hit both report true.
+        let (_, hit) = ModelTuning::resolve_with_cap_hit("ornith:9b", None, None);
+        assert!(hit);
+        let (_, hit) = ModelTuning::resolve_with_cap_hit("qwen3:8b", None, Some("qwen=11"));
+        assert!(hit);
+        // Bad: family/default resolution is NOT a cap match — callers must
+        // keep the size-profile preset (e.g. tiny's 5 iterations).
+        let (t, hit) = ModelTuning::resolve_with_cap_hit("unknown-model", None, None);
+        assert!(!hit);
+        // Family default stays inside tuning; callers keep the preset.
+        assert_eq!(t.max_iterations, 20);
+        // Invalid env entries yield nothing AND the model has no static
+        // entry → no match. A static-entry model (ornith:9b) would still
+        // legitimately report a hit via the static fallback.
+        let (_, hit) =
+            ModelTuning::resolve_with_cap_hit("qwen3:8b", None, Some("garbage,qwen3=abc"));
+        assert!(!hit, "invalid env entries must not count as a match");
+        let (_, hit) = ModelTuning::resolve_with_cap_hit("ornith:9b", None, Some("garbage"));
+        assert!(hit, "static-table fallback is a genuine match");
     }
 
     #[test]
