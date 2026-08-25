@@ -153,6 +153,25 @@ impl ToolRegistry {
         // choke point shared by the agent loop and the MCP server. Unknown
         // names pass through untouched so existing diagnostics still apply.
         let call = normalize_tool_call(tc);
+
+        // G3-5: a salvaged `_raw`-only arguments object means the model's
+        // JSON body could not be parsed. Surface WHAT was wrong (with the
+        // truncated recovered body) instead of letting the tool emit a
+        // generic missing-key error.
+        if let Some(raw) = raw_only_arguments(&call.arguments) {
+            return Ok(ToolResult {
+                success: false,
+                output: format!(
+                    "Tool call arguments were not valid JSON, so the call \
+                     could not be applied.\nRecovered body (truncated):\n{}\n\n\
+                     Re-send the call as proper JSON: \
+                     {{\"name\": \"<Tool>\", \"arguments\": {{...}}}}.",
+                    truncate_lines(raw, 6)
+                ),
+                retry: true,
+            });
+        }
+
         let result = match call.name.as_str() {
             "Read" => self.execute_read(&call.arguments)?,
             "Edit" => self.execute_edit(&call.arguments)?,
@@ -414,9 +433,21 @@ impl ToolRegistry {
     /// Str-replace Edit mode (aider-compatible).
     ///
     /// Requires a prior Read this session (same read-before-edit invariant as
-    /// the hash protocol). Matches exact occurrences of `old_string` in the
-    /// current file content: 0 matches → error with hint to Read first;
-    /// >1 match without `replace_all` → error asking for more context.
+    /// the hash protocol). Matching is two-stage:
+    ///
+    /// 1. EXACT: occurrences of `old_string` in the current file content —
+    ///    0 matches → fall through to the tolerance ladder; >1 match without
+    ///    `replace_all` → error asking for more context.
+    /// 2. FUZZY LADDER ([`crate::edit_replacers::run_ladder`]): graduated
+    ///    strategies (line-trim → whitespace-normalized → trimmed-boundary →
+    ///    escape-normalized → indent-flexible → context-aware → block-anchor)
+    ///    tolerate whitespace/indentation drift from weaker models. Every
+    ///    candidate passes the disproportionate-match guard, which rejects
+    ///    spans wildly larger than `old_string` so a loose match can never
+    ///    swallow half a file. A fuzzy success appends a one-line
+    ///    `[edit matched via <strategy>]` note to the output so the model
+    ///    learns its drift was tolerated; multiple viable spans without
+    ///    `replace_all` still fail with the usual "provide more context".
     ///
     /// CRLF handling (kilocode-style): `\r\n` is normalized to `\n` for
     /// matching, and restored on write when the original file used CRLF.
@@ -971,8 +1002,23 @@ const ARG_KEY_ALIASES: &[(&str, &str)] = &[
     ("new_text", "new_string"),
 ];
 
+/// Extract the salvage body when arguments carry ONLY an `_raw` string (the
+/// parser's unparsable-JSON retention shape). Mixed objects pass through.
+fn raw_only_arguments(args: &serde_json::Value) -> Option<&str> {
+    let map = args.as_object()?;
+    if map.len() == 1 {
+        map.get("_raw")?.as_str()
+    } else {
+        None
+    }
+}
+
 /// Fold one incoming call onto canonical tool/argument naming.
-fn normalize_tool_call(tc: &ParsedToolCall) -> ParsedToolCall {
+///
+/// Idempotent: canonical names pass through unchanged and aliased keys are
+/// only moved when the canonical key is absent, so re-normalizing an already
+/// normalized call is a no-op.
+pub(crate) fn normalize_tool_call(tc: &ParsedToolCall) -> ParsedToolCall {
     ParsedToolCall {
         name: normalize_tool_name(&tc.name),
         arguments: rekey_arg_aliases(tc.arguments.clone()),
@@ -2201,6 +2247,56 @@ mod tests {
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn alias_normalization_is_idempotent() {
+        // G3-1: the agent loop normalizes upstream of the quality gate and
+        // execute() normalizes again — the second pass must be a no-op.
+        let once = normalize_tool_call(&ParsedToolCall {
+            name: "str_replace".to_string(),
+            arguments: serde_json::json!({
+                "file_path": "a.rs",
+                "old_str": "x",
+                "new_str": "y"
+            }),
+        });
+        let twice = normalize_tool_call(&once);
+        assert_eq!(once, twice);
+        assert_eq!(once.name, "Edit");
+        assert_eq!(once.arguments["path"], "a.rs");
+        assert_eq!(once.arguments["old_string"], "x");
+        assert_eq!(once.arguments["new_string"], "y");
+    }
+
+    #[tokio::test]
+    async fn raw_only_arguments_get_actionable_diagnostic() {
+        // G3-5: salvaged `_raw`-only args must explain WHAT was wrong and
+        // show the recovered body instead of a generic missing-key error.
+        let mut registry = ToolRegistry::new();
+        let tc = ParsedToolCall {
+            name: "Read".to_string(),
+            arguments: serde_json::json!({
+                "_raw": "{\"name\": \"Read\", \"path\": no_close"
+            }),
+        };
+        let result = registry.execute(&tc).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("not valid JSON"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("no_close"),
+            "recovered body must be shown, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("Re-send the call as proper JSON"),
+            "got: {}",
+            result.output
+        );
     }
 
     // ---- Edit str_replace mode (aider-compatible) ----

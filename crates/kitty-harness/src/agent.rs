@@ -674,6 +674,16 @@ impl Agent {
                     all_tool_calls.extend(parsed);
                 }
 
+                // G3-1: fold synonym/aliased tool names and argument keys onto
+                // the canonical forms UPSTREAM of every consumer that inspects
+                // tool-call identity — quality monitoring, corrective
+                // diagnostics, episode memory, and dispatch. ToolRegistry::
+                // execute re-normalizes harmlessly (the operation is
+                // idempotent), so hallucinated names never leak through.
+                for tc in &mut all_tool_calls {
+                    *tc = crate::tools::normalize_tool_call(tc);
+                }
+
                 // Quality monitor: check for hallucinated tools before execution.
                 // F2.4: window is NOT cleared — persists across turns.
                 let violations = self
@@ -2101,6 +2111,54 @@ mod tests {
             err.to_string().contains("Doom loop"),
             "expected doom-loop fail-fast, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn synonym_named_call_passes_quality_gate_and_executes() {
+        // G3-1: normalization runs BEFORE the quality monitor, so a
+        // hallucinated synonym name reaches the gate as the canonical tool —
+        // no HallucinatedTool corrective message, correct execution, and
+        // dispatch re-normalization is a harmless no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("edit.txt");
+        std::fs::write(&file_path, "content").unwrap();
+
+        let mock = MockClient::new(vec![]);
+        let cfg = AgentConfig {
+            workspace: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(mock, cfg);
+
+        // Turn 1: canonical Read (satisfies read-before-edit).
+        let read = tool_call_response(
+            "Read",
+            serde_json::json!({"path": file_path.to_string_lossy()}),
+        );
+        agent.process_response("p", read).await.unwrap();
+
+        // Turn 2: synonym-named edit with drifted arg keys.
+        let edit = tool_call_response(
+            "str_replace",
+            serde_json::json!({
+                "file_path": file_path.to_string_lossy(),
+                "old_str": "content",
+                "new_str": "CONTENT"
+            }),
+        );
+        agent.process_response("p", edit).await.unwrap();
+
+        // (a) Quality gate saw the CANONICAL name — no hallucination notice.
+        assert!(
+            !agent.messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains("does not exist"))),
+            "synonym must not surface as hallucinated: {:#?}",
+            agent.messages
+        );
+        // (b) The call EXECUTED as Edit (aliases re-keyed onto real args).
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "CONTENT");
     }
 
     // -----------------------------------------------------------------------

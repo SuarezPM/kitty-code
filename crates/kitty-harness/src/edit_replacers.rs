@@ -18,6 +18,17 @@ const BLOCK_ANCHOR_SIMILARITY_THRESHOLD: f64 = 0.65;
 /// Context-aware middle-line trimmed-equality floor.
 const CONTEXT_AWARE_MIDDLE_RATIO: f64 = 0.5;
 
+/// Files larger than this skip fuzzy matching entirely (same scale as the
+/// agent's `TRUNCATION_MAX_BYTES` output cap): scanning a file far bigger
+/// than anything fed back to the model is pure waste, and exact matching has
+/// already failed by the time the ladder runs.
+const FUZZY_MAX_CONTENT_BYTES: usize = 512 * 1024;
+
+/// Block-anchor candidates larger than this skip the Levenshtein middle
+/// comparison — a span this big would be rejected by the disproportionate
+/// guard for any multi-line `old_string` anyway, so comparing is waste.
+const BLOCK_ANCHOR_MAX_SPAN_BYTES: usize = 64 * 1024;
+
 /// How a tolerance-ladder attempt resolved.
 #[derive(Debug)]
 pub(crate) enum LadderOutcome {
@@ -44,10 +55,16 @@ pub(crate) struct LadderHit {
 /// Run the tolerance ladder over `content` looking for `find`.
 ///
 /// Strategy order: line-trim → whitespace-normalized → trimmed-boundary →
-/// escape-normalized → indent-flexible → context-aware → block-anchor. Every
+/// escape-normalized → indent-flexible → context-aware → block-anchor; the
+/// first strategy producing a vetted match short-circuits the rest. Every
 /// candidate passes through [`is_disproportionate_match`] — the guard is part
-/// of the ladder itself and is never bypassed.
+/// of the ladder itself and is never bypassed. Oversized files bail before
+/// any strategy runs (see [`FUZZY_MAX_CONTENT_BYTES`]).
 pub(crate) fn run_ladder(content: &str, find: &str, replace_all: bool) -> LadderOutcome {
+    if find.is_empty() || content.len() > FUZZY_MAX_CONTENT_BYTES {
+        return LadderOutcome::NotFound;
+    }
+
     type Strategy = fn(&str, &str) -> Vec<String>;
     const STRATEGIES: [(&str, Strategy); 7] = [
         ("line-trim", line_trimmed_candidates),
@@ -61,7 +78,14 @@ pub(crate) fn run_ladder(content: &str, find: &str, replace_all: bool) -> Ladder
 
     let mut ambiguous = false;
     for (label, strategy) in STRATEGIES {
+        // Candidate spans repeat whenever the drifted block occurs several
+        // times; vetting each DISTINCT span once keeps the pass O(spans)
+        // instead of O(candidates × file).
+        let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
         for span in strategy(content, find) {
+            if !tried.insert(span.clone()) {
+                continue;
+            }
             if !content.contains(&span) {
                 // Defensive: strategies promise verbatim spans.
                 continue;
@@ -440,8 +464,14 @@ fn block_anchor_candidates(content: &str, find: &str) -> Vec<String> {
 
     let mut out = Vec::new();
     for &(start, end) in &candidates {
+        let span = content_lines[start..=end].join("\n");
+        if span.len() > BLOCK_ANCHOR_MAX_SPAN_BYTES {
+            // Levenshtein over a span this size is waste: the guard would
+            // reject it for any multi-line old_string regardless of outcome.
+            continue;
+        }
         if middle_similarity(start, end) >= BLOCK_ANCHOR_SIMILARITY_THRESHOLD {
-            out.push(content_lines[start..=end].join("\n"));
+            out.push(span);
         }
     }
     out
@@ -697,5 +727,36 @@ mod tests {
             run_ladder(DRIFTED, "totally absent text\nwith lines", false),
             LadderOutcome::NotFound
         ));
+    }
+
+    #[test]
+    fn ladder_bails_on_oversized_files_but_not_normal_ones() {
+        // G3-2: files beyond the fuzzy size cap bail before any strategy runs.
+        let mut big = String::with_capacity(FUZZY_MAX_CONTENT_BYTES + 8192);
+        while big.len() <= FUZZY_MAX_CONTENT_BYTES {
+            big.push_str("filler line\n");
+        }
+        big.push_str("    target_value();\n");
+        assert!(matches!(
+            run_ladder(&big, "target_value();", false),
+            LadderOutcome::NotFound
+        ));
+
+        // Control: the same drifted line in a normal-size file still matches.
+        let small = "filler\n    target_value();\n";
+        assert!(matches!(
+            run_ladder(small, "target_value();", false),
+            LadderOutcome::Hit(_)
+        ));
+    }
+
+    #[test]
+    fn block_anchor_skips_oversized_candidates() {
+        // G3-2: candidates beyond the span cap skip Levenshtein comparison —
+        // an identical middle would match without the cap.
+        let huge = "x".repeat(BLOCK_ANCHOR_MAX_SPAN_BYTES + 1);
+        let content = format!("A\n{huge}\nZ");
+        let find = format!("A\n{huge}\nZ");
+        assert!(block_anchor_candidates(&content, &find).is_empty());
     }
 }

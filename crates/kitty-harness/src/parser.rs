@@ -196,8 +196,15 @@ impl ToolCallParser {
             results.extend(self.parse_tool_calls_marker(content));
         }
 
-        // 3. Try XML <tool_call> blocks
-        results.extend(self.parse_xml_tool_calls(content));
+        // 3. XML <tool_call> blocks — fully subsumed by the asymmetric layer
+        //    above (its opener/closer/payload sets are supersets), so it only
+        //    runs when that layer produced nothing. Keeping every bare block
+        //    owned by exactly ONE layer prevents the same call from being
+        //    parsed twice and dispatched twice. The standalone helper remains
+        //    for the <think>-block path below.
+        if results.is_empty() {
+            results.extend(self.parse_xml_tool_calls(content));
+        }
 
         // 4. Try JSON blocks (```json / ```tool ... ```)
         results.extend(self.parse_json_code_blocks(content));
@@ -244,16 +251,19 @@ impl ToolCallParser {
             call.name = self.canonical_tool_name(&call.name);
         }
 
-        // Collapse exact duplicates introduced by overlapping syntax layers
-        // (a bare `<tool_call>` block matches both the asymmetric layer and
-        // the XML layer — dispatching it twice would be pure harm). First
-        // occurrence wins; order is preserved.
+        // Collapse repeated identical calls for SIDE-EFFECT-FREE tools only:
+        // a repeated read carries no information (and overlapping opener
+        // prefixes can yield the same read twice), while identical stateful
+        // calls (Bash/Edit/Write) are legitimate sequences or retries and are
+        // always kept.
+        const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Glob", "Grep"];
         let mut unique: Vec<ParsedToolCall> = Vec::with_capacity(results.len());
         for call in results {
-            if !unique
-                .iter()
-                .any(|s| s.name == call.name && s.arguments == call.arguments)
-            {
+            let duplicate_read_only = READ_ONLY_TOOLS.contains(&call.name.as_str())
+                && unique
+                    .iter()
+                    .any(|s| s.name == call.name && s.arguments == call.arguments);
+            if !duplicate_read_only {
                 unique.push(call);
             }
         }
@@ -426,8 +436,14 @@ impl ToolCallParser {
         const OPENERS: [&str; 3] = ["<|tool_call>", "<|tool_call|>", "<tool_call>"];
         const CLOSERS: [&str; 3] = ["<tool_call|>", "<|end_tool_call|>", "</tool_call>"];
         let mut results = Vec::new();
-        // Opener variants are mutually non-overlapping strings, so a span
-        // matched by one can never be re-matched by another — union is safe.
+        // Opener variants overlap by design: the pipeless form is a strict
+        // prefix of the piped one, so symmetric-tag content is probed by both
+        // passes. A misaligned pass yields a shifted payload that fails to
+        // parse and self-suppresses; when two passes do parse the same block,
+        // the results are identical calls, and repeated identical READS are
+        // collapsed at the end of parse_internal. The XML layer below is
+        // gated off once this layer produces anything, so a bare block always
+        // has exactly one owning layer and is never dispatched twice.
         for opener in OPENERS {
             results.extend(
                 self.parse_delimited_calls_with(content, opener, &CLOSERS, |payload| {
@@ -1726,6 +1742,35 @@ mid
         assert_eq!(calls.len(), 2, "got: {calls:?}");
         assert_eq!(calls[0].name, "Read");
         assert_eq!(calls[1].name, "Edit");
+    }
+
+    #[test]
+    fn duplicate_identical_stateful_calls_survive() {
+        // G3-4: two IDENTICAL Bash calls in one response are an intentional
+        // sequence — dedup must not collapse stateful tools.
+        let parser = ToolCallParser::new();
+        let block = r#"<tool_call>{"name":"Bash","arguments":{"command":"make test"}}</tool_call>"#;
+        let input = format!("{block}\n{block}");
+        let calls = parser.parse(&input);
+        assert_eq!(
+            calls.len(),
+            2,
+            "stateful duplicates must survive: {calls:?}"
+        );
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[1].name, "Bash");
+    }
+
+    #[test]
+    fn duplicate_identical_read_only_call_collapses() {
+        // G3-4: a repeated identical read carries no information — collapse
+        // it (also covers any residual cross-layer double-parse of reads).
+        let parser = ToolCallParser::new();
+        let block = r#"<tool_call>{"name":"Read","arguments":{"path":"a.rs"}}</tool_call>"#;
+        let input = format!("{block}\n{block}");
+        let calls = parser.parse(&input);
+        assert_eq!(calls.len(), 1, "read-only duplicates collapse: {calls:?}");
+        assert_eq!(calls[0].name, "Read");
     }
 
     #[test]
