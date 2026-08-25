@@ -6,6 +6,27 @@
 //! (invalid/missing value falls back to the default). The same variable also
 //! overrides [`crate::cloud::CloudClient`], whose own default is 120s.
 //!
+//! # Explicit context window (F2)
+//!
+//! Ollama's server-side default for `num_ctx` is TIERED BY SERVER VRAM
+//! (<24 GB VRAM → 4096) and prompts are TRUNCATED SILENTLY when they exceed
+//! it. To make the window explicit and audible:
+//!
+//! - Every `/api/chat` payload carries `"options": {"num_ctx": N}` INSIDE the
+//!   options object (never top-level). N resolves once per client from
+//!   `KITTY_NUM_CTX` (parsed as `u32`) or [`DEFAULT_NUM_CTX`] (32768), and
+//!   stays FIXED for the whole session — changing `num_ctx` between requests
+//!   forces an expensive model reload server-side.
+//! - Every payload carries `"truncate": false`, so overflow produces HTTP 400
+//!   (`exceed_context_size_error`) mapped to
+//!   [`RuntimeError::ContextOverflow`] instead of silent degradation.
+//! - Responses expose `prompt_eval_count` (actual prompt tokens processed);
+//!   when it reaches 95% of the window a warning is logged (truncation tell).
+//!
+//! Note: KV-cache quantization (`OLLAMA_KV_CACHE_TYPE=q8_0`) is a SERVER env
+//! var applied at model load — it CANNOT be set via API/Modelfile/request.
+//! [`kv_cache_preflight_warning`] implements the pragmatic client-side check.
+//!
 //! # Qwen thinking/reasoning normalization (E3)
 //!
 //! Qwen-family "think" models emit reasoning either server-side (Ollama's
@@ -49,6 +70,98 @@ pub const ENV_TIMEOUT_SECS: &str = "KITTY_OLLAMA_TIMEOUT_SECS";
 /// Env flag (E3): when set to exactly `1`, thinking mode is disabled for
 /// qwen-family models regardless of the model id.
 pub const ENV_NO_THINK: &str = "KITTY_NO_THINK";
+
+/// Env var (F2): explicit context window in tokens for `/api/chat`
+/// `options.num_ctx`. Parsed as `u32`; missing/invalid values fall back to
+/// [`DEFAULT_NUM_CTX`]. Resolved ONCE per [`OllamaClient`] — the value must
+/// stay fixed for a whole session (changing it reloads the model).
+pub const ENV_NUM_CTX: &str = "KITTY_NUM_CTX";
+
+/// Default context window requested from the server when `KITTY_NUM_CTX` is
+/// unset. Chosen to defeat the tiered-by-VRAM server default (4096 on <24 GB
+/// machines) that silently truncates prompts.
+pub const DEFAULT_NUM_CTX: u32 = 32768;
+
+/// Env var (F2 KV preflight): set to `q8_0` or `q4_0` to acknowledge that the
+/// Ollama SERVER runs with `OLLAMA_KV_CACHE_TYPE` quantized. Large windows
+/// (`num_ctx > 16384`) hold f16 KV caches that can OOM an 8 GB GPU
+/// (~4.8 GB at 32k); q8_0 halves it. The client cannot introspect the
+/// server's env, so this acknowledgement silences the warning.
+pub const ENV_KV_QUANT_ACK: &str = "KITTY_KV_QUANT_ACK";
+
+/// Pure resolver behind [`ENV_NUM_CTX`] — testable without process-env
+/// mutation. Missing, empty, unparsable, or zero values fall back to
+/// [`DEFAULT_NUM_CTX`].
+#[must_use]
+pub fn parse_num_ctx(raw: Option<&str>) -> u32 {
+    match raw.map(str::trim) {
+        Some(s) => s.parse::<u32>().ok().filter(|v| *v > 0),
+        None => None,
+    }
+    .unwrap_or(DEFAULT_NUM_CTX)
+}
+
+/// F2 KV preflight: returns a human-readable warning when a large context
+/// window is requested without acknowledging server-side KV quantization.
+///
+/// Pure predicate — the CLI prints the warning at agentic-session startup;
+/// this function decides IF one is due. Returns `None` when num_ctx fits a
+/// small GPU comfortably (≤16384) or the ack var is set to a known quant
+/// type (`q8_0`, `q4_0`). No hard failure by design.
+#[must_use]
+pub fn kv_cache_preflight_warning(num_ctx: u32, kv_ack: Option<&str>) -> Option<String> {
+    let acked = matches!(kv_ack.map(str::trim), Some("q8_0") | Some("q4_0"));
+    if num_ctx <= 16384 || acked {
+        return None;
+    }
+    Some(format!(
+        "num_ctx={num_ctx} on a typical 8GB GPU holds a ~{:.1}GB f16 KV cache (OOM risk). \
+         Start the Ollama server with OLLAMA_KV_CACHE_TYPE=q8_0 (halves KV memory), \
+         or set {ENV_KV_QUANT_ACK}=q8_0 to acknowledge.",
+        f64::from(num_ctx) * 150_000.0 / 1_000_000_000.0
+    ))
+}
+
+/// True when `prompt_eval_count` reached 95% of the resolved window — the
+/// truncation tell exposed by the response field.
+#[must_use]
+pub fn prompt_near_capacity(prompt_eval_count: i64, num_ctx: u32) -> bool {
+    if prompt_eval_count < 0 || num_ctx == 0 {
+        return false;
+    }
+    u64::try_from(prompt_eval_count)
+        .map(|c| c >= u64::from(num_ctx) * 95 / 100)
+        .unwrap_or(false)
+}
+
+/// True when an HTTP error body identifies a context-window overflow
+/// (`truncate:false` turns silent truncation into this audible failure).
+/// Matches Ollama's `exceed_context_size_error` type as well as plain-text
+/// variants like "input length exceeds context size".
+#[must_use]
+pub fn is_context_overflow_body(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("exceed_context_size_error")
+        || (lower.contains("exceed") && lower.contains("context"))
+}
+
+/// Map a non-2xx chat response to a [`RuntimeError`]: HTTP 400 bodies that
+/// indicate context overflow become [`RuntimeError::ContextOverflow`] with an
+/// actionable message; everything else stays [`RuntimeError::Api`]. Pure —
+/// unit-testable without HTTP.
+#[must_use]
+pub fn classify_api_error(status: u16, body: &str, requested_num_ctx: u32) -> RuntimeError {
+    if status == 400 && is_context_overflow_body(body) {
+        return RuntimeError::ContextOverflow {
+            requested: requested_num_ctx,
+            message: body.to_string(),
+        };
+    }
+    RuntimeError::Api {
+        status,
+        message: body.to_string(),
+    }
+}
 
 /// Pure predicate behind [`should_disable_thinking`] — testable without
 /// process-env mutation.
@@ -258,6 +371,10 @@ pub struct ChatRequest {
     /// leaves the field out entirely (server default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
+    /// F2: `Some(false)` serializes as `"truncate": false`, turning context
+    /// overflow into an audible HTTP 400 instead of silent prompt truncation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncate: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -272,6 +389,11 @@ pub struct RequestOptions {
     pub num_predict: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<i32>,
+    /// Caller-side thinking override (F2): `Some(false)` forces `"think":
+    /// false` on this request regardless of model-id/env heuristics. Used by
+    /// the harness to express a per-model profile's `ThinkingMode::Off`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
 }
 
 /// Chat response from Ollama.
@@ -284,6 +406,10 @@ pub struct ChatResponse {
     pub eval_count: Option<i64>,
     #[serde(default)]
     pub eval_duration: Option<i64>,
+    /// F2 truncation tell: actual prompt tokens processed server-side. When
+    /// this nears the requested window, earlier turns were likely truncated.
+    #[serde(default)]
+    pub prompt_eval_count: Option<i64>,
 }
 
 /// Response from Ollama's `/api/tokenize` endpoint.
@@ -315,22 +441,31 @@ pub struct ModelListResponse {
 /// Typed client for the Ollama HTTP API.
 ///
 /// All network errors are surfaced as [`RuntimeError::Http`]. Non-2xx HTTP
-/// status codes are mapped to [`RuntimeError::Api`].
+/// status codes are mapped to [`RuntimeError::Api`], except context-window
+/// overflows on 400 which become [`RuntimeError::ContextOverflow`] (F2).
+///
+/// The context window (`num_ctx`) is resolved ONCE at construction from
+/// `KITTY_NUM_CTX` (or [`DEFAULT_NUM_CTX`]) and stays fixed for the whole
+/// session — alternating values across requests would reload the model.
 #[derive(Clone)]
 pub struct OllamaClient {
     base_url: String,
     http: reqwest::Client,
     timeout: Duration,
+    num_ctx: u32,
 }
 
 impl OllamaClient {
     /// Create a client pointing at the given base URL.
     ///
     /// Timeout comes from `KITTY_OLLAMA_TIMEOUT_SECS` when set to a valid
-    /// `u64`, else [`DEFAULT_OLLAMA_TIMEOUT_SECS`] (300s).
+    /// `u64`, else [`DEFAULT_OLLAMA_TIMEOUT_SECS`] (300s). Context window
+    /// comes from `KITTY_NUM_CTX` when set to a valid `u32`, else
+    /// [`DEFAULT_NUM_CTX`] (32768).
     pub fn new(base_url: &str) -> Self {
         let raw = std::env::var(ENV_TIMEOUT_SECS).ok();
         let timeout_secs = parse_timeout_secs(raw.as_deref(), DEFAULT_OLLAMA_TIMEOUT_SECS);
+        let num_ctx = parse_num_ctx(std::env::var(ENV_NUM_CTX).ok().as_deref());
         let timeout = Duration::from_secs(timeout_secs);
         let http = reqwest::Client::builder()
             .timeout(timeout)
@@ -340,7 +475,26 @@ impl OllamaClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
             timeout,
+            num_ctx,
         }
+    }
+
+    /// Override the resolved context window explicitly (F2). Useful for tests
+    /// and for callers that resolve configuration themselves; keeps the
+    /// once-per-client guarantee without touching process env.
+    #[must_use]
+    pub fn with_num_ctx(mut self, num_ctx: u32) -> Self {
+        self.num_ctx = if num_ctx == 0 {
+            DEFAULT_NUM_CTX
+        } else {
+            num_ctx
+        };
+        self
+    }
+
+    /// The fixed per-session context window this client requests.
+    pub fn num_ctx(&self) -> u32 {
+        self.num_ctx
     }
 
     /// Request timeout actually configured (default 300s, env-overridable).
@@ -357,6 +511,11 @@ impl OllamaClient {
     ///
     /// E3: when [`should_disable_thinking`] is true for `model`, the request
     /// carries `"think": false` so qwen-family models skip reasoning.
+    ///
+    /// F2: the payload always carries `options.num_ctx` (fixed per-session
+    /// value) and `"truncate": false`; a 400 context-overflow response maps
+    /// to [`RuntimeError::ContextOverflow`]. When `prompt_eval_count`
+    /// reaches 95% of the window a warning is logged.
     pub async fn chat(
         &self,
         model: &str,
@@ -364,36 +523,69 @@ impl OllamaClient {
         tools: Option<Vec<ToolDefinition>>,
         options: Option<RequestOptions>,
     ) -> Result<ChatResponse> {
-        let think = if should_disable_thinking(model) {
-            Some(false)
-        } else {
-            None
-        };
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            tools,
-            stream: Some(false),
-            options,
-            think,
-        };
+        let num_ctx = self.num_ctx;
+        let request = self.build_chat_request(model, messages, tools, options);
 
         let url = format!("{}/api/chat", self.base_url);
-        debug!(url = %url, model = %model, "sending chat request");
+        debug!(url = %url, model = %model, num_ctx, "sending chat request");
 
         let resp = self.http.post(&url).json(&request).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             warn!(status = %status, body = %body, "ollama chat returned error");
-            return Err(RuntimeError::Api {
-                status: status.as_u16(),
-                message: body,
-            });
+            return Err(classify_api_error(status.as_u16(), &body, num_ctx));
         }
 
         let response: ChatResponse = resp.json().await?;
+        if let Some(count) = response.prompt_eval_count {
+            if prompt_near_capacity(count, num_ctx) {
+                warn!(
+                    prompt_eval_count = count,
+                    num_ctx,
+                    "prompt nearly filled the context window (>=95%); \
+                     earlier turns were likely truncated server-side"
+                );
+            }
+        }
         Ok(response)
+    }
+
+    /// Pure payload builder shared by [`OllamaClient::chat`] and tests:
+    /// merges the fixed per-session `num_ctx` into the caller's options
+    /// (caller-explicit values win), forces `"truncate": false`, and applies
+    /// the thinking-disable heuristics (E3 env/model-id + F2 caller override).
+    #[must_use]
+    pub fn build_chat_request(
+        &self,
+        model: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: Option<RequestOptions>,
+    ) -> ChatRequest {
+        let mut opts = options.unwrap_or_default();
+        // Fixed per-session window: never alternate values across requests.
+        opts.num_ctx
+            .get_or_insert(i32::try_from(self.num_ctx).unwrap_or(i32::MAX));
+        let think = match opts.think {
+            Some(false) => Some(false),
+            _ => {
+                if should_disable_thinking(model) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+        };
+        ChatRequest {
+            model: model.to_string(),
+            messages,
+            tools,
+            stream: Some(false),
+            options: Some(opts),
+            think,
+            truncate: Some(false),
+        }
     }
 
     /// Health check — returns `true` if the Ollama server is reachable and
@@ -641,6 +833,7 @@ mod tests {
             stream: Some(false),
             options: None,
             think: None,
+            truncate: Some(false),
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(!json.as_object().unwrap().contains_key("tools"));
@@ -662,6 +855,7 @@ mod tests {
             done: true,
             eval_count: None,
             eval_duration: None,
+            prompt_eval_count: None,
         }
     }
 
@@ -779,6 +973,7 @@ mod tests {
             stream: None,
             options: None,
             think: Some(false),
+            truncate: Some(false),
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["think"], serde_json::json!(false));
@@ -819,5 +1014,175 @@ mod tests {
         };
         // args JSON is {"path":"abcd"} = 15 chars + name 4 = 19 → ceil(19/4)=5
         assert_eq!(estimate_input_tokens(&[m]), 5);
+    }
+
+    // ── F2: explicit context window + truncate:false ──────────────────
+
+    #[test]
+    fn parse_num_ctx_good_and_bad_inputs() {
+        // Good inputs parse.
+        assert_eq!(parse_num_ctx(Some("16384")), 16384);
+        assert_eq!(parse_num_ctx(Some("4096")), 4096);
+        assert_eq!(parse_num_ctx(Some(" 8192 ")), 8192);
+        // Bad inputs fall back to the default (never zero, never panic).
+        assert_eq!(parse_num_ctx(None), DEFAULT_NUM_CTX);
+        assert_eq!(parse_num_ctx(Some("")), DEFAULT_NUM_CTX);
+        assert_eq!(parse_num_ctx(Some("   ")), DEFAULT_NUM_CTX);
+        assert_eq!(parse_num_ctx(Some("abc")), DEFAULT_NUM_CTX);
+        assert_eq!(parse_num_ctx(Some("-5")), DEFAULT_NUM_CTX);
+        assert_eq!(parse_num_ctx(Some("12.5")), DEFAULT_NUM_CTX);
+        assert_eq!(parse_num_ctx(Some("0")), DEFAULT_NUM_CTX);
+    }
+
+    #[test]
+    fn chat_payload_carries_fixed_num_ctx_inside_options_and_truncate_false() {
+        let client = OllamaClient::new("http://localhost:11434").with_num_ctx(8192);
+        let messages = vec![Message::user("hi")];
+
+        let req1 = client.build_chat_request("m", messages.clone(), None, None);
+        let json1 = serde_json::to_value(&req1).unwrap();
+        // num_ctx must live INSIDE options, never top-level.
+        let top = json1.as_object().unwrap();
+        assert!(
+            !top.contains_key("num_ctx"),
+            "num_ctx must not be top-level"
+        );
+        assert_eq!(json1["options"]["num_ctx"], serde_json::json!(8192));
+        assert_eq!(json1["truncate"], serde_json::json!(false));
+
+        // Second consecutive build must carry the IDENTICAL fixed value
+        // (alternating num_ctx across requests reloads the model).
+        let req2 = client.build_chat_request("m", messages, None, None);
+        let json2 = serde_json::to_value(&req2).unwrap();
+        assert_eq!(json1["options"]["num_ctx"], json2["options"]["num_ctx"]);
+        assert_eq!(json1["truncate"], json2["truncate"]);
+    }
+
+    #[test]
+    fn chat_payload_merges_into_existing_caller_options_without_clobbering() {
+        let client = OllamaClient::new("http://localhost:11434").with_num_ctx(4096);
+        let opts = RequestOptions {
+            temperature: Some(0.3),
+            ..Default::default()
+        };
+        let json =
+            serde_json::to_value(client.build_chat_request("m", vec![], None, Some(opts))).unwrap();
+        assert_eq!(json["options"]["num_ctx"], serde_json::json!(4096));
+        let temp = json["options"]["temperature"].as_f64().unwrap();
+        assert!((temp - f64::from(0.3_f32)).abs() < 1e-9);
+        assert_eq!(json["truncate"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn is_context_overflow_body_matches_overflow_only() {
+        // Good: recognized overflow shapes.
+        assert!(is_context_overflow_body(
+            r#"{"error":{"message":"input length exceeds context size","type":"exceed_context_size_error"}}"#
+        ));
+        assert!(is_context_overflow_body(
+            r#"{"error":"prompt exceeds context size (25000 > 4096)"}"#
+        ));
+        // Bad: unrelated 400/500 bodies must NOT match.
+        assert!(!is_context_overflow_body(
+            r#"{"error":"model 'x' not found"}"#
+        ));
+        assert!(!is_context_overflow_body(
+            r#"{"error":"grammar and tools are not supported together"}"#
+        ));
+        assert!(!is_context_overflow_body(""));
+    }
+
+    #[test]
+    fn classify_api_error_routes_overflow_vs_plain_api_errors() {
+        let overflow_body =
+            r#"{"error":"exceed_context_size_error: input length 33000 > context 32768"}"#;
+        let err = classify_api_error(400, overflow_body, 32768);
+        match &err {
+            RuntimeError::ContextOverflow { requested, message } => {
+                assert_eq!(*requested, 32768);
+                assert!(message.contains("33000"), "server body preserved verbatim");
+            }
+            other => panic!("expected ContextOverflow, got {other:?}"),
+        }
+        // Actionable message: states requested vs available + suggests KITTY_NUM_CTX.
+        let display = err.to_string();
+        assert!(
+            display.contains("KITTY_NUM_CTX"),
+            "actionable hint missing: {display}"
+        );
+        assert!(display.contains("32768"));
+
+        // Bad: non-400 or unrelated bodies stay plain Api errors.
+        assert!(matches!(
+            classify_api_error(500, overflow_body, 32768),
+            RuntimeError::Api { status: 500, .. }
+        ));
+        assert!(matches!(
+            classify_api_error(400, r#"{"error":"model not found"}"#, 32768),
+            RuntimeError::Api { status: 400, .. }
+        ));
+    }
+
+    #[test]
+    fn prompt_near_capacity_threshold_is_95_percent() {
+        // Good: at/above 95% warns; below does not.
+        assert!(prompt_near_capacity(31_200, 32_768)); // 95.2%
+        assert!(prompt_near_capacity(32_768, 32_768));
+        assert!(!prompt_near_capacity(30_000, 32_768));
+        assert!(!prompt_near_capacity(100, 4096));
+        // Bad inputs never warn.
+        assert!(!prompt_near_capacity(-1, 32_768));
+        assert!(!prompt_near_capacity(10_000, 0));
+    }
+
+    #[test]
+    fn kv_cache_preflight_warning_good_and_bad_inputs() {
+        let msg = kv_cache_preflight_warning(32768, None).expect("large ctx unacked must warn");
+        assert!(msg.contains("OLLAMA_KV_CACHE_TYPE=q8_0"));
+        assert!(msg.contains(ENV_KV_QUANT_ACK));
+        // Acknowledged quant types silence the warning.
+        assert!(kv_cache_preflight_warning(32768, Some("q8_0")).is_none());
+        assert!(kv_cache_preflight_warning(32768, Some(" q4_0 ")).is_none());
+        // Small windows never warn.
+        assert!(kv_cache_preflight_warning(16384, None).is_none());
+        assert!(kv_cache_preflight_warning(4096, None).is_none());
+        // Unknown ack values do NOT count as acknowledgement.
+        assert!(kv_cache_preflight_warning(65536, Some("yes")).is_some());
+        assert!(kv_cache_preflight_warning(65536, Some("")).is_some());
+    }
+
+    #[test]
+    fn with_num_ctx_rejects_zero_and_reports_resolved_value() {
+        let client = OllamaClient::new("http://localhost:11434");
+        assert_eq!(client.num_ctx(), DEFAULT_NUM_CTX);
+        let custom = OllamaClient::new("http://localhost:11434")
+            .with_num_ctx(16384)
+            .with_num_ctx(0);
+        assert_eq!(custom.num_ctx(), DEFAULT_NUM_CTX);
+        assert_eq!(
+            OllamaClient::new("http://localhost:11434")
+                .with_num_ctx(2048)
+                .num_ctx(),
+            2048
+        );
+    }
+
+    #[test]
+    fn caller_think_false_override_forces_think_field_off() {
+        let client = OllamaClient::new("http://localhost:11434");
+        // F2 profile Off: caller-side think override reaches the wire even
+        // for models whose id/env would keep thinking on.
+        let opts = RequestOptions {
+            think: Some(false),
+            ..Default::default()
+        };
+        let json =
+            serde_json::to_value(client.build_chat_request("ornith:9b", vec![], None, Some(opts)))
+                .unwrap();
+        assert_eq!(json["think"], serde_json::json!(false));
+        // Without the override, ornith keeps thinking on (no think field).
+        let json = serde_json::to_value(client.build_chat_request("ornith:9b", vec![], None, None))
+            .unwrap();
+        assert!(json.as_object().unwrap().get("think").is_none());
     }
 }

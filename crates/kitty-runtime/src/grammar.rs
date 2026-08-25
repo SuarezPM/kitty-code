@@ -199,6 +199,22 @@ impl<C: ChatClient> ChatClient for GrammarClient<C> {
         })
     }
 
+    /// F2: forward request options (num_ctx, num_predict, think, …) to the
+    /// inner client — the default trait impl would silently drop them.
+    fn chat_with_options<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<crate::client::Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: Option<crate::client::RequestOptions>,
+    ) -> Pin<Box<dyn Future<Output = crate::error::Result<ChatResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            self.inner
+                .chat_with_options(model, messages, tools, options)
+                .await
+        })
+    }
+
     fn count_tokens<'a>(
         &'a self,
         model: &'a str,
@@ -335,6 +351,7 @@ mod tests {
             done: true,
             eval_count: None,
             eval_duration: None,
+            prompt_eval_count: None,
         };
         let mock = MockClient::new(vec![resp]);
         let client = GrammarClient::new(mock, grammar);
@@ -380,6 +397,7 @@ mod tests {
             done: true,
             eval_count: None,
             eval_duration: None,
+            prompt_eval_count: None,
         };
         let mock = MockClient::new(vec![resp]);
         let client = GrammarClient::new(mock, grammar);

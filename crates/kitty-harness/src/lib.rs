@@ -25,7 +25,7 @@ pub use bootstrap::{Bootstrap, BootstrapResult};
 pub use context::ContextBudget;
 pub use guard::{detect_write_targets, is_write_via_redirect, Guard, GuardVerdict};
 pub use knowledge::{KnowledgeBase, KnowledgeConfig};
-pub use model_profile::ModelProfile;
+pub use model_profile::{ModelProfile, ModelTuning, ThinkingMode};
 pub use plugin::{HelloPlugin, Plugin, PluginError, PluginRegistry, TwoToolPlugin};
 pub use quality_monitor::{QualityConfig, QualityMonitor};
 pub use router::{ToolCategory, ToolRouter};

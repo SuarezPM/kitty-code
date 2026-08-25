@@ -103,7 +103,159 @@ impl ModelProfile {
 /// A matching entry replaces the profile default even when it RAISES it
 /// (e.g. tiny profile's deliberate 5 → 24 for `ornith:9b`); use the env
 /// override to escape that without recompiling.
+///
+/// SINGLE SOURCE OF TRUTH (F2): these caps are consumed exclusively through
+/// [`ModelTuning::resolve`] / [`turn_cap_for_model`] — never read directly
+/// elsewhere.
 static MODEL_TURN_CAPS: &[(&str, usize)] = &[("ornith:9b", 24), ("ornith-1.5", 16)];
+
+// ── Per-model inference settings (F2) ──────────────────────────────
+
+/// How a model should use its reasoning/thinking capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingMode {
+    /// Keep thinking enabled with NO forced per-turn cap. For
+    /// reasoning-trained models: exceeding any cap retries without thinking,
+    /// which is exactly the force-off we must avoid by default.
+    On,
+    /// Keep thinking enabled but cap it at N tokens per turn; exceeding the
+    /// cap retries once with thinking disabled (FASE D budget mechanism).
+    Budget(u32),
+    /// Hard-disable thinking (`"think": false` on every request). Only
+    /// reachable via explicit override (`KITTY_NO_THINK=1` or programmatic
+    /// config mutation) — profiles never select Off on their own.
+    Off,
+}
+
+/// Per-model inference settings resolved from the model id (F2).
+///
+/// Named `ModelTuning` because `ModelProfile` (above) is the existing
+/// size-preset struct; this type carries what the size presets cannot:
+/// sampling parameters and thinking policy keyed off the model id itself.
+///
+/// # Iteration-budget accounting (Oracle finding M5)
+///
+/// `max_iterations` is the tool-loop budget PER PROMPT ATTEMPT. The outer
+/// verification revision cycle (`VERIFY_MAX_REVISIONS = 2`) can re-enter the
+/// full loop up to 2 more times after workspace-test failures, so the
+/// WORST-CASE LLM-call count per user prompt is roughly
+/// `max_iterations × 3`. Keep the default modest (≤24 unless an explicit
+/// bench profile raises it): raising it multiplies across revision cycles.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelTuning {
+    /// Unified per-model tool-loop iteration cap (absorbs the Tier-4 turn
+    /// caps — see the accounting warning above).
+    pub max_iterations: usize,
+    /// Sampling temperature sent as `options.temperature`.
+    pub temperature: f32,
+    /// Nucleus sampling cutoff (`options.top_p`).
+    pub top_p: Option<f32>,
+    /// Top-K sampling cutoff (`options.top_k`).
+    pub top_k: Option<u32>,
+    /// Max output tokens requested (`options.num_predict`); the E3 dynamic
+    /// output cap may lower it further so prompt+output fit the window.
+    pub num_predict: u32,
+    /// Thinking policy wired into the request path.
+    pub thinking: ThinkingMode,
+}
+
+impl Default for ModelTuning {
+    fn default() -> Self {
+        Self::default_profile()
+    }
+}
+
+/// Static per-family defaults (F2). Resolution order in
+/// [`ModelTuning::resolve`]: exact model-id match → family match (id contains
+/// "ornith" / "qwen") → default.
+impl ModelTuning {
+    /// Fallback for unknown models: conservative sampling, capped thinking.
+    #[must_use]
+    pub fn default_profile() -> Self {
+        Self {
+            max_iterations: 20,
+            temperature: 0.3,
+            top_p: None,
+            top_k: None,
+            num_predict: 8192,
+            thinking: ThinkingMode::Budget(2048),
+        }
+    }
+
+    /// Qwen family: deterministic-ish sampling with a ~2048-token thinking
+    /// budget (winning bench config keeps thinking ON but bounded).
+    #[must_use]
+    pub fn qwen_family() -> Self {
+        Self::default_profile()
+    }
+
+    /// Ornith family (reasoning-trained): thinking stays ON uncapped — NEVER
+    /// forced off by default — with the higher-entropy sampling it was
+    /// trained for.
+    #[must_use]
+    pub fn ornith_family() -> Self {
+        Self {
+            max_iterations: 20,
+            temperature: 0.6,
+            top_p: Some(0.95),
+            top_k: None,
+            num_predict: 8192,
+            thinking: ThinkingMode::On,
+        }
+    }
+
+    /// Resolve inference settings for `model_id`.
+    ///
+    /// Order: exact model-id table hit → family substring match ("ornith",
+    /// "qwen", case-insensitive) → default. Overrides applied last:
+    ///
+    /// 1. `KITTY_MODEL_TURN_CAPS` env entries (`turn_caps_env`) override
+    ///    `max_iterations` when their prefix matches.
+    /// 2. `no_think_env == Some("1")` forces `ThinkingMode::Off` — it wins
+    ///    over EVERY profile.
+    ///
+    /// Pure function: pass `std::env::var(...)` results from the caller
+    /// ([`resolve_from_env`]) to keep resolution testable.
+    #[must_use]
+    pub fn resolve(
+        model_id: &str,
+        no_think_env: Option<&str>,
+        turn_caps_env: Option<&str>,
+    ) -> Self {
+        let lower = model_id.to_ascii_lowercase();
+        let mut tuning = if lower.contains("ornith") {
+            Self::ornith_family()
+        } else if lower.contains("qwen") {
+            Self::qwen_family()
+        } else {
+            Self::default_profile()
+        };
+        // Unified Tier-4 caps: env override first, static prefix table next;
+        // both beat the family/default value computed above.
+        if let Some(cap) = turn_cap_from_env_spec(turn_caps_env, model_id)
+            .or_else(|| turn_cap_static_for(model_id))
+        {
+            tuning.max_iterations = cap;
+        }
+        // KITTY_NO_THINK=1 overrides any profile's thinking mode.
+        if no_think_env == Some("1") {
+            tuning.thinking = ThinkingMode::Off;
+        }
+        tuning
+    }
+
+    /// Convenience wrapper reading both env vars at call time.
+    #[must_use]
+    pub fn resolve_from_env(model_id: &str) -> Self {
+        Self::resolve(
+            model_id,
+            std::env::var(kitty_runtime::client::ENV_NO_THINK)
+                .ok()
+                .as_deref(),
+            std::env::var(ENV_MODEL_TURN_CAPS).ok().as_deref(),
+        )
+    }
+}
 
 /// Env override for per-model turn caps.
 ///
@@ -121,30 +273,48 @@ pub const ENV_MODEL_TURN_CAPS: &str = "KITTY_MODEL_TURN_CAPS";
 ///    construction, so the env read is cheap): first prefix match wins.
 /// 2. Static [`MODEL_TURN_CAPS`] table: first prefix match wins.
 /// 3. `None` — caller keeps the profile default.
+///
+/// F2: this function remains the standalone Tier-4 lookup (used by tests and
+/// external callers); [`ModelTuning::resolve`] composes the same pieces into
+/// the full per-model tuning.
 pub fn turn_cap_for_model(model_id: &str) -> Option<usize> {
-    if let Ok(spec) = std::env::var(ENV_MODEL_TURN_CAPS) {
-        for entry in spec.split(',') {
-            let Some((prefix, cap)) = entry.split_once('=') else {
-                continue;
-            };
-            let prefix = prefix.trim();
-            if prefix.is_empty() {
-                continue;
-            }
-            let Ok(cap) = cap.trim().parse::<usize>() else {
-                continue;
-            };
-            if model_id.starts_with(prefix) {
-                return Some(cap);
-            }
+    turn_cap_from_env_spec(std::env::var(ENV_MODEL_TURN_CAPS).ok().as_deref(), model_id)
+        .or_else(|| turn_cap_static_for(model_id))
+}
+
+/// Pure env-spec half of [`turn_cap_for_model`]: parse a
+/// `KITTY_MODEL_TURN_CAPS`-style spec (`prefix=N,...`) and return the cap of
+/// the first prefix matching `model_id`. Invalid entries are skipped
+/// silently; `spec == None` yields `None`.
+#[must_use]
+pub fn turn_cap_from_env_spec(spec: Option<&str>, model_id: &str) -> Option<usize> {
+    let spec = spec?;
+    for entry in spec.split(',') {
+        let Some((prefix, cap)) = entry.split_once('=') else {
+            continue;
+        };
+        let prefix = prefix.trim();
+        if prefix.is_empty() {
+            continue;
         }
-    }
-    for (prefix, cap) in MODEL_TURN_CAPS {
+        let Ok(cap) = cap.trim().parse::<usize>() else {
+            continue;
+        };
         if model_id.starts_with(prefix) {
-            return Some(*cap);
+            return Some(cap);
         }
     }
     None
+}
+
+/// Static-table half of [`turn_cap_for_model`]: first [`MODEL_TURN_CAPS`]
+/// prefix match, or `None`.
+#[must_use]
+fn turn_cap_static_for(model_id: &str) -> Option<usize> {
+    MODEL_TURN_CAPS
+        .iter()
+        .find(|(prefix, _)| model_id.starts_with(prefix))
+        .map(|(_, cap)| *cap)
 }
 
 /// Crate-wide lock serializing env-mutating unit tests (cargo runs test
@@ -270,12 +440,15 @@ mod tests {
 
     #[test]
     fn turn_cap_env_mixed_valid_and_invalid_entries() {
-        with_env_turn_caps(Some("garbage,qwen3:8b=abc,=42,ornith-1.5= 16 ,qwen3:8b=7"), || {
-            // "garbage" (no '='), "qwen3:8b=abc" (bad number) and "=42"
-            // (empty prefix) are skipped silently; valid entries still apply.
-            assert_eq!(turn_cap_for_model("ornith-1.5-x"), Some(16));
-            assert_eq!(turn_cap_for_model("qwen3:8b"), Some(7));
-        });
+        with_env_turn_caps(
+            Some("garbage,qwen3:8b=abc,=42,ornith-1.5= 16 ,qwen3:8b=7"),
+            || {
+                // "garbage" (no '='), "qwen3:8b=abc" (bad number) and "=42"
+                // (empty prefix) are skipped silently; valid entries still apply.
+                assert_eq!(turn_cap_for_model("ornith-1.5-x"), Some(16));
+                assert_eq!(turn_cap_for_model("qwen3:8b"), Some(7));
+            },
+        );
     }
 
     #[test]
@@ -295,5 +468,83 @@ mod tests {
         with_env_turn_caps(Some("ornith=5,ornith:9b=8"), || {
             assert_eq!(turn_cap_for_model("ornith:9b"), Some(5));
         });
+    }
+
+    // ── F2: per-model tuning resolution ────────────────────────────────
+
+    #[test]
+    fn tuning_resolution_exact_beats_family_beats_default() {
+        // Exact match (via unified Tier-4 caps): ornith:9b keeps its 24-cap
+        // AND the ornith family sampling/thinking policy.
+        let exact = ModelTuning::resolve("ornith:9b", None, None);
+        assert_eq!(exact.max_iterations, 24);
+        assert_eq!(exact.thinking, ThinkingMode::On);
+        assert!((exact.temperature - 0.6).abs() < f32::EPSILON);
+        assert_eq!(exact.top_p, Some(0.95));
+        assert_eq!(exact.num_predict, 8192);
+
+        // Family match (substring, case-insensitive): ornith without an
+        // exact cap entry falls back to the family default 20.
+        let family = ModelTuning::resolve("Ornith-2X-Instruct", None, None);
+        assert_eq!(family.thinking, ThinkingMode::On);
+        assert_eq!(family.max_iterations, 20);
+
+        // qwen family.
+        let qwen = ModelTuning::resolve("qwen3:8b", None, None);
+        assert_eq!(qwen.thinking, ThinkingMode::Budget(2048));
+        assert!((qwen.temperature - 0.3).abs() < f32::EPSILON);
+        assert_eq!(qwen.num_predict, 8192);
+
+        // Unknown model → default profile.
+        let unknown = ModelTuning::resolve("smollm2:1.7b", None, None);
+        assert_eq!(unknown, ModelTuning::default_profile());
+    }
+
+    #[test]
+    fn tuning_no_think_override_wins_over_all_profiles() {
+        for model in ["ornith:9b", "qwen3:8b", "unknown-model"] {
+            let t = ModelTuning::resolve(model, Some("1"), None);
+            assert_eq!(
+                t.thinking,
+                ThinkingMode::Off,
+                "KITTY_NO_THINK must win for {model}"
+            );
+        }
+        // Values other than exactly "1" do NOT override.
+        let kept = ModelTuning::resolve("ornith:9b", Some("0"), None);
+        assert_eq!(kept.thinking, ThinkingMode::On);
+        let kept = ModelTuning::resolve("ornith:9b", Some("yes"), None);
+        assert_eq!(kept.thinking, ThinkingMode::On);
+        let kept = ModelTuning::resolve("qwen3:8b", None, None);
+        assert_ne!(kept.thinking, ThinkingMode::Off);
+    }
+
+    #[test]
+    fn tuning_caps_env_overrides_max_iterations_last() {
+        // Env caps beat even the static exact-match table entry.
+        let t = ModelTuning::resolve("ornith:9b", None, Some("ornith:9b=7"));
+        assert_eq!(t.max_iterations, 7);
+        // Env entries for unrelated models leave the resolved value alone;
+        // invalid entries are skipped silently (bad input tolerated).
+        let t = ModelTuning::resolve("ornith:9b", None, Some("garbage,qwen3=abc,=4"));
+        assert_eq!(t.max_iterations, 24);
+        let t = ModelTuning::resolve("qwen3:8b", None, Some("garbage,qwen3=abc,=4"));
+        assert_eq!(t.max_iterations, 20);
+    }
+
+    #[test]
+    fn tuning_defaults_stay_modest_for_revision_cycles() {
+        // Oracle M5: worst case ≈ max_iterations × 3 LLM calls per prompt
+        // (VERIFY_MAX_REVISIONS = 2 revision cycles re-enter the full loop).
+        // Every resolvable default must stay ≤ 24 so the worst case stays
+        // bounded (~72 calls).
+        for model in ["ornith:9b", "ornith-1.5", "qwen3:8b", "mystery-model"] {
+            let t = ModelTuning::resolve(model, None, None);
+            assert!(
+                t.max_iterations <= 24,
+                "{model} default too high: {}",
+                t.max_iterations
+            );
+        }
     }
 }

@@ -184,6 +184,22 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Run { prompt, no_memory } => {
             let prompt = prompt.join(" ");
+            // F2 KV preflight: the client cannot introspect the Ollama
+            // server's env, so warn (never fail) when a large explicit window
+            // risks OOM on 8GB GPUs without acknowledged KV quantization.
+            let num_ctx = kitty_runtime::client::parse_num_ctx(
+                std::env::var(kitty_runtime::client::ENV_NUM_CTX)
+                    .ok()
+                    .as_deref(),
+            );
+            if let Some(warning) = kitty_runtime::client::kv_cache_preflight_warning(
+                num_ctx,
+                std::env::var(kitty_runtime::client::ENV_KV_QUANT_ACK)
+                    .ok()
+                    .as_deref(),
+            ) {
+                warn!("{}", warning);
+            }
             let memory_db_path = if no_memory {
                 None
             } else {

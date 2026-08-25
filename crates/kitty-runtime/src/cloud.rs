@@ -36,7 +36,7 @@ use tracing::{debug, info, warn};
 use zeroize::Zeroize;
 
 use crate::client::parse_timeout_secs;
-use crate::client::{ChatResponse, ENV_TIMEOUT_SECS, Message, ToolCall, ToolCallFunction};
+use crate::client::{ChatResponse, Message, ToolCall, ToolCallFunction, ENV_TIMEOUT_SECS};
 use crate::error::{Result, RuntimeError};
 use crate::tools::ToolDefinition;
 
@@ -308,7 +308,10 @@ impl CloudClient {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let api_key = SecretString::new(api_key.into());
         let raw = std::env::var(ENV_TIMEOUT_SECS).ok();
-        let timeout = Duration::from_secs(parse_timeout_secs(raw.as_deref(), DEFAULT_CLOUD_TIMEOUT_SECS));
+        let timeout = Duration::from_secs(parse_timeout_secs(
+            raw.as_deref(),
+            DEFAULT_CLOUD_TIMEOUT_SECS,
+        ));
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .build()
@@ -456,6 +459,7 @@ impl CloudClient {
             done: true,
             eval_count: usage.and_then(|u| u.total_tokens),
             eval_duration: None,
+            prompt_eval_count: usage.and_then(|u| u.prompt_tokens),
         })
     }
 }
@@ -603,6 +607,7 @@ mod tests {
             done: true,
             eval_count: None,
             eval_duration: None,
+            prompt_eval_count: None,
         }
     }
 
@@ -624,6 +629,7 @@ mod tests {
             done: true,
             eval_count: Some(42),
             eval_duration: None,
+            prompt_eval_count: None,
         }
     }
 
@@ -670,10 +676,7 @@ mod tests {
     fn cloud_timeout_default_flows_through_parse_fn() {
         // The constructor's env read reduces to this pure call; asserting it
         // here pins CloudClient's 120s default without process-env mutation.
-        assert_eq!(
-            parse_timeout_secs(None, DEFAULT_CLOUD_TIMEOUT_SECS),
-            120
-        );
+        assert_eq!(parse_timeout_secs(None, DEFAULT_CLOUD_TIMEOUT_SECS), 120);
         assert_eq!(
             parse_timeout_secs(Some("900"), DEFAULT_CLOUD_TIMEOUT_SECS),
             900

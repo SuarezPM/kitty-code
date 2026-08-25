@@ -16,7 +16,7 @@ use crate::bootstrap::Bootstrap;
 use crate::context::{ContextBudget, ContextError};
 use crate::contract::{contract_guard_enabled, looks_like_done_claim, Contract};
 use crate::knowledge::{KnowledgeBase, KnowledgeConfig};
-use crate::model_profile::ModelProfile;
+use crate::model_profile::{ModelProfile, ModelTuning, ThinkingMode};
 use crate::parser::{ParsedToolCall, ToolCallParser};
 use crate::quality_monitor::{QualityConfig, QualityMonitor, QualityViolation};
 use crate::router::{tools_for_category, ToolRouter};
@@ -68,6 +68,11 @@ pub struct AgentConfig {
     pub bash_timeout_secs: u64,
     /// Model profile preset (tiny|medium|large). Determines defaults for context, thinking, caps, etc.
     pub profile: &'static ModelProfile,
+    /// Per-model inference settings (F2): sampling, thinking mode, and the
+    /// unified per-model iteration cap. Resolved from the model id in
+    /// [`Agent::new`] (exact → family → default); post-construction
+    /// `config_mut()` overrides still win.
+    pub tuning: ModelTuning,
     /// Whether to use 2-stage tool routing (router ready but gated behind this flag).
     pub use_routing: bool,
     /// Whether grammar-constrained decoding is enabled (tiny profile / spike).
@@ -90,6 +95,7 @@ impl Default for AgentConfig {
             memory_db_path: None,
             bash_timeout_secs: 60,
             profile: ModelProfile::medium(),
+            tuning: ModelTuning::default(),
             use_routing: false,
             enable_grammar: false,
         }
@@ -271,12 +277,14 @@ impl Agent {
             config.bash_timeout_secs = p.bash_timeout_secs;
             config.compact_threshold = p.compact_threshold;
         }
-        // Tier 4: per-model-id iteration cap overrides the profile default
-        // (env-tunable via KITTY_MODEL_TURN_CAPS, static table otherwise).
-        // Post-construction `config_mut()` overrides still win: they run later.
-        if let Some(cap) = crate::model_profile::turn_cap_for_model(&config.model) {
-            config.max_iterations = cap;
-        }
+        // F2: per-model inference settings — sampling, thinking mode, and the
+        // UNIFIED iteration cap (absorbs the former standalone Tier-4
+        // turn-cap override; env KITTY_MODEL_TURN_CAPS + KITTY_NO_THINK apply
+        // inside the resolver). Post-construction `config_mut()` overrides
+        // still win: they run later.
+        let tuning = ModelTuning::resolve_from_env(&config.model);
+        config.tuning = tuning;
+        config.max_iterations = config.tuning.max_iterations;
         // Filter tools by profile subset (tiny → 4 tools, medium/large → 6)
         let tools: Vec<ToolDefinition> = {
             let subset = config.profile.tool_subset;
@@ -307,8 +315,17 @@ impl Agent {
         let mut budget = ContextBudget::new(config.context_window);
         budget.set_threshold(config.compact_threshold);
         let tool_names: Vec<String> = tools.iter().map(|t| t.function.name.clone()).collect();
+        // F2: per-turn thinking policy comes from the resolved model profile.
+        // Budget(n) seeds the FASE D cap (exceeding it retries once without
+        // thinking); On stays UNCAPPED — a reasoning-trained model must never
+        // be forced off mid-session by a budget trip; Off is enforced on the
+        // wire via `"think": false` in request_options (no cap needed).
+        let per_turn_thinking_cap = match config.tuning.thinking {
+            ThinkingMode::Budget(n) => Some(n as usize),
+            ThinkingMode::On | ThinkingMode::Off => None,
+        };
         let thinking_budget = ThinkingBudget::new(
-            config.max_thinking_tokens,
+            per_turn_thinking_cap,
             None, // No session cap by default
         );
         let quality_monitor = QualityMonitor::new(config.quality_config.clone(), tool_names);
@@ -444,7 +461,14 @@ impl Agent {
         // VERIFY_MAX_REVISIONS cycles). See `verify_workspace`.
         let mut revision_cycles: usize = 0;
         'verify: loop {
-            // Main loop: iterate until we get a text response
+            // Bounded tool loop: EVERY iteration processes the response — tool
+            // calls are executed and fed back, text responses still consume an
+            // iteration (the loop never breaks on text; it runs to
+            // `max_iterations`). Only when the budget is EXHAUSTED does
+            // `force_response` below extract a final answer with a single
+            // no-tools call. The outer `'verify` cycle may then re-enter this
+            // full loop up to VERIFY_MAX_REVISIONS times, multiplying the
+            // worst-case LLM-call count per prompt (see ModelTuning docs).
             for iteration in 0..self.config.max_iterations {
                 debug!(iteration, "Agent loop iteration");
 
@@ -1007,7 +1031,11 @@ impl Agent {
             },
         );
 
-        let options = Some(self.request_options(&messages));
+        let mut options = self.request_options(&messages);
+        // F2.6 hard guarantee: the retry must not think again, regardless of
+        // model-id/env heuristics — force `"think": false` on this request.
+        options.think = Some(false);
+        let options = Some(options);
         self.client
             .chat_with_options(
                 &self.config.model,
@@ -1019,17 +1047,32 @@ impl Agent {
             .context("Retry LLM call without thinking failed")
     }
 
-    /// E3 dynamic max-output cap: request only as much output as still fits
-    /// the context window (`context_limit − estimated_input − 1024`, floor
-    /// 256), preventing the "requested 8192 output but prompt 24577" failure
-    /// class on small local models. Input estimated conservatively at
-    /// chars/4 via [`kitty_runtime::client::estimate_input_tokens`].
+    /// E3 dynamic max-output cap + F2 per-model sampling/thinking:
+    /// request only as much output as still fits the context window
+    /// (`context_limit − estimated_input − 1024`, floor 256), never more than
+    /// the profile's `num_predict`; sampling parameters and the thinking
+    /// override come from the resolved per-model tuning. Input estimated
+    /// conservatively at chars/4 via
+    /// [`kitty_runtime::client::estimate_input_tokens`]. The session-fixed
+    /// `num_ctx` is injected by [`kitty_runtime::OllamaClient`] itself.
     fn request_options(&self, messages: &[Message]) -> kitty_runtime::client::RequestOptions {
         let est = kitty_runtime::client::estimate_input_tokens(messages);
-        let num_predict =
-            kitty_runtime::client::dynamic_max_output(self.config.context_window, est);
+        let dynamic = i64::from(kitty_runtime::client::dynamic_max_output(
+            self.config.context_window,
+            est,
+        ));
+        let num_predict = i32::try_from(dynamic.min(i64::from(self.config.tuning.num_predict)))
+            .unwrap_or(kitty_runtime::client::MIN_OUTPUT_TOKENS);
         kitty_runtime::client::RequestOptions {
             num_predict: Some(num_predict),
+            temperature: Some(self.config.tuning.temperature),
+            top_p: self.config.tuning.top_p,
+            top_k: self.config.tuning.top_k.map(|k| k as i32),
+            think: if self.config.tuning.thinking == ThinkingMode::Off {
+                Some(false)
+            } else {
+                None
+            },
             ..Default::default()
         }
     }
@@ -1505,6 +1548,7 @@ mod tests {
             done: true,
             eval_count: None,
             eval_duration: None,
+            prompt_eval_count: None,
         }
     }
 
@@ -1527,6 +1571,7 @@ mod tests {
             done: true,
             eval_count: None,
             eval_duration: None,
+            prompt_eval_count: None,
         }
     }
 
