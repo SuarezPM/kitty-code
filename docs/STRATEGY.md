@@ -202,7 +202,7 @@ protocolo pre-registrado (`benches/ab/README.md`) y se publicarán vía
 | Fuzzy edit ladder + guard de match desproporcionado | **DONE** (código; sin medir) | `9bac5c0`, `baa286e` |
 | Parser salvage P8/P13-P15 + tool aliases | **DONE** (código; sin medir) | `d80bc95` |
 | Normalización upstream de tool calls + ladder bounds + dedup semantics | **DONE** (código; sin medir) | `baa286e` |
-| Medición A/B pre-registrada de las palancas | **PENDIENTE** — runbook listo en `benches/ab/`, no ejecutado | — |
+| Medición A/B bajo el harness nuevo (selección de modelo) | **PENDIENTE** — runbook listo en `benches/ab/`, no ejecutado; el par mide modelo-vs-modelo bajo el harness nuevo, NO una ablación por palanca (num_ctx 32768 + truncate:false son inyectados incondicionalmente; la ack KV es solo warning; ladder/parser no tienen toggles) | — |
 
 North-star targets, exactamente como publicados (sin cambios): little-coder
 **45.56%** Aider Polyglot (Qwen3.5-9B Q4_K_M, num_ctx 32768, temp 0.3) ·

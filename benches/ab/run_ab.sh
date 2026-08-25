@@ -57,16 +57,17 @@ cat > "$MANIFEST" <<EOF
   "profile": "$PROFILE",
   "interleave": true,
   "valid_run_gate": "errored trials <= 10% of N per arm; no early cuts",
+  "env_baseline": "both arms launched from one normalized prefix; stripped: KITTY_NUM_CTX, KITTY_KV_QUANT_ACK, KITTY_MODEL_TURN_CAPS, KITTY_NO_THINK, KITTY_LINT_GATE, KITTY_EDIT_CHECK",
   "arm_a": {
     "model": "$MODEL_A",
-    "levers": "none (no KITTY_NUM_CTX / no turn-cap overrides)"
+    "levers": "none — normalized baseline only"
   },
   "arm_b": {
     "model": "$MODEL_B",
     "levers": {
       "KITTY_NUM_CTX": "${ARM_B_NUM_CTX:-32768}",
       "KITTY_KV_QUANT_ACK": "${ARM_B_KV_ACK:-q8_0}",
-      "note": "explicit context window + acknowledged KV quantization plan; sampling/thinking come from per-model profiles"
+      "note": "same normalized baseline + these declared levers layered on top"
     }
   }
 }
@@ -76,18 +77,25 @@ echo "pre-registration manifest: $MANIFEST"
 OUT_A="benches/ab/results/${TS}-armA.json"
 OUT_B="benches/ab/results/${TS}-armB.json"
 
+# ── Symmetric normalized env baseline (G4-FIX2) ─────────────────────────────
+# BOTH arms launch from this exact prefix so ambient operator env can never
+# leak into one arm and not the other (the manifest's "levers" claim must be
+# true). Stripped set: every harness lever env var.
+CLEAN_ENV=(env -u KITTY_NUM_CTX -u KITTY_KV_QUANT_ACK -u KITTY_MODEL_TURN_CAPS -u KITTY_NO_THINK -u KITTY_LINT_GATE -u KITTY_EDIT_CHECK)
+
 # NOTE: `--model` is a TOP-LEVEL argument and must precede the subcommand.
 
-echo "=== ARM A: $MODEL_A (baseline, levers off) ==="
-env -u KITTY_NUM_CTX -u KITTY_KV_QUANT_ACK -u KITTY_MODEL_TURN_CAPS \
+echo "=== ARM A: $MODEL_A (normalized baseline, declared levers: none) ==="
+"${CLEAN_ENV[@]}" \
     "$BIN" --model "$MODEL_A" bench-ab \
     --thinking "$THINKING" -l "$N" --suite "$SUITE" \
     --profile "$PROFILE" --interleave \
     -o "$OUT_A"
 
-echo "=== ARM B: $MODEL_B (new levers on) ==="
-KITTY_NUM_CTX="${ARM_B_NUM_CTX:-32768}" \
-KITTY_KV_QUANT_ACK="${ARM_B_KV_ACK:-q8_0}" \
+echo "=== ARM B: $MODEL_B (same normalized baseline + declared levers on top) ==="
+"${CLEAN_ENV[@]}" \
+    KITTY_NUM_CTX="${ARM_B_NUM_CTX:-32768}" \
+    KITTY_KV_QUANT_ACK="${ARM_B_KV_ACK:-q8_0}" \
     "$BIN" --model "$MODEL_B" bench-ab \
     --thinking "$THINKING" -l "$N" --suite "$SUITE" \
     --profile "$PROFILE" --interleave \

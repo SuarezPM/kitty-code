@@ -540,24 +540,7 @@ async fn main() -> Result<()> {
 
             let mut per_budget_out = Vec::new();
             for budget in &budgets_sorted {
-                let results = &per_budget[budget];
-                let passed = results.iter().filter(|r| r.passed).count();
-                let total = results.len();
-                let rate = if total > 0 {
-                    100.0 * passed as f64 / total as f64
-                } else {
-                    0.0
-                };
-                let (lo, hi) = wilson_ci(passed, total);
-                let p50 = p50_ms(results.iter().map(|r| r.latency_ms).collect());
-                per_budget_out.push(serde_json::json!({
-                    "budget": budget,
-                    "passed": passed,
-                    "total": total,
-                    "rate": rate,
-                    "wilson_ci": [lo, hi],
-                    "p50_ms": p50,
-                }));
+                per_budget_out.push(budget_summary(*budget, &per_budget[budget]));
             }
 
             let mut pairwise = Vec::new();
@@ -1190,6 +1173,39 @@ fn build_ab_plan(
     plan
 }
 
+/// Aggregate one budget arm's results into its `per_budget` JSON entry
+/// (G4-FIX1: the runbook's central errored-trials gate needs serialized
+/// error counts, which the output previously lacked).
+///
+/// Verdict policy, documented: `"error"` and `"timeout"` are counted in
+/// SEPARATE keys — `errored` (in-run failures) vs `timed_out` (task-level
+/// harness-limit outcomes, a different failure class). The README gate
+/// applies to `errored`; consumers apply their own timeout policy. All
+/// pre-existing fields are preserved untouched for backward compatibility.
+fn budget_summary(budget: usize, results: &[BenchResult]) -> serde_json::Value {
+    let passed = results.iter().filter(|r| r.passed).count();
+    let total = results.len();
+    let rate = if total > 0 {
+        100.0 * passed as f64 / total as f64
+    } else {
+        0.0
+    };
+    let (lo, hi) = wilson_ci(passed, total);
+    let p50 = p50_ms(results.iter().map(|r| r.latency_ms).collect());
+    let errored = results.iter().filter(|r| r.verdict == "error").count();
+    let timed_out = results.iter().filter(|r| r.verdict == "timeout").count();
+    serde_json::json!({
+        "budget": budget,
+        "passed": passed,
+        "total": total,
+        "rate": rate,
+        "wilson_ci": [lo, hi],
+        "p50_ms": p50,
+        "errored": errored,
+        "timed_out": timed_out,
+    })
+}
+
 fn wilson_ci(passed: usize, total: usize) -> (f64, f64) {
     if total == 0 {
         return (0.0, 0.0);
@@ -1266,6 +1282,49 @@ mod bench_ab_tests {
             t4096.0 < 0.5 && t4096.1 > 0.5,
             "wilson ci should surround p=0.5"
         );
+    }
+
+    /// G4-FIX1: mixed-verdict results must serialize `errored` and
+    /// `timed_out` counts per budget (the runbook gate reads these), with
+    /// all pre-existing fields preserved untouched.
+    #[test]
+    fn budget_summary_serializes_errored_and_timed_out_counts() {
+        fn mk(id: &str, passed: bool, verdict: &str) -> super::BenchResult {
+            super::BenchResult {
+                id: id.into(),
+                lang: "python".into(),
+                passed,
+                verdict: verdict.into(),
+                latency_ms: 100.0,
+            }
+        }
+        // Mixed fixture: 2 pass + 1 fail + 2 error + 1 timeout.
+        let results = vec![
+            mk("a", true, "pass"),
+            mk("b", true, "pass"),
+            mk("c", false, "fail"),
+            mk("d", false, "error"),
+            mk("e", false, "error"),
+            mk("f", false, "timeout"),
+        ];
+        let entry = super::budget_summary(2048, &results);
+
+        // New counters: error and timeout counted SEPARATELY.
+        assert_eq!(entry["errored"], serde_json::json!(2));
+        assert_eq!(entry["timed_out"], serde_json::json!(1));
+
+        // Backward compatibility: existing fields untouched.
+        assert_eq!(entry["budget"], serde_json::json!(2048));
+        assert_eq!(entry["passed"], serde_json::json!(2));
+        assert_eq!(entry["total"], serde_json::json!(6));
+        assert!((entry["rate"].as_f64().unwrap() - 100.0 * 2.0 / 6.0).abs() < 1e-9);
+        assert!(entry.get("wilson_ci").is_some());
+        assert!(entry.get("p50_ms").is_some());
+
+        // Empty arm: counters are zero, not absent.
+        let empty = super::budget_summary(1024, &[]);
+        assert_eq!(empty["errored"], serde_json::json!(0));
+        assert_eq!(empty["timed_out"], serde_json::json!(0));
     }
 }
 

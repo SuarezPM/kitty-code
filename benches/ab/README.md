@@ -24,9 +24,12 @@ anywhere until it follows the rules below.
 
 ## 2. What counts as a valid run
 
-* **Errored-trials gate:** errored trials must be ≤10% of N per arm
-  (checked from the result JSON's top-level stats — harbor/bench drivers can
-  exit 0 while trials error; parse the counters, not the exit code).
+* **Errored-trials gate:** errored trials must be ≤10% of N per arm,
+  read from the serialized `per_budget[].errored` counter in the result
+  JSON (bench-ab serializes verdict counts per budget; `errored` counts
+  verdict `"error"`, and task-level timeouts are reported separately under
+  `timed_out` — apply your own timeout policy, the gate itself reads
+  `errored`). Parse the counters, not the driver's exit code.
 * No early-cut: `finished_at` present / driver completed; aborted runs are
   `_partialN`, directional-only, and never comparable to completed arms.
 * Manifest exists, predates the results file, and its HEAD sha matches a
@@ -38,6 +41,18 @@ anywhere until it follows the rules below.
 Provisional numbers NEVER go to validation, docs (`docs/AUDIT.md`,
 `CNAS.md`), or any claim without this protocol having been followed
 end-to-end.
+
+### Sizing N against the gate
+
+The gate makes N a design decision, not a convenience: with N=15 the ≤10%
+gate allows at most ONE errored trial per arm, so against configs that
+historically error around ~20% most attempts are void by construction.
+Pick N so expected errors sit under the gate with margin: if pilot error
+rate is p≈0.2, you need floor(0.1·N) comfortably above p·N's lower range —
+as a rule of thumb **N≥30 for p≈20%**. And state it explicitly: **a model
+erroring >10% under this protocol is a FINDING** (unmeasurable under
+current harness quality), not a failure to retry — record it as such
+instead of re-rolling N until the gate passes.
 
 ## 3. Where things land
 
@@ -75,6 +90,14 @@ kitty-cli --model "$MODEL" bench-ab \
 
 (`bench-ab` flags: `--thinking`, `-l/--limit`, `--reps`, `--suite`,
 `-o/--out`, `--interleave`; there is no per-subcommand model flag.)
+
+**Honest attribution:** this pair is a MODEL-vs-MODEL comparison under the
+new harness, NOT a per-lever ablation. Arm A also runs with the client's
+unconditional defaults — `num_ctx=32768` and `"truncate": false` are
+injected by OllamaClient on every request regardless of arm — the KV ack is
+warning-only, and the ladder/parser levers have no env toggles at all. The
+only declared deltas between arms are the model id and arm B's explicit
+`KITTY_NUM_CTX`/ack layering on top of the shared normalized baseline.
 
 ## 5. Server-side prerequisites checklist (host, NOT settable via API)
 
