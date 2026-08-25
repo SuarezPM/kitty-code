@@ -148,23 +148,28 @@ impl ToolRegistry {
 
     /// Execute a parsed tool call.
     pub async fn execute(&mut self, tc: &ParsedToolCall) -> Result<ToolResult, ToolError> {
-        let result = match tc.name.as_str() {
-            "Read" => self.execute_read(&tc.arguments)?,
-            "Edit" => self.execute_edit(&tc.arguments)?,
-            "Write" => self.execute_write(&tc.arguments)?,
-            "Bash" => self.execute_bash(&tc.arguments).await?,
-            "Glob" => self.execute_glob(&tc.arguments)?,
-            "Grep" => self.execute_grep(&tc.arguments)?,
+        // Alias normalization: weaker models emit near-miss tool names and
+        // argument keys; both fold onto the canonical forms at this single
+        // choke point shared by the agent loop and the MCP server. Unknown
+        // names pass through untouched so existing diagnostics still apply.
+        let call = normalize_tool_call(tc);
+        let result = match call.name.as_str() {
+            "Read" => self.execute_read(&call.arguments)?,
+            "Edit" => self.execute_edit(&call.arguments)?,
+            "Write" => self.execute_write(&call.arguments)?,
+            "Bash" => self.execute_bash(&call.arguments).await?,
+            "Glob" => self.execute_glob(&call.arguments)?,
+            "Grep" => self.execute_grep(&call.arguments)?,
             other => return Err(ToolError::NotFound(other.to_string())),
         };
         if result.success {
-            match tc.name.as_str() {
+            match call.name.as_str() {
                 "Edit" | "Write" => self.file_modifications += 1,
                 "Bash" => {
                     // A successful shell command counts as a file modification
                     // only when Guard's write-target analysis saw one (redirects,
                     // tee, dd, sed -i …). Read-only commands stay neutral.
-                    if let Some(cmd) = tc.arguments.get("command").and_then(|v| v.as_str()) {
+                    if let Some(cmd) = call.arguments.get("command").and_then(|v| v.as_str()) {
                         if !crate::guard::detect_write_targets(cmd).is_empty() {
                             self.file_modifications += 1;
                         }
@@ -917,6 +922,90 @@ impl ToolRegistry {
     pub fn is_file_read(&self, path: &Path) -> bool {
         self.read_files.contains(path)
     }
+}
+
+/// Canonical tool names served by [`ToolRegistry`].
+const REAL_TOOLS: [&str; 6] = ["Read", "Edit", "Write", "Bash", "Glob", "Grep"];
+
+/// Common hallucinated synonyms mapped onto the real tools. Never consulted
+/// before the exact/case-insensitive real-name check, so a synonym can never
+/// shadow a canonical tool name.
+const TOOL_SYNONYMS: &[(&str, &str)] = &[
+    // str_replace-style editors → Edit
+    ("str_replace", "Edit"),
+    ("str_replace_editor", "Edit"),
+    ("str_replace_based_edit_tool", "Edit"),
+    ("edit_file", "Edit"),
+    // file viewers → Read
+    ("view", "Read"),
+    ("read_file", "Read"),
+    ("cat", "Read"),
+    // file creators → Write
+    ("write_file", "Write"),
+    ("create_file", "Write"),
+    // shell aliases → Bash
+    ("shell", "Bash"),
+    ("terminal", "Bash"),
+    ("run_command", "Bash"),
+    // directory listings / glob-style names → Glob
+    ("find", "Glob"),
+    ("ls", "Glob"),
+    ("list_files", "Glob"),
+    ("list_dir", "Glob"),
+    // search synonyms → Grep
+    ("search", "Grep"),
+    ("search_files", "Grep"),
+];
+
+/// Argument-key aliases folded onto the canonical keys, applied ONLY when the
+/// canonical key is absent from the arguments object.
+const ARG_KEY_ALIASES: &[(&str, &str)] = &[
+    ("file_path", "path"),
+    ("filepath", "path"),
+    ("file", "path"),
+    ("cmd", "command"),
+    ("query", "pattern"),
+    ("old_str", "old_string"),
+    ("old_text", "old_string"),
+    ("new_str", "new_string"),
+    ("new_text", "new_string"),
+];
+
+/// Fold one incoming call onto canonical tool/argument naming.
+fn normalize_tool_call(tc: &ParsedToolCall) -> ParsedToolCall {
+    ParsedToolCall {
+        name: normalize_tool_name(&tc.name),
+        arguments: rekey_arg_aliases(tc.arguments.clone()),
+    }
+}
+
+/// Resolve `name` onto the canonical casing of a real tool (case-insensitive)
+/// or a known hallucinated synonym; unknown names pass through unchanged.
+fn normalize_tool_name(name: &str) -> String {
+    if let Some(real) = REAL_TOOLS.iter().find(|t| t.eq_ignore_ascii_case(name)) {
+        return (*real).to_string();
+    }
+    if let Some((_, real)) = TOOL_SYNONYMS
+        .iter()
+        .find(|(s, _)| s.eq_ignore_ascii_case(name))
+    {
+        return (*real).to_string();
+    }
+    name.to_string()
+}
+
+/// Re-key aliased argument names onto canonical ones; an alias is only moved
+/// when the canonical key is absent, and consumed aliases are removed.
+fn rekey_arg_aliases(args: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(mut map) = args else {
+        return args;
+    };
+    for (alias, canonical) in ARG_KEY_ALIASES {
+        if let Some(value) = map.remove(*alias) {
+            map.entry((*canonical).to_string()).or_insert(value);
+        }
+    }
+    serde_json::Value::Object(map)
 }
 
 /// Whether per-edit syntax checks are enabled (`KITTY_EDIT_CHECK=1`).
@@ -2030,6 +2119,88 @@ mod tests {
             ctl.output
         );
         assert_eq!(std::fs::read(&victim).unwrap(), b"payload");
+    }
+
+    // ---- Tool alias normalization (dispatch-time) ----
+
+    #[tokio::test]
+    async fn alias_synonym_name_dispatches_to_real_tool() {
+        // "str_replace" is not a real tool; it must dispatch to Edit.
+        let f = temp_file("alpha\nbeta");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let tc = ParsedToolCall {
+            name: "str_replace".to_string(),
+            arguments: serde_json::json!({
+                "path": f.path().to_str().unwrap(),
+                "old_string": "beta",
+                "new_string": "BETA"
+            }),
+        };
+        let result = registry.execute(&tc).await.unwrap();
+        assert!(result.success, "got: {}", result.output);
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "alpha\nBETA");
+    }
+
+    #[tokio::test]
+    async fn alias_arg_rekey_maps_onto_canonical_keys() {
+        // file_path → path, cmd → command (only when canonical absent).
+        let f = temp_file("content");
+        let mut registry = ToolRegistry::new();
+        let tc = ParsedToolCall {
+            name: "Read".to_string(),
+            arguments: serde_json::json!({"file_path": f.path().to_str().unwrap()}),
+        };
+        let result = registry.execute(&tc).await.unwrap();
+        assert!(result.success, "file_path alias must satisfy Read's `path`");
+
+        let normalized = normalize_tool_call(&ParsedToolCall {
+            name: "Bash".to_string(),
+            arguments: serde_json::json!({"cmd": "echo hi", "extra": 1}),
+        });
+        assert_eq!(normalized.arguments["command"], "echo hi");
+        assert!(normalized.arguments.get("cmd").is_none());
+        assert_eq!(normalized.arguments["extra"], 1);
+    }
+
+    #[test]
+    fn alias_canonical_key_wins_over_alias() {
+        // When the canonical key is already present, the alias is dropped
+        // and the canonical value is kept.
+        let normalized = normalize_tool_call(&ParsedToolCall {
+            name: "Read".to_string(),
+            arguments: serde_json::json!({"path": "real.txt", "file_path": "fake.txt"}),
+        });
+        assert_eq!(normalized.arguments["path"], "real.txt");
+        assert!(normalized.arguments.get("file_path").is_none());
+    }
+
+    #[test]
+    fn alias_real_names_pass_through_with_canonical_casing() {
+        // Case-insensitive resolution onto canonical casing...
+        assert_eq!(normalize_tool_name("read"), "Read");
+        assert_eq!(normalize_tool_name("BASH"), "Bash");
+        assert_eq!(normalize_tool_name("Glob"), "Glob");
+        // ...and a synonym table entry can never shadow a real name.
+        assert_eq!(normalize_tool_name("Edit"), "Edit");
+    }
+
+    #[tokio::test]
+    async fn alias_unknown_names_pass_through_unchanged() {
+        let mut registry = ToolRegistry::new();
+        let tc = ParsedToolCall {
+            name: "TotallyMadeUp".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let err = registry.execute(&tc).await.unwrap_err();
+        match err {
+            ToolError::NotFound(name) => {
+                assert_eq!(name, "TotallyMadeUp", "unknown names must pass through");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     // ---- Edit str_replace mode (aider-compatible) ----

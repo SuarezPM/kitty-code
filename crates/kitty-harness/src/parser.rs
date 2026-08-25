@@ -26,6 +26,12 @@ use std::borrow::Cow;
 use serde_json::Value;
 
 /// A parsed tool call with name and arguments.
+///
+/// Salvage convention: when a call's arguments payload cannot be parsed as a
+/// JSON object, the call is retained with `arguments` set to
+/// `{"_raw": "<best-effort body>"}` instead of being dropped outright.
+/// `_raw`-only arguments count as empty for [`is_empty_arguments`], so the
+/// downstream empty-args recovery layer can still attach real arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedToolCall {
     pub name: String,
@@ -238,6 +244,21 @@ impl ToolCallParser {
             call.name = self.canonical_tool_name(&call.name);
         }
 
+        // Collapse exact duplicates introduced by overlapping syntax layers
+        // (a bare `<tool_call>` block matches both the asymmetric layer and
+        // the XML layer — dispatching it twice would be pure harm). First
+        // occurrence wins; order is preserved.
+        let mut unique: Vec<ParsedToolCall> = Vec::with_capacity(results.len());
+        for call in results {
+            if !unique
+                .iter()
+                .any(|s| s.name == call.name && s.arguments == call.arguments)
+            {
+                unique.push(call);
+            }
+        }
+        results = unique;
+
         results
     }
 
@@ -396,17 +417,26 @@ impl ToolCallParser {
         Some(content[inner_start..inner_start + end].trim())
     }
 
-    /// Parse the asymmetric Gemma 4 opener `<|tool_call>` (no trailing pipe).
-    /// The payload may be a JSON envelope or the inline-name form `NAME{json}`;
-    /// closers seen in the wild: `<tool_call|>`, `<|end_tool_call|>`,
-    /// `</tool_call>`.
+    /// Parse asymmetric Gemma tool-call blocks across the opener variants
+    /// seen in the wild — `<|tool_call>` (no trailing pipe), the symmetric
+    /// `<|tool_call|>`, and bare `<tool_call>` — each combinable with any of
+    /// the closers `<tool_call|>`, `<|end_tool_call|>`, `</tool_call>`. The
+    /// payload may be a JSON envelope or the inline-name form `NAME{json}`.
     fn parse_asymmetric_tool_calls(&self, content: &str) -> Vec<ParsedToolCall> {
-        const OPENER: &str = "<|tool_call>";
+        const OPENERS: [&str; 3] = ["<|tool_call>", "<|tool_call|>", "<tool_call>"];
         const CLOSERS: [&str; 3] = ["<tool_call|>", "<|end_tool_call|>", "</tool_call>"];
-        self.parse_delimited_calls_with(content, OPENER, &CLOSERS, |payload| {
-            self.parse_tool_call_json(payload)
-                .or_else(|| self.parse_inline_name_payload(payload))
-        })
+        let mut results = Vec::new();
+        // Opener variants are mutually non-overlapping strings, so a span
+        // matched by one can never be re-matched by another — union is safe.
+        for opener in OPENERS {
+            results.extend(
+                self.parse_delimited_calls_with(content, opener, &CLOSERS, |payload| {
+                    self.parse_tool_call_json(payload)
+                        .or_else(|| self.parse_inline_name_payload(payload))
+                }),
+            );
+        }
+        results
     }
 
     /// Parse the inline-name payload form `NAME{json}` (Gemma 4): the trimmed
@@ -482,47 +512,64 @@ impl ToolCallParser {
     /// Handles: {"name":"...","arguments":{...}}, {"function":{"name":...}},
     /// and {"tool":"...","parameters":{...}}.
     ///
-    /// Falls back to [`repair_json`] when strict parsing fails. A missing
-    /// `arguments` field yields an empty object so the empty-args recovery
-    /// layer can fill it in later.
+    /// Falls back to [`repair_json`] when strict parsing fails. When even
+    /// repair cannot parse the body, a recoverable tool name is salvaged and
+    /// the call is retained with its best-effort body as `_raw` (see
+    /// [`ParsedToolCall`]) instead of being dropped. A missing arguments
+    /// field yields an empty object so the empty-args recovery layer can
+    /// fill it in later.
     fn parse_tool_call_json(&self, json_str: &str) -> Option<ParsedToolCall> {
         if let Some(val) = parse_lenient_value(json_str) {
             return self.tool_call_from_value(&val);
         }
-        None
+        // Embedded-object tolerance: a balanced JSON object inside otherwise
+        // noisy payload text (e.g. an unrecognized closer tag after it)
+        // parses from its own span before anything else is tried. The
+        // earliest-starting span is the OUTERMOST object.
+        if let Some(&(s, e)) = balanced_spans(json_str, '{', '}')
+            .iter()
+            .min_by_key(|&&(s, _)| s)
+        {
+            if let Some(val) = parse_lenient_value(&json_str[s..=e]) {
+                if let Some(tc) = self.tool_call_from_value(&val) {
+                    return Some(tc);
+                }
+            }
+        }
+        // Salvage: the JSON could not be parsed even after repair. If a tool
+        // name is still recoverable, retain the call with its best-effort
+        // body as `_raw` instead of dropping it outright (empty arguments
+        // let downstream recovery layers fill them in).
+        let name = salvage_name_from_body(json_str)?;
+        Some(ParsedToolCall {
+            name,
+            arguments: serde_json::json!({ "_raw": json_str.trim() }),
+        })
     }
 
     /// Detect tool-call shapes in an already-parsed JSON value.
+    ///
+    /// Arguments are read through the alias chain `arguments` → `parameters`
+    /// → `args`. A non-object payload is retained as an `_raw` string on the
+    /// call rather than poisoning dispatch with unusable arguments.
     fn tool_call_from_value(&self, val: &Value) -> Option<ParsedToolCall> {
         // Format 1: {"name": "tool_name", "arguments": {...}}
         if let Some(name) = val.get("name").and_then(Value::as_str) {
-            let args = val.get("arguments").cloned().unwrap_or_else(empty_object);
-            return Some(ParsedToolCall {
-                name: name.to_string(),
-                arguments: args,
-            });
+            return Some(finish_call(name, args_field(val)));
         }
 
         // Format 2: {"function": {"name": "tool_name", "arguments": {...}}}
         if let Some(func) = val.get("function") {
             if let Some(name) = func.get("name").and_then(Value::as_str) {
-                let args = func.get("arguments").cloned().unwrap_or_else(empty_object);
-                return Some(ParsedToolCall {
-                    name: name.to_string(),
-                    arguments: args,
-                });
+                return Some(finish_call(name, args_field(func)));
             }
         }
 
         // Format 3: {"tool": "name", "parameters": {...}}
-        if let (Some(name), Some(params)) = (
-            val.get("tool").and_then(Value::as_str),
-            val.get("parameters"),
-        ) {
-            return Some(ParsedToolCall {
-                name: name.to_string(),
-                arguments: params.clone(),
-            });
+        if let Some(name) = val.get("tool").and_then(Value::as_str) {
+            if let Some(args) = args_field(val) {
+                return Some(finish_call(name, Some(args)));
+            }
         }
 
         None
@@ -539,8 +586,7 @@ impl ToolCallParser {
 
         let (pos, tool) = self.find_tool_mention(content)?;
 
-        let w_start =
-            floor_char_boundary(content, pos.saturating_sub(RECOVERY_WINDOW_HALF_BYTES));
+        let w_start = floor_char_boundary(content, pos.saturating_sub(RECOVERY_WINDOW_HALF_BYTES));
         let w_end = ceil_char_boundary(
             content,
             (pos + tool.len() + RECOVERY_WINDOW_HALF_BYTES).min(content.len()),
@@ -587,6 +633,39 @@ impl ToolCallParser {
             }
         }
 
+        // Salvage chain: structured fragment forms scoped to the same
+        // window — channel-tagged targets, loose `call:NAME{json}`, then an
+        // inline `NAME{json}` starting right at a mention of the tool.
+        if let Some(call) = self
+            .parse_channel_tagged_forms(window)
+            .into_iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&tool))
+        {
+            return Some(call);
+        }
+        if let Some(call) = self
+            .parse_loose_call_forms(window)
+            .into_iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&tool))
+        {
+            return Some(call);
+        }
+        let mut scan = mention_off;
+        while let Some(rel) = find_word_bounded(&window[scan..], &tool) {
+            let start = scan + rel;
+            if let Some(call) = self.parse_inline_name_payload(&window[start..]) {
+                if !is_empty_arguments(&call.arguments) {
+                    return Some(call);
+                }
+            }
+            // `tool` is ASCII, so this advance stays on a char boundary and
+            // always makes progress.
+            scan = start + tool.len();
+            if scan >= window.len() {
+                break;
+            }
+        }
+
         None
     }
 
@@ -610,7 +689,11 @@ impl ToolCallParser {
         if self.known_tools.iter().any(|t| t == name) {
             return name.to_string();
         }
-        if let Some(exact) = self.known_tools.iter().find(|t| t.eq_ignore_ascii_case(name)) {
+        if let Some(exact) = self
+            .known_tools
+            .iter()
+            .find(|t| t.eq_ignore_ascii_case(name))
+        {
             return exact.clone();
         }
         let lowered = name.to_lowercase();
@@ -843,13 +926,57 @@ fn normalize_gemma_quote_tokens(content: &str) -> Cow<'_, str> {
     )
 }
 
-/// True when `args` is null, non-object, or an empty object — i.e. unusable.
+/// True when `args` is null, non-object, empty, or carries only the `_raw`
+/// salvage payload — i.e. no usable arguments yet.
 fn is_empty_arguments(args: &Value) -> bool {
     match args {
         Value::Null => true,
-        Value::Object(map) => map.is_empty(),
+        Value::Object(map) => map.is_empty() || (map.len() == 1 && map.contains_key("_raw")),
         _ => false,
     }
+}
+
+/// First present arguments field among the accepted aliases
+/// (`arguments` → `parameters` → `args`).
+fn args_field(val: &Value) -> Option<&Value> {
+    ["arguments", "parameters", "args"]
+        .iter()
+        .find_map(|key| val.get(key))
+}
+
+/// Assemble the final call for a recovered name: object payloads clone
+/// through verbatim, absent payloads become an empty object, and non-object
+/// payloads are retained as the `_raw` salvage string (see
+/// [`ParsedToolCall`]).
+fn finish_call(name: &str, args: Option<&Value>) -> ParsedToolCall {
+    match args {
+        None => ParsedToolCall {
+            name: name.to_string(),
+            arguments: empty_object(),
+        },
+        Some(v) if v.is_object() => ParsedToolCall {
+            name: name.to_string(),
+            arguments: v.clone(),
+        },
+        Some(v) => ParsedToolCall {
+            name: name.to_string(),
+            arguments: serde_json::json!({ "_raw": v.to_string() }),
+        },
+    }
+}
+
+/// Best-effort extraction of a `"name": "X"` value from JSON that could not
+/// be parsed even after repair. The value must be word-like and within
+/// [`MAX_INLINE_NAME_LEN`].
+fn salvage_name_from_body(body: &str) -> Option<String> {
+    const KEY: &str = "\"name\"";
+    let key = body.find(KEY)?;
+    let rest = body[key + KEY.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let name = &rest[..end];
+    (is_word_like(name) && name.len() <= MAX_INLINE_NAME_LEN).then(|| name.to_string())
 }
 
 fn empty_object() -> Value {
@@ -867,11 +994,10 @@ fn find_word_bounded(hay: &str, needle: &str) -> Option<usize> {
         if !hb[i..i + nb.len()].eq_ignore_ascii_case(nb) {
             continue;
         }
-        let prev_ok =
-            i == 0 || !(hb[i - 1].is_ascii_alphanumeric() || hb[i - 1] == b'_');
+        let prev_ok = i == 0 || !(hb[i - 1].is_ascii_alphanumeric() || hb[i - 1] == b'_');
         let next_i = i + nb.len();
-        let next_ok = next_i == hb.len()
-            || !(hb[next_i].is_ascii_alphanumeric() || hb[next_i] == b'_');
+        let next_ok =
+            next_i == hb.len() || !(hb[next_i].is_ascii_alphanumeric() || hb[next_i] == b'_');
         if prev_ok && next_ok {
             return Some(i);
         }
@@ -898,8 +1024,10 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
 
 /// Last [`RECOVER_SCAN_MAX_BYTES`] bytes of `content` (char-boundary safe).
 fn recover_scan_tail(content: &str) -> &str {
-    let start =
-        floor_char_boundary(content, content.len().saturating_sub(RECOVER_SCAN_MAX_BYTES));
+    let start = floor_char_boundary(
+        content,
+        content.len().saturating_sub(RECOVER_SCAN_MAX_BYTES),
+    );
     &content[start..]
 }
 
@@ -908,13 +1036,8 @@ fn recover_scan_tail(content: &str) -> &str {
 /// balanced JSON object after it. The TAG lookup is bounded, but the payload
 /// scan runs on the unbounded remainder so large arguments are not clipped.
 /// Requires a non-empty JSON object payload.
-fn channel_payload_after_target(
-    tail: &str,
-    pos: usize,
-    tool: &str,
-) -> Option<ParsedToolCall> {
-    let window_end =
-        ceil_char_boundary(tail, (pos + MESSAGE_TAG_LOOKAHEAD_BYTES).min(tail.len()));
+fn channel_payload_after_target(tail: &str, pos: usize, tool: &str) -> Option<ParsedToolCall> {
+    let window_end = ceil_char_boundary(tail, (pos + MESSAGE_TAG_LOOKAHEAD_BYTES).min(tail.len()));
     let window = &tail[pos..window_end];
     let (tag_rel, tag_len) = window
         .find("<|message|>")
@@ -954,7 +1077,9 @@ fn parse_loose_call_payload(rest: &str) -> Option<(&str, Value)> {
     }
     let name = &rest[..name_end];
     let rest = rest[name_end..].trim_start();
-    let (s, e) = *balanced_spans(rest, '{', '}').iter().find(|&&(s, _)| s == 0)?;
+    let (s, e) = *balanced_spans(rest, '{', '}')
+        .iter()
+        .find(|&&(s, _)| s == 0)?;
     Some((name, parse_lenient_value(&rest[s..=e])?))
 }
 
@@ -1152,14 +1277,45 @@ some text here
     }
 
     #[test]
+    fn salvage_invalid_args_retains_call_with_raw_body() {
+        let parser = ToolCallParser::new();
+        // Contains {"name" but the arguments payload is not JSON: P14 keeps
+        // the call alive with a best-effort `_raw` body instead of dropping.
+        let input = r#"{"name": "Read", "arguments": not_json}"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["_raw"], input);
+        // `_raw`-only arguments count as empty so recovery can still fire.
+        assert!(is_empty_arguments(&calls[0].arguments));
+    }
+
+    #[test]
+    fn salvage_non_object_args_field_retains_raw_value() {
+        let parser = ToolCallParser::new();
+        // arguments present but not an object → retained as `_raw`.
+        let input = r#"{"name": "Bash", "arguments": "ls -la"}"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        // The raw payload is the JSON-serialized form of the field.
+        assert_eq!(
+            calls[0].arguments["_raw"],
+            serde_json::Value::String("\"ls -la\"".to_string())
+        );
+        assert!(is_empty_arguments(&calls[0].arguments));
+    }
+
+    #[test]
     fn diagnostics_malformed_standalone_name() {
         let parser = ToolCallParser::new();
         // Contains {"name" heuristic but invalid JSON / missing arguments field
         let input = r#"{"name": "Read", "arguments": not_json}"#;
         let (calls, diagnostics) = parser.parse_with_diagnostics(input);
-        assert!(calls.is_empty());
-        assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].contains("Malformed"));
+        // P14 salvage retains the call, so no diagnostic is emitted.
+        assert_eq!(calls.len(), 1);
+        assert!(diagnostics.is_empty());
+        assert_eq!(calls[0].arguments["_raw"], input);
     }
 
     #[test]
@@ -1376,7 +1532,10 @@ some text here
         let parser = ToolCallParser::new();
         let input = "I will use Bash to run the tests now.";
         let calls = parser.parse(input);
-        assert!(calls.is_empty(), "prose mention without JSON must not synthesize a call");
+        assert!(
+            calls.is_empty(),
+            "prose mention without JSON must not synthesize a call"
+        );
     }
 
     // --- fuzzy tool-name tests ---
@@ -1505,7 +1664,8 @@ some text here
     #[test]
     fn parse_gemma_quote_tokens_normalized() {
         let parser = ToolCallParser::new();
-        let input = r#"<|tool_call|>{"name":<|'|>Read<|'|>,"arguments":{"path":<|"|>foo.rs<|"|>}}<|end|>"#;
+        let input =
+            r#"<|tool_call|>{"name":<|'|>Read<|'|>,"arguments":{"path":<|"|>foo.rs<|"|>}}<|end|>"#;
         let calls = parser.parse(input);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Read");
@@ -1528,8 +1688,109 @@ some text here
         let input = r#"<|tool_call>read{"path":"a.rs"}<tool_call|>"#;
         let calls = parser.parse(input);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "Read", "inline raw name must be canonicalized");
+        assert_eq!(
+            calls[0].name, "Read",
+            "inline raw name must be canonicalized"
+        );
         assert_eq!(calls[0].arguments["path"], "a.rs");
+    }
+
+    #[test]
+    fn parse_asymmetric_layer_accepts_bare_opener_with_wild_closer() {
+        // P8: bare `<tool_call>` opener combined with a wild closer that the
+        // XML layer alone cannot handle.
+        let parser = ToolCallParser::new();
+        let input = r#"<tool_call>{"name":"Edit","arguments":{"path":"a.rs"}}<tool_call|>"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1, "exactly one call, no cross-layer duplicate");
+        assert_eq!(calls[0].name, "Edit");
+        assert_eq!(calls[0].arguments["path"], "a.rs");
+    }
+
+    #[test]
+    fn parse_asymmetric_bare_opener_without_duplicate_dispatch() {
+        // P8: a well-formed bare block must still yield exactly ONE call even
+        // though both the asymmetric layer and the XML layer can parse it.
+        let parser = ToolCallParser::new();
+        let input =
+            r#"prefix <tool_call>{"name":"Read","arguments":{"path":"a.rs"}}</tool_call> tail"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+
+        // Two bare blocks → exactly two distinct calls.
+        let two = r#"<tool_call>{"name":"Read","arguments":{"path":"a.rs"}}</tool_call>
+mid
+<tool_call>{"name":"Edit","arguments":{"path":"b.rs","old":"x","new":"y"}}</tool_call>"#;
+        let calls = parser.parse(two);
+        assert_eq!(calls.len(), 2, "got: {calls:?}");
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[1].name, "Edit");
+    }
+
+    #[test]
+    fn recover_fallback_channel_form_near_mention() {
+        // P13: prose mentions Bash; the only structured payload is a
+        // channel-tagged fragment — the salvage chain must find it.
+        let parser = ToolCallParser::new();
+        let input = r#"I will use Bash now <|channel|>commentary to=Bash <|message|>{"command":"ls -la"}<|im_end|>"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
+    }
+
+    #[test]
+    fn recover_fallback_inline_name_after_mention() {
+        // P13: bare-object window scan fails (no standalone `{...}` object),
+        // inline `NAME{json}` right after the mention wins.
+        let parser = ToolCallParser::new();
+        let input = r#"let me Grep{"pattern":"fn main"} for it"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Grep");
+        assert_eq!(calls[0].arguments["pattern"], "fn main");
+    }
+
+    #[test]
+    fn recover_fallback_negative_no_payload_at_all() {
+        // P13 bad fixture: mention without any structured form nearby.
+        let parser = ToolCallParser::new();
+        let input = r#"I would like to use the Grep tool someday, please."#;
+        let calls = parser.parse(input);
+        assert!(calls.is_empty(), "got: {calls:?}");
+    }
+
+    #[test]
+    fn parse_args_alias_accepted() {
+        // P15: `args` is accepted as an alias for arguments/parameters.
+        let parser = ToolCallParser::new();
+
+        let direct = r#"{"name":"Bash","args":{"command":"ls"}}"#;
+        let calls = parser.parse(direct);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].arguments["command"], "ls");
+
+        let nested = r#"{"function":{"name":"Bash","args":{"command":"ls"}}}"#;
+        let calls = parser.parse(nested);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["command"], "ls");
+
+        let tool_form = r#"{"tool":"Bash","args":{"command":"ls"}}"#;
+        let calls = parser.parse(tool_form);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["command"], "ls");
+    }
+
+    #[test]
+    fn parse_args_alias_bad_fixture_missing_everything() {
+        // P15 bad fixture: name present but no arguments field at all →
+        // empty arguments, not an error.
+        let parser = ToolCallParser::new();
+        let calls = parser.parse(r#"{"name":"Bash"}"#);
+        assert_eq!(calls.len(), 1);
+        assert!(is_empty_arguments(&calls[0].arguments));
     }
 
     #[test]
@@ -1635,7 +1896,10 @@ some text here
         let marker = r#"call:Bash{"command":"ls"}"#;
         let input = format!("{marker}{filler}");
         let calls = parser.parse(&input);
-        assert!(calls.is_empty(), "marker beyond the 32K tail must not parse");
+        assert!(
+            calls.is_empty(),
+            "marker beyond the 32K tail must not parse"
+        );
     }
 
     #[test]
