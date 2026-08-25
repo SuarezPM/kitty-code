@@ -186,3 +186,24 @@ Evidencia: `benches/bench_polyglot_oracle_smoke15.json` + `.omo/evidence/.../har
 - **Bench-ab** `bench_ab 50` interleaved seed 42, `wilson_ci` 1.96, `p50_ms`, thinking 512 knee `benches/ab_gbnf_result.json` + `ab_recall.py`.
 
 **Consequences:** tiny 4K nunca activa embedding/hybrid/cloud (guard `profile=="tiny"` + `is_small_model`); spec 250 LOC gate respected (sandbox 253 ~gate, plugin 546 allowed as new module); `clippy -D warnings` green via `#[allow(dead_code)]`/`is_multiple_of`/`empty_line_after_doc_comments` fixes; all F6 tracks land as untracked + docs but wired via `lib.rs` when final merge.
+
+### F7 — Estado de palancas del harness (batch aterrizado 2026-08-25)
+
+Estado de implementación, con commit de referencia. **Ninguna palanca
+tiene aún un rate medido**: los números provienen exclusivamente del
+protocolo pre-registrado (`benches/ab/README.md`) y se publicarán vía
+`docs/AUDIT.md`/`CNAS.md`.
+
+| Palanca | Estado | Commits |
+|---------|--------|---------|
+| Verification loop + revision cycles + lint gate | **DONE** (código; sin medir) | `4eee68b`, `ea69554`, `29c68d7` |
+| num_ctx explícito + truncate:false + overflow→400 (`ContextOverflow`) | **DONE** (código; sin medir) | `a4012cf` |
+| Per-model thinking/sampling profiles (`ModelTuning`) + turn caps unificados + canal thinking vivo | **DONE** (código; sin medir) | `59d7a75` |
+| Fuzzy edit ladder + guard de match desproporcionado | **DONE** (código; sin medir) | `9bac5c0`, `baa286e` |
+| Parser salvage P8/P13-P15 + tool aliases | **DONE** (código; sin medir) | `d80bc95` |
+| Normalización upstream de tool calls + ladder bounds + dedup semantics | **DONE** (código; sin medir) | `baa286e` |
+| Medición A/B pre-registrada de las palancas | **PENDIENTE** — runbook listo en `benches/ab/`, no ejecutado | — |
+
+North-star targets, exactamente como publicados (sin cambios): little-coder
+**45.56%** Aider Polyglot (Qwen3.5-9B Q4_K_M, num_ctx 32768, temp 0.3) ·
+gate TB2.0 **9.2%±2.4** · ornith-1.5 9B oficial TB2.1 **46.2** / SWE-V **70.6**.

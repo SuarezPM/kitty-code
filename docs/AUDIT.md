@@ -204,7 +204,7 @@ Recorded from the 2026-08-21 kitty harbor-adapter smokes (Oracle Gate 1 requirem
 
 1. **Guard limitation (Write-on-existing-file).** Kitty's Guard blocks Write on an existing file unless the Edit tool is used. This stalled ornith:9b on tasks requiring file modification during smoke k1.
 2. **Thinking-budget mismatch.** ornith-1.5:9b repeatedly overran the medium profile thinking budget (1024 tokens, set by the earlier bench-ab knee decision tuned on ornith:9b). Its numbers are NOT budget-comparable to ornith:9b's.
-3. **Context-length dependency.** kitty-cli does not send `num_ctx`; benchmarks require server-side `OLLAMA_CONTEXT_LENGTH=16384` (host prereq documented in `bench/harbor/adapters/kitty/README.md`). Without it Ollama truncates prompts at the 4096 default → empty responses.
+3. **Context-length dependency.** ~~kitty-cli does not send `num_ctx`~~ **Updated 2026-08-25 (commit a4012cf):** the client now sends an explicit session-fixed `options.num_ctx` (`KITTY_NUM_CTX`, default 32768) plus `"truncate": false` on every `/api/chat` payload, so overflow surfaces as an audible HTTP 400 (`RuntimeError::ContextOverflow`) instead of silent truncation at the server's tiered default. Server-side `OLLAMA_CONTEXT_LENGTH` still governs what is actually available; benchmarks should keep declaring it explicitly.
 4. **Two-boundary sandbox decision (Gate-4).** Bash children are Landlock/seccomp-contained by default; harbor bench runs set `KITTY_SANDBOX=off` because the outer Docker boundary is active; opt-out is loud and per-run.
 
 ### Approved night strategy (pre-registered)
@@ -215,7 +215,30 @@ Oracle-full runs go first: TB2-89 (`harbor run -p bench/official/terminal-bench-
 
 ---
 
-## 7. Roadmap
+## 7. Landed harness levers (batch f7, 2026-08-25)
+
+Landed CODE, listed with their commits for traceability. **None of these
+levers has a measured rate claim attached yet** — any number produced with
+them must come from the pre-registered protocol in `benches/ab/README.md`
+before it may appear in this audit or `CNAS.md`.
+
+| Lever | Commits | What changed |
+|-------|---------|--------------|
+| Verification loop + revision cycles + lint-gate hygiene | `4eee68b`, `ea69554`, `29c68d7` | Outer verification cycle around the tool loop: workspace tests grade finished work, failures fed back for revision (bounded cycles); scratch-file leak closed on every exit path; verify loop disabled in bench contexts. Worst-case LLM calls ≈ max_iterations × 3 per prompt (documented on the profile struct). |
+| Explicit context window + audible overflow | `a4012cf` | Every `/api/chat` payload carries session-fixed `options.num_ctx` (`KITTY_NUM_CTX`, default 32768) and `"truncate": false`; overflow maps to `RuntimeError::ContextOverflow` (requested vs available + remediation hint); `prompt_eval_count` near-capacity warning; KV-cache preflight warning. |
+| Per-model inference profiles (ModelTuning) | `59d7a75` | Exact → family ("ornith"/"qwen") → default resolution of sampling + thinking mode; Tier-4 turn caps unified into one source of truth; thinking channel made live via lazy seeding from `tuning.thinking` (CLI/bench A/B axis reaches the tracker); dead `max_thinking_tokens` removed. |
+| Fuzzy edit replacer ladder | `9bac5c0`, `baa286e` | `crates/kitty-harness/src/edit_replacers.rs`: ordered fuzzy strategies behind hashline/search-replace failure, with disproportionate-match guard; later bounded candidate search (512 KiB bail-out, 64 KiB anchor cap, once-per-span vetting). |
+| Parser salvage + tool aliases | `d80bc95` | Opener variants (bare/symmetric/asymmetric `<tool_call>`), aliased argument keys, raw retention, extended recovery chain, hallucinated tool-name aliases. |
+| Upstream tool-call normalization | `baa286e` | Synonym/alias normalization runs in the agent loop immediately after parsing — upstream of quality monitor, diagnostics, episode memory and dispatch; idempotent (dispatch re-normalizes harmlessly). |
+
+North-star targets remain exactly as published (unchanged by this batch):
+little-coder **45.56%** Aider Polyglot (Qwen3.5-9B Q4_K_M, num_ctx 32768,
+temp 0.3) · TB2.0 gate **9.2%±2.4** · ornith-1.5 9B official TB2.1 **46.2**
+and SWE-V **70.6**.
+
+---
+
+## 8. Roadmap
 
 * [x] Harbor + Docker stack verified (oracle 15/15 and 5/5 smokes; superseded by full-suite measurements 2026-08-22)
 * [x] Homemade proxies for ornith:9b 13/15 86.7% and TB2 8/8 100% + 2/15 13.3%
