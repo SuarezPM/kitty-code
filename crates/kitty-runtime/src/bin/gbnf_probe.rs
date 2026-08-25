@@ -221,12 +221,7 @@ fn generate(
             ])
         }
         GrammarArm::CanaryWord => LlamaSampler::chain_simple([
-            build_lazy_sampler_with(
-                model,
-                CANARY_GRAMMAR,
-                &["{\"name\"".to_string()],
-                &[],
-            )?,
+            build_lazy_sampler_with(model, CANARY_GRAMMAR, &["{\"name\"".to_string()], &[])?,
             LlamaSampler::dist(seed),
         ]),
         GrammarArm::CanaryTok => {
@@ -393,13 +388,19 @@ fn run_diag_tokens(args: &Args) -> Result<(), String> {
             .collect();
         report.insert(p.to_string(), serde_json::Value::Array(rows));
     }
-    let derived: Vec<i32> = derive_trigger_tokens_pub(&model).iter().map(|t| t.0).collect();
+    let derived: Vec<i32> = derive_trigger_tokens_pub(&model)
+        .iter()
+        .map(|t| t.0)
+        .collect();
     let out = serde_json::json!({
         "model_file": args.model.display().to_string(),
         "tokenizations": report,
         "derived_trigger_token_ids": derived,
     });
-    println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 
@@ -412,8 +413,8 @@ fn run() -> Result<(), String> {
         .prompts_file
         .as_ref()
         .ok_or("--prompts-file is required (or use --diag-tokens)")?;
-    let prompts_raw =
-        std::fs::read_to_string(prompts_file).map_err(|e| format!("read {}: {e}", prompts_file.display()))?;
+    let prompts_raw = std::fs::read_to_string(prompts_file)
+        .map_err(|e| format!("read {}: {e}", prompts_file.display()))?;
     let prompts: Vec<String> =
         serde_json::from_str(&prompts_raw).map_err(|e| format!("parse prompts file: {e}"))?;
     if prompts.is_empty() {
