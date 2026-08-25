@@ -959,7 +959,7 @@ fn parse_loose_call_payload(rest: &str) -> Option<(&str, Value)> {
 }
 
 /// Classic two-row Levenshtein edit distance.
-fn levenshtein(a: &str, b: &str) -> usize {
+pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     if a.is_empty() {

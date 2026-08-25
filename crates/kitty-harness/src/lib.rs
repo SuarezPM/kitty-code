@@ -5,6 +5,7 @@
 
 pub mod contract;
 pub use contract::{Assertion, AssertionCheck, AssertionStatus, Contract, ContractState};
+mod edit_replacers;
 pub mod agent;
 pub mod bootstrap;
 pub mod context;

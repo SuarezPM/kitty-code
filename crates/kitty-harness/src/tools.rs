@@ -449,13 +449,45 @@ impl ToolRegistry {
 
         let count = before.matches(&old_n).count();
         if count == 0 {
+            // Exact match failed: run the tolerance ladder (guarded fuzzy
+            // strategies) before giving up, so whitespace/indentation drift
+            // from weaker models still lands atomically.
+            let hit = match crate::edit_replacers::run_ladder(&before, &old_n, replace_all) {
+                crate::edit_replacers::LadderOutcome::Hit(hit) => hit,
+                crate::edit_replacers::LadderOutcome::Ambiguous => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: format!(
+                            "old_string matches multiple locations in {path} \
+                             (after whitespace tolerance). Provide more surrounding \
+                             context to make it unique, or set replace_all=true."
+                        ),
+                        retry: false,
+                    });
+                }
+                crate::edit_replacers::LadderOutcome::NotFound => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: format!(
+                            "old_string not found in {path}. \
+                             Read the file first, then pass the exact text from it \
+                             (whitespace and indentation matter)."
+                        ),
+                        retry: false,
+                    });
+                }
+            };
+            let after_n = if hit.all_occurrences {
+                before.replace(&hit.span, &new_n)
+            } else {
+                before.replacen(&hit.span, &new_n, 1)
+            };
+            let mut output = format!("Edit applied to {path}");
+            output.push_str(&format!("\n\n[edit matched via {}]", hit.label));
+            output.push_str(&self.finish_str_replace(path_buf, &before, after_n, had_crlf)?);
             return Ok(ToolResult {
-                success: false,
-                output: format!(
-                    "old_string not found in {path}. \
-                     Read the file first, then pass the exact text from it \
-                     (whitespace and indentation matter)."
-                ),
+                success: true,
+                output,
                 retry: false,
             });
         }
@@ -476,23 +508,34 @@ impl ToolRegistry {
         } else {
             before.replacen(&old_n, &new_n, 1)
         };
-        // Restore original line endings on write
-        let after = if had_crlf {
-            after_n.replace('\n', "\r\n")
-        } else {
-            after_n
-        };
-
-        std::fs::write(path_buf, &after)?;
-        self.hashline.read_file(path_buf)?;
 
         let mut output = format!("Edit applied to {path}");
-        output.push_str(&self.build_edit_feedback(path, path_buf, &before, &after));
+        output.push_str(&self.finish_str_replace(path_buf, &before, after_n, had_crlf)?);
         Ok(ToolResult {
             success: true,
             output,
             retry: false,
         })
+    }
+
+    /// Shared str-replace write-back: restore the file's original CRLF line
+    /// endings, persist, refresh the hashline snapshot, and build the edit
+    /// feedback (diff + re-show). Returns the feedback text to append.
+    fn finish_str_replace(
+        &mut self,
+        path_buf: &Path,
+        before: &str,
+        after_n: String,
+        had_crlf: bool,
+    ) -> Result<String, ToolError> {
+        let after = if had_crlf {
+            after_n.replace('\n', "\r\n")
+        } else {
+            after_n
+        };
+        std::fs::write(path_buf, &after)?;
+        self.hashline.read_file(path_buf)?;
+        Ok(self.build_edit_feedback(&path_buf.to_string_lossy(), path_buf, before, &after))
     }
 
     /// Feedback appended after every successful edit (either protocol):
@@ -1044,9 +1087,7 @@ fn cargo_check_lint(path: &Path) -> Option<CheckOutcome> {
             .stdout(Stdio::from(stdout_dup))
             .stderr(Stdio::from(stderr_dup))
             .spawn(),
-        _ => Err(std::io::Error::other(
-            "failed to duplicate lint scratch fd",
-        )),
+        _ => Err(std::io::Error::other("failed to duplicate lint scratch fd")),
     };
     let mut child = match spawned {
         Ok(child) => child,
@@ -2160,6 +2201,128 @@ mod tests {
         assert!(result.success, "got: {}", result.output);
         let on_disk = std::fs::read_to_string(f.path()).unwrap();
         assert_eq!(on_disk, "alpha\r\nBETA\r\ngamma", "CRLF must be preserved");
+    }
+
+    #[test]
+    fn str_replace_fuzzy_line_trim_succeeds_with_strategy_note() {
+        // Indentation drift in old_string — exact match fails, line-trim lands.
+        let f = temp_file("fn a() {\n    old();\n}\n");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "fn a() {\nold();\n}",
+            "new_string": "fn a() {\n    new();\n}"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(result.success, "got: {}", result.output);
+        assert!(
+            result.output.contains("[edit matched via line-trim]"),
+            "strategy note expected, got: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            "fn a() {\n    new();\n}\n"
+        );
+    }
+
+    #[test]
+    fn str_replace_fuzzy_crlf_roundtrip_preserved() {
+        // Drifted old_string against a CRLF file: fuzzy span replacement must
+        // still restore the file's original CRLF endings on disk.
+        let f = temp_file("alpha\r\nbeta\r\ngamma");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "  beta", // leading-space drift, no \r at all
+            "new_string": "BETA"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(result.success, "got: {}", result.output);
+        let on_disk = std::fs::read_to_string(f.path()).unwrap();
+        assert_eq!(
+            on_disk, "alpha\r\nBETA\r\ngamma",
+            "CRLF must survive a fuzzy edit"
+        );
+    }
+
+    #[test]
+    fn str_replace_fuzzy_ambiguous_without_replace_all() {
+        // Tab-drifted old_string misses exactly but fuzzy-matches BOTH
+        // space-indented occurrences — ambiguity without replace_all.
+        let f = temp_file("  same\nmid\n  same\nother");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "\tsame",
+            "new_string": "different"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("multiple locations"),
+            "got: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            "  same\nmid\n  same\nother",
+            "ambiguous fuzzy match must not modify the file"
+        );
+    }
+
+    #[test]
+    fn str_replace_fuzzy_replace_all_replaces_every_drifted_occurrence() {
+        let f = temp_file("  same\nmid\n  same\nother");
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "\tsame",
+            "new_string": "uniq",
+            "replace_all": true
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(result.success, "got: {}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            "uniq\nmid\nuniq\nother"
+        );
+    }
+
+    #[test]
+    fn str_replace_fuzzy_guard_refuses_disproportionate_span() {
+        // Giant indentation drift makes every candidate wildly larger than
+        // old_string — the guard must reject and the edit must fail cleanly.
+        let pad = " ".repeat(1200);
+        let f = temp_file(format!("{pad}a();\n{pad}b();\n").as_str());
+        let mut registry = ToolRegistry::new();
+        registry
+            .execute_read(&serde_json::json!({"path": f.path().to_str().unwrap()}))
+            .unwrap();
+        let args = serde_json::json!({
+            "path": f.path().to_str().unwrap(),
+            "old_string": "a();\nb();",
+            "new_string": "x();\ny();"
+        });
+        let result = registry.execute_edit(&args).unwrap();
+        assert!(!result.success, "guard must refuse the ballooned span");
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            format!("{pad}a();\n{pad}b();\n"),
+            "guarded-out fuzzy match must not modify the file"
+        );
     }
 
     #[test]
