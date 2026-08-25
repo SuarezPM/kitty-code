@@ -360,22 +360,18 @@ async fn main() -> Result<()> {
             println!("RESULTS");
             println!("Passed: {}/{} ({:.1}%)", passed, total, rate);
 
-            let mut by_lang: std::collections::HashMap<String, (usize, usize)> =
-                std::collections::HashMap::new();
-            for r in &results {
-                let entry = by_lang.entry(r.lang.clone()).or_insert((0, 0));
-                entry.0 += 1;
-                if r.passed {
-                    entry.1 += 1;
-                }
-            }
-            for (lang, (t, p)) in by_lang.iter() {
+            // Per-language breakdown: language parsed from polyglot task-name
+            // prefixes (polyglot_python_* → python), label fallback otherwise.
+            let by_lang = tally_by_language(&results);
+            for (lang, t) in &by_lang {
+                let lang_rate = if t.attempted > 0 {
+                    100.0 * t.passed as f64 / t.attempted as f64
+                } else {
+                    0.0
+                };
                 println!(
-                    "  {}: {}/{} ({:.0}%)",
-                    lang,
-                    p,
-                    t,
-                    100.0 * *p as f64 / *t as f64
+                    "  {lang}: attempted={} passed={} failed={} errored={} ({:.1}%)",
+                    t.attempted, t.passed, t.failed, t.errored, lang_rate
                 );
             }
 
@@ -395,10 +391,17 @@ async fn main() -> Result<()> {
                 "passed": passed,
                 "rate_pct": rate,
                 "memory": cfg.use_memory,
+                "by_language": by_lang.iter().map(|(lang, t)| (lang.clone(), serde_json::json!({
+                    "attempted": t.attempted,
+                    "passed": t.passed,
+                    "failed": t.failed,
+                    "errored": t.errored,
+                }))).collect::<std::collections::BTreeMap<String, serde_json::Value>>(),
                 "details": results.iter().map(|r| serde_json::json!({
                     "id": r.id,
                     "lang": r.lang,
                     "passed": r.passed,
+                    "verdict": r.verdict,
                     "latency_ms": r.latency_ms,
                 })).collect::<Vec<_>>(),
             });
@@ -606,7 +609,55 @@ struct BenchResult {
     id: String,
     lang: String,
     passed: bool,
+    /// Outcome verdict: "pass" | "fail" | "error" | "timeout".
+    verdict: String,
     latency_ms: f64,
+}
+
+/// Language for a bench result: parse polyglot task-name prefixes
+/// (`polyglot_python_list-ops__koxBfT3` → `python`, `polyglot_go_pig-latin__…`
+/// → `go`), falling back to the exercise language label when the id does not
+/// carry a `polyglot_<lang>_` prefix.
+fn language_of(id: &str, lang_label: &str) -> String {
+    if let Some(rest) = id.strip_prefix("polyglot_") {
+        if let Some(idx) = rest.find('_') {
+            let candidate = &rest[..idx];
+            if !candidate.is_empty() {
+                return candidate.to_string();
+            }
+        }
+    }
+    lang_label.to_string()
+}
+
+/// Per-language outcome tally for the result summary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LangTally {
+    attempted: usize,
+    passed: usize,
+    failed: usize,
+    errored: usize,
+}
+
+/// Aggregate results by language (parsed from task names, label fallback).
+/// `errored` counts error/timeout outcomes; `failed` counts completed runs
+/// that did not pass.
+fn tally_by_language(results: &[BenchResult]) -> std::collections::BTreeMap<String, LangTally> {
+    let mut tally: std::collections::BTreeMap<String, LangTally> =
+        std::collections::BTreeMap::new();
+    for r in results {
+        let lang = language_of(&r.id, &r.lang);
+        let e = tally.entry(lang).or_default();
+        e.attempted += 1;
+        if r.passed {
+            e.passed += 1;
+        } else if r.verdict == "error" || r.verdict == "timeout" {
+            e.errored += 1;
+        } else {
+            e.failed += 1;
+        }
+    }
+    tally
 }
 
 /// A benchmark exercise loaded from JSON.
@@ -931,6 +982,7 @@ async fn run_one_bench(
         id: ex.id.to_string(),
         lang: ex.label.to_string(),
         passed,
+        verdict: verdict.to_string(),
         latency_ms,
     })
 }
@@ -1211,5 +1263,94 @@ mod profile_heuristic_tests {
             is_small_model("tiny", "ornith:9b"),
             "ornith:9b+tiny should be small (profile tiny) — diverges from old heuristic"
         );
+    }
+}
+
+#[cfg(test)]
+mod language_breakdown_tests {
+    use super::{tally_by_language, BenchResult, LangTally};
+
+    fn result(id: &str, lang: &str, passed: bool, verdict: &str) -> BenchResult {
+        BenchResult {
+            id: id.to_string(),
+            lang: lang.to_string(),
+            passed,
+            verdict: verdict.to_string(),
+            latency_ms: 0.0,
+        }
+    }
+
+    #[test]
+    fn language_parsed_from_polyglot_task_names() {
+        assert_eq!(
+            super::language_of("polyglot_python_list-ops__koxBfT3", "x"),
+            "python"
+        );
+        assert_eq!(
+            super::language_of("polyglot_go_pig-latin__jGEaYgv", "x"),
+            "go"
+        );
+        assert_eq!(
+            super::language_of("polyglot_rust_acronym__H3Wcvcj", "x"),
+            "rust"
+        );
+        assert_eq!(
+            super::language_of("polyglot_cpp_clock__JqkaQ4P", "x"),
+            "cpp"
+        );
+        assert_eq!(
+            super::language_of("polyglot_java_phone-number__o26caVU", "x"),
+            "java"
+        );
+        assert_eq!(
+            super::language_of("polyglot_javascript_wordy__9zXJF8V", "x"),
+            "javascript"
+        );
+    }
+
+    #[test]
+    fn language_falls_back_to_label_without_prefix() {
+        assert_eq!(super::language_of("py-fibonacci", "python"), "python");
+        assert_eq!(super::language_of("tb2-makefile", "makefile"), "makefile");
+        // Degenerate prefix (no language segment) → label fallback
+        assert_eq!(super::language_of("polyglot_", "go"), "go");
+        assert_eq!(super::language_of("polyglot_weird", "go"), "go");
+    }
+
+    #[test]
+    fn tally_counts_attempted_passed_failed_errored() {
+        let results = vec![
+            result("polyglot_python_a__1", "python", true, "pass"),
+            result("polyglot_python_b__2", "python", false, "fail"),
+            result("polyglot_python_c__3", "python", false, "error"),
+            result("polyglot_python_d__4", "python", false, "timeout"),
+            result("polyglot_go_e__5", "go", true, "pass"),
+            result("py-fib", "python", true, "pass"),
+        ];
+        let tally = tally_by_language(&results);
+        assert_eq!(
+            tally.get("python"),
+            Some(&LangTally {
+                attempted: 5,
+                passed: 2,
+                failed: 1,
+                errored: 2,
+            })
+        );
+        assert_eq!(
+            tally.get("go"),
+            Some(&LangTally {
+                attempted: 1,
+                passed: 1,
+                failed: 0,
+                errored: 0,
+            })
+        );
+        assert_eq!(tally.len(), 2, "label fallback merges into parsed language");
+    }
+
+    #[test]
+    fn tally_empty_results_is_empty() {
+        assert!(tally_by_language(&[]).is_empty());
     }
 }

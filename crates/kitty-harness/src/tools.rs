@@ -73,6 +73,11 @@ pub struct ToolRegistry {
     read_files: HashSet<PathBuf>,
     /// Files written this session (for write guard).
     written_files: HashSet<PathBuf>,
+    /// Successful file-modifying executions this session (Edit/Write, plus
+    /// Bash commands whose Guard analysis detected write targets). Consumed
+    /// by the verification loop to decide whether test failures are the
+    /// agent's doing.
+    file_modifications: usize,
     /// The hashline editor for file operations.
     pub hashline: HashlineEditor,
     /// Bash command timeout in seconds (F1.3). Default: 60.
@@ -100,6 +105,7 @@ impl ToolRegistry {
         Self {
             read_files: HashSet::new(),
             written_files: HashSet::new(),
+            file_modifications: 0,
             hashline: HashlineEditor::new(),
             bash_timeout_secs,
             max_read_lines: 300,
@@ -112,6 +118,7 @@ impl ToolRegistry {
         Self {
             read_files: HashSet::new(),
             written_files: HashSet::new(),
+            file_modifications: 0,
             hashline: HashlineEditor::new(),
             bash_timeout_secs: 60,
             max_read_lines,
@@ -141,15 +148,38 @@ impl ToolRegistry {
 
     /// Execute a parsed tool call.
     pub async fn execute(&mut self, tc: &ParsedToolCall) -> Result<ToolResult, ToolError> {
-        match tc.name.as_str() {
-            "Read" => self.execute_read(&tc.arguments),
-            "Edit" => self.execute_edit(&tc.arguments),
-            "Write" => self.execute_write(&tc.arguments),
-            "Bash" => self.execute_bash(&tc.arguments).await,
-            "Glob" => self.execute_glob(&tc.arguments),
-            "Grep" => self.execute_grep(&tc.arguments),
-            other => Err(ToolError::NotFound(other.to_string())),
+        let result = match tc.name.as_str() {
+            "Read" => self.execute_read(&tc.arguments)?,
+            "Edit" => self.execute_edit(&tc.arguments)?,
+            "Write" => self.execute_write(&tc.arguments)?,
+            "Bash" => self.execute_bash(&tc.arguments).await?,
+            "Glob" => self.execute_glob(&tc.arguments)?,
+            "Grep" => self.execute_grep(&tc.arguments)?,
+            other => return Err(ToolError::NotFound(other.to_string())),
+        };
+        if result.success {
+            match tc.name.as_str() {
+                "Edit" | "Write" => self.file_modifications += 1,
+                "Bash" => {
+                    // A successful shell command counts as a file modification
+                    // only when Guard's write-target analysis saw one (redirects,
+                    // tee, dd, sed -i …). Read-only commands stay neutral.
+                    if let Some(cmd) = tc.arguments.get("command").and_then(|v| v.as_str()) {
+                        if !crate::guard::detect_write_targets(cmd).is_empty() {
+                            self.file_modifications += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
+        Ok(result)
+    }
+
+    /// Number of successful file-modifying executions this session
+    /// (Edit/Write plus write-target Bash commands).
+    pub fn file_modifications(&self) -> usize {
+        self.file_modifications
     }
 
     /// Execute a Read tool call.
@@ -280,7 +310,12 @@ impl ToolRegistry {
                     std::fs::write(&path_buf, &new_file_content)?;
                     self.hashline.read_file(&path_buf)?;
                     let mut output = format!("Edit applied to {path} (line {line})");
-                    output.push_str(&self.build_edit_feedback(path, &path_buf, &before, &new_file_content));
+                    output.push_str(&self.build_edit_feedback(
+                        path,
+                        &path_buf,
+                        &before,
+                        &new_file_content,
+                    ));
                     Ok(ToolResult {
                         success: true,
                         output,
@@ -387,13 +422,13 @@ impl ToolRegistry {
         old_string: &str,
         args: &serde_json::Value,
     ) -> Result<ToolResult, ToolError> {
-        let new_string =
-            args.get("new_string")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ToolError::InvalidArgs {
-                    tool: "Edit".to_string(),
-                    reason: "missing 'new_string' (required alongside 'old_string')".to_string(),
-                })?;
+        let new_string = args
+            .get("new_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidArgs {
+                tool: "Edit".to_string(),
+                reason: "missing 'new_string' (required alongside 'old_string')".to_string(),
+            })?;
 
         let replace_all = args
             .get("replace_all")
@@ -500,6 +535,8 @@ impl ToolRegistry {
             }
         }
 
+        append_lint_feedback(&mut out, path_buf);
+
         out
     }
 
@@ -552,9 +589,12 @@ impl ToolRegistry {
         // Populate hashline snapshot for read-before-edit invariant
         let _ = self.hashline.read_file(&path_buf);
 
+        let mut output = format!("Wrote {path}");
+        append_lint_feedback(&mut output, &path_buf);
+
         Ok(ToolResult {
             success: true,
-            output: format!("Wrote {path}"),
+            output,
             retry: false,
         })
     }
@@ -581,7 +621,31 @@ impl ToolRegistry {
                 tool: "Bash".to_string(),
                 reason: "missing 'command'".to_string(),
             })?;
+        self.run_bash_command(command, Duration::from_secs(self.bash_timeout_secs))
+            .await
+    }
 
+    /// Run a shell command under the same containment stack as the Bash tool
+    /// (`Guard::check_chain` policy → `Sandbox::apply` kernel containment →
+    /// hard timeout), inheriting the process working directory. Used by the
+    /// Bash tool itself.
+    pub async fn run_bash_command(
+        &self,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<ToolResult, ToolError> {
+        self.run_bash_command_in(command, timeout, None).await
+    }
+
+    /// Like [`Self::run_bash_command`] but optionally executing `command` in
+    /// `dir`. The verification loop passes the workspace so project test
+    /// commands (`make test`, `cargo test`, …) resolve the right project.
+    pub async fn run_bash_command_in(
+        &self,
+        command: &str,
+        timeout: Duration,
+        dir: Option<&Path>,
+    ) -> Result<ToolResult, ToolError> {
         // Guard: check the full chain
         let verdicts = Guard::check_chain(command);
         for verdict in &verdicts {
@@ -618,8 +682,7 @@ impl ToolRegistry {
         };
 
         // Execute the command with a timeout. `kill_on_drop(true)` guarantees
-        // the child is killed if the future is cancelled by the timeout.
-        let timeout = Duration::from_secs(self.bash_timeout_secs);
+        // the child is killed if the future is dropped by the timeout.
         let run = async {
             let mut cmd = tokio::process::Command::new("sh");
             cmd.arg("-c")
@@ -627,6 +690,9 @@ impl ToolRegistry {
                 .kill_on_drop(true)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            if let Some(dir) = dir {
+                cmd.current_dir(dir);
+            }
             if let Some(sb) = sandbox {
                 sb.apply(&mut cmd).map_err(|e| match e {
                     SandboxError::Unsupported(_) | SandboxError::Setup(_) => {
@@ -667,10 +733,7 @@ impl ToolRegistry {
                 // future was dropped. Report as a failed tool result.
                 return Ok(ToolResult {
                     success: false,
-                    output: format!(
-                        "command timed out after {}s (killed)",
-                        self.bash_timeout_secs
-                    ),
+                    output: format!("command timed out after {}s (killed)", timeout.as_secs()),
                     retry: false,
                 });
             }
@@ -819,6 +882,233 @@ fn edit_check_enabled() -> bool {
     std::env::var("KITTY_EDIT_CHECK").as_deref() == Ok("1")
 }
 
+/// Whether the post-edit lint gate is enabled (`KITTY_LINT_GATE=1`).
+/// Off by default (same cost rationale as [`edit_check_enabled`]).
+fn lint_gate_enabled() -> bool {
+    std::env::var("KITTY_LINT_GATE").as_deref() == Ok("1")
+}
+
+/// Append the lint-gate section to a tool output when `KITTY_LINT_GATE=1`.
+///
+/// `.rs` files get `cargo check --message-format=json` on the nearest crate;
+/// `.py` files get `python3 -m py_compile`. Other extensions are not gated.
+fn append_lint_feedback(out: &mut String, path_buf: &Path) {
+    if !lint_gate_enabled() {
+        return;
+    }
+    let lint = match path_buf.extension().and_then(|e| e.to_str()) {
+        Some("rs") => cargo_check_lint(path_buf),
+        Some("py") => run_extension_check(path_buf),
+        _ => None,
+    };
+    if let Some(lint) = lint {
+        out.push_str(&format!("\n\n--- Lint ({}) ---\n", lint.label));
+        if lint.passed {
+            out.push_str("OK");
+        } else {
+            out.push_str(&format!("FAILED:\n{}", truncate_lines(&lint.detail, 10)));
+        }
+    }
+}
+
+/// Hard ceiling for one `cargo check` lint run before the child is killed.
+const LINT_GATE_TIMEOUT_SECS: u64 = 120;
+/// Maximum compiler diagnostics rendered into the tool output.
+const LINT_GATE_MAX_DIAGS: usize = 10;
+
+/// Nearest ancestor directory of `path` containing a `Cargo.toml`.
+fn nearest_crate_root(path: &Path) -> Option<PathBuf> {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d.join("Cargo.toml").is_file() {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// One rendered rustc diagnostic from `cargo check --message-format=json`.
+#[derive(Debug)]
+struct RustcDiag {
+    level: String,
+    rendered: String,
+}
+
+/// Extract error/warning diagnostics from `cargo check --message-format=json`
+/// output (one JSON object per line). Non-compiler-message lines (artifact
+/// notifications, diagnostics metadata) are ignored.
+fn parse_cargo_check_json(stdout: &str) -> Vec<RustcDiag> {
+    let mut diags = Vec::new();
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+            continue;
+        }
+        let Some(msg) = v.get("message") else {
+            continue;
+        };
+        let level = msg
+            .get("level")
+            .and_then(|l| l.as_str())
+            .unwrap_or("")
+            .to_string();
+        if level != "error" && level != "warning" {
+            continue;
+        }
+        // Prefer rustc's pre-rendered text; fall back to message + primary span.
+        let rendered = match msg.get("rendered").and_then(|r| r.as_str()) {
+            Some(r) if !r.trim().is_empty() => r.trim().to_string(),
+            _ => {
+                let text = msg
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let span = msg
+                    .get("spans")
+                    .and_then(|s| s.as_array())
+                    .and_then(|a| {
+                        a.iter().find(|s| {
+                            s.get("is_primary")
+                                .and_then(|p| p.as_bool())
+                                .unwrap_or(false)
+                        })
+                    })
+                    .or_else(|| {
+                        msg.get("spans")
+                            .and_then(|s| s.as_array())
+                            .and_then(|a| a.first())
+                    });
+                match span {
+                    Some(s) => {
+                        let file = s.get("file_name").and_then(|f| f.as_str()).unwrap_or("?");
+                        let line = s.get("line_start").and_then(|l| l.as_u64()).unwrap_or(0);
+                        format!("{text} ({file}:{line})")
+                    }
+                    None => text,
+                }
+            }
+        };
+        diags.push(RustcDiag { level, rendered });
+    }
+    diags
+}
+
+/// Create a unique scratch file for capturing subprocess output (std-only;
+/// `tempfile` is a dev-dependency in this crate). Opened read+write so the
+/// parent can read the captured output back after the child exits. Caller
+/// removes the file.
+fn scratch_file(label: &str) -> std::io::Result<(std::fs::File, PathBuf)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path =
+        std::env::temp_dir().join(format!("kitty-lint-{}-{}-{}", label, std::process::id(), n));
+    // File::create is write-only → reads back with EBADF; open rw explicitly.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+    Ok((file, path))
+}
+
+/// Run `cargo check --message-format=json` on the crate that owns `path` and
+/// collect its errors/warnings. Returns `None` when the file lives outside
+/// any Cargo crate or cargo cannot be spawned. The child's stdout/stderr go
+/// to scratch files (never pipes) so the deadline poll cannot deadlock on a
+/// full pipe buffer.
+fn cargo_check_lint(path: &Path) -> Option<CheckOutcome> {
+    const LABEL: &str = "cargo check";
+    let crate_root = nearest_crate_root(path)?;
+
+    let (mut stdout_file, stdout_path) = scratch_file("out").ok()?;
+    let (mut stderr_file, stderr_path) = scratch_file("err").ok()?;
+    let spawn_result = std::process::Command::new("cargo")
+        .args(["check", "--message-format=json"])
+        .current_dir(&crate_root)
+        .stdout(Stdio::from(stdout_file.try_clone().ok()?))
+        .stderr(Stdio::from(stderr_file.try_clone().ok()?))
+        .spawn();
+    let mut child = match spawn_result {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = std::fs::remove_file(&stdout_path);
+            let _ = std::fs::remove_file(&stderr_path);
+            return None;
+        }
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(LINT_GATE_TIMEOUT_SECS);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_file(&stdout_path);
+                    let _ = std::fs::remove_file(&stderr_path);
+                    return Some(CheckOutcome {
+                        label: LABEL.to_string(),
+                        passed: false,
+                        detail: format!(
+                            "cargo check timed out after {LINT_GATE_TIMEOUT_SECS}s (killed)"
+                        ),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return None;
+            }
+        }
+    };
+
+    use std::io::{Read, Seek};
+    // The child inherited dup'd fds sharing our file offset; rewind to
+    // actually read what it wrote.
+    stdout_file.rewind().ok()?;
+    let mut stdout = String::new();
+    stdout_file.read_to_string(&mut stdout).ok()?;
+    stderr_file.rewind().ok()?;
+    let mut stderr = String::new();
+    stderr_file.read_to_string(&mut stderr).ok()?;
+    let _ = std::fs::remove_file(&stdout_path);
+    let _ = std::fs::remove_file(&stderr_path);
+
+    let diags = parse_cargo_check_json(&stdout);
+    let has_errors = diags.iter().any(|d| d.level == "error");
+    let passed = status.success() && !has_errors;
+
+    let mut detail = String::new();
+    for (i, d) in diags.iter().enumerate() {
+        if i >= LINT_GATE_MAX_DIAGS {
+            detail.push_str(&format!("... ({} more diagnostics)\n", diags.len() - i));
+            break;
+        }
+        detail.push_str(&d.rendered);
+        detail.push('\n');
+    }
+    if !passed && detail.is_empty() {
+        // No parsed diagnostics but the check failed — surface raw stderr so
+        // the model still gets an actionable signal (e.g. manifest errors).
+        detail = stderr;
+    }
+
+    Some(CheckOutcome {
+        label: LABEL.to_string(),
+        passed,
+        detail,
+    })
+}
+
 /// Outcome of a cheap post-edit syntax check.
 struct CheckOutcome {
     label: String,
@@ -836,14 +1126,21 @@ fn run_extension_check(path: &Path) -> Option<CheckOutcome> {
     let ext = path.extension()?.to_str()?;
     let display = path.display().to_string();
     let (label, program, args): (&str, &str, Vec<String>) = match ext {
-        "py" => ("python3 -m py_compile", "python3", vec!["-m".into(), "py_compile".into(), display]),
+        "py" => (
+            "python3 -m py_compile",
+            "python3",
+            vec!["-m".into(), "py_compile".into(), display],
+        ),
         "js" | "ts" => ("node --check", "node", vec!["--check".into(), display]),
         "sh" => ("bash -n", "bash", vec!["-n".into(), display]),
         "go" => ("gofmt -e", "gofmt", vec!["-e".into(), display]),
         _ => return None,
     };
 
-    let output = std::process::Command::new(program).args(&args).output().ok()?;
+    let output = std::process::Command::new(program)
+        .args(&args)
+        .output()
+        .ok()?;
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let passed = if ext == "go" {
         output.status.success() && stderr.trim().is_empty()
@@ -957,8 +1254,10 @@ fn unified_diff(before: &str, after: &str, max_lines: usize) -> String {
     }
 
     // Absolute line numbers per op index.
-    let old_no = |idx: usize| -> usize { ops[..idx].iter().filter(|(k, _)| *k != OpKind::Add).count() };
-    let new_no = |idx: usize| -> usize { ops[..idx].iter().filter(|(k, _)| *k != OpKind::Del).count() };
+    let old_no =
+        |idx: usize| -> usize { ops[..idx].iter().filter(|(k, _)| *k != OpKind::Add).count() };
+    let new_no =
+        |idx: usize| -> usize { ops[..idx].iter().filter(|(k, _)| *k != OpKind::Del).count() };
 
     let mut out = String::new();
     let mut emitted = 0usize;
@@ -1799,7 +2098,10 @@ mod tests {
             result.output
         );
         // File untouched
-        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "same\nsame\nother");
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            "same\nsame\nother"
+        );
     }
 
     #[test]
@@ -1888,13 +2190,29 @@ mod tests {
         });
         let result = registry.execute_edit(&args).unwrap();
         assert!(result.success);
-        assert!(result.output.contains("--- Diff ---"), "got: {}", result.output);
+        assert!(
+            result.output.contains("--- Diff ---"),
+            "got: {}",
+            result.output
+        );
         assert!(result.output.contains("-l3"), "got: {}", result.output);
         assert!(result.output.contains("+L3"), "got: {}", result.output);
         // Re-show block: tagged lines around the change (Read-style format)
-        assert!(result.output.contains("|l2"), "re-show context missing, got: {}", result.output);
-        assert!(result.output.contains("|L3"), "re-show edited line missing, got: {}", result.output);
-        assert!(result.output.contains("|l4"), "re-show context missing, got: {}", result.output);
+        assert!(
+            result.output.contains("|l2"),
+            "re-show context missing, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("|L3"),
+            "re-show edited line missing, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("|l4"),
+            "re-show context missing, got: {}",
+            result.output
+        );
     }
 
     #[test]
@@ -1924,9 +2242,17 @@ mod tests {
         });
         let result = registry.execute_edit(&args).unwrap();
         assert!(result.success, "hash protocol broken: {}", result.output);
-        assert!(result.output.contains("--- Diff ---"), "got: {}", result.output);
+        assert!(
+            result.output.contains("--- Diff ---"),
+            "got: {}",
+            result.output
+        );
         assert!(result.output.contains("+HELLO"), "got: {}", result.output);
-        assert!(result.output.contains("|world"), "re-show missing, got: {}", result.output);
+        assert!(
+            result.output.contains("|world"),
+            "re-show missing, got: {}",
+            result.output
+        );
     }
 
     #[test]
@@ -2009,5 +2335,155 @@ mod tests {
         let emitted = d.lines().count();
         assert!(emitted <= 41, "cap exceeded: {emitted} lines");
         assert!(d.contains("diff truncated"));
+    }
+
+    // -------------------------------------------------------------------
+    // Lint gate (KITTY_LINT_GATE=1)
+    // -------------------------------------------------------------------
+
+    fn lint_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::model_profile::test_env_lock()
+    }
+
+    #[test]
+    fn lint_gate_disabled_by_default() {
+        let _g = lint_env_lock();
+        let prev = std::env::var("KITTY_LINT_GATE").ok();
+        std::env::remove_var("KITTY_LINT_GATE");
+        assert!(!lint_gate_enabled(), "lint gate must default to off");
+        if let Some(v) = prev {
+            std::env::set_var("KITTY_LINT_GATE", v);
+        }
+    }
+
+    #[test]
+    fn nearest_crate_root_walks_up() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/Cargo.toml"), "[package]\n").unwrap();
+        let file = dir.path().join("a/b/lib.rs");
+        assert_eq!(
+            nearest_crate_root(&file),
+            Some(dir.path().join("a")),
+            "nearest ancestor Cargo.toml wins"
+        );
+        // No crate anywhere → None
+        let orphan_dir = tempfile::tempdir().unwrap();
+        assert_eq!(nearest_crate_root(&orphan_dir.path().join("x.rs")), None);
+    }
+
+    #[test]
+    fn cargo_check_lint_reports_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"lint_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let main = dir.path().join("src/main.rs");
+        std::fs::write(&main, "fn main() { let x: i32 = \"not a number\"; }\n").unwrap();
+
+        let outcome = cargo_check_lint(&main).expect("crate exists so cargo check runs");
+        assert!(!outcome.passed, "type error must fail the lint gate");
+        assert!(outcome.detail.contains("error"), "got: {}", outcome.detail);
+    }
+
+    #[test]
+    fn cargo_check_lint_passes_on_clean_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"lint_probe_ok\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let main = dir.path().join("src/main.rs");
+        std::fs::write(&main, "fn main() { println!(\"ok\"); }\n").unwrap();
+
+        let outcome = cargo_check_lint(&main).expect("cargo check should run");
+        assert!(
+            outcome.passed,
+            "clean crate must pass, detail: {}",
+            outcome.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_write_appends_lint_section_when_enabled() {
+        let _g = lint_env_lock();
+        let prev = std::env::var("KITTY_LINT_GATE").ok();
+        std::env::set_var("KITTY_LINT_GATE", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("bad.py");
+        let mut registry = ToolRegistry::new();
+        let args = serde_json::json!({
+            "path": py.to_str().unwrap(),
+            "content": "def f(:\n"
+        });
+        let result = registry.execute_write(&args).unwrap();
+        assert!(result.success);
+        assert!(
+            result.output.contains("--- Lint ("),
+            "lint section expected in output, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("FAILED"),
+            "syntax-broken .py must be flagged, got: {}",
+            result.output
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("KITTY_LINT_GATE", v),
+            None => std::env::remove_var("KITTY_LINT_GATE"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_write_has_no_lint_section_when_disabled() {
+        let _g = lint_env_lock();
+        let prev = std::env::var("KITTY_LINT_GATE").ok();
+        std::env::remove_var("KITTY_LINT_GATE");
+
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("fine.py");
+        let mut registry = ToolRegistry::new();
+        let args = serde_json::json!({
+            "path": py.to_str().unwrap(),
+            "content": "x = 1\n"
+        });
+        let result = registry.execute_write(&args).unwrap();
+        assert!(
+            !result.output.contains("--- Lint"),
+            "gate off → no lint section, got: {}",
+            result.output
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("KITTY_LINT_GATE", v),
+            None => std::env::remove_var("KITTY_LINT_GATE"),
+        }
+    }
+
+    #[test]
+    fn parse_cargo_check_json_extracts_errors_and_warnings() {
+        let stdout = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"x"}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"error","rendered":"error[E0308]: mismatched types\n --> src/main.rs:1:1\n"}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"warning","message":"unused variable","spans":[{"file_name":"src/lib.rs","line_start":7,"is_primary":true}]}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"note","message":"ignored"}}"#,
+            "\n"
+        );
+        let diags = parse_cargo_check_json(stdout);
+        assert_eq!(diags.len(), 2, "only error+warning kept, got: {diags:?}");
+        assert_eq!(diags[0].level, "error");
+        assert!(diags[0].rendered.contains("E0308"));
+        assert_eq!(diags[1].level, "warning");
+        assert!(diags[1].rendered.contains("src/lib.rs:7"));
     }
 }

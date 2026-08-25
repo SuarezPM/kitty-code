@@ -9,6 +9,7 @@ use kitty_memory::{Episode, EpisodeStore};
 use kitty_runtime::{
     ChatClient, ChatResponse, GrammarClient, GrammarConfig, Message, ToolDefinition,
 };
+use std::path::Path;
 use tracing::{debug, info, warn};
 
 use crate::bootstrap::Bootstrap;
@@ -437,90 +438,135 @@ impl Agent {
         // Reset thinking budget for this turn
         self.thinking_budget.reset_turn();
 
-        // Main loop: iterate until we get a text response
-        for iteration in 0..self.config.max_iterations {
-            debug!(iteration, "Agent loop iteration");
+        // Verification loop (P0): outer revision cycle around the tool loop.
+        // After the agent finishes, workspace tests grade the work; failures
+        // are fed back as a user message so the model can revise (up to
+        // VERIFY_MAX_REVISIONS cycles). See `verify_workspace`.
+        let mut revision_cycles: usize = 0;
+        'verify: loop {
+            // Main loop: iterate until we get a text response
+            for iteration in 0..self.config.max_iterations {
+                debug!(iteration, "Agent loop iteration");
 
-            // Check context budget before LLM call. Compaction fires when the
-            // tracked usage reaches the compaction threshold (default 80% of
-            // the context limit — `ContextBudget::DEFAULT_THRESHOLD`).
-            if self.budget.should_compact() {
-                self.trigger_compaction().await?;
-            }
-
-            if self.budget.should_halt() {
-                warn!("Context halting: compaction exhausted");
-                return self
-                    .force_response("Context limit reached. Please start a new conversation.")
-                    .await;
-            }
-
-            // E3 step cap: on the final iteration, tell the model to wrap up
-            // now instead of being cut mid-action (runs exactly once, since
-            // `iteration + 1 == max_iterations` matches a single iteration).
-            if iteration + 1 == self.config.max_iterations {
-                self.push_message(Message::user(MAX_STEPS_PROMPT)).await;
-            }
-
-            // LLM call
-            let response = self.llm_call().await?;
-
-            // Extract thinking tokens for budget tracking (thinking is metadata,
-            // not a conversation message — tracked via explicit budget.consume).
-            if let Some(thinking) = response.message.thinking.as_deref() {
-                let tokens = self.count_tokens(thinking).await;
-                // Apply thinking budget cap
-                if let Err(e) = self.thinking_budget.record(tokens) {
-                    warn!(error = %e, streak = self.empty_response_streak, "Thinking budget exceeded, retrying without thinking");
-                    // F2.6: Retry without thinking — re-call LLM, then fall through
-                    // to normal processing (tool calls and all). Max 1 retry per turn.
-                    // Note: empty_response_streak is NOT reset here; thinking retry counts toward streak.
-                    let retry_response = self.llm_call_no_thinking().await?;
-                    self.process_response(user_prompt, retry_response).await?;
-                    // Fail-fast after retry as well (handoff §6). Warn with streak always.
-                    if should_fail_fast(self.empty_response_streak) {
-                        warn!(streak = self.empty_response_streak, "Empty response streak cap reached (2) after thinking retry, failing fast");
-                        return Ok("no response (empty after 2 retries)".to_string());
-                    }
-                    // Don't reset thinking budget — we already retried once
-                    continue;
+                // Check context budget before LLM call. Compaction fires when the
+                // tracked usage reaches the compaction threshold (default 80% of
+                // the context limit — `ContextBudget::DEFAULT_THRESHOLD`).
+                if self.budget.should_compact() {
+                    self.trigger_compaction().await?;
                 }
-                // Thinking tokens are consumed against budget but not pushed as
-                // a message — explicit consume here is correct (F2.3 exception).
-                self.budget.consume(tokens);
+
+                if self.budget.should_halt() {
+                    warn!("Context halting: compaction exhausted");
+                    return self
+                        .force_response("Context limit reached. Please start a new conversation.")
+                        .await;
+                }
+
+                // E3 step cap: on the final iteration, tell the model to wrap up
+                // now instead of being cut mid-action (runs exactly once, since
+                // `iteration + 1 == max_iterations` matches a single iteration).
+                if iteration + 1 == self.config.max_iterations {
+                    self.push_message(Message::user(MAX_STEPS_PROMPT)).await;
+                }
+
+                // LLM call
+                let response = self.llm_call().await?;
+
+                // Extract thinking tokens for budget tracking (thinking is metadata,
+                // not a conversation message — tracked via explicit budget.consume).
+                if let Some(thinking) = response.message.thinking.as_deref() {
+                    let tokens = self.count_tokens(thinking).await;
+                    // Apply thinking budget cap
+                    if let Err(e) = self.thinking_budget.record(tokens) {
+                        warn!(error = %e, streak = self.empty_response_streak, "Thinking budget exceeded, retrying without thinking");
+                        // F2.6: Retry without thinking — re-call LLM, then fall through
+                        // to normal processing (tool calls and all). Max 1 retry per turn.
+                        // Note: empty_response_streak is NOT reset here; thinking retry counts toward streak.
+                        let retry_response = self.llm_call_no_thinking().await?;
+                        self.process_response(user_prompt, retry_response).await?;
+                        // Fail-fast after retry as well (handoff §6). Warn with streak always.
+                        if should_fail_fast(self.empty_response_streak) {
+                            warn!(streak = self.empty_response_streak, "Empty response streak cap reached (2) after thinking retry, failing fast");
+                            return Ok("no response (empty after 2 retries)".to_string());
+                        }
+                        // Don't reset thinking budget — we already retried once
+                        continue;
+                    }
+                    // Thinking tokens are consumed against budget but not pushed as
+                    // a message — explicit consume here is correct (F2.3 exception).
+                    self.budget.consume(tokens);
+                }
+
+                self.process_response(user_prompt, response).await?;
+
+                // Fail-fast: 2 consecutive empty responses → terminate quickly
+                // instead of looping until max_iterations/timeout (handoff §6).
+                if should_fail_fast(self.empty_response_streak) {
+                    warn!(
+                        streak = self.empty_response_streak,
+                        "Empty response streak cap reached (2), failing fast"
+                    );
+                    // Episode already saved as failure in process_response.
+                    return Ok("no response (empty after 2 retries)".to_string());
+                }
+
+                // Reset thinking budget for next turn
+                self.thinking_budget.reset_turn();
+                // F2.4: Do NOT clear the quality monitor window — it persists
+                // across turns to detect cross-turn tool loops.
             }
 
-            self.process_response(user_prompt, response).await?;
+            // Exhausted iterations — force a final response
+            warn!(
+                iterations = self.config.max_iterations,
+                "Agent loop exhausted iterations"
+            );
+            let text = self
+                .force_response("Please provide your final answer now.")
+                .await?;
 
-            // Fail-fast: 2 consecutive empty responses → terminate quickly
-            // instead of looping until max_iterations/timeout (handoff §6).
-            if should_fail_fast(self.empty_response_streak) {
-                warn!(
-                    streak = self.empty_response_streak,
-                    "Empty response streak cap reached (2), failing fast"
-                );
-                // Episode already saved as failure in process_response.
-                return Ok("no response (empty after 2 retries)".to_string());
+            // Verification gate: only meaningful when the agent actually
+            // touched files — otherwise failures are pre-existing and not
+            // the model's to fix.
+            let verification = if self.registry.file_modifications() == 0 {
+                debug!("verification skipped: no file modifications this session");
+                Verification::Skipped
+            } else {
+                self.verify_workspace().await
+            };
+
+            match verification {
+                Verification::Failed(output) if revision_cycles < VERIFY_MAX_REVISIONS => {
+                    revision_cycles += 1;
+                    warn!(
+                        revision_cycles,
+                        max_revisions = VERIFY_MAX_REVISIONS,
+                        "Verification failed — feeding test output back for revision"
+                    );
+                    self.push_message(Message::user(format!(
+                        "Your changes caused test failures:\n\n{output}\n\nPlease fix."
+                    )))
+                    .await;
+                    continue 'verify;
+                }
+                Verification::Failed(_) => {
+                    // Revision budget exhausted (or gate disabled mid-flight):
+                    // return the work as-is, recorded as a failure.
+                    self.save_episode(user_prompt, &text, false);
+                    return Ok(text);
+                }
+                Verification::Passed => {
+                    self.save_episode(user_prompt, &text, true);
+                    return Ok(text);
+                }
+                Verification::Skipped => {
+                    // No test command / loop disabled / nothing modified —
+                    // historical behavior: exhausted iterations count as fail.
+                    self.save_episode(user_prompt, &text, false);
+                    return Ok(text);
+                }
             }
-
-            // Reset thinking budget for next turn
-            self.thinking_budget.reset_turn();
-            // F2.4: Do NOT clear the quality monitor window — it persists
-            // across turns to detect cross-turn tool loops.
         }
-
-        // Exhausted iterations — force a final response
-        warn!(
-            iterations = self.config.max_iterations,
-            "Agent loop exhausted iterations"
-        );
-        let text = self
-            .force_response("Please provide your final answer now.")
-            .await?;
-        // The loop did not finish naturally — record the episode as a failure
-        // so memory reflects reality (otherwise only "pass" episodes accumulate).
-        self.save_episode(user_prompt, &text, false);
-        Ok(text)
     }
 
     pub async fn run_with_events(
@@ -1324,7 +1370,116 @@ fn truncate_tool_output(output: String, max_bytes: usize) -> String {
 /// heuristic (consistent with `ContextBudget::estimate_tokens`) and floors
 /// at [`MIN_OUTPUT_BUDGET_BYTES`].
 fn effective_output_cap(remaining_tokens: usize) -> usize {
-    remaining_tokens.saturating_mul(4).max(MIN_OUTPUT_BUDGET_BYTES)
+    remaining_tokens
+        .saturating_mul(4)
+        .max(MIN_OUTPUT_BUDGET_BYTES)
+}
+
+// ---------------------------------------------------------------------------
+// Verification loop (P0): grade the agent's work with workspace tests and
+// feed failures back so the model can revise.
+// ---------------------------------------------------------------------------
+
+/// Env override that disables the verification loop (`KITTY_VERIFY_LOOP=off`).
+pub const ENV_VERIFY_LOOP: &str = "KITTY_VERIFY_LOOP";
+
+/// Maximum revision cycles after a failed verification (spec: up to 2).
+const VERIFY_MAX_REVISIONS: usize = 2;
+
+/// Hard timeout for one workspace test run. Independent of
+/// `bash_timeout_secs` (profile-driven, tuned for single commands) because a
+/// full test suite legitimately runs longer.
+const VERIFY_TEST_TIMEOUT_SECS: u64 = 300;
+
+/// Outcome of grading the workspace after the tool loop finishes.
+enum Verification {
+    /// Loop disabled / no test command detected / no files modified —
+    /// behave exactly as before the loop existed.
+    Skipped,
+    /// Test command ran successfully.
+    Passed,
+    /// Test command failed; payload is the combined stdout+stderr excerpt.
+    Failed(String),
+}
+
+/// Whether the verification loop is enabled (default on; `KITTY_VERIFY_LOOP=off`
+/// disables).
+fn verify_loop_enabled() -> bool {
+    std::env::var(ENV_VERIFY_LOOP).as_deref() != Ok("off")
+}
+
+/// `true` when a Makefile declares a `test:` target (column-0 target line).
+fn makefile_has_test_target(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| content.lines().any(|l| l.starts_with("test:")))
+        .unwrap_or(false)
+}
+
+/// Detect the workspace test command (priority order: Rust → Python → JS/TS →
+/// Go → generic Makefile). `None` when no recognizable project marker exists.
+fn detect_test_command(workspace: &Path) -> Option<String> {
+    if workspace.join("Cargo.toml").exists() {
+        return Some("cargo test --workspace -- -q".to_string());
+    }
+    if workspace.join("pyproject.toml").exists() || workspace.join("setup.py").exists() {
+        return Some("python3 -m pytest --tb=short -q".to_string());
+    }
+    if workspace.join("package.json").exists() {
+        return Some("npm test -- --brief".to_string());
+    }
+    if workspace.join("go.mod").exists() {
+        return Some("go test ./...".to_string());
+    }
+    for name in ["Makefile", "makefile"] {
+        let mk = workspace.join(name);
+        if mk.is_file() && makefile_has_test_target(&mk) {
+            return Some("make test".to_string());
+        }
+    }
+    None
+}
+
+impl Agent {
+    /// Run the workspace test command detected for [`AgentConfig::workspace`].
+    ///
+    /// The command executes through the same containment stack as the Bash
+    /// tool (Guard policy → Sandbox kernel containment → hard timeout), so
+    /// `KITTY_SANDBOX=off` applies here too. Output is truncated to the same
+    /// cap as tool results before being fed back to the model.
+    async fn verify_workspace(&self) -> Verification {
+        if !verify_loop_enabled() {
+            return Verification::Skipped;
+        }
+        let Some(command) = detect_test_command(&self.config.workspace) else {
+            debug!("verification skipped: no test command detected");
+            return Verification::Skipped;
+        };
+        info!(command = %command, "verification: running workspace tests");
+        let result = self
+            .registry
+            .run_bash_command_in(
+                &command,
+                std::time::Duration::from_secs(VERIFY_TEST_TIMEOUT_SECS),
+                Some(&self.config.workspace),
+            )
+            .await;
+        match result {
+            Ok(r) if r.success => {
+                info!(command = %command, "verification: tests passed");
+                Verification::Passed
+            }
+            Ok(r) => {
+                warn!(command = %command, "verification: tests failed");
+                Verification::Failed(truncate_tool_output(r.output, TRUNCATION_MAX_BYTES))
+            }
+            Err(e) => {
+                // Blocked / sandbox failure running the test command itself:
+                // do not punish the model for harness-level issues.
+                warn!(error = %e, "verification: test command could not run");
+                Verification::Skipped
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1811,6 +1966,277 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Verification loop (P0): test feedback to agent
+    // -----------------------------------------------------------------------
+
+    /// Write a Makefile whose `test` target exits with `code`.
+    fn makefile_workspace(dir: &Path, code: u8) -> std::path::PathBuf {
+        std::fs::write(dir.join("Makefile"), format!("test:\n\t@exit {code}\n")).unwrap();
+        dir.to_path_buf()
+    }
+
+    #[test]
+    fn detect_test_command_priority_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+
+        // No markers → None
+        assert_eq!(detect_test_command(ws), None);
+
+        // Generic: Makefile WITH a test target → make test
+        makefile_workspace(ws, 0);
+        assert_eq!(
+            detect_test_command(ws).as_deref(),
+            Some("make test"),
+            "Makefile with test target should map to `make test`"
+        );
+
+        // Go beats generic Makefile
+        std::fs::write(ws.join("go.mod"), "module x\n").unwrap();
+        assert_eq!(detect_test_command(ws).as_deref(), Some("go test ./..."));
+
+        // JS/TS beats Go
+        std::fs::write(ws.join("package.json"), "{}").unwrap();
+        assert_eq!(
+            detect_test_command(ws).as_deref(),
+            Some("npm test -- --brief")
+        );
+
+        // Python beats JS/TS (setup.py variant)
+        std::fs::write(ws.join("package.json.bak"), "{}").unwrap();
+        std::fs::remove_file(ws.join("package.json")).unwrap();
+        std::fs::write(ws.join("setup.py"), "").unwrap();
+        assert_eq!(
+            detect_test_command(ws).as_deref(),
+            Some("python3 -m pytest --tb=short -q")
+        );
+
+        // Rust beats everything
+        std::fs::remove_file(ws.join("setup.py")).unwrap();
+        std::fs::write(ws.join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
+        assert_eq!(
+            detect_test_command(ws).as_deref(),
+            Some("cargo test --workspace -- -q")
+        );
+    }
+
+    #[test]
+    fn makefile_without_test_target_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Makefile"), "build:\n\t@true\n").unwrap();
+        assert_eq!(detect_test_command(dir.path()), None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
+    async fn verify_loop_triggers_on_test_failure() {
+        let _g = env_lock();
+        let prev = std::env::var(ENV_VERIFY_LOOP).ok();
+        std::env::remove_var(ENV_VERIFY_LOOP);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = makefile_workspace(dir.path(), 1); // `make test` fails
+        let notes = ws.join("notes.txt");
+
+        // Per pass: max_iterations(2) tool-loop calls + 1 forced response.
+        // Pass 1 edits a file; passes 2-3 are the two revision cycles.
+        let mut responses = vec![
+            tool_call_response(
+                "Write",
+                serde_json::json!({"path": notes.to_string_lossy(), "content": "v1"}),
+            ),
+            dummy_response("editing"),
+            dummy_response("done v1"),
+        ];
+        for round in 2..=3 {
+            responses.push(dummy_response(&format!("fix attempt {round}")));
+            responses.push(dummy_response("still fixing"));
+            responses.push(dummy_response(&format!("done v{round}")));
+        }
+
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                workspace: ws.clone(),
+                ..Default::default()
+            },
+        );
+        agent.config_mut().max_iterations = 2;
+        let out = agent.run("break things").await.unwrap();
+
+        // Two revision cycles → exactly two feedback messages.
+        let feedback = agent
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("Your changes caused test failures:"))
+            })
+            .count();
+        assert_eq!(feedback, 2, "expected exactly 2 revision feedback messages");
+        assert_eq!(
+            out, "done v3",
+            "final output comes from the last forced response"
+        );
+        if let Some(v) = prev {
+            std::env::set_var("KITTY_VERIFY_LOOP", v);
+        } else {
+            std::env::remove_var("KITTY_VERIFY_LOOP");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
+    async fn verify_loop_not_triggered_on_success() {
+        let _g = env_lock();
+        let prev = std::env::var(ENV_VERIFY_LOOP).ok();
+        std::env::remove_var(ENV_VERIFY_LOOP);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = makefile_workspace(dir.path(), 0); // `make test` succeeds
+        let notes = ws.join("notes.txt");
+
+        let responses = vec![
+            tool_call_response(
+                "Write",
+                serde_json::json!({"path": notes.to_string_lossy(), "content": "v1"}),
+            ),
+            dummy_response("editing"),
+            dummy_response("done v1"),
+        ];
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                workspace: ws,
+                ..Default::default()
+            },
+        );
+        agent.config_mut().max_iterations = 2;
+        let out = agent.run("make it work").await.unwrap();
+
+        assert_eq!(out, "done v1");
+        assert_eq!(
+            agent
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.role == "user"
+                        && m.content
+                            .as_deref()
+                            .is_some_and(|c| c.contains("Your changes caused test failures:"))
+                })
+                .count(),
+            0,
+            "no feedback message when tests pass"
+        );
+        if let Some(v) = prev {
+            std::env::set_var(ENV_VERIFY_LOOP, v);
+        } else {
+            std::env::remove_var(ENV_VERIFY_LOOP);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
+    async fn verify_loop_disabled_via_env() {
+        let _g = env_lock();
+        let prev = std::env::var(ENV_VERIFY_LOOP).ok();
+        std::env::set_var(ENV_VERIFY_LOOP, "off");
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = makefile_workspace(dir.path(), 1); // would fail — but loop is off
+        let notes = ws.join("notes.txt");
+
+        let responses = vec![
+            tool_call_response(
+                "Write",
+                serde_json::json!({"path": notes.to_string_lossy(), "content": "v1"}),
+            ),
+            dummy_response("editing"),
+            dummy_response("done v1"),
+        ];
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                workspace: ws,
+                ..Default::default()
+            },
+        );
+        agent.config_mut().max_iterations = 2;
+        let out = agent.run("break things").await.unwrap();
+
+        assert_eq!(out, "done v1");
+        assert_eq!(
+            agent
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.role == "user"
+                        && m.content
+                            .as_deref()
+                            .is_some_and(|c| c.contains("Your changes caused test failures:"))
+                })
+                .count(),
+            0,
+            "KITTY_VERIFY_LOOP=off must disable the feedback loop"
+        );
+        if let Some(v) = prev {
+            std::env::set_var(ENV_VERIFY_LOOP, v);
+        } else {
+            std::env::remove_var(ENV_VERIFY_LOOP);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
+    async fn verify_loop_skipped_without_file_edits() {
+        let _g = env_lock();
+        let prev = std::env::var(ENV_VERIFY_LOOP).ok();
+        std::env::remove_var(ENV_VERIFY_LOOP);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = makefile_workspace(dir.path(), 1); // fails, but agent edited nothing
+
+        let responses = vec![
+            dummy_response("just chatting"),
+            dummy_response("still talking"),
+            dummy_response("done"),
+        ];
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                workspace: ws,
+                ..Default::default()
+            },
+        );
+        agent.config_mut().max_iterations = 2;
+        let out = agent.run("talk only").await.unwrap();
+
+        assert_eq!(out, "done");
+        assert_eq!(
+            agent
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.role == "user"
+                        && m.content
+                            .as_deref()
+                            .is_some_and(|c| c.contains("Your changes caused test failures:"))
+                })
+                .count(),
+            0,
+            "failing tests without file edits must not trigger revisions"
+        );
+        if let Some(v) = prev {
+            std::env::set_var(ENV_VERIFY_LOOP, v);
+        } else {
+            std::env::remove_var(ENV_VERIFY_LOOP);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // E3: truncation-to-disk
     // -----------------------------------------------------------------------
 
@@ -1898,7 +2324,7 @@ mod tests {
         // Tiny / exhausted budgets floor at MIN_OUTPUT_BUDGET_BYTES.
         assert_eq!(effective_output_cap(0), MIN_OUTPUT_BUDGET_BYTES);
         assert_eq!(effective_output_cap(100), MIN_OUTPUT_BUDGET_BYTES); // 400 < 2048
-        // Saturating: huge remaining tokens cannot overflow usize.
+                                                                        // Saturating: huge remaining tokens cannot overflow usize.
         assert_eq!(effective_output_cap(usize::MAX), usize::MAX);
     }
 
@@ -1944,6 +2370,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
     async fn tool_result_truncated_by_remaining_budget() {
         let _g = env_lock();
         let tmp = tempfile::tempdir().unwrap();
