@@ -1028,13 +1028,20 @@ fn cargo_check_lint(path: &Path) -> Option<CheckOutcome> {
 
     let (mut stdout_file, stdout_path) = scratch_file("out").ok()?;
     let (mut stderr_file, stderr_path) = scratch_file("err").ok()?;
-    let spawn_result = std::process::Command::new("cargo")
-        .args(["check", "--message-format=json"])
-        .current_dir(&crate_root)
-        .stdout(Stdio::from(stdout_file.try_clone().ok()?))
-        .stderr(Stdio::from(stderr_file.try_clone().ok()?))
-        .spawn();
-    let mut child = match spawn_result {
+    // Duplicate the scratch fds up front; a failed dup must clean up both
+    // files (spawn never happened, but the Err arm below still runs).
+    let spawned = match (stdout_file.try_clone(), stderr_file.try_clone()) {
+        (Ok(stdout_dup), Ok(stderr_dup)) => std::process::Command::new("cargo")
+            .args(["check", "--message-format=json"])
+            .current_dir(&crate_root)
+            .stdout(Stdio::from(stdout_dup))
+            .stderr(Stdio::from(stderr_dup))
+            .spawn(),
+        _ => Err(std::io::Error::other(
+            "failed to duplicate lint scratch fd",
+        )),
+    };
+    let mut child = match spawned {
         Ok(child) => child,
         Err(_) => {
             let _ = std::fs::remove_file(&stdout_path);
@@ -1073,15 +1080,20 @@ fn cargo_check_lint(path: &Path) -> Option<CheckOutcome> {
 
     use std::io::{Read, Seek};
     // The child inherited dup'd fds sharing our file offset; rewind to
-    // actually read what it wrote.
-    stdout_file.rewind().ok()?;
-    let mut stdout = String::new();
-    stdout_file.read_to_string(&mut stdout).ok()?;
-    stderr_file.rewind().ok()?;
-    let mut stderr = String::new();
-    stderr_file.read_to_string(&mut stderr).ok()?;
+    // actually read what it wrote. Read through a closure so both scratch
+    // files are removed even when a rewind/read fails mid-way.
+    let captured = (|| {
+        stdout_file.rewind().ok()?;
+        let mut stdout = String::new();
+        stdout_file.read_to_string(&mut stdout).ok()?;
+        stderr_file.rewind().ok()?;
+        let mut stderr = String::new();
+        stderr_file.read_to_string(&mut stderr).ok()?;
+        Some((stdout, stderr))
+    })();
     let _ = std::fs::remove_file(&stdout_path);
     let _ = std::fs::remove_file(&stderr_path);
+    let (stdout, stderr) = captured?;
 
     let diags = parse_cargo_check_json(&stdout);
     let has_errors = diags.iter().any(|d| d.level == "error");
@@ -2406,6 +2418,53 @@ mod tests {
             outcome.passed,
             "clean crate must pass, detail: {}",
             outcome.detail
+        );
+    }
+
+    /// Regression: `cargo_check_lint` must not leave `kitty-lint-*` scratch
+    /// files behind in the temp dir — cleanup is guaranteed on every exit path
+    /// (spawn failure, timeout, read error, success).
+    #[test]
+    fn cargo_check_lint_leaves_no_scratch_files() {
+        fn leftover_count() -> usize {
+            std::env::temp_dir()
+                .read_dir()
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("kitty-lint-"))
+                        .count()
+                })
+                .unwrap_or(0)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"lint_probe_scratch\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let main = dir.path().join("src/main.rs");
+        std::fs::write(&main, "fn main() {}\n").unwrap();
+
+        // Baseline taken BEFORE the run: sibling tests may legitimately hold
+        // their own transient scratch files while their cargo check is still
+        // in flight; only files that outlive every run indicate a leak.
+        let baseline = leftover_count();
+        assert!(cargo_check_lint(&main).is_some(), "cargo check should run");
+
+        // Poll briefly so concurrent lint tests can finish and clean theirs.
+        for _ in 0..300 {
+            if leftover_count() <= baseline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            leftover_count() <= baseline,
+            "scratch files leaked: {} > baseline {baseline}",
+            leftover_count()
         );
     }
 
