@@ -905,6 +905,12 @@ async fn run_one_bench(
     );
 
     let start = Instant::now();
+    // Bench determinism gate: exercises are single-file throwaway workspaces
+    // graded via `ex.check`; if one gained a Cargo.toml/pyproject.toml
+    // mid-task, the agent verification loop would run workspace tests plus
+    // revision cycles against the 30s exercise cap. Bench never wants that.
+    std::env::set_var(kitty_harness::agent::ENV_VERIFY_LOOP, "off");
+
     let base_config = AgentConfig {
         model: cfg.model.clone(),
         profile: cfg.profile,

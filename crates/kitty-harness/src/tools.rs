@@ -1027,7 +1027,14 @@ fn cargo_check_lint(path: &Path) -> Option<CheckOutcome> {
     let crate_root = nearest_crate_root(path)?;
 
     let (mut stdout_file, stdout_path) = scratch_file("out").ok()?;
-    let (mut stderr_file, stderr_path) = scratch_file("err").ok()?;
+    // Second open must not leak the first file when it fails.
+    let (mut stderr_file, stderr_path) = match scratch_file("err") {
+        Ok(pair) => pair,
+        Err(_) => {
+            let _ = std::fs::remove_file(&stdout_path);
+            return None;
+        }
+    };
     // Duplicate the scratch fds up front; a failed dup must clean up both
     // files (spawn never happened, but the Err arm below still runs).
     let spawned = match (stdout_file.try_clone(), stderr_file.try_clone()) {
