@@ -1265,9 +1265,20 @@ fn scratch_file(label: &str) -> std::io::Result<(std::fs::File, PathBuf)> {
 /// lives outside any Cargo crate or cargo cannot be spawned.
 async fn cargo_check_lint(path: &Path) -> Option<CheckOutcome> {
     let owned = path.to_path_buf();
-    tokio::task::spawn_blocking(move || cargo_check_lint_blocking(&owned))
-        .await
-        .ok()?
+    match tokio::task::spawn_blocking(move || cargo_check_lint_blocking(&owned)).await {
+        Ok(outcome) => outcome,
+        // G4-2: a panic inside the blocking task must not silently swallow
+        // lint feedback — log it, then degrade to None like other gate
+        // failures.
+        Err(join_err) => {
+            tracing::warn!(
+                error = %join_err,
+                file = %path.display(),
+                "lint gate blocking task failed (panic or cancelled); skipping lint feedback"
+            );
+            None
+        }
+    }
 }
 
 /// Blocking core behind [`cargo_check_lint`]; runs on a blocking-pool thread.

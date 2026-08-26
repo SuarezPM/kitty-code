@@ -129,16 +129,17 @@ impl ModelProfile {
 /// Conservative auto-detection of nano-tier models by id shape (f8 T4.1).
 ///
 /// Matches ONLY the enumerated parameter sizes {0.5, 1, 1.5, 2, 3} billion at
-/// a token boundary (`start`/`-`/`.`/`_` before, end/`-`/`.`/`_`/`@` after),
-/// case-insensitive: `qwen2.5-3b`, `llama3.2-1b`, `smollm2-1.5B@q4` match;
-/// `qwen3-1.7b` and `qwen3:8b` deliberately do NOT (1.7b and 8b are outside
-/// the set) and stay on their explicit/default profile.
+/// a token boundary (`start`/`-`/`.`/`_`/`:` before — colon covers canonical
+/// ollama tags like `qwen2.5:3b`; end/`-`/`.`/`_`/`@` after), case-insensitive:
+/// `qwen2.5-3b`, `llama3.2:1b`, `smollm2-1.5B@q4` match; `qwen3-1.7b`,
+/// `ornith-1.5:9b` and `qwen3:8b` deliberately do NOT (1.7b and 8b are outside
+/// the enumerated set) and stay on their explicit/default profile.
 #[must_use]
 pub fn is_nano_sized_model(model_id: &str) -> bool {
     static NANO_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     NANO_RE
         .get_or_init(|| {
-            regex::Regex::new(r"(?i)(^|[-._])(0\.5|1|1\.5|2|3)b($|[-._@])")
+            regex::Regex::new(r"(?i)(^|[-._:])(0\.5|1|1\.5|2|3)b($|[-._@])")
                 .expect("static regex should compile")
         })
         .is_match(model_id)
@@ -497,6 +498,8 @@ mod tests {
         for model in [
             "qwen2.5-3b",
             "llama3.2-1b",
+            "qwen2.5:3b",
+            "llama3.2:1b",
             "smollm2-1.7B-placeholder-not-matching",
             "qwen3-0.5b-instruct",
             "gemma-2b",
@@ -525,16 +528,27 @@ mod tests {
 
     #[test]
     fn nano_detection_regex_boundaries() {
+        // Dash/dot separators.
         assert!(is_nano_sized_model("qwen2.5-3b"));
         assert!(is_nano_sized_model("llama3.2-1b"));
         assert!(is_nano_sized_model("QWEN3-0.5B-Instruct"));
         assert!(is_nano_sized_model("smollm-1.5b@q4"));
         assert!(is_nano_sized_model("2b"));
+        // Colon-tagged ollama ids (G4-4).
+        assert!(is_nano_sized_model("qwen2.5:3b"), "colon pre-boundary");
+        assert!(
+            is_nano_sized_model("llama3.2:1b"),
+            "colon-tagged canonical form"
+        );
         // Boundary discipline: no false positives.
         assert!(!is_nano_sized_model("qwen3-1.7b"), "1.7b outside the set");
         assert!(!is_nano_sized_model("13b"), "13b is not in the set");
         assert!(!is_nano_sized_model("xb"), "not a size token");
         assert!(!is_nano_sized_model("qwen3:8b"));
+        assert!(
+            !is_nano_sized_model("ornith-1.5:9b"),
+            "size must be followed by b"
+        );
     }
 
     #[test]

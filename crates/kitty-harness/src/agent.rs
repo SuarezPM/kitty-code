@@ -119,8 +119,8 @@ impl AgentConfig {
         self.max_iterations = p.max_iterations;
         self.bash_timeout_secs = p.bash_timeout_secs;
         self.compact_threshold = p.compact_threshold;
-        // dedup: with_profile and new_inner both enforce tiny→grammar for CLI vs direct Agent::new callers
-        if p.name == "tiny" {
+        // dedup: with_profile and new_inner both enforce tiny/nano→grammar for CLI vs direct Agent::new callers
+        if matches!(p.name, "tiny" | "nano") {
             self.enable_grammar = true;
         }
         self
@@ -424,9 +424,9 @@ impl Agent {
                 tools
             }
         };
-        // Grammar enforcement: auto-enable for tiny profile (spike).
-        // dedup: with_profile and new_inner both enforce tiny→grammar for CLI vs direct Agent::new callers
-        if config.profile.name == "tiny" {
+        // Grammar enforcement: auto-enable for tiny/nano profiles (spike).
+        // dedup: with_profile and new_inner both enforce tiny/nano→grammar for CLI vs direct Agent::new callers
+        if matches!(config.profile.name, "tiny" | "nano") {
             config.enable_grammar = true;
         }
         // Grammar enforcement: wrap client if enabled (spike, default false).
@@ -2191,6 +2191,27 @@ mod tests {
         assert!(
             agent.config().enable_grammar,
             "new_inner tiny should force enable_grammar true even when explicitly false"
+        );
+        // case 4 (G4-3): nano mirrors tiny at both enforcement sites.
+        let cfg_nano = AgentConfig {
+            enable_grammar: false,
+            ..Default::default()
+        }
+        .with_profile("nano");
+        assert!(
+            cfg_nano.enable_grammar,
+            "with_profile nano should force enable_grammar true even when explicitly false"
+        );
+        let cfg_direct = AgentConfig {
+            profile: ModelProfile::nano(),
+            enable_grammar: false,
+            ..Default::default()
+        };
+        let mock = MockClient::new(vec![dummy_response("ok")]);
+        let agent = Agent::new(mock, cfg_direct);
+        assert!(
+            agent.config().enable_grammar,
+            "new_inner nano should force enable_grammar true even when explicitly false"
         );
     }
 

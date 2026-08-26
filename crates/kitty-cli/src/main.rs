@@ -383,8 +383,14 @@ async fn main() -> Result<()> {
                 agent.config_mut().bash_timeout_secs = cli.bash_timeout;
             }
             if cli.semantic_memory {
-                if cli.profile == "tiny" {
-                    warn!("--semantic-memory requires medium/large profile, ignoring for tiny");
+                // G4-1: gate on the RESOLVED profile, not the raw flag string
+                // (the "auto" default never equals "tiny" verbatim).
+                let resolved = ModelProfile::from_cli(&cli.profile, &cli.model);
+                if resolved.name == "tiny" || resolved.name == "nano" {
+                    warn!(
+                        "--semantic-memory requires medium/large profile, ignoring for {}",
+                        resolved.name
+                    );
                 } else {
                     warn!("--semantic-memory enabled (hybrid BM25+embedding RRF)");
                 }
@@ -1408,7 +1414,10 @@ fn p50_ms(mut latencies: Vec<f64>) -> f64 {
 }
 
 fn is_small_model(profile: &str, model: &str) -> bool {
-    ModelProfile::from_cli(profile, model).name == "tiny"
+    // G4-1: gate on the RESOLVED profile name — nano sessions (auto-detected
+    // or explicit) must get the same small-model bench guard as tiny, or
+    // SQLite recall stalls a 4096-token session.
+    matches!(ModelProfile::from_cli(profile, model).name, "tiny" | "nano")
 }
 
 #[cfg(test)]
@@ -1754,5 +1763,34 @@ mod num_ctx_resolution_tests {
                 source: "fallback"
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod small_model_gate_tests {
+    use super::is_small_model;
+
+    #[test]
+    fn nano_sessions_count_as_small_models_for_bench_gating() {
+        // G4-1 ACs: nano must trip the same memory-off guard as tiny.
+        assert!(
+            is_small_model("auto", "qwen2.5-3b"),
+            "auto-profile + nano-detected id ⇒ small"
+        );
+        assert!(
+            is_small_model("nano", "some-model-id"),
+            "explicit --profile nano ⇒ small"
+        );
+        assert!(
+            is_small_model("tiny", "some-model-id"),
+            "tiny parity preserved"
+        );
+        // Medium parity preserved: these stay OUT of the guard.
+        assert!(
+            !is_small_model("auto", "ornith-1.5:9b"),
+            "1.5 without trailing b never matched nano detection"
+        );
+        assert!(!is_small_model("auto", "qwen3:8b"));
+        assert!(!is_small_model("medium", "qwen2.5-3b"));
     }
 }
