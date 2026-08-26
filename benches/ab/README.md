@@ -47,12 +47,14 @@ end-to-end.
 The gate makes N a design decision, not a convenience: with N=15 the ≤10%
 gate allows at most ONE errored trial per arm, so against configs that
 historically error around ~20% most attempts are void by construction.
-Pick N so expected errors sit under the gate with margin: if pilot error
-rate is p≈0.2, you need floor(0.1·N) comfortably above p·N's lower range —
-as a rule of thumb **N≥30 for p≈20%**. And state it explicitly: **a model
-erroring >10% under this protocol is a FINDING** (unmeasurable under
-current harness quality), not a failure to retry — record it as such
-instead of re-rolling N until the gate passes.
+Pick N so expected errors sit under the gate with margin. Note the
+arithmetic honestly: at true error rate p against this 10% gate, expected
+errors converge to p·N while the gate allows only 0.1·N — so **if pilot
+p ≥ 0.10, NO N passes the gate**: record it as a FINDING and stop. Use a
+larger N only when pilot p sits comfortably below 0.10, to tighten the CI.
+And state it explicitly: **a model erroring >10% under this protocol is a
+FINDING** (unmeasurable under current harness quality), not a failure to
+retry — record it as such instead of re-rolling N until the gate passes.
 
 ## 3. Where things land
 
