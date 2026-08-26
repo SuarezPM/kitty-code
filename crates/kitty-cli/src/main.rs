@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use kitty_harness::agent::{clamp_autorun_hops, Agent, AgentConfig};
 use kitty_harness::knowledge::KnowledgeConfig;
 use kitty_harness::tools::standard_tool_definitions;
+use kitty_harness::ContextBudget;
 use kitty_harness::{ModelProfile, ThinkingMode};
 use kitty_memory::{Episode, EpisodeStore};
 use kitty_runtime::OllamaClient;
@@ -357,6 +358,16 @@ async fn main() -> Result<()> {
             // but explicit CLI flags should survive). We check against clap defaults.
             if cli.context_window != 16384 {
                 agent.config_mut().context_window = cli.context_window;
+                // f8 AD5: reduced window ⇒ re-derive the effective compaction
+                // threshold against the profile value (and resize the budget,
+                // which the pre-P3 overlay forgot).
+                let profile_threshold = agent.config().compact_threshold;
+                let budget = agent.budget_mut();
+                budget.set_max(cli.context_window);
+                budget.set_threshold(ContextBudget::derive_compaction_threshold(
+                    profile_threshold,
+                    cli.context_window,
+                ));
             }
             if cli.max_iterations != 20 {
                 agent.config_mut().max_iterations = cli.max_iterations;
@@ -1087,10 +1098,14 @@ async fn run_one_bench(
     }
     // Ensure compact threshold follows profile (tiny 0.7, medium 0.8, large 0.8)
     agent.config_mut().compact_threshold = cfg.profile.compact_threshold;
-    // Re-sync budget threshold from profile (ensures tiny 0.7 vs medium 0.8)
+    // Re-sync budget threshold: f8 AD5 derives the EFFECTIVE value for the
+    // actual window (never raises above the profile threshold).
     agent
         .budget_mut()
-        .set_threshold(cfg.profile.compact_threshold);
+        .set_threshold(ContextBudget::derive_compaction_threshold(
+            cfg.profile.compact_threshold,
+            cfg.context_window,
+        ));
     let outcome =
         tokio::time::timeout(std::time::Duration::from_secs(30), agent.run(&prompt)).await;
 

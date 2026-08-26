@@ -30,6 +30,34 @@ impl ContextBudget {
     /// Default compaction threshold (80%).
     pub const DEFAULT_THRESHOLD: f32 = 0.8;
 
+    /// AD5 floor for the derived compaction threshold: small windows compact
+    /// early enough to leave working room, but never absurdly early.
+    pub const DERIVED_THRESHOLD_FLOOR: f32 = 0.62;
+
+    /// Token headroom reserved below the window when deriving a threshold:
+    /// `(ctx - RESERVE)/ctx` leaves this much room for prompt+output.
+    pub const DERIVED_RESERVE_TOKENS: usize = 2048;
+
+    /// Derive an EFFECTIVE compaction threshold for the given context window
+    /// (f8 AD5): `min(profile_threshold, max(0.62, (ctx - 2048) / ctx))`.
+    ///
+    /// Pure function applied wherever a profile threshold meets a possibly
+    /// REDUCED window (nano-tier presets or CLI/env-reduced contexts). The
+    /// `min` guarantees derivation NEVER raises above the profile threshold:
+    /// when `(ctx-reserve)/ctx >= profile_threshold` (e.g. any ≥16k window
+    /// against an 0.8 profile) the result equals the profile value unchanged.
+    #[must_use]
+    pub fn derive_compaction_threshold(profile_threshold: f32, context_window: usize) -> f32 {
+        if context_window == 0 {
+            return profile_threshold;
+        }
+        let usable = context_window.saturating_sub(Self::DERIVED_RESERVE_TOKENS) as f32;
+        let ratio = usable / context_window as f32;
+        ratio
+            .max(Self::DERIVED_THRESHOLD_FLOOR)
+            .min(profile_threshold)
+    }
+
     /// Create a new budget with a given max token limit (uses default threshold 0.8).
     pub fn new(max_tokens: usize) -> Self {
         Self::new_with_threshold(max_tokens, Self::DEFAULT_THRESHOLD)
@@ -94,6 +122,12 @@ impl ContextBudget {
     /// Whether we should hard-stop (too many failed compactions).
     pub fn should_halt(&self) -> bool {
         self.consecutive_compactions >= self.max_consecutive_compactions
+    }
+
+    /// Consecutive unsuccessful compaction attempts (observability for the
+    /// halt guard: halt engages when this reaches `max_consecutive_compactions`).
+    pub fn consecutive_compactions(&self) -> usize {
+        self.consecutive_compactions
     }
 
     /// Record token consumption (e.g., from an LLM response).
@@ -217,5 +251,46 @@ mod tests {
         budget.reset();
         assert_eq!(budget.used(), 0);
         assert!(!budget.should_halt());
+    }
+
+    /// f8 T3.2 (AD5) exact expectation table for the derived threshold.
+    #[test]
+    fn derive_compaction_threshold_expectation_table() {
+        let cases = [
+            // (profile_threshold, context_window, expected)
+            (0.7_f32, 4096, 0.62_f32), // tiny@4096: (2048/4096)=0.5 floored
+            (0.8, 4096, 0.62),         // medium@4096
+            (0.8, 16384, 0.80),        // medium@16384: 0.875 capped at profile
+            (0.8, 32768, 0.80),        // large@32768: ~0.94 capped at profile
+        ];
+        for (profile, ctx, expected) in cases {
+            let got = ContextBudget::derive_compaction_threshold(profile, ctx);
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "derive({profile}, {ctx}) = {got}, expected {expected}"
+            );
+        }
+    }
+
+    /// Derivation is INACTIVE (returns the profile value unchanged) whenever
+    /// the formula would raise above it — and never raises, ever.
+    #[test]
+    fn derive_compaction_threshold_never_raises_and_inactive_at_defaults() {
+        // At-default windows where the ratio exceeds the profile threshold.
+        assert!((ContextBudget::derive_compaction_threshold(0.8, 16384) - 0.8).abs() < 1e-6);
+        assert!((ContextBudget::derive_compaction_threshold(0.7, 8192) - 0.7).abs() < 1e-6);
+        // Property: for arbitrary inputs the result never exceeds profile.
+        for ctx in [1usize, 512, 2048, 4096, 8192, 16384, 1_000_000] {
+            for profile in [0.62_f32, 0.7, 0.8, 0.95] {
+                let got = ContextBudget::derive_compaction_threshold(profile, ctx);
+                assert!(
+                    got <= profile + 1e-6,
+                    "raised above profile: {got} > {profile}"
+                );
+                assert!(got >= ContextBudget::DERIVED_THRESHOLD_FLOOR - 1e-6);
+            }
+        }
+        // Degenerate zero window falls back to the profile value.
+        assert!((ContextBudget::derive_compaction_threshold(0.8, 0) - 0.8).abs() < 1e-6);
     }
 }

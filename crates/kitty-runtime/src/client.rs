@@ -377,7 +377,7 @@ pub struct ChatRequest {
     pub truncate: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RequestOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
@@ -764,6 +764,20 @@ impl<T: ChatClient + ?Sized> ChatClient for Box<T> {
         tools: Option<Vec<ToolDefinition>>,
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
         (**self).chat(model, messages, tools)
+    }
+
+    /// f8 AD4 rider: forward options on the boxed path too. Without this the
+    /// blanket impl inherited the DEFAULT chat_with_options (delegate to
+    /// plain `chat`), silently dropping RequestOptions — num_predict caps,
+    /// sampling overrides and thinking flags never reached ANY boxed client.
+    fn chat_with_options<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: Option<RequestOptions>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
+        (**self).chat_with_options(model, messages, tools, options)
     }
 
     fn count_tokens<'a>(

@@ -197,6 +197,38 @@ fn autorun_hop_retries_after_revisions_exhausted(
     hops_remaining > 0 && revision_cycles >= VERIFY_MAX_REVISIONS
 }
 
+/// f8 AD6/m7: walk-back window (in messages) when searching for a safe
+/// user-turn boundary before the naive compaction split point. Bounded so a
+/// pathologically long assistant→tool run cannot scan the whole history.
+const COMPACTION_WALKBACK_MAX: usize = 12;
+
+/// Pure boundary selection for compaction (f8 AD6): starting at
+/// `naive_split_at`, walk BACK up to [`COMPACTION_WALKBACK_MAX`] messages to
+/// the nearest index `i > 0` where `messages[i]` begins a USER turn. Cutting
+/// at a user boundary can never orphan tool results or split an
+/// assistant→tool run (rule 3): every kept message from there on belongs to
+/// a complete turn. If no user boundary exists within the window, fall back
+/// to the naive split (degenerate histories stay graceful).
+#[must_use]
+fn compaction_split_boundary(messages: &[Message], naive_split_at: usize) -> usize {
+    if naive_split_at == 0 {
+        return 0;
+    }
+    // Candidates are naive-1 down to max(naive-K, 1) — index 0 is excluded
+    // (a zero split would compact nothing).
+    let lower = naive_split_at
+        .saturating_sub(COMPACTION_WALKBACK_MAX)
+        .max(1);
+    let mut idx = naive_split_at;
+    while idx > lower {
+        idx -= 1;
+        if messages[idx].role == "user" {
+            return idx;
+        }
+    }
+    naive_split_at
+}
+
 /// Verdict returned by [`DoomLoopGuard::record`] after one tool execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoomLoopVerdict {
@@ -381,7 +413,14 @@ impl Agent {
             client
         };
         let mut budget = ContextBudget::new(config.context_window);
-        budget.set_threshold(config.compact_threshold);
+        // f8 AD5: derive the EFFECTIVE compaction threshold for the actual
+        // window (never raises above the profile value; equals it on ≥16k
+        // windows against 0.8 profiles). `config.compact_threshold` keeps the
+        // PROFILE value as the explicit-override surface.
+        budget.set_threshold(ContextBudget::derive_compaction_threshold(
+            config.compact_threshold,
+            config.context_window,
+        ));
         let tool_names: Vec<String> = tools.iter().map(|t| t.function.name.clone()).collect();
         // F2/G2-FIX3: per-turn thinking policy comes from the resolved model
         // profile. This is only the INITIAL seed — `run()` re-seeds from the
@@ -1252,11 +1291,12 @@ impl Agent {
     async fn trigger_compaction(&mut self) -> Result<()> {
         info!("Triggering context compaction");
 
-        // Split messages: keep recent ones, summarize old ones
-        let keep_count = 4.min(self.messages.len());
-        let split_at = self.messages.len().saturating_sub(keep_count);
+        // Split messages: keep recent ones, summarize old ones.
+        let len = self.messages.len();
+        let keep_count = 4.min(len);
+        let naive_split_at = len.saturating_sub(keep_count);
 
-        if split_at == 0 {
+        if naive_split_at == 0 {
             // Nothing left to compact (e.g. context full from a single huge
             // message). Register the no-op so the consecutive-compaction halt
             // guard can engage instead of spinning until max_iterations.
@@ -1264,21 +1304,23 @@ impl Agent {
             return Ok(());
         }
 
-        let old_messages: Vec<Message> = self.messages.drain(..split_at).collect();
+        // f8 AD6: move the boundary back to the nearest USER turn so tool
+        // results are never orphaned and kept turns stay complete.
+        let final_split = compaction_split_boundary(&self.messages, naive_split_at);
 
-        // Token accounting must reflect what actually left the conversation,
-        // so `freed` is computed from the PRE-prune text.
-        let freed_text: String = old_messages
+        // m7 accounting consistency: freed_text AND summary_source BOTH
+        // derive from the SAME final boundary, computed BEFORE the drain.
+        let freed_text: String = self.messages[..final_split]
             .iter()
             .filter_map(|m| m.content.as_deref())
             .collect::<Vec<_>>()
             .join("\n");
 
-        // E3 deterministic prune: tool-result messages older than the last 4
-        // exchanges (everything drained above) get their content erased BEFORE
-        // the summarizer LLM sees them — survives even a weak/dumb summarizer
-        // model, because the erasure is deterministic, not model-dependent.
-        let summary_source: String = old_messages
+        // E3 deterministic prune: everything drained gets its tool-output
+        // content erased BEFORE the summarizer LLM sees it — survives even a
+        // weak/dumb summarizer model, because the erasure is deterministic,
+        // not model-dependent.
+        let summary_source: String = self.messages[..final_split]
             .iter()
             .map(|m| {
                 if m.role == "tool" {
@@ -1290,9 +1332,13 @@ impl Agent {
             .collect::<Vec<_>>()
             .join("\n");
 
+        let old_messages: Vec<Message> = self.messages.drain(..final_split).collect();
+        debug_assert_eq!(old_messages.len(), final_split);
+
         let summary_prompt = format!(
             "Summarize the key decisions, code changes, and context from this conversation \
-             segment. Be concise — only include information needed for ongoing work:\n\n{}",
+             segment in at most 280 words of plain prose. Be concise — only include \
+             information needed for ongoing work:\n\n{}",
             summary_source
         );
 
@@ -1303,10 +1349,16 @@ impl Agent {
             thinking: None,
             tool_calls: None,
         }];
-        let options = Some(self.request_options(&summary_messages));
+        // f8 AD4: summarization is mechanical — override ONLY the sampling
+        // fields for a cheap, near-deterministic, bounded reply. num_ctx is
+        // intentionally NOT set here: the session window is client-frozen
+        // (G2-FIX4 guard traps caller injection in debug builds).
+        let mut options = self.request_options(&summary_messages);
+        options.temperature = Some(0.1);
+        options.num_predict = Some(400);
         let summary = self
             .client
-            .chat_with_options(&self.config.model, summary_messages, None, options)
+            .chat_with_options(&self.config.model, summary_messages, None, Some(options))
             .await
             .context("Compaction summary LLM call failed")?;
 
@@ -1709,6 +1761,8 @@ mod tests {
     struct CapturingClient {
         inner: MockClient,
         last_messages: std::sync::Arc<std::sync::Mutex<Option<Vec<Message>>>>,
+        last_options:
+            std::sync::Arc<std::sync::Mutex<Option<kitty_runtime::client::RequestOptions>>>,
     }
 
     impl CapturingClient {
@@ -1716,6 +1770,7 @@ mod tests {
             Self {
                 inner: MockClient::new(responses),
                 last_messages: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                last_options: std::sync::Arc::new(std::sync::Mutex::new(None)),
             }
         }
     }
@@ -1731,6 +1786,23 @@ mod tests {
             Box::pin(async move {
                 *self.last_messages.lock().unwrap() = Some(messages.clone());
                 self.inner.chat(model, messages, tools).await
+            })
+        }
+
+        fn chat_with_options<'a>(
+            &'a self,
+            model: &'a str,
+            messages: Vec<Message>,
+            tools: Option<Vec<ToolDefinition>>,
+            options: Option<kitty_runtime::client::RequestOptions>,
+        ) -> Pin<Box<dyn Future<Output = kitty_runtime::Result<ChatResponse>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                *self.last_messages.lock().unwrap() = Some(messages.clone());
+                *self.last_options.lock().unwrap() = options.clone();
+                self.inner
+                    .chat_with_options(model, messages, tools, options)
+                    .await
             })
         }
 
@@ -1940,7 +2012,9 @@ mod tests {
         assert!((cfg.compact_threshold - 0.7).abs() < f32::EPSILON);
         let mock2 = MockClient::new(vec![dummy_response("hi")]);
         let agent2 = Agent::new(mock2, cfg);
-        assert!((agent2.budget().threshold() - 0.7).abs() < f32::EPSILON);
+        // f8 AD5: budget holds the DERIVED effective threshold (tiny@4096
+        // → 0.62); config keeps the profile value 0.7.
+        assert!((agent2.budget().threshold() - 0.62).abs() < 1e-6);
         assert_eq!(agent2.budget().max(), 4096);
     }
 
@@ -3052,6 +3126,322 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("[Context Summary]"));
+    }
+
+    // -----------------------------------------------------------------------
+    // f8 T3.1: cheap summarizer override (AD4)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn compaction_summary_uses_cheap_overrides() {
+        let capturing = CapturingClient::new(vec![dummy_response("summary text")]);
+        let last_options = capturing.last_options.clone();
+        let last_messages = capturing.last_messages.clone();
+        let cfg = AgentConfig {
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(capturing, cfg);
+
+        agent.messages.push(Message::user("goal"));
+        agent.messages.push(Message::assistant("a"));
+        agent.messages.push(Message::user("b"));
+        agent.messages.push(Message::assistant("c"));
+        agent.messages.push(Message::user("d"));
+
+        agent.trigger_compaction().await.unwrap();
+
+        let options = last_options
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("options captured");
+        // AD4 overrides, exactly these two fields:
+        assert_eq!(options.temperature, Some(0.1));
+        assert_eq!(options.num_predict, Some(400));
+        // num_ctx must be ABSENT from caller options — the session-fixed
+        // window is injected by the client itself (G2-FIX4 guard).
+        assert_eq!(options.num_ctx, None);
+
+        // The prompt demands a 280-word cap.
+        let captured = last_messages.lock().unwrap().clone().unwrap();
+        let prompt = captured[0].content.as_deref().unwrap();
+        assert!(prompt.contains("280 words"), "prompt: {prompt}");
+    }
+
+    // -----------------------------------------------------------------------
+    // f8 T3.3: safe prune boundary with bounded walk-back (AD6/m7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compaction_split_boundary_pure_table() {
+        let m = |role: &str| Message {
+            role: role.to_string(),
+            content: Some(role.to_string()),
+            thinking: None,
+            tool_calls: None,
+        };
+        // Nearest user within the window wins.
+        let history = vec![
+            m("user"),
+            m("assistant"),
+            m("tool"),
+            m("user"),
+            m("assistant"),
+        ];
+        assert_eq!(compaction_split_boundary(&history, 4), 3);
+
+        // Tool at naive split → walk back to its turn-start user.
+        let history = vec![
+            m("user"),
+            m("assistant"),
+            m("user"),
+            m("assistant"),
+            m("tool"),
+            m("user"),
+        ];
+        assert_eq!(compaction_split_boundary(&history, 4), 2);
+
+        // No user in reach within K=12 → naive fallback.
+        let mut history = vec![m("system"), m("assistant"), m("tool")];
+        for _ in 0..12 {
+            history.push(m("assistant"));
+            history.push(m("tool"));
+        }
+        history.push(m("user"));
+        history.push(m("assistant"));
+        // naive_split_at points deep into the long assistant→tool run; the
+        // only user sits >12 back ⇒ naive fallback.
+        let naive = history.len() - 2;
+        assert_eq!(compaction_split_boundary(&history, naive), naive);
+
+        // Degenerate: no user at all → naive fallback.
+        let history = vec![m("system"), m("assistant"), m("tool"), m("assistant")];
+        assert_eq!(compaction_split_boundary(&history, 2), 2);
+        // Zero split stays zero.
+        assert_eq!(compaction_split_boundary(&history, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn compaction_never_orphans_tool_results() {
+        let capturing = CapturingClient::new(vec![dummy_response("summary text")]);
+        let cfg = AgentConfig {
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(capturing, cfg);
+
+        // len=8, naive keep=4 ⇒ naive_split=4. Under the OLD code this
+        // drained [..4) and left a TOOL result as the first kept message —
+        // orphaned from its assistant. The walk-back must cut at the
+        // turn-start user instead.
+        agent.messages.push(Message::user("goal")); // 0
+        agent.messages.push(Message::assistant("working")); // 1
+        agent.messages.push(Message::user("second turn")); // 2
+        agent.messages.push(Message::assistant("ran tool")); // 3
+        agent.messages.push(Message::tool_result("TOOL_OUTPUT")); // 4
+        agent.messages.push(Message::user("third turn")); // 5
+        agent.messages.push(Message::assistant("ack")); // 6
+        agent.messages.push(Message::user("fourth turn")); // 7
+
+        agent.trigger_compaction().await.unwrap();
+
+        // Summary inserted at 0; kept side starts at a USER boundary.
+        assert_eq!(agent.messages[0].role, "system");
+        assert_eq!(
+            agent.messages[1].role, "user",
+            "kept side must begin at a complete user turn, never a tool result"
+        );
+        // No tool message may appear before the first user turn.
+        let first_user = agent
+            .messages
+            .iter()
+            .position(|m| m.role == "user")
+            .unwrap();
+        assert!(
+            agent.messages[1..=first_user]
+                .iter()
+                .all(|m| m.role == "user"),
+            "orphaned pre-user messages survived compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_last_two_user_turns_intact() {
+        let capturing = CapturingClient::new(vec![dummy_response("summary text")]);
+        let cfg = AgentConfig {
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(capturing, cfg);
+
+        // Five user turns, each followed by an assistant reply and a tool
+        // result. Whatever boundary is chosen, the LAST TWO user turns and
+        // their complete runs must remain in history.
+        for i in 1..=5 {
+            agent.messages.push(Message::user(format!("turn {i}")));
+            agent
+                .messages
+                .push(Message::assistant(format!("reply {i}")));
+            agent
+                .messages
+                .push(Message::tool_result(format!("out {i}")));
+        }
+        let users_before: Vec<String> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .filter_map(|m| m.content.clone())
+            .collect();
+
+        agent.trigger_compaction().await.unwrap();
+
+        let kept_users: Vec<String> = agent
+            .messages
+            .iter()
+            .skip(1) // summary system message
+            .filter(|m| m.role == "user")
+            .filter_map(|m| m.content.clone())
+            .collect();
+        assert_eq!(
+            &kept_users[..],
+            &users_before[users_before.len().saturating_sub(2)..],
+            "the last two user turns must survive compaction intact"
+        );
+        // Each surviving user turn keeps its full run: assistant + tool follow.
+        for (i, msg) in agent.messages.iter().enumerate() {
+            if msg.role == "user"
+                && i > 0
+                && msg
+                    .content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("turn "))
+            {
+                if let Some(next_a) = agent.messages.get(i + 1) {
+                    assert_eq!(next_a.role, "assistant", "orphaned user turn at {i}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_no_user_turns_falls_back_gracefully() {
+        let capturing = CapturingClient::new(vec![dummy_response("summary text")]);
+        let cfg = AgentConfig {
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(capturing, cfg);
+
+        // Degenerate: no user turns anywhere → walk-back finds nothing and
+        // must fall back to the naive split WITHOUT panicking.
+        agent.messages.push(Message::assistant("a"));
+        agent.messages.push(Message::tool_result("t1"));
+        agent.messages.push(Message::assistant("b"));
+        agent.messages.push(Message::tool_result("t2"));
+        agent.messages.push(Message::assistant("c"));
+
+        agent.trigger_compaction().await.unwrap();
+        assert!(agent.messages[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("[Context Summary]"));
+        // Naive split kept the last 4; only the first was summarized away.
+        assert_eq!(agent.messages.len(), 5); // summary + 4 kept
+    }
+
+    #[tokio::test]
+    async fn compaction_walkback_bounded_falls_back_to_naive() {
+        let capturing = CapturingClient::new(vec![dummy_response("summary text")]);
+        let last_messages = capturing.last_messages.clone();
+        let cfg = AgentConfig {
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(capturing, cfg);
+
+        // Long assistant→tool run (>K=12) between two user turns: the only
+        // earlier user sits beyond the walk-back window ⇒ naive fallback.
+        agent.messages.push(Message::user("ancient goal"));
+        for i in 0..15 {
+            agent
+                .messages
+                .push(Message::assistant(format!("work {i} NAIVE_DRAINED_MARKER")));
+            agent
+                .messages
+                .push(Message::tool_result(format!("out {i}")));
+        }
+        agent.messages.push(Message::user("recent turn"));
+        agent.messages.push(Message::assistant("recent reply"));
+        agent.messages.push(Message::user("final question"));
+
+        agent.trigger_compaction().await.unwrap();
+
+        // Naive fallback ⇒ boundary == naive exactly: post-compaction length
+        // is summary + last 4 messages.
+        assert_eq!(agent.messages.len(), 5);
+        // The summarizer saw exactly the naively-drained window: the marked
+        // run messages AND the ancient user turn (both sit before naive).
+        let captured = last_messages.lock().unwrap().clone().unwrap();
+        let prompt = captured[0].content.as_deref().unwrap();
+        assert!(prompt.contains("NAIVE_DRAINED_MARKER"));
+        assert!(
+            prompt.contains("ancient goal"),
+            "fallback must drain exactly [..naive), not walk back further"
+        );
+
+        // Kept side: recent run + final user turn intact.
+        assert!(agent
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some("recent turn")));
+        assert!(agent
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some("final question")));
+    }
+
+    #[tokio::test]
+    async fn compaction_insufficient_freeing_keeps_halt_semantics() {
+        // Anti-halt fixture (m7): tool-heavy history where the scripted
+        // summary is LONGER than what pruning freed → record_compaction
+        // errors each time. Semantics unchanged: warn path, consecutive
+        // counter increments per attempt, halt engages only after the SAME
+        // threshold as before (3).
+        let long_summary = "x".repeat(2000); // needed ≈ 500+100 ≫ freed
+        let capturing = CapturingClient::new(vec![
+            dummy_response(&long_summary),
+            dummy_response(&long_summary),
+            dummy_response(&long_summary),
+        ]);
+        let cfg = AgentConfig {
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(capturing, cfg);
+
+        agent.messages.push(Message::user("short goal"));
+        agent.messages.push(Message::assistant("ok"));
+        for i in 0..6 {
+            agent
+                .messages
+                .push(Message::tool_result(format!("out {i}")));
+            agent.messages.push(Message::assistant("noted"));
+        }
+        agent.messages.push(Message::user("latest"));
+
+        agent.trigger_compaction().await.unwrap();
+        assert!(
+            !agent.budget.should_halt(),
+            "one insufficient compaction must not escalate to halt"
+        );
+        assert_eq!(agent.budget.consecutive_compactions(), 1);
+
+        for _ in 0..2 {
+            agent.trigger_compaction().await.unwrap();
+        }
+        assert!(agent.budget.should_halt());
     }
 
     // -----------------------------------------------------------------------
