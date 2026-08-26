@@ -57,7 +57,7 @@ cat > "$MANIFEST" <<EOF
   "profile": "$PROFILE",
   "interleave": true,
   "valid_run_gate": "errored trials <= 10% of N per arm; no early cuts",
-  "env_baseline": "both arms launched from one normalized prefix; stripped: KITTY_NUM_CTX, KITTY_KV_QUANT_ACK, KITTY_MODEL_TURN_CAPS, KITTY_NO_THINK, KITTY_LINT_GATE, KITTY_EDIT_CHECK",
+  "env_baseline": "both arms launched from one normalized prefix; stripped: KITTY_NUM_CTX, KITTY_KV_QUANT_ACK, KITTY_MODEL_TURN_CAPS, KITTY_NO_THINK, KITTY_LINT_GATE, KITTY_EDIT_CHECK, KITTY_AUTORUN_HOPS",
   "arm_a": {
     "model": "$MODEL_A",
     "levers": "none — normalized baseline only"
@@ -77,11 +77,12 @@ echo "pre-registration manifest: $MANIFEST"
 OUT_A="benches/ab/results/${TS}-armA.json"
 OUT_B="benches/ab/results/${TS}-armB.json"
 
-# ── Symmetric normalized env baseline (G4-FIX2) ─────────────────────────────
+# ── Symmetric normalized env baseline (G4-FIX2 + f8 T1.3) ───────────────────
 # BOTH arms launch from this exact prefix so ambient operator env can never
 # leak into one arm and not the other (the manifest's "levers" claim must be
-# true). Stripped set: every harness lever env var.
-CLEAN_ENV=(env -u KITTY_NUM_CTX -u KITTY_KV_QUANT_ACK -u KITTY_MODEL_TURN_CAPS -u KITTY_NO_THINK -u KITTY_LINT_GATE -u KITTY_EDIT_CHECK)
+# true). Stripped set: every harness lever env var, INCLUDING the interactive-
+# only KITTY_AUTORUN_HOPS (bench autorun is flag-only via --hops).
+CLEAN_ENV=(env -u KITTY_NUM_CTX -u KITTY_KV_QUANT_ACK -u KITTY_MODEL_TURN_CAPS -u KITTY_NO_THINK -u KITTY_LINT_GATE -u KITTY_EDIT_CHECK -u KITTY_AUTORUN_HOPS)
 
 # NOTE: `--model` is a TOP-LEVEL argument and must precede the subcommand.
 

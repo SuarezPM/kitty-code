@@ -7,7 +7,7 @@ mod mcp;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use kitty_harness::agent::{Agent, AgentConfig};
+use kitty_harness::agent::{clamp_autorun_hops, Agent, AgentConfig};
 use kitty_harness::knowledge::KnowledgeConfig;
 use kitty_harness::tools::standard_tool_definitions;
 use kitty_harness::{ModelProfile, ThinkingMode};
@@ -128,6 +128,11 @@ pub enum Commands {
         /// Number of exercises to run
         #[arg(short, long, default_value = "15")]
         limit: usize,
+        /// Autorun continuation hops for every exercise (default 0 = off).
+        /// Each hop grants one extra full tool-loop cycle on iteration
+        /// exhaustion; worst-case LLM calls ≈ iterations × 3 × (hops+1).
+        #[arg(long, default_value = "0")]
+        hops: usize,
         /// Output file for results
         #[arg(short, long, default_value = "bench_results.json")]
         out: PathBuf,
@@ -147,6 +152,9 @@ pub enum Commands {
         /// Number of exercises per budget
         #[arg(short, long, default_value = "50")]
         limit: usize,
+        /// Autorun continuation hops for every exercise (default 0 = off).
+        #[arg(long, default_value = "0")]
+        hops: usize,
         /// Repetitions per (task,budget) pair
         #[arg(long, default_value = "1")]
         reps: usize,
@@ -221,6 +229,14 @@ async fn main() -> Result<()> {
             }
             .with_profile(&cli.profile);
             let mut agent = Agent::new(client, base_config);
+            // f8 T1.1: interactive sessions may grant autorun continuation
+            // hops via env (bench paths NEVER read this — they are flag-only).
+            if let Ok(raw) = std::env::var("KITTY_AUTORUN_HOPS") {
+                match raw.trim().parse::<usize>() {
+                    Ok(v) => agent.config_mut().autorun_hops = clamp_autorun_hops(v),
+                    Err(_) => warn!("KITTY_AUTORUN_HOPS={raw:?} is not a valid usize — ignoring"),
+                }
+            }
             // Overlay explicit CLI overrides after profile sync (profile wins by default,
             // but explicit CLI flags should survive). We check against clap defaults.
             if cli.context_window != 16384 {
@@ -269,6 +285,7 @@ async fn main() -> Result<()> {
         Commands::Bench {
             suite,
             limit,
+            hops,
             out,
             exercises: exercises_path,
             no_memory,
@@ -312,6 +329,7 @@ async fn main() -> Result<()> {
                 thinking_budget: cli.thinking_budget,
                 context_window: cli.context_window,
                 max_iterations: bench_max_iterations,
+                autorun_hops: kitty_harness::agent::clamp_autorun_hops(hops),
                 bash_timeout: cli.bash_timeout,
                 profile: ModelProfile::from_cli(&cli.profile),
                 enable_knowledge: cli.knowledge,
@@ -465,6 +483,7 @@ async fn main() -> Result<()> {
         Commands::BenchAb {
             thinking,
             limit,
+            hops,
             reps,
             suite,
             out,
@@ -493,6 +512,7 @@ async fn main() -> Result<()> {
                 thinking_budget: 2048, // overridden per run below
                 context_window: cli.context_window,
                 max_iterations: bench_max_iterations,
+                autorun_hops: kitty_harness::agent::clamp_autorun_hops(hops),
                 bash_timeout: cli.bash_timeout,
                 profile: ModelProfile::from_cli(&cli.profile),
                 enable_knowledge: cli.knowledge,
@@ -850,6 +870,10 @@ struct BenchConfig {
     thinking_budget: usize,
     context_window: usize,
     max_iterations: usize,
+    /// Autorun continuation hops (f8 T1.3): FLAG-ONLY on bench paths — the
+    /// harness never reads `KITTY_AUTORUN_HOPS`, so ambient env cannot leak
+    /// into benchmark runs. Default 0.
+    autorun_hops: usize,
     bash_timeout: u64,
     profile: &'static ModelProfile,
     enable_knowledge: bool,
@@ -929,6 +953,9 @@ async fn run_one_bench(
     // Agent::new syncs profile fields, so patch explicit bench overrides here.
     // Copy Run overlay logic to preserve profile tiny/medium/large unless CLI explicitly differs.
     agent.config_mut().max_iterations = cfg.max_iterations;
+    // f8 T1.3: bench autorun is FLAG-ONLY — set explicitly (default 0) so an
+    // ambient KITTY_AUTORUN_HOPS can never leak into a benchmark run.
+    agent.config_mut().autorun_hops = clamp_autorun_hops(cfg.autorun_hops);
     if cfg.context_window != 16384 {
         agent.config_mut().context_window = cfg.context_window;
         agent.budget_mut().set_max(cfg.context_window);
@@ -1265,6 +1292,31 @@ mod bench_ab_tests {
                 assert_eq!(budgets, vec![1024, 2048, 4096]);
             }
             _ => panic!("expected BenchAb"),
+        }
+    }
+
+    /// f8 T1.3 AC: `--hops` propagates; absent flag ⇒ 0.
+    #[test]
+    fn test_bench_hops_flag_propagation() {
+        // Explicit --hops 3 propagates.
+        let cli = Cli::try_parse_from(["kitty", "bench-ab", "--hops", "3"])
+            .expect("parse bench-ab --hops 3");
+        match cli.command {
+            Commands::BenchAb { hops, .. } => assert_eq!(hops, 3),
+            _ => panic!("expected BenchAb"),
+        }
+        // Absent flag defaults to 0 (byte-identical legacy behavior).
+        let cli = Cli::try_parse_from(["kitty", "bench-ab"]).expect("parse bench-ab default");
+        match cli.command {
+            Commands::BenchAb { hops, .. } => assert_eq!(hops, 0),
+            _ => panic!("expected BenchAb"),
+        }
+        // Same on the Bench subcommand.
+        let cli =
+            Cli::try_parse_from(["kitty", "bench", "--hops", "2"]).expect("parse bench --hops 2");
+        match cli.command {
+            Commands::Bench { hops, .. } => assert_eq!(hops, 2),
+            _ => panic!("expected Bench"),
         }
     }
 

@@ -480,9 +480,19 @@ fn run_app(
                             let prompt_clone = prompt.clone();
                             tokio::task::spawn_local(async move {
                                 let client = OllamaClient::new(&url_clone);
+                                // f8 T1.1: interactive TUI sessions may grant
+                                // autorun hops via env (bench paths never read
+                                // this). Invalid/absent ⇒ 0.
+                                let autorun_hops = std::env::var("KITTY_AUTORUN_HOPS")
+                                    .ok()
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                                    .unwrap_or(0);
                                 let config = AgentConfig {
                                     model: model_clone,
                                     context_window: window,
+                                    autorun_hops: kitty_harness::agent::clamp_autorun_hops(
+                                        autorun_hops,
+                                    ),
                                     ..Default::default()
                                 };
                                 let mut agent = Agent::new(client, config);

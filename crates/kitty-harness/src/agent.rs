@@ -48,6 +48,13 @@ pub struct AgentConfig {
     pub model: String,
     /// Maximum number of tool-call iterations before forcing a text response.
     pub max_iterations: usize,
+    /// Autorun continuation hops (f8 AD1): extra FULL tool-loop cycles granted
+    /// ONLY on iteration exhaustion — force_response is skipped, an
+    /// [`AUTORUN_CONTINUE_PROMPT`] is pushed and the inner loop restarts.
+    /// Default 0 keeps behavior byte-identical to the legacy single-cycle run;
+    /// clamped to 0..=[`MAX_AUTORUN_HOPS`] wherever set. Independent of
+    /// `VERIFY_MAX_REVISIONS` (which counts verification-driven re-entries).
+    pub autorun_hops: usize,
     /// Context window size in tokens.
     pub context_window: usize,
     /// Compaction threshold (0.0-1.0). Default: 0.8.
@@ -83,6 +90,7 @@ impl Default for AgentConfig {
         Self {
             model: "qwen3:8b".to_string(),
             max_iterations: 20,
+            autorun_hops: 0,
             context_window: 16384,
             compact_threshold: 0.8,
             enable_knowledge: false,
@@ -146,6 +154,43 @@ const DOOM_LOOP_NUDGE_MSG: &str =
 /// MAX_STEPS_PROMPT pattern).
 const MAX_STEPS_PROMPT: &str =
     "FINAL ITERATION: summarize progress and deliver your best result now.";
+
+/// Autorun continuation prompt (f8 AD1): pushed when an iteration budget is
+/// exhausted while [`AgentConfig::autorun_hops`] remain. Style-matches
+/// [`MAX_STEPS_PROMPT`] but signals the opposite — keep working the SAME task
+/// with tools; stop calling tools only when done. The two are never injected
+/// in the same cycle: MAX_STEPS is suppressed while hops remain.
+const AUTORUN_CONTINUE_PROMPT: &str =
+    "CONTINUE: you have more budget — keep working on the same task using tools. \
+     When the task is complete, stop calling tools and give your final answer.";
+
+/// Hard upper bound for [`AgentConfig::autorun_hops`] (clamp helper below).
+/// Each hop multiplies worst-case LLM calls by another full tool-loop cycle,
+/// so runaway values are rejected at every set site.
+pub const MAX_AUTORUN_HOPS: usize = 12;
+
+/// Clamp `autorun_hops` into 0..=[`MAX_AUTORUN_HOPS`] (usize cannot be
+/// negative). Applied wherever the value is set: config default stays 0
+/// (byte-identical legacy behavior), CLI/env/bench values are bounded here.
+#[must_use]
+pub fn clamp_autorun_hops(hops: usize) -> usize {
+    hops.min(MAX_AUTORUN_HOPS)
+}
+
+/// Fixed-machine rule (f8 AD1): after verification FAILS and the revision
+/// budget is exhausted, one autorun hop may buy one more full cycle.
+///
+/// Note on reachability: because hops are consumed on ITERATION EXHAUSTION
+/// (before any verification can run), a strictly-serial run usually arrives
+/// here with `hops_remaining == 0`; the rule keeps its guarantee for any path
+/// that still holds hops at verification time. Unit-tested directly.
+#[must_use]
+fn autorun_hop_retries_after_revisions_exhausted(
+    hops_remaining: usize,
+    revision_cycles: usize,
+) -> bool {
+    hops_remaining > 0 && revision_cycles >= VERIFY_MAX_REVISIONS
+}
 
 /// Verdict returned by [`DoomLoopGuard::record`] after one tool execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +320,9 @@ impl Agent {
         mut config: AgentConfig,
         tools: Vec<ToolDefinition>,
     ) -> Self {
+        // Clamp the autorun surface at construction (covers CLI/env/bench
+        // plumbing, which all set the field before Agent::new).
+        config.autorun_hops = clamp_autorun_hops(config.autorun_hops);
         // Sync derived fields from profile (single source of truth).
         // Keeps AgentConfig::default() (medium) unchanged for existing tests,
         // while --profile tiny correctly drives caps.
@@ -477,87 +525,117 @@ impl Agent {
         // are fed back as a user message so the model can revise (up to
         // VERIFY_MAX_REVISIONS cycles). See `verify_workspace`.
         let mut revision_cycles: usize = 0;
+        // f8 AD1: autorun hop budget. Consumed ONLY on iteration exhaustion
+        // (never by verification revisions); 0 = byte-identical legacy run.
+        let mut hops_remaining = self.config.autorun_hops;
         'verify: loop {
-            // Bounded tool loop: EVERY iteration processes the response — tool
-            // calls are executed and fed back, text responses still consume an
-            // iteration (the loop never breaks on text; it runs to
-            // `max_iterations`). Only when the budget is EXHAUSTED does
-            // `force_response` below extract a final answer with a single
-            // no-tools call. The outer `'verify` cycle may then re-enter this
-            // full loop up to VERIFY_MAX_REVISIONS times, multiplying the
-            // worst-case LLM-call count per prompt (see ModelTuning docs).
-            for iteration in 0..self.config.max_iterations {
-                debug!(iteration, "Agent loop iteration");
+            // Fixed state machine (f8 AD1): the inner for restarts on hop
+            // consumption; force_response + Verification run ONLY on real
+            // completion paths — natural terminal return, or exhaustion with
+            // no hops left.
+            'autorun: loop {
+                // Bounded tool loop: EVERY iteration processes the response —
+                // tool calls are executed and fed back, text responses still
+                // consume an iteration (the loop never breaks on text; it runs
+                // to `max_iterations`). Only when the budget is EXHAUSTED does
+                // the post-loop code below extract a final answer. The outer
+                // cycles multiply worst-case LLM calls per prompt: revisions
+                // (×VERIFY_MAX_REVISIONS) and hops (see ModelTuning docs).
+                for iteration in 0..self.config.max_iterations {
+                    debug!(iteration, "Agent loop iteration");
 
-                // Check context budget before LLM call. Compaction fires when the
-                // tracked usage reaches the compaction threshold (default 80% of
-                // the context limit — `ContextBudget::DEFAULT_THRESHOLD`).
-                if self.budget.should_compact() {
-                    self.trigger_compaction().await?;
-                }
-
-                if self.budget.should_halt() {
-                    warn!("Context halting: compaction exhausted");
-                    return self
-                        .force_response("Context limit reached. Please start a new conversation.")
-                        .await;
-                }
-
-                // E3 step cap: on the final iteration, tell the model to wrap up
-                // now instead of being cut mid-action (runs exactly once, since
-                // `iteration + 1 == max_iterations` matches a single iteration).
-                if iteration + 1 == self.config.max_iterations {
-                    self.push_message(Message::user(MAX_STEPS_PROMPT)).await;
-                }
-
-                // LLM call
-                let response = self.llm_call().await?;
-
-                // Extract thinking tokens for budget tracking (thinking is metadata,
-                // not a conversation message — tracked via explicit budget.consume).
-                if let Some(thinking) = response.message.thinking.as_deref() {
-                    let tokens = self.count_tokens(thinking).await;
-                    // Apply thinking budget cap
-                    if let Err(e) = self.thinking_budget.record(tokens) {
-                        warn!(error = %e, streak = self.empty_response_streak, "Thinking budget exceeded, retrying without thinking");
-                        // F2.6: Retry without thinking — re-call LLM, then fall through
-                        // to normal processing (tool calls and all). Max 1 retry per turn.
-                        // Note: empty_response_streak is NOT reset here; thinking retry counts toward streak.
-                        let retry_response = self.llm_call_no_thinking().await?;
-                        self.process_response(user_prompt, retry_response).await?;
-                        // Fail-fast after retry as well (handoff §6). Warn with streak always.
-                        if should_fail_fast(self.empty_response_streak) {
-                            warn!(streak = self.empty_response_streak, "Empty response streak cap reached (2) after thinking retry, failing fast");
-                            return Ok("no response (empty after 2 retries)".to_string());
-                        }
-                        // Don't reset thinking budget — we already retried once
-                        continue;
+                    // Check context budget before LLM call. Compaction fires when the
+                    // tracked usage reaches the compaction threshold (default 80% of
+                    // the context limit — `ContextBudget::DEFAULT_THRESHOLD`).
+                    if self.budget.should_compact() {
+                        self.trigger_compaction().await?;
                     }
-                    // Thinking tokens are consumed against budget but not pushed as
-                    // a message — explicit consume here is correct (F2.3 exception).
-                    self.budget.consume(tokens);
+
+                    if self.budget.should_halt() {
+                        warn!("Context halting: compaction exhausted");
+                        return self
+                            .force_response(
+                                "Context limit reached. Please start a new conversation.",
+                            )
+                            .await;
+                    }
+
+                    // E3 step cap: on the final iteration, tell the model to wrap up
+                    // now instead of being cut mid-action (runs exactly once, since
+                    // `iteration + 1 == max_iterations` matches a single iteration).
+                    // SUPPRESSED while autorun hops remain (f8 AD1/m6): this cycle
+                    // would continue rather than finish, and contradictory
+                    // "finish now"/"continue" signals confuse small models.
+                    if iteration + 1 == self.config.max_iterations && hops_remaining == 0 {
+                        self.push_message(Message::user(MAX_STEPS_PROMPT)).await;
+                    }
+
+                    // LLM call
+                    let response = self.llm_call().await?;
+
+                    // Extract thinking tokens for budget tracking (thinking is metadata,
+                    // not a conversation message — tracked via explicit budget.consume).
+                    if let Some(thinking) = response.message.thinking.as_deref() {
+                        let tokens = self.count_tokens(thinking).await;
+                        // Apply thinking budget cap
+                        if let Err(e) = self.thinking_budget.record(tokens) {
+                            warn!(error = %e, streak = self.empty_response_streak, "Thinking budget exceeded, retrying without thinking");
+                            // F2.6: Retry without thinking — re-call LLM, then fall through
+                            // to normal processing (tool calls and all). Max 1 retry per turn.
+                            // Note: empty_response_streak is NOT reset here; thinking retry counts toward streak.
+                            let retry_response = self.llm_call_no_thinking().await?;
+                            self.process_response(user_prompt, retry_response).await?;
+                            // Fail-fast after retry as well (handoff §6). Warn with streak always.
+                            if should_fail_fast(self.empty_response_streak) {
+                                warn!(streak = self.empty_response_streak, "Empty response streak cap reached (2) after thinking retry, failing fast");
+                                return Ok("no response (empty after 2 retries)".to_string());
+                            }
+                            // Don't reset thinking budget — we already retried once
+                            continue;
+                        }
+                        // Thinking tokens are consumed against budget but not pushed as
+                        // a message — explicit consume here is correct (F2.3 exception).
+                        self.budget.consume(tokens);
+                    }
+
+                    self.process_response(user_prompt, response).await?;
+
+                    // Fail-fast: 2 consecutive empty responses → terminate quickly
+                    // instead of looping until max_iterations/timeout (handoff §6).
+                    if should_fail_fast(self.empty_response_streak) {
+                        warn!(
+                            streak = self.empty_response_streak,
+                            "Empty response streak cap reached (2), failing fast"
+                        );
+                        // Episode already saved as failure in process_response.
+                        return Ok("no response (empty after 2 retries)".to_string());
+                    }
+
+                    // Reset thinking budget for next turn
+                    self.thinking_budget.reset_turn();
+                    // F2.4: Do NOT clear the quality monitor window — it persists
+                    // across turns to detect cross-turn tool loops.
                 }
 
-                self.process_response(user_prompt, response).await?;
-
-                // Fail-fast: 2 consecutive empty responses → terminate quickly
-                // instead of looping until max_iterations/timeout (handoff §6).
-                if should_fail_fast(self.empty_response_streak) {
-                    warn!(
-                        streak = self.empty_response_streak,
-                        "Empty response streak cap reached (2), failing fast"
+                // Iteration budget exhausted WITHOUT a natural terminal return.
+                if hops_remaining > 0 {
+                    // AD1 hop path: NO force_response, NO verification, NO episode
+                    // save — push the continuation prompt into history so context
+                    // persists, spend one hop, restart the full inner loop.
+                    hops_remaining -= 1;
+                    info!(
+                        remaining = hops_remaining,
+                        total = self.config.autorun_hops,
+                        "autorun: iterations exhausted — continuing with a fresh cycle"
                     );
-                    // Episode already saved as failure in process_response.
-                    return Ok("no response (empty after 2 retries)".to_string());
+                    self.push_message(Message::user(AUTORUN_CONTINUE_PROMPT))
+                        .await;
+                    continue 'autorun;
                 }
-
-                // Reset thinking budget for next turn
-                self.thinking_budget.reset_turn();
-                // F2.4: Do NOT clear the quality monitor window — it persists
-                // across turns to detect cross-turn tool loops.
+                break 'autorun;
             }
 
-            // Exhausted iterations — force a final response
+            // Exhausted iterations with no hops left — force a final response.
             warn!(
                 iterations = self.config.max_iterations,
                 "Agent loop exhausted iterations"
@@ -590,9 +668,24 @@ impl Agent {
                     .await;
                     continue 'verify;
                 }
-                Verification::Failed(_) => {
+                Verification::Failed(output) => {
                     // Revision budget exhausted (or gate disabled mid-flight):
-                    // return the work as-is, recorded as a failure.
+                    // consume ONE autorun hop iff any remain — a full fresh
+                    // cycle retries with the LATEST failure output fed back;
+                    // no save here (intermediate). Otherwise return the work
+                    // as-is, recorded as a failure (terminal).
+                    if autorun_hop_retries_after_revisions_exhausted(
+                        hops_remaining,
+                        revision_cycles,
+                    ) {
+                        hops_remaining -= 1;
+                        warn!(remaining = hops_remaining, "Verification failed and revisions exhausted — autorun hop spent, retrying full cycle");
+                        self.push_message(Message::user(format!(
+                            "Your changes caused test failures:\n\n{output}\n\nPlease fix."
+                        )))
+                        .await;
+                        continue 'verify;
+                    }
                     self.save_episode(user_prompt, &text, false);
                     return Ok(text);
                 }
@@ -2469,6 +2562,208 @@ mod tests {
         } else {
             std::env::remove_var(ENV_VERIFY_LOOP);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // f8 T1.1/T1.2: autorun continuation hops (fixed state machine)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clamp_autorun_hops_bounds_surface() {
+        // Good inputs pass through.
+        assert_eq!(clamp_autorun_hops(0), 0);
+        assert_eq!(clamp_autorun_hops(1), 1);
+        assert_eq!(clamp_autorun_hops(12), 12);
+        // Bad inputs clamp to the cap (usize cannot go negative).
+        assert_eq!(clamp_autorun_hops(13), 12);
+        assert_eq!(clamp_autorun_hops(usize::MAX), 12);
+        assert_eq!(MAX_AUTORUN_HOPS, 12);
+    }
+
+    #[tokio::test]
+    async fn autorun_hops_zero_keeps_legacy_single_cycle() {
+        // hops=0 must be byte-identical legacy: first exhaustion goes straight
+        // to force_response — no continuation prompt anywhere in history.
+        let responses = vec![dummy_response("cycle1"), dummy_response("forced final")];
+        let mut agent = Agent::new(MockClient::new(responses), AgentConfig::default());
+        agent.config_mut().max_iterations = 1;
+        let out = agent.run("hi").await.unwrap();
+        assert_eq!(out, "forced final");
+        assert_eq!(
+            agent
+                .messages
+                .iter()
+                .filter(|m| m.content.as_deref() == Some(AUTORUN_CONTINUE_PROMPT))
+                .count(),
+            0,
+            "hops=0 must never inject the continuation prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn autorun_hop_consumed_on_exhaustion_completes_later_cycle() {
+        // max_iterations=1 so each scripted response exhausts one cycle.
+        // hops=2: cycles 1-2 exhaust and consume a hop each (NO forced
+        // response); cycle 3 exhausts with hops==0 → force_response consumes
+        // the 4th scripted reply.
+        let responses = vec![
+            dummy_response("cycle1"),
+            dummy_response("cycle2"),
+            dummy_response("cycle3"),
+            dummy_response("final answer"),
+        ];
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                autorun_hops: 2,
+                ..Default::default()
+            },
+        );
+        agent.config_mut().max_iterations = 1;
+        let out = agent.run("keep going").await.unwrap();
+        assert_eq!(out, "final answer");
+
+        // Continuation prompt persisted in history, once per consumed hop.
+        let continues = agent
+            .messages
+            .iter()
+            .filter(|m| m.content.as_deref() == Some(AUTORUN_CONTINUE_PROMPT))
+            .count();
+        assert_eq!(continues, 2, "one CONTINUE prompt per consumed hop");
+
+        // MAX_STEPS suppressed while hops remained (cycles 1-2), injected only
+        // on cycle 3's final iteration where exhaustion would really finish.
+        let max_steps = agent
+            .messages
+            .iter()
+            .filter(|m| m.content.as_deref() == Some(MAX_STEPS_PROMPT))
+            .count();
+        assert_eq!(max_steps, 1, "MAX_STEPS only when no hops remain");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
+    async fn verify_failed_consumes_revision_not_hop() {
+        let _g = env_lock();
+        let prev = std::env::var(ENV_VERIFY_LOOP).ok();
+        std::env::remove_var(ENV_VERIFY_LOOP);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = makefile_workspace(dir.path(), 1); // always failing tests
+        let notes = ws.join("notes.txt");
+
+        // hops=1, max_iterations=2. Fixed-machine trace:
+        //   c1: Write + "editing" -> exhaust -> HOP spent, CONTINUE pushed.
+        //   c2: fix2/fixing2 -> exhaust (hops==0) -> forced "done v2" -> verify
+        //       FAILED -> REVISION #1 fed back.
+        //   c3: fix3/fixing3 -> forced "done v3" -> FAILED -> REVISION #2.
+        //   c4: fix4/fixing4 -> forced "done v4" -> FAILED, revisions
+        //       exhausted, hops==0 -> return as-is.
+        // Verification failures spend REVISIONS (feedback pushes), never
+        // hops: exactly ONE CONTINUE despite two verify-Failed re-entries.
+        let mut responses = vec![
+            tool_call_response(
+                "Write",
+                serde_json::json!({"path": notes.to_string_lossy(), "content": "v1"}),
+            ),
+            dummy_response("editing"),
+        ];
+        for round in 2..=4 {
+            responses.push(dummy_response(&format!("fix attempt {round}")));
+            responses.push(dummy_response(&format!("still fixing {round}")));
+            responses.push(dummy_response(&format!("done v{round}")));
+        }
+
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                workspace: ws.clone(),
+                autorun_hops: 1,
+                ..Default::default()
+            },
+        );
+        agent.config_mut().max_iterations = 2;
+        let out = agent.run("break things").await.unwrap();
+
+        assert_eq!(out, "done v4");
+        let feedback = agent
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("Your changes caused test failures:"))
+            })
+            .count();
+        assert_eq!(feedback, 2, "verify failures consume revisions");
+        let continues = agent
+            .messages
+            .iter()
+            .filter(|m| m.content.as_deref() == Some(AUTORUN_CONTINUE_PROMPT))
+            .count();
+        assert_eq!(
+            continues, 1,
+            "verification-driven retries must not consume hops"
+        );
+        if let Some(v) = prev {
+            std::env::set_var(ENV_VERIFY_LOOP, v);
+        } else {
+            std::env::remove_var(ENV_VERIFY_LOOP);
+        }
+    }
+
+    #[test]
+    fn autorun_hop_retry_rule_after_revisions_exhausted() {
+        // Good: hop available AND revisions exhausted -> retry via hop.
+        assert!(autorun_hop_retries_after_revisions_exhausted(
+            1,
+            VERIFY_MAX_REVISIONS
+        ));
+        // Bad: no hop left -> terminal return even with revisions exhausted.
+        assert!(!autorun_hop_retries_after_revisions_exhausted(
+            0,
+            VERIFY_MAX_REVISIONS
+        ));
+        // Bad: revisions NOT exhausted yet -> revision branch handles it.
+        assert!(!autorun_hop_retries_after_revisions_exhausted(
+            1,
+            VERIFY_MAX_REVISIONS - 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn episodes_saved_only_at_terminal_branches() {
+        // Intermediate cycles end in TOOL-call responses (which never reach a
+        // save path) with VARIED args so the args-aware tool-loop detector
+        // stays quiet; only the terminal Skipped branch saves. Two consumed
+        // hops, exactly ONE episode row.
+        let db = tempfile::tempdir().unwrap();
+        let db_path = db.path().join("episodes.db");
+        let responses = vec![
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.md"})),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.rs"})),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.txt"})),
+            dummy_response("terminal answer"),
+        ];
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                memory_db_path: Some(db_path.to_string_lossy().to_string()),
+                autorun_hops: 2,
+                ..Default::default()
+            },
+        );
+        agent.config_mut().max_iterations = 1;
+        let out = agent.run("persist me").await.unwrap();
+        assert_eq!(out, "terminal answer");
+
+        let store = kitty_memory::EpisodeStore::open(&db_path.to_string_lossy()).unwrap();
+        assert_eq!(
+            store.count().unwrap(),
+            1,
+            "intermediate hop cycles must not save episodes"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -91,7 +91,18 @@ kitty-cli --model "$MODEL" bench-ab \
 ```
 
 (`bench-ab` flags: `--thinking`, `-l/--limit`, `--reps`, `--suite`,
-`-o/--out`, `--interleave`; there is no per-subcommand model flag.)
+`-o/--out`, `--interleave`, `--hops`; there is no per-subcommand model flag.)
+
+**`--hops` arm lever (f8):** autorun continuation hops grant each exercise
+extra FULL tool-loop cycles on iteration exhaustion. Bench autorun is
+FLAG-ONLY — the harness never reads `KITTY_AUTORUN_HOPS`, and the launcher
+strips that var from BOTH arms, so an ambient export can never contaminate a
+run; arms differ only when you explicitly pass different `--hops` values.
+**Cost warning:** worst-case LLM calls per exercise ≈
+max_iterations × 3 × (hops+1) — against the 30s per-exercise bench timeout,
+hops > 0 on a slow model mostly converts timeouts into voided runs. Size N
+and hops together, and prefer hops=1 with a raised timeout over large hop
+counts.
 
 **Honest attribution:** this pair is a MODEL-vs-MODEL comparison under the
 new harness, NOT a per-lever ablation. Arm A also runs with the client's
