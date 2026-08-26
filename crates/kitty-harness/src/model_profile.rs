@@ -1,18 +1,27 @@
 //! Model profiles — parametrize harness behaviour per model size.
 //!
-//! Three presets: tiny (≤2B), medium (8-13B, default), large (27-35B).
-//! Each preset determines context window, thinking budget, iteration cap,
-//! tool subset, native-tool flag, read cap, bash timeout and compaction threshold.
+//! Four presets: nano (<2B small-family models, minimal prompt), tiny (≤2B),
+//! medium (8-13B, default), large (27-35B). Each preset determines context
+//! window, iteration cap, tool subset, native-tool flag, read cap, bash
+//! timeout, compaction threshold and prompt style.
+
+/// How verbose the agent's runtime system prompt should be (f8 T4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptStyle {
+    /// Full bootstrap detail + qwen stance overlay (tiny/medium/large).
+    Full,
+    /// Compact imperative runtime contract for nano models; skips verbose
+    /// bootstrap hints and stance overlays.
+    Minimal,
+}
 
 /// Profile that parametrizes harness behaviour (context, thinking, tools, caps).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelProfile {
-    /// Human-readable name: "tiny" | "medium" | "large".
+    /// Human-readable name: "nano" | "tiny" | "medium" | "large".
     pub name: &'static str,
     /// Context window in tokens.
     pub context_window: usize,
-    /// Max thinking/reasoning tokens. `None` = no thinking budget (tiny).
-    pub max_thinking_tokens: Option<usize>,
     /// Max tool-call iterations before forcing a text response.
     pub max_iterations: usize,
     /// Subset of tool names exposed for this profile.
@@ -25,47 +34,66 @@ pub struct ModelProfile {
     pub bash_timeout_secs: u64,
     /// Compaction threshold (0.0-1.0).
     pub compact_threshold: f32,
+    /// System-prompt verbosity for this tier (f8 T4.1).
+    pub prompt_style: PromptStyle,
 }
 
 // ── Static presets ─────────────────────────────────────────────────
 
+static NANO: ModelProfile = ModelProfile {
+    name: "nano",
+    context_window: 4096,
+    max_iterations: 5,
+    tool_subset: &["Read", "Write", "Edit", "Bash"],
+    use_native_tools: false,
+    read_cap: 80,
+    bash_timeout_secs: 30,
+    compact_threshold: 0.7,
+    prompt_style: PromptStyle::Minimal,
+};
+
 static TINY: ModelProfile = ModelProfile {
     name: "tiny",
     context_window: 4096,
-    max_thinking_tokens: None,
     max_iterations: 5,
     tool_subset: &["Read", "Write", "Edit", "Bash"],
     use_native_tools: false,
     read_cap: 100,
     bash_timeout_secs: 30,
     compact_threshold: 0.7,
+    prompt_style: PromptStyle::Full,
 };
 
 static MEDIUM: ModelProfile = ModelProfile {
     name: "medium",
     context_window: 16384,
-    max_thinking_tokens: Some(1024),
     max_iterations: 20,
     tool_subset: &["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
     use_native_tools: true,
     read_cap: 300,
     bash_timeout_secs: 60,
     compact_threshold: 0.8,
+    prompt_style: PromptStyle::Full,
 };
 
 static LARGE: ModelProfile = ModelProfile {
     name: "large",
     context_window: 32768,
-    max_thinking_tokens: Some(4096),
     max_iterations: 20,
     tool_subset: &["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
     use_native_tools: true,
     read_cap: 500,
     bash_timeout_secs: 120,
     compact_threshold: 0.8,
+    prompt_style: PromptStyle::Full,
 };
 
 impl ModelProfile {
+    /// Preset for sub-2B small-family models (4K ctx, 5 iter, 4 tools,
+    /// read cap 80, minimal prompt).
+    pub fn nano() -> &'static Self {
+        &NANO
+    }
     /// Preset for sub-2B models (4K ctx, no thinking, 5 iter, 4 tools, no native).
     pub fn tiny() -> &'static Self {
         &TINY
@@ -79,15 +107,41 @@ impl ModelProfile {
         &LARGE
     }
 
-    /// Resolve a CLI string to a profile. Unknown values fall back to `medium`.
-    pub fn from_cli(s: &str) -> &'static Self {
-        match s.trim().to_ascii_lowercase().as_str() {
+    /// Resolve the session profile from the CLI `--profile` value and the
+    /// model id (f8 T4.1).
+    ///
+    /// An explicitly recognized profile name always wins (`--profile medium`
+    /// on a 3B model stays medium). Otherwise ("auto" or any unrecognized
+    /// value) the MODEL NAME decides via [`is_nano_sized_model`]: conservative
+    /// sub-3B family ids select `nano`, everything else stays `medium`.
+    pub fn from_cli(profile: &str, model_id: &str) -> &'static Self {
+        match profile.trim().to_ascii_lowercase().as_str() {
+            "nano" => Self::nano(),
             "tiny" => Self::tiny(),
             "large" => Self::large(),
             "medium" => Self::medium(),
+            _ if is_nano_sized_model(model_id) => Self::nano(),
             _ => Self::medium(),
         }
     }
+}
+
+/// Conservative auto-detection of nano-tier models by id shape (f8 T4.1).
+///
+/// Matches ONLY the enumerated parameter sizes {0.5, 1, 1.5, 2, 3} billion at
+/// a token boundary (`start`/`-`/`.`/`_` before, end/`-`/`.`/`_`/`@` after),
+/// case-insensitive: `qwen2.5-3b`, `llama3.2-1b`, `smollm2-1.5B@q4` match;
+/// `qwen3-1.7b` and `qwen3:8b` deliberately do NOT (1.7b and 8b are outside
+/// the set) and stay on their explicit/default profile.
+#[must_use]
+pub fn is_nano_sized_model(model_id: &str) -> bool {
+    static NANO_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    NANO_RE
+        .get_or_init(|| {
+            regex::Regex::new(r"(?i)(^|[-._])(0\.5|1|1\.5|2|3)b($|[-._@])")
+                .expect("static regex should compile")
+        })
+        .is_match(model_id)
 }
 
 // ── Per-model turn caps (Tier 4) ───────────────────────────────────
@@ -373,12 +427,12 @@ mod tests {
         let p = ModelProfile::tiny();
         assert_eq!(p.name, "tiny");
         assert_eq!(p.context_window, 4096);
-        assert_eq!(p.max_thinking_tokens, None);
         assert_eq!(p.max_iterations, 5);
         assert_eq!(p.tool_subset, &["Read", "Write", "Edit", "Bash"]);
         assert!(!p.use_native_tools);
         assert_eq!(p.read_cap, 100);
         assert_eq!(p.bash_timeout_secs, 30);
+        assert_eq!(p.prompt_style, PromptStyle::Full);
     }
 
     #[test]
@@ -386,13 +440,13 @@ mod tests {
         let p = ModelProfile::medium();
         assert_eq!(p.name, "medium");
         assert_eq!(p.context_window, 16384);
-        assert_eq!(p.max_thinking_tokens, Some(1024));
         assert_eq!(p.max_iterations, 20);
         assert_eq!(p.tool_subset.len(), 6);
         assert!(p.use_native_tools);
         assert_eq!(p.read_cap, 300);
         assert_eq!(p.bash_timeout_secs, 60);
         assert!((p.compact_threshold - 0.8).abs() < f32::EPSILON);
+        assert_eq!(p.prompt_style, PromptStyle::Full);
     }
 
     #[test]
@@ -400,27 +454,92 @@ mod tests {
         let p = ModelProfile::large();
         assert_eq!(p.name, "large");
         assert_eq!(p.context_window, 32768);
-        assert_eq!(p.max_thinking_tokens, Some(4096));
         assert_eq!(p.max_iterations, 20);
         assert!(p.use_native_tools);
         assert_eq!(p.read_cap, 500);
+        assert_eq!(p.prompt_style, PromptStyle::Full);
     }
 
     #[test]
-    fn from_cli_dispatch() {
-        assert_eq!(ModelProfile::from_cli("tiny").name, "tiny");
-        assert_eq!(ModelProfile::from_cli("TINY").name, "tiny");
-        assert_eq!(ModelProfile::from_cli("medium").name, "medium");
-        assert_eq!(ModelProfile::from_cli("large").name, "large");
-        assert_eq!(ModelProfile::from_cli("LARGE").name, "large");
-        assert_eq!(ModelProfile::from_cli("unknown").name, "medium");
-        assert_eq!(ModelProfile::from_cli("").name, "medium");
-        assert_eq!(ModelProfile::from_cli("  tiny  ").name, "tiny");
+    fn nano_preset_values() {
+        // f8 T4.1: minimal-prompt tier for conservative sub-3B models.
+        let p = ModelProfile::nano();
+        assert_eq!(p.name, "nano");
+        assert_eq!(p.context_window, 4096);
+        assert_eq!(p.max_iterations, 5);
+        assert_eq!(p.tool_subset, &["Read", "Write", "Edit", "Bash"]);
+        assert!(!p.use_native_tools);
+        assert_eq!(p.read_cap, 80);
+        assert_eq!(p.bash_timeout_secs, 30);
+        assert!((p.compact_threshold - 0.7).abs() < f32::EPSILON);
+        assert_eq!(p.prompt_style, PromptStyle::Minimal);
+    }
+
+    #[test]
+    fn from_cli_dispatch_explicit_names_win() {
+        assert_eq!(ModelProfile::from_cli("tiny", "any-model").name, "tiny");
+        assert_eq!(ModelProfile::from_cli("TINY", "qwen2.5-3b").name, "tiny");
+        assert_eq!(
+            ModelProfile::from_cli("medium", "qwen2.5-3b").name,
+            "medium",
+            "explicit profile beats auto-detection"
+        );
+        assert_eq!(ModelProfile::from_cli("large", "m").name, "large");
+        assert_eq!(ModelProfile::from_cli("LARGE", "m").name, "large");
+        assert_eq!(ModelProfile::from_cli("nano", "anything").name, "nano");
+        assert_eq!(ModelProfile::from_cli("", "unknown-model").name, "medium");
+        assert_eq!(ModelProfile::from_cli("  tiny  ", "x").name, "tiny");
+    }
+
+    #[test]
+    fn from_cli_auto_detects_nano_by_model_name() {
+        // Enumerated sizes at token boundaries → nano.
+        for model in [
+            "qwen2.5-3b",
+            "llama3.2-1b",
+            "smollm2-1.7B-placeholder-not-matching",
+            "qwen3-0.5b-instruct",
+            "gemma-2b",
+            "_1.5b",
+        ] {
+            let expected = if model.contains("1.7") {
+                "medium"
+            } else {
+                "nano"
+            };
+            assert_eq!(
+                ModelProfile::from_cli("auto", model).name,
+                expected,
+                "{model} should auto-resolve to {expected}"
+            );
+        }
+        // Outside the enumerated set → NOT nano (stays medium).
+        for model in ["qwen3-1.7b", "qwen3:8b", "llama3.2-12b", "ornith:9b"] {
+            assert_eq!(
+                ModelProfile::from_cli("auto", model).name,
+                "medium",
+                "{model} must not auto-select nano"
+            );
+        }
+    }
+
+    #[test]
+    fn nano_detection_regex_boundaries() {
+        assert!(is_nano_sized_model("qwen2.5-3b"));
+        assert!(is_nano_sized_model("llama3.2-1b"));
+        assert!(is_nano_sized_model("QWEN3-0.5B-Instruct"));
+        assert!(is_nano_sized_model("smollm-1.5b@q4"));
+        assert!(is_nano_sized_model("2b"));
+        // Boundary discipline: no false positives.
+        assert!(!is_nano_sized_model("qwen3-1.7b"), "1.7b outside the set");
+        assert!(!is_nano_sized_model("13b"), "13b is not in the set");
+        assert!(!is_nano_sized_model("xb"), "not a size token");
+        assert!(!is_nano_sized_model("qwen3:8b"));
     }
 
     #[test]
     fn from_cli_is_static() {
-        let a = ModelProfile::from_cli("tiny") as *const _;
+        let a = ModelProfile::from_cli("tiny", "m") as *const _;
         let b = ModelProfile::tiny() as *const _;
         assert_eq!(a, b);
     }

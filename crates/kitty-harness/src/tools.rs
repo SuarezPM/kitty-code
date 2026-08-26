@@ -113,22 +113,9 @@ impl ToolRegistry {
         }
     }
 
-    /// Create a registry with a custom Read truncation limit (F3.1).
-    pub fn with_read_limit(max_read_lines: usize) -> Self {
-        Self {
-            read_files: HashSet::new(),
-            written_files: HashSet::new(),
-            file_modifications: 0,
-            hashline: HashlineEditor::new(),
-            bash_timeout_secs: 60,
-            max_read_lines,
-            bash_sandbox: Some(Sandbox::new(SandboxConfig::new(default_workspace_root()))),
-        }
-    }
-
-    /// Override the default Read window cap (chainable). f8 T2.3: the agent
-    /// wires [`ModelProfile::read_cap`] here so the active profile actually
-    /// governs the default window instead of a hard-coded 300.
+    /// Override the default Read window cap (chainable, f8 T2.3/P4 Rider B).
+    /// The agent wires [`ModelProfile::read_cap`] here so the active profile
+    /// actually governs the default window; tests use it directly.
     pub fn with_read_cap(mut self, max_read_lines: usize) -> Self {
         self.max_read_lines = max_read_lines;
         self
@@ -182,8 +169,8 @@ impl ToolRegistry {
 
         let result = match call.name.as_str() {
             "Read" => self.execute_read(&call.arguments)?,
-            "Edit" => self.execute_edit(&call.arguments)?,
-            "Write" => self.execute_write(&call.arguments)?,
+            "Edit" => self.execute_edit(&call.arguments).await?,
+            "Write" => self.execute_write(&call.arguments).await?,
             "Bash" => self.execute_bash(&call.arguments).await?,
             "Glob" => self.execute_glob(&call.arguments)?,
             "Grep" => self.execute_grep(&call.arguments)?,
@@ -291,11 +278,18 @@ impl ToolRegistry {
         output.push_str(&tagged.join("\n"));
 
         let omitted_after = total_lines - idx_end;
-        if omitted_after > 0 || idx0 > 0 {
+        if omitted_after > 0 {
+            // Content follows the window — suggest the exact next window.
             output.push_str(&format!(
                 "\n... ({omitted_after} lines after this window — retry Read with \
                  \"offset\": {}, \"limit\": {limit}, or use Grep to search specific content)",
                 idx_end + 1
+            ));
+        } else if idx0 > 0 {
+            // Tail-window read: nothing after, so a next-offset would be
+            // bogus — state the mid-file start instead (G2 rider).
+            output.push_str(&format!(
+                "\n... (window starts at line {first_line} of {total_lines} — prior content exists)"
             ));
         }
 
@@ -312,7 +306,7 @@ impl ToolRegistry {
     /// - Str-replace (aider-compatible): args contain `old_string` (+ `new_string`,
     ///   optional `replace_all`). Matches exact text in the current file content.
     /// - Hash-snapshot: args contain `hash` (+ `new`, optional `line`).
-    fn execute_edit(&mut self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn execute_edit(&mut self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
         let path =
             args.get("path")
                 .and_then(|v| v.as_str())
@@ -334,7 +328,9 @@ impl ToolRegistry {
                     retry: false,
                 });
             }
-            let mut result = self.execute_edit_str_replace(path, &path_buf, old_string, args)?;
+            let mut result = self
+                .execute_edit_str_replace(path, &path_buf, old_string, args)
+                .await?;
             // E-G1a: dual-mode args — when both old_string and hash are
             // provided, str_replace wins and the hash is silently ignored;
             // surface that explicitly so the model can correct its args.
@@ -386,12 +382,11 @@ impl ToolRegistry {
                     std::fs::write(&path_buf, &new_file_content)?;
                     self.hashline.read_file(&path_buf)?;
                     let mut output = format!("Edit applied to {path} (line {line})");
-                    output.push_str(&self.build_edit_feedback(
-                        path,
-                        &path_buf,
-                        &before,
-                        &new_file_content,
-                    ));
+                    output.push_str(
+                        &self
+                            .build_edit_feedback(path, &path_buf, &before, &new_file_content)
+                            .await,
+                    );
                     Ok(ToolResult {
                         success: true,
                         output,
@@ -414,7 +409,11 @@ impl ToolRegistry {
                     // Re-read to get updated hashes
                     self.hashline.read_file(&path_buf)?;
                     let mut output = format!("Edit applied to {path}");
-                    output.push_str(&self.build_edit_feedback(path, &path_buf, &before, &new_file_content));
+                    output.push_str(
+                        &self
+                            .build_edit_feedback(path, &path_buf, &before, &new_file_content)
+                            .await,
+                    );
                     Ok(ToolResult {
                         success: true,
                         output,
@@ -503,7 +502,7 @@ impl ToolRegistry {
     ///
     /// CRLF handling (kilocode-style): `\r\n` is normalized to `\n` for
     /// matching, and restored on write when the original file used CRLF.
-    fn execute_edit_str_replace(
+    async fn execute_edit_str_replace(
         &mut self,
         path: &str,
         path_buf: &Path,
@@ -572,7 +571,11 @@ impl ToolRegistry {
             };
             let mut output = format!("Edit applied to {path}");
             output.push_str(&format!("\n\n[edit matched via {}]", hit.label));
-            output.push_str(&self.finish_str_replace(path_buf, &before, after_n, had_crlf)?);
+            output.push_str(
+                &self
+                    .finish_str_replace(path_buf, &before, after_n, had_crlf)
+                    .await?,
+            );
             return Ok(ToolResult {
                 success: true,
                 output,
@@ -598,7 +601,11 @@ impl ToolRegistry {
         };
 
         let mut output = format!("Edit applied to {path}");
-        output.push_str(&self.finish_str_replace(path_buf, &before, after_n, had_crlf)?);
+        output.push_str(
+            &self
+                .finish_str_replace(path_buf, &before, after_n, had_crlf)
+                .await?,
+        );
         Ok(ToolResult {
             success: true,
             output,
@@ -609,7 +616,7 @@ impl ToolRegistry {
     /// Shared str-replace write-back: restore the file's original CRLF line
     /// endings, persist, refresh the hashline snapshot, and build the edit
     /// feedback (diff + re-show). Returns the feedback text to append.
-    fn finish_str_replace(
+    async fn finish_str_replace(
         &mut self,
         path_buf: &Path,
         before: &str,
@@ -623,13 +630,15 @@ impl ToolRegistry {
         };
         std::fs::write(path_buf, &after)?;
         self.hashline.read_file(path_buf)?;
-        Ok(self.build_edit_feedback(&path_buf.to_string_lossy(), path_buf, before, &after))
+        Ok(self
+            .build_edit_feedback(&path_buf.to_string_lossy(), path_buf, before, &after)
+            .await)
     }
 
     /// Feedback appended after every successful edit (either protocol):
     /// unified diff snippet (capped), re-show of the edited region (±10
     /// lines), and — when `KITTY_EDIT_CHECK=1` — a cheap syntax check.
-    fn build_edit_feedback(
+    async fn build_edit_feedback(
         &self,
         path: &str,
         path_buf: &Path,
@@ -666,13 +675,13 @@ impl ToolRegistry {
             }
         }
 
-        append_lint_feedback(&mut out, path_buf);
+        append_lint_feedback(&mut out, path_buf).await;
 
         out
     }
 
     /// Execute a Write tool call.
-    fn execute_write(&mut self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
+    async fn execute_write(&mut self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
         let path =
             args.get("path")
                 .and_then(|v| v.as_str())
@@ -721,7 +730,7 @@ impl ToolRegistry {
         let _ = self.hashline.read_file(&path_buf);
 
         let mut output = format!("Wrote {path}");
-        append_lint_feedback(&mut output, &path_buf);
+        append_lint_feedback(&mut output, &path_buf).await;
 
         Ok(ToolResult {
             success: true,
@@ -1122,12 +1131,12 @@ fn lint_gate_enabled() -> bool {
 ///
 /// `.rs` files get `cargo check --message-format=json` on the nearest crate;
 /// `.py` files get `python3 -m py_compile`. Other extensions are not gated.
-fn append_lint_feedback(out: &mut String, path_buf: &Path) {
+async fn append_lint_feedback(out: &mut String, path_buf: &Path) {
     if !lint_gate_enabled() {
         return;
     }
     let lint = match path_buf.extension().and_then(|e| e.to_str()) {
-        Some("rs") => cargo_check_lint(path_buf),
+        Some("rs") => cargo_check_lint(path_buf).await,
         Some("py") => run_extension_check(path_buf),
         _ => None,
     };
@@ -1248,11 +1257,21 @@ fn scratch_file(label: &str) -> std::io::Result<(std::fs::File, PathBuf)> {
 }
 
 /// Run `cargo check --message-format=json` on the crate that owns `path` and
-/// collect its errors/warnings. Returns `None` when the file lives outside
-/// any Cargo crate or cargo cannot be spawned. The child's stdout/stderr go
-/// to scratch files (never pipes) so the deadline poll cannot deadlock on a
-/// full pipe buffer.
-fn cargo_check_lint(path: &Path) -> Option<CheckOutcome> {
+/// collect its errors/warnings (async, f8 T4.2): the whole blocking section
+/// (scratch files + spawn + poll-to-deadline) runs on the blocking pool via
+/// [`tokio::task::spawn_blocking`] so the 100 ms poll never parks an async
+/// worker thread. Semantics unchanged: 120 s deadline, kill on timeout, both
+/// scratch files cleaned on every exit path. Returns `None` when the file
+/// lives outside any Cargo crate or cargo cannot be spawned.
+async fn cargo_check_lint(path: &Path) -> Option<CheckOutcome> {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || cargo_check_lint_blocking(&owned))
+        .await
+        .ok()?
+}
+
+/// Blocking core behind [`cargo_check_lint`]; runs on a blocking-pool thread.
+fn cargo_check_lint_blocking(path: &Path) -> Option<CheckOutcome> {
     const LABEL: &str = "cargo check";
     let crate_root = nearest_crate_root(path)?;
 
@@ -1802,20 +1821,20 @@ mod tests {
         assert!(registry.is_file_read(f.path()));
     }
 
-    #[test]
-    fn write_guard_blocks_existing_file() {
+    #[tokio::test]
+    async fn write_guard_blocks_existing_file() {
         let f = temp_file("existing");
         let mut registry = ToolRegistry::new();
         let args = serde_json::json!({
             "path": f.path().to_str().unwrap(),
             "content": "new content"
         });
-        let err = registry.execute_write(&args).unwrap_err();
+        let err = registry.execute_write(&args).await.unwrap_err();
         assert!(matches!(err, ToolError::WriteBlocked { .. }));
     }
 
-    #[test]
-    fn write_allows_new_files() {
+    #[tokio::test]
+    async fn write_allows_new_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new_file.txt");
         let mut registry = ToolRegistry::new();
@@ -1823,13 +1842,13 @@ mod tests {
             "path": path.to_str().unwrap(),
             "content": "hello"
         });
-        let result = registry.execute_write(&args).unwrap();
+        let result = registry.execute_write(&args).await.unwrap();
         assert!(result.success);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
     }
 
-    #[test]
-    fn edit_blocked_without_read() {
+    #[tokio::test]
+    async fn edit_blocked_without_read() {
         let f = temp_file("line1\nline2");
         let mut registry = ToolRegistry::new();
         let args = serde_json::json!({
@@ -1837,7 +1856,7 @@ mod tests {
             "hash": "dummy",
             "new": "replaced"
         });
-        let err = registry.execute_edit(&args).unwrap_err();
+        let err = registry.execute_edit(&args).await.unwrap_err();
         assert!(matches!(err, ToolError::EditBlocked(_)));
     }
 
@@ -1956,7 +1975,7 @@ mod tests {
         let lines: Vec<String> = (1..=500).map(|i| format!("line {i}")).collect();
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let mut registry = ToolRegistry::with_read_limit(300);
+        let mut registry = ToolRegistry::with_timeout(60).with_read_cap(300);
         let args = serde_json::json!({"path": path.to_str().unwrap()});
         let result = registry.execute_read(&args).unwrap();
         assert!(result.success);
@@ -2023,8 +2042,8 @@ mod tests {
         assert!(result.output.contains("\"offset\": 70"), "next-window hint");
     }
 
-    #[test]
-    fn read_clamps_malformed_paging_args_instead_of_erroring() {
+    #[tokio::test]
+    async fn read_clamps_malformed_paging_args_instead_of_erroring() {
         // f8 T2.3 AC: weak-model tolerance — offset<1→1, limit<1→cap,
         // non-numeric strings → defaults; NEVER InvalidArgs.
         let dir = tempfile::tempdir().unwrap();
@@ -2070,7 +2089,8 @@ mod tests {
             .output
             .starts_with(&format!("{}: lines 1-10 of 10", path.display())));
 
-        // Offset beyond EOF clamps to the last line rather than erroring.
+        // Offset beyond EOF clamps to the last line rather than erroring;
+        // the tail-window note must NOT suggest a next offset (G2 rider).
         let result = registry
             .execute_read(&serde_json::json!({
                 "path": path.to_str().unwrap(),
@@ -2080,10 +2100,20 @@ mod tests {
         assert!(result
             .output
             .starts_with(&format!("{}: lines 10-10 of 10", path.display())));
+        assert!(
+            result.output.contains("window starts at line 10 of 10"),
+            "tail-window note expected, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("\"offset\":"),
+            "no bogus next-offset on a tail window, got: {}",
+            result.output
+        );
     }
 
-    #[test]
-    fn read_cap_builder_governs_default_window() {
+    #[tokio::test]
+    async fn read_cap_builder_governs_default_window() {
         // f8 T2.3 AC: the profile value plumbed via with_read_cap actually
         // governs the default window (tiny=100 / medium=300 / large=500 are
         // asserted on the profile side in model_profile tests).
@@ -2110,7 +2140,7 @@ mod tests {
             "hash": &e_hash[..8],
             "new": "E"
         });
-        let edit_result = registry.execute_edit(&edit).unwrap();
+        let edit_result = registry.execute_edit(&edit).await.unwrap();
         assert!(edit_result.success, "got: {}", edit_result.output);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\nc\nd\nE");
     }
@@ -2152,8 +2182,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn edit_blocked_message_mentions_must_read() {
+    #[tokio::test]
+    async fn edit_blocked_message_mentions_must_read() {
         let f = temp_file("line1\nline2");
         let mut registry = ToolRegistry::new();
         let args = serde_json::json!({
@@ -2161,14 +2191,14 @@ mod tests {
             "hash": "deadbeef",
             "new": "replaced"
         });
-        let err = registry.execute_edit(&args).unwrap_err();
+        let err = registry.execute_edit(&args).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("File not loaded"), "got: {msg}");
         assert!(msg.contains("must Read before Edit"), "got: {msg}");
     }
 
-    #[test]
-    fn edit_after_read_succeeds() {
+    #[tokio::test]
+    async fn edit_after_read_succeeds() {
         let f = temp_file("hello\nworld");
         let mut registry = ToolRegistry::new();
         // First read
@@ -2190,25 +2220,25 @@ mod tests {
             "hash": hash,
             "new": "HELLO"
         });
-        let edit_res = registry.execute_edit(&edit_args).unwrap();
+        let edit_res = registry.execute_edit(&edit_args).await.unwrap();
         assert!(edit_res.success);
     }
 
-    #[test]
-    fn write_blocks_existing_file_message_mentions_edit() {
+    #[tokio::test]
+    async fn write_blocks_existing_file_message_mentions_edit() {
         let f = temp_file("existing");
         let mut registry = ToolRegistry::new();
         let args = serde_json::json!({
             "path": f.path().to_str().unwrap(),
             "content": "new"
         });
-        let err = registry.execute_write(&args).unwrap_err();
+        let err = registry.execute_write(&args).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("use Edit instead"), "got: {msg}");
     }
 
-    #[test]
-    fn write_then_edit_without_extra_read_succeeds() {
+    #[tokio::test]
+    async fn write_then_edit_without_extra_read_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new.txt");
         let mut registry = ToolRegistry::new();
@@ -2216,7 +2246,7 @@ mod tests {
             "path": path.to_str().unwrap(),
             "content": "line1\nline2"
         });
-        registry.execute_write(&write_args).unwrap();
+        registry.execute_write(&write_args).await.unwrap();
         // Now edit without explicit Read — should succeed because Write populated snapshot
         let read_args = serde_json::json!({"path": path.to_str().unwrap()});
         let read_res = registry.execute_read(&read_args).unwrap();
@@ -2236,7 +2266,7 @@ mod tests {
             "hash": hash,
             "new": "LINE1"
         });
-        let edit_res = registry.execute_edit(&edit_args).unwrap();
+        let edit_res = registry.execute_edit(&edit_args).await.unwrap();
         assert!(edit_res.success);
     }
 
@@ -2489,8 +2519,8 @@ mod tests {
 
     // ---- Edit str_replace mode (aider-compatible) ----
 
-    #[test]
-    fn str_replace_success_single_match() {
+    #[tokio::test]
+    async fn str_replace_success_single_match() {
         let f = temp_file("alpha\nbeta\ngamma");
         let mut registry = ToolRegistry::new();
         registry
@@ -2501,7 +2531,7 @@ mod tests {
             "old_string": "beta",
             "new_string": "BETA"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(result.success, "got: {}", result.output);
         assert_eq!(
             std::fs::read_to_string(f.path()).unwrap(),
@@ -2509,8 +2539,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn str_replace_not_found_error_message() {
+    #[tokio::test]
+    async fn str_replace_not_found_error_message() {
         let f = temp_file("alpha\nbeta");
         let mut registry = ToolRegistry::new();
         registry
@@ -2521,7 +2551,7 @@ mod tests {
             "old_string": "MISSING",
             "new_string": "x"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(!result.success);
         assert!(
             result.output.contains("old_string not found"),
@@ -2537,8 +2567,8 @@ mod tests {
 
     // ---- E-G1 low findings ----
 
-    #[test]
-    fn edit_dual_mode_args_notes_hash_ignored() {
+    #[tokio::test]
+    async fn edit_dual_mode_args_notes_hash_ignored() {
         // E-G1a: when BOTH old_string and hash are provided, str_replace mode
         // wins and the output must say the hash was ignored.
         let f = temp_file("alpha\nbeta\ngamma");
@@ -2552,7 +2582,7 @@ mod tests {
             "new_string": "BETA",
             "hash": "deadbeef"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(result.success, "got: {}", result.output);
         assert!(
             result
@@ -2567,8 +2597,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn edit_empty_old_string_fails_immediately() {
+    #[tokio::test]
+    async fn edit_empty_old_string_fails_immediately() {
         // E-G1b: empty old_string must fail before occurrence counting /
         // file IO (an empty needle would match everywhere).
         let f = temp_file("alpha\nbeta");
@@ -2581,15 +2611,15 @@ mod tests {
             "old_string": "",
             "new_string": "x"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(!result.success);
         assert_eq!(result.output, "old_string must not be empty");
         // File untouched
         assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "alpha\nbeta");
     }
 
-    #[test]
-    fn str_replace_multiple_matches_error_without_replace_all() {
+    #[tokio::test]
+    async fn str_replace_multiple_matches_error_without_replace_all() {
         let f = temp_file("same\nsame\nother");
         let mut registry = ToolRegistry::new();
         registry
@@ -2600,7 +2630,7 @@ mod tests {
             "old_string": "same",
             "new_string": "different"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(!result.success);
         assert!(
             result.output.contains("matches 2 locations"),
@@ -2619,8 +2649,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn str_replace_replace_all_success() {
+    #[tokio::test]
+    async fn str_replace_replace_all_success() {
         let f = temp_file("same\nmid\nsame");
         let mut registry = ToolRegistry::new();
         registry
@@ -2632,7 +2662,7 @@ mod tests {
             "new_string": "uniq",
             "replace_all": true
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(result.success, "got: {}", result.output);
         assert_eq!(
             std::fs::read_to_string(f.path()).unwrap(),
@@ -2640,8 +2670,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn str_replace_crlf_preserved() {
+    #[tokio::test]
+    async fn str_replace_crlf_preserved() {
         let f = temp_file("alpha\r\nbeta\r\ngamma");
         let mut registry = ToolRegistry::new();
         registry
@@ -2652,14 +2682,14 @@ mod tests {
             "old_string": "beta",
             "new_string": "BETA"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(result.success, "got: {}", result.output);
         let on_disk = std::fs::read_to_string(f.path()).unwrap();
         assert_eq!(on_disk, "alpha\r\nBETA\r\ngamma", "CRLF must be preserved");
     }
 
-    #[test]
-    fn str_replace_fuzzy_line_trim_succeeds_with_strategy_note() {
+    #[tokio::test]
+    async fn str_replace_fuzzy_line_trim_succeeds_with_strategy_note() {
         // Indentation drift in old_string — exact match fails, line-trim lands.
         let f = temp_file("fn a() {\n    old();\n}\n");
         let mut registry = ToolRegistry::new();
@@ -2671,7 +2701,7 @@ mod tests {
             "old_string": "fn a() {\nold();\n}",
             "new_string": "fn a() {\n    new();\n}"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(result.success, "got: {}", result.output);
         assert!(
             result.output.contains("[edit matched via line-trim]"),
@@ -2684,8 +2714,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn str_replace_fuzzy_crlf_roundtrip_preserved() {
+    #[tokio::test]
+    async fn str_replace_fuzzy_crlf_roundtrip_preserved() {
         // Drifted old_string against a CRLF file: fuzzy span replacement must
         // still restore the file's original CRLF endings on disk.
         let f = temp_file("alpha\r\nbeta\r\ngamma");
@@ -2698,7 +2728,7 @@ mod tests {
             "old_string": "  beta", // leading-space drift, no \r at all
             "new_string": "BETA"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(result.success, "got: {}", result.output);
         let on_disk = std::fs::read_to_string(f.path()).unwrap();
         assert_eq!(
@@ -2707,8 +2737,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn str_replace_fuzzy_ambiguous_without_replace_all() {
+    #[tokio::test]
+    async fn str_replace_fuzzy_ambiguous_without_replace_all() {
         // Tab-drifted old_string misses exactly but fuzzy-matches BOTH
         // space-indented occurrences — ambiguity without replace_all.
         let f = temp_file("  same\nmid\n  same\nother");
@@ -2721,7 +2751,7 @@ mod tests {
             "old_string": "\tsame",
             "new_string": "different"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(!result.success);
         assert!(
             result.output.contains("multiple locations"),
@@ -2735,8 +2765,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn str_replace_fuzzy_replace_all_replaces_every_drifted_occurrence() {
+    #[tokio::test]
+    async fn str_replace_fuzzy_replace_all_replaces_every_drifted_occurrence() {
         let f = temp_file("  same\nmid\n  same\nother");
         let mut registry = ToolRegistry::new();
         registry
@@ -2748,7 +2778,7 @@ mod tests {
             "new_string": "uniq",
             "replace_all": true
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(result.success, "got: {}", result.output);
         assert_eq!(
             std::fs::read_to_string(f.path()).unwrap(),
@@ -2756,8 +2786,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn str_replace_fuzzy_guard_refuses_disproportionate_span() {
+    #[tokio::test]
+    async fn str_replace_fuzzy_guard_refuses_disproportionate_span() {
         // Giant indentation drift makes every candidate wildly larger than
         // old_string — the guard must reject and the edit must fail cleanly.
         let pad = " ".repeat(1200);
@@ -2771,7 +2801,7 @@ mod tests {
             "old_string": "a();\nb();",
             "new_string": "x();\ny();"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(!result.success, "guard must refuse the ballooned span");
         assert_eq!(
             std::fs::read_to_string(f.path()).unwrap(),
@@ -2780,8 +2810,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn str_replace_multiline_old_string() {
+    #[tokio::test]
+    async fn str_replace_multiline_old_string() {
         let f = temp_file("fn a() {\n    old();\n}\n");
         let mut registry = ToolRegistry::new();
         registry
@@ -2792,7 +2822,7 @@ mod tests {
             "old_string": "fn a() {\n    old();\n}",
             "new_string": "fn a() {\n    new();\n}"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(result.success, "got: {}", result.output);
         assert_eq!(
             std::fs::read_to_string(f.path()).unwrap(),
@@ -2800,8 +2830,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn str_replace_blocked_without_read() {
+    #[tokio::test]
+    async fn str_replace_blocked_without_read() {
         let f = temp_file("alpha\nbeta");
         let mut registry = ToolRegistry::new();
         let args = serde_json::json!({
@@ -2809,12 +2839,12 @@ mod tests {
             "old_string": "alpha",
             "new_string": "A"
         });
-        let err = registry.execute_edit(&args).unwrap_err();
+        let err = registry.execute_edit(&args).await.unwrap_err();
         assert!(matches!(err, ToolError::EditBlocked(_)));
     }
 
-    #[test]
-    fn str_replace_output_has_diff_and_reshow() {
+    #[tokio::test]
+    async fn str_replace_output_has_diff_and_reshow() {
         let f = temp_file("l1\nl2\nl3\nl4\nl5");
         let mut registry = ToolRegistry::new();
         registry
@@ -2825,7 +2855,7 @@ mod tests {
             "old_string": "l3",
             "new_string": "L3"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(result.success);
         assert!(
             result.output.contains("--- Diff ---"),
@@ -2852,8 +2882,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hash_edit_output_includes_diff_and_reshow() {
+    #[tokio::test]
+    async fn hash_edit_output_includes_diff_and_reshow() {
         // Feedback block applies to BOTH modes; hash protocol must keep working.
         let f = temp_file("hello\nworld");
         let mut registry = ToolRegistry::new();
@@ -2877,7 +2907,7 @@ mod tests {
             "hash": hash,
             "new": "HELLO"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(result.success, "hash protocol broken: {}", result.output);
         assert!(
             result.output.contains("--- Diff ---"),
@@ -2892,8 +2922,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn edit_check_disabled_by_default() {
+    #[tokio::test]
+    async fn edit_check_disabled_by_default() {
         if std::env::var("KITTY_EDIT_CHECK").as_deref() == Ok("1") {
             println!("SKIP: KITTY_EDIT_CHECK=1 set in ambient environment");
             return;
@@ -2910,7 +2940,7 @@ mod tests {
             "old_string": "x = 1",
             "new_string": "x = 2"
         });
-        let result = registry.execute_edit(&args).unwrap();
+        let result = registry.execute_edit(&args).await.unwrap();
         assert!(result.success);
         assert!(
             !result.output.contains("--- Check ("),
@@ -3009,8 +3039,8 @@ mod tests {
         assert_eq!(nearest_crate_root(&orphan_dir.path().join("x.rs")), None);
     }
 
-    #[test]
-    fn cargo_check_lint_reports_error() {
+    #[tokio::test]
+    async fn cargo_check_lint_reports_error() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -3021,13 +3051,15 @@ mod tests {
         let main = dir.path().join("src/main.rs");
         std::fs::write(&main, "fn main() { let x: i32 = \"not a number\"; }\n").unwrap();
 
-        let outcome = cargo_check_lint(&main).expect("crate exists so cargo check runs");
+        let outcome = cargo_check_lint(&main)
+            .await
+            .expect("crate exists so cargo check runs");
         assert!(!outcome.passed, "type error must fail the lint gate");
         assert!(outcome.detail.contains("error"), "got: {}", outcome.detail);
     }
 
-    #[test]
-    fn cargo_check_lint_passes_on_clean_crate() {
+    #[tokio::test]
+    async fn cargo_check_lint_passes_on_clean_crate() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -3038,7 +3070,9 @@ mod tests {
         let main = dir.path().join("src/main.rs");
         std::fs::write(&main, "fn main() { println!(\"ok\"); }\n").unwrap();
 
-        let outcome = cargo_check_lint(&main).expect("cargo check should run");
+        let outcome = cargo_check_lint(&main)
+            .await
+            .expect("cargo check should run");
         assert!(
             outcome.passed,
             "clean crate must pass, detail: {}",
@@ -3049,8 +3083,8 @@ mod tests {
     /// Regression: `cargo_check_lint` must not leave `kitty-lint-*` scratch
     /// files behind in the temp dir — cleanup is guaranteed on every exit path
     /// (spawn failure, timeout, read error, success).
-    #[test]
-    fn cargo_check_lint_leaves_no_scratch_files() {
+    #[tokio::test]
+    async fn cargo_check_lint_leaves_no_scratch_files() {
         fn leftover_count() -> usize {
             std::env::temp_dir()
                 .read_dir()
@@ -3077,7 +3111,10 @@ mod tests {
         // their own transient scratch files while their cargo check is still
         // in flight; only files that outlive every run indicate a leak.
         let baseline = leftover_count();
-        assert!(cargo_check_lint(&main).is_some(), "cargo check should run");
+        assert!(
+            cargo_check_lint(&main).await.is_some(),
+            "cargo check should run"
+        );
 
         // Poll briefly so concurrent lint tests can finish and clean theirs.
         for _ in 0..300 {
@@ -3106,7 +3143,7 @@ mod tests {
             "path": py.to_str().unwrap(),
             "content": "def f(:\n"
         });
-        let result = registry.execute_write(&args).unwrap();
+        let result = registry.execute_write(&args).await.unwrap();
         assert!(result.success);
         assert!(
             result.output.contains("--- Lint ("),
@@ -3138,7 +3175,7 @@ mod tests {
             "path": py.to_str().unwrap(),
             "content": "x = 1\n"
         });
-        let result = registry.execute_write(&args).unwrap();
+        let result = registry.execute_write(&args).await.unwrap();
         assert!(
             !result.output.contains("--- Lint"),
             "gate off → no lint section, got: {}",

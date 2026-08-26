@@ -193,8 +193,9 @@ pub struct Cli {
     #[arg(long, default_value = "60")]
     pub bash_timeout: u64,
 
-    /// Model profile preset: tiny|medium|large (default: medium)
-    #[arg(long, global = true, default_value = "medium", value_parser = clap::builder::PossibleValuesParser::new(["tiny", "medium", "large"]))]
+    /// Model profile preset: nano|tiny|medium|large (default: auto —
+    /// auto-detects nano-tier sub-3B models by id shape)
+    #[arg(long, global = true, default_value = "auto", value_parser = clap::builder::PossibleValuesParser::new(["nano", "tiny", "medium", "large", "auto"]))]
     pub profile: String,
 
     /// Enable semantic memory (hybrid BM25+embedding RRF, medium/large only)
@@ -458,7 +459,7 @@ async fn main() -> Result<()> {
                 max_iterations: bench_max_iterations,
                 autorun_hops: kitty_harness::agent::clamp_autorun_hops(hops),
                 bash_timeout: cli.bash_timeout,
-                profile: ModelProfile::from_cli(&cli.profile),
+                profile: ModelProfile::from_cli(&cli.profile, &cli.model),
                 enable_knowledge: cli.knowledge,
                 knowledge_dir: PathBuf::from(cli.knowledge_dir.clone()),
             };
@@ -641,7 +642,7 @@ async fn main() -> Result<()> {
                 max_iterations: bench_max_iterations,
                 autorun_hops: kitty_harness::agent::clamp_autorun_hops(hops),
                 bash_timeout: cli.bash_timeout,
-                profile: ModelProfile::from_cli(&cli.profile),
+                profile: ModelProfile::from_cli(&cli.profile, &cli.model),
                 enable_knowledge: cli.knowledge,
                 knowledge_dir: PathBuf::from(cli.knowledge_dir.clone()),
             };
@@ -1406,8 +1407,8 @@ fn p50_ms(mut latencies: Vec<f64>) -> f64 {
     }
 }
 
-fn is_small_model(profile: &str, _model: &str) -> bool {
-    ModelProfile::from_cli(profile).name == "tiny"
+fn is_small_model(profile: &str, model: &str) -> bool {
+    ModelProfile::from_cli(profile, model).name == "tiny"
 }
 
 #[cfg(test)]

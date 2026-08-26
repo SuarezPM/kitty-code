@@ -311,7 +311,7 @@ desde JSON · resultados reproducibles · commit `F5 done`.
 
 ## F6 — Roadmap del repo
 
-### F6.1 Quick wins pendientes (del AUDIT §9)
+### F6.1 Quick wins pendientes (del AUDIT §8 Roadmap)
 - [ ] **Thinking budget A/B:** modo `kitty bench ab --thinking 1024,2048,4096 --limit 50`
       (n=50 por condición) → elegir el mejor y fijarlo como default.
 - [ ] **Más ejercicios:** list comprehensions, decorators con args, async/await (Python);

@@ -16,7 +16,7 @@ use crate::bootstrap::Bootstrap;
 use crate::context::{ContextBudget, ContextError};
 use crate::contract::{contract_guard_enabled, looks_like_done_claim, Contract};
 use crate::knowledge::{KnowledgeBase, KnowledgeConfig};
-use crate::model_profile::{ModelProfile, ModelTuning, ThinkingMode};
+use crate::model_profile::{ModelProfile, ModelTuning, PromptStyle, ThinkingMode};
 use crate::parser::{ParsedToolCall, ToolCallParser};
 use crate::quality_monitor::{QualityConfig, QualityMonitor, QualityViolation};
 use crate::router::{tools_for_category, ToolRouter};
@@ -108,9 +108,12 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
-    /// Build a config from a CLI profile string, syncing derived fields from the profile.
+    /// Build a config from a CLI profile string, syncing derived fields from
+    /// the profile. The MODEL ID participates when the profile value does not
+    /// name a preset ("auto" or unknown): f8 T4.1 auto-detects nano-tier
+    /// models by id shape.
     pub fn with_profile(mut self, profile_name: &str) -> Self {
-        let p = ModelProfile::from_cli(profile_name);
+        let p = ModelProfile::from_cli(profile_name, &self.model);
         self.profile = p;
         self.context_window = p.context_window;
         self.max_iterations = p.max_iterations;
@@ -286,6 +289,20 @@ impl DoomLoopGuard {
 /// ask permission instead of acting (cheetahclaws-proven). Appended to the
 /// system prompt when the model id contains "qwen".
 pub const QWEN_STANCE_OVERLAY: &str = "Communicate by executing: treat user requests as direct tool instructions. Do not ask permission. Do not narrate plans without acting.";
+
+/// f8 T4.1: minimal runtime contract for the nano tier (`PromptStyle::
+/// Minimal`). Terse identity plus the four non-negotiables; the workspace
+/// line is appended in `preflight`. Budget: ≤1600 chars INCLUDING that line.
+const MINIMAL_RUNTIME: &str = "\
+You are a coding agent working inside this repository. Complete the user's task using tools.
+
+Rules:
+- One action per turn: either ONE tool call OR your final text answer, never both.
+- Read a file before editing it; only edit files you have read this session.
+- Edits must be the smallest unique span: old_string has to match exactly once, \
+with just enough surrounding lines to disambiguate. Use Write only for NEW files.
+- Before finishing, check your work and state what you changed in one short \
+paragraph.";
 
 /// Returns the stance overlay for `model`, if any (currently qwen-family only).
 fn model_stance_overlay(model: &str) -> Option<&'static str> {
@@ -1147,7 +1164,35 @@ impl Agent {
     /// The system message leads the conversation. When the model id contains
     /// "qwen", the E3 [`QWEN_STANCE_OVERLAY`] is appended (or emitted alone)
     /// so Qwen-family models act instead of hedging.
+    ///
+    /// f8 T4.1: profiles with [`PromptStyle::Minimal`] (nano tier) get a
+    /// compact imperative contract instead — terse identity, one-action-
+    /// per-turn, read-before-edit and smallest-unique-span guidance, plus at
+    /// most the project-type labels. Verbose bootstrap command hints and the
+    /// stance overlay are skipped (the Minimal text is already imperative).
     fn preflight(&mut self, _user_prompt: &str) {
+        if self.config.profile.prompt_style == PromptStyle::Minimal {
+            let mut system_msg = String::from(MINIMAL_RUNTIME);
+            if let Some(result) = self.bootstrap.result() {
+                let labels = result
+                    .project_types
+                    .iter()
+                    .map(|p| p.label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !labels.is_empty() {
+                    system_msg.push_str(&format!("\nWorkspace type: {labels}."));
+                }
+            }
+            self.messages.push(Message {
+                role: "system".to_string(),
+                content: Some(system_msg),
+                thinking: None,
+                tool_calls: None,
+            });
+            return;
+        }
+
         let mut system_msg = String::new();
         if let Some(result) = self.bootstrap.result() {
             if !result.hint.is_empty() {
@@ -3521,5 +3566,80 @@ mod tests {
             !agent2.messages.iter().any(|m| m.role == "system"),
             "non-qwen model must not get the stance overlay"
         );
+    }
+
+    #[test]
+    fn minimal_prompt_style_preflight_is_compact() {
+        // f8 T4.1: nano tier gets the compact imperative contract — ≤1600
+        // chars total (workspace label included), no verbose build-command
+        // hints and no qwen stance overlay.
+        let client = OllamaClient::new("http://localhost:11434");
+        let cfg = AgentConfig {
+            model: "qwen2.5-3b".to_string(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        }
+        .with_profile("auto");
+        assert_eq!(cfg.profile.name, "nano", "3b id auto-selects nano");
+        let mut agent = Agent::new(client, cfg);
+        agent.run_bootstrap();
+        agent.preflight("hi");
+
+        let system = agent
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .expect("minimal preflight must still lead with a system message");
+        let content = system.content.as_deref().unwrap_or_default();
+        assert!(
+            content.starts_with("You are a coding agent working inside this repository."),
+            "got: {content}"
+        );
+        assert!(
+            content.len() <= 1600,
+            "minimal prompt budget exceeded: {} chars",
+            content.len()
+        );
+        assert!(content.contains("One action per turn"));
+        assert!(content.contains("Read a file before editing"));
+        assert!(!content.contains("Available build commands"), "{content}");
+        assert!(!content.contains(QWEN_STANCE_OVERLAY));
+    }
+
+    #[tokio::test]
+    async fn full_prompt_style_path_unchanged_for_medium() {
+        // f8 T4.1 AC: the Full path keeps bootstrap detail + stance overlay.
+        let client = OllamaClient::new("http://localhost:11434");
+        let cfg = AgentConfig {
+            model: "qwen3:8b".to_string(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(client, cfg);
+        agent.run_bootstrap();
+        agent.preflight("hi");
+        // No project marker in /tmp → no hint; the qwen stance alone leads.
+        let system = agent
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .expect("qwen medium profile gets the stance overlay");
+        assert_eq!(system.content.as_deref(), Some(QWEN_STANCE_OVERLAY));
+    }
+
+    #[test]
+    fn explicit_profile_beats_nano_autodetection() {
+        // f8 T4.1 AC: --profile medium on a 3B id stays medium.
+        let cfg = AgentConfig {
+            model: "qwen2.5-3b".to_string(),
+            ..Default::default()
+        }
+        .with_profile("medium");
+        assert_eq!(cfg.profile.name, "medium");
+        assert_eq!(cfg.profile.prompt_style, PromptStyle::Full);
+        // And nano is reachable explicitly.
+        let cfg = AgentConfig::default().with_profile("nano");
+        assert_eq!(cfg.profile.name, "nano");
+        assert_eq!(cfg.profile.prompt_style, PromptStyle::Minimal);
     }
 }

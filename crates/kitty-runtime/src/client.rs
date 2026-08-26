@@ -443,6 +443,67 @@ pub struct ModelListResponse {
 // OllamaClient
 // ---------------------------------------------------------------------------
 
+/// Capacity of the per-client token-count LRU cache (f8 T4.3).
+const TOKEN_CACHE_CAPACITY: usize = 256;
+
+/// Mutex-protected LRU map for `/api/tokenize` results, keyed by
+/// (model id, hashed prompt). Insertion-order eviction: the oldest entry is
+/// dropped once [`TOKEN_CACHE_CAPACITY`] is exceeded. Interior mutability on
+/// [`OllamaClient`]; `Arc` keeps clones sharing one cache.
+#[derive(Default)]
+struct TokenCache {
+    map: std::collections::HashMap<(String, u64), usize>,
+    order: std::collections::VecDeque<(String, u64)>,
+}
+
+impl TokenCache {
+    /// Cached count for `key`, marking it most-recently-used.
+    fn get(&mut self, key: &(String, u64)) -> Option<usize> {
+        let hit = self.map.get(key).copied()?;
+        // Refresh recency.
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.clone());
+        Some(hit)
+    }
+
+    /// Insert `key → value`, evicting the oldest entry at capacity.
+    fn insert(&mut self, key: (String, u64), value: usize) {
+        if self.map.contains_key(&key) {
+            // Refresh + overwrite (counts can't change, but stay correct).
+            self.insert_touch(&key);
+            self.map.insert(key, value);
+            return;
+        }
+        if self.order.len() >= TOKEN_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.map.insert(key.clone(), value);
+        self.order.push_back(key);
+    }
+
+    fn insert_touch(&mut self, key: &(String, u64)) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.clone());
+    }
+}
+
+/// Stable cache key for a tokenize request: model id plus a hash of the
+/// prompt text (DefaultHasher is process-stable enough for an in-memory
+/// cache; collisions across 256 entries are negligible and only cost an
+/// inaccurate cached count — never correctness of the request path).
+fn token_cache_key(model: &str, prompt: &str) -> (String, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    prompt.hash(&mut hasher);
+    (model.to_string(), hasher.finish())
+}
+
 /// Typed client for the Ollama HTTP API.
 ///
 /// All network errors are surfaced as [`RuntimeError::Http`]. Non-2xx HTTP
@@ -458,6 +519,8 @@ pub struct OllamaClient {
     http: reqwest::Client,
     timeout: Duration,
     num_ctx: u32,
+    /// f8 T4.3: LRU cache over `/api/tokenize` counts; clones share it.
+    token_cache: std::sync::Arc<std::sync::Mutex<TokenCache>>,
 }
 
 impl OllamaClient {
@@ -481,6 +544,7 @@ impl OllamaClient {
             http,
             timeout,
             num_ctx,
+            token_cache: std::sync::Arc::new(std::sync::Mutex::new(TokenCache::default())),
         }
     }
 
@@ -698,6 +762,25 @@ impl OllamaClient {
     /// far more accurate than a character/word heuristic and required for
     /// correct context budgeting on the actual model being run.
     pub async fn count_tokens(&self, model: &str, prompt: &str) -> Result<usize> {
+        // f8 T4.3: identical (model, prompt) pairs repeat heavily across
+        // turns (system prompt, knowledge/episode injections); serve them
+        // from the LRU without touching the network. Errors are NOT cached:
+        // miss → compute → insert.
+        let key = token_cache_key(model, prompt);
+        if let Some(hit) = self.token_cache.lock().expect("token cache").get(&key) {
+            debug!(model = %model, cached = true, "token count served from LRU");
+            return Ok(hit);
+        }
+        let tokens = self.count_tokens_remote(model, prompt).await?;
+        self.token_cache
+            .lock()
+            .expect("token cache")
+            .insert(key, tokens);
+        Ok(tokens)
+    }
+
+    /// Uncached `/api/tokenize` round-trip behind [`OllamaClient::count_tokens`].
+    async fn count_tokens_remote(&self, model: &str, prompt: &str) -> Result<usize> {
         let url = format!("{}/api/tokenize", self.base_url);
         let body = serde_json::json!({ "model": model, "prompt": prompt });
         let resp = self.http.post(&url).json(&body).send().await?;
@@ -957,6 +1040,112 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RuntimeError::Api { status: 500, .. }));
+    }
+
+    /// Serve `n` canned /api/tokenize responses on an ephemeral port while
+    /// counting accepted connections. Returns (client, port, counter).
+    fn spawn_tokenize_server(
+        n: usize,
+    ) -> (
+        OllamaClient,
+        u16,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let port = listener.local_addr().unwrap().port();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_thread = Arc::clone(&counter);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(n) {
+                let Ok(mut stream) = stream else { break };
+                counter_thread.fetch_add(1, Ordering::SeqCst);
+                // Drain the full request (headers + Content-Length body).
+                let mut data = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let read = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    data.extend_from_slice(&buf[..read]);
+                    let Ok(text) = std::str::from_utf8(&data) else {
+                        continue;
+                    };
+                    let Some(header_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let content_length = text
+                        .split("\r\n")
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                let body = "{\"tokens\":[1,2,3,4,5]}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let client = OllamaClient::new(&format!("http://127.0.0.1:{port}"));
+        (client, port, counter)
+    }
+
+    #[tokio::test]
+    async fn token_cache_serves_repeat_without_second_http_call() {
+        // f8 T4.3 AC: second identical count_tokens performs ZERO additional
+        // /api/tokenize round-trips; distinct content still computes.
+        let (client, _port, counter) = spawn_tokenize_server(4);
+        let first = client.count_tokens("m", "hello world").await.unwrap();
+        let second = client.count_tokens("m", "hello world").await.unwrap();
+        assert_eq!(first, 5);
+        assert_eq!(second, 5);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "repeat must be served from the LRU cache"
+        );
+
+        // Distinct prompt → one more real call.
+        let _ = client.count_tokens("m", "different").await.unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Same prompt, DIFFERENT model → separate cache entry, real call.
+        let _ = client.count_tokens("other", "hello world").await.unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // Warm again across all three — no further calls.
+        let _ = client.count_tokens("m", "hello world").await.unwrap();
+        let _ = client.count_tokens("m", "different").await.unwrap();
+        let _ = client.count_tokens("other", "hello world").await.unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn token_cache_lru_eviction_bounded() {
+        // f8 T4.3 AC: >capacity inserts evict oldest without panicking.
+        let mut cache = TokenCache::default();
+        for i in 0..400usize {
+            cache.insert(("m".to_string(), i as u64), i);
+        }
+        assert_eq!(cache.order.len(), TOKEN_CACHE_CAPACITY);
+        assert_eq!(cache.map.len(), TOKEN_CACHE_CAPACITY);
+        // Oldest entries are gone; newest are present.
+        assert_eq!(cache.get(&("m".to_string(), 0)), None);
+        assert_eq!(cache.get(&("m".to_string(), 399)), Some(399));
     }
 
     #[test]
