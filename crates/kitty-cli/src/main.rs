@@ -1027,6 +1027,21 @@ async fn run_bench(items: &[BenchItem], cfg: &BenchConfig) -> Result<Vec<BenchRe
 
 /// Run a single benchmark exercise with the given config.
 /// Shared by `run_bench` and the A/B thinking-budget benchmark.
+/// G3-FIX1: re-seed an agent's budget compaction threshold from its
+/// EFFECTIVE post-overlay context window (`agent.config().context_window`),
+/// never from a raw CLI argument. AD5 derivation semantics apply: the result
+/// never raises above `profile_threshold` and equals it on windows where the
+/// ratio already exceeds the profile value.
+fn sync_budget_threshold(agent: &mut Agent, profile_threshold: f32) {
+    let effective_window = agent.config().context_window;
+    agent
+        .budget_mut()
+        .set_threshold(ContextBudget::derive_compaction_threshold(
+            profile_threshold,
+            effective_window,
+        ));
+}
+
 async fn run_one_bench(
     ex: &BenchItem,
     cfg: &BenchConfig,
@@ -1098,14 +1113,11 @@ async fn run_one_bench(
     }
     // Ensure compact threshold follows profile (tiny 0.7, medium 0.8, large 0.8)
     agent.config_mut().compact_threshold = cfg.profile.compact_threshold;
-    // Re-sync budget threshold: f8 AD5 derives the EFFECTIVE value for the
-    // actual window (never raises above the profile threshold).
-    agent
-        .budget_mut()
-        .set_threshold(ContextBudget::derive_compaction_threshold(
-            cfg.profile.compact_threshold,
-            cfg.context_window,
-        ));
+    // G3-FIX1: re-sync derives from the agent's EFFECTIVE post-overlay
+    // context window (profile preset unless --context-window overrode it) —
+    // NOT the raw CLI argument, which silently undid AD5's small-window
+    // protection on tiny-profile bench runs.
+    sync_budget_threshold(&mut agent, cfg.profile.compact_threshold);
     let outcome =
         tokio::time::timeout(std::time::Duration::from_secs(30), agent.run(&prompt)).await;
 
@@ -1400,7 +1412,10 @@ fn is_small_model(profile: &str, _model: &str) -> bool {
 
 #[cfg(test)]
 mod bench_ab_tests {
-    use super::{build_ab_plan, parse_thinking_budgets, wilson_ci, Cli, Commands};
+    use super::{
+        build_ab_plan, parse_thinking_budgets, sync_budget_threshold, wilson_ci, Agent,
+        AgentConfig, Cli, Commands, ModelProfile, OllamaClient,
+    };
     use clap::Parser;
 
     #[test]
@@ -1424,6 +1439,42 @@ mod bench_ab_tests {
             }
             _ => panic!("expected BenchAb"),
         }
+    }
+
+    /// G3-FIX1 AC: the bench threshold re-sync derives from the agent's
+    /// EFFECTIVE window — a tiny-profile bench agent WITHOUT an explicit
+    /// --context-window keeps AD5's small-window protection (0.62 exactly).
+    #[test]
+    fn bench_threshold_resync_derives_from_effective_window() {
+        // Tiny preset ⇒ effective window 4096; NO --context-window override.
+        let mut agent = Agent::new(
+            OllamaClient::new("http://localhost:11434"),
+            AgentConfig::default().with_profile("tiny"),
+        );
+        assert_eq!(agent.config().context_window, 4096);
+        sync_budget_threshold(&mut agent, ModelProfile::tiny().compact_threshold);
+        assert!(
+            (agent.budget().threshold() - 0.62).abs() < 1e-6,
+            "tiny bench agent must keep derived 0.62, got {}",
+            agent.budget().threshold()
+        );
+
+        // Control: medium at its default window stays the profile value.
+        let mut agent = Agent::new(
+            OllamaClient::new("http://localhost:11434"),
+            AgentConfig::default().with_profile("medium"),
+        );
+        sync_budget_threshold(&mut agent, ModelProfile::medium().compact_threshold);
+        assert!((agent.budget().threshold() - 0.8).abs() < 1e-6);
+
+        // Explicit reduced override derives against THAT window.
+        let mut agent = Agent::new(
+            OllamaClient::new("http://localhost:11434"),
+            AgentConfig::default().with_profile("medium"),
+        );
+        agent.config_mut().context_window = 4096;
+        sync_budget_threshold(&mut agent, ModelProfile::medium().compact_threshold);
+        assert!((agent.budget().threshold() - 0.62).abs() < 1e-6);
     }
 
     /// f8 T1.3 AC: `--hops` propagates; absent flag ⇒ 0.

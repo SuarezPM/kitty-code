@@ -202,10 +202,11 @@ fn autorun_hop_retries_after_revisions_exhausted(
 /// pathologically long assistant→tool run cannot scan the whole history.
 const COMPACTION_WALKBACK_MAX: usize = 12;
 
-/// Pure boundary selection for compaction (f8 AD6): starting at
-/// `naive_split_at`, walk BACK up to [`COMPACTION_WALKBACK_MAX`] messages to
-/// the nearest index `i > 0` where `messages[i]` begins a USER turn. Cutting
-/// at a user boundary can never orphan tool results or split an
+/// Pure boundary selection for compaction (f8 AD6 + G3-FIX2): if the naive
+/// split ALREADY lands on a user turn, keep it exactly (no under-freeing).
+/// Otherwise walk BACK up to [`COMPACTION_WALKBACK_MAX`] messages to the
+/// nearest index `i > 0` where `messages[i]` begins a USER turn. Cutting at
+/// a user boundary can never orphan tool results or split an
 /// assistant→tool run (rule 3): every kept message from there on belongs to
 /// a complete turn. If no user boundary exists within the window, fall back
 /// to the naive split (degenerate histories stay graceful).
@@ -214,8 +215,14 @@ fn compaction_split_boundary(messages: &[Message], naive_split_at: usize) -> usi
     if naive_split_at == 0 {
         return 0;
     }
-    // Candidates are naive-1 down to max(naive-K, 1) — index 0 is excluded
-    // (a zero split would compact nothing).
+    // G3-FIX2: the naive point is tested FIRST — when it already sits on a
+    // user boundary it is used as-is instead of being skipped for an older,
+    // strictly-less-freeing cut.
+    if messages[naive_split_at].role == "user" {
+        return naive_split_at;
+    }
+    // Remaining candidates are naive-1 down to max(naive-K, 1) — index 0 is
+    // excluded (a zero split would compact nothing).
     let lower = naive_split_at
         .saturating_sub(COMPACTION_WALKBACK_MAX)
         .max(1);
@@ -3220,6 +3227,33 @@ mod tests {
         assert_eq!(compaction_split_boundary(&history, 2), 2);
         // Zero split stays zero.
         assert_eq!(compaction_split_boundary(&history, 0), 0);
+
+        // G3-FIX2: naive lands EXACTLY on a user ⇒ returned unchanged (the
+        // old decrement-first scan skipped it for an older turn).
+        let history = vec![
+            m("user"),
+            m("assistant"),
+            m("user"),
+            m("assistant"),
+            m("user"),
+            m("assistant"),
+        ];
+        assert_eq!(
+            compaction_split_boundary(&history, 4),
+            4,
+            "exact user-boundary landing must not under-free"
+        );
+        // Mixed: exact landing beats walking back even when older users exist.
+        let history = vec![
+            m("user"),
+            m("assistant"),
+            m("tool"),
+            m("user"),
+            m("assistant"),
+            m("user"),
+            m("assistant"),
+        ];
+        assert_eq!(compaction_split_boundary(&history, 5), 5);
     }
 
     #[tokio::test]
