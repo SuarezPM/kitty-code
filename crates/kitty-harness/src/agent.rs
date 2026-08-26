@@ -239,6 +239,43 @@ fn compaction_split_boundary(messages: &[Message], naive_split_at: usize) -> usi
     naive_split_at
 }
 
+/// Collapse consecutive trailing `assistant` messages to at most one (B1-400
+/// wire sanitizer). Idempotent, tail-only — interior duplicates untouched.
+/// MERGE: if any tail assistant has tool_calls, concat all onto the LAST;
+/// DROP: else keep only the LAST. Cheap O(tail) scan, no allocation when tail≤1.
+pub fn sanitize_trailing_assistants(mut history: Vec<Message>) -> Vec<Message> {
+    let trailing = history
+        .iter()
+        .rev()
+        .take_while(|m| m.role == "assistant")
+        .count();
+    if trailing <= 1 {
+        return history;
+    }
+    let len = history.len();
+    let start = len - trailing;
+    let mut merged: Vec<kitty_runtime::ToolCall> = Vec::new();
+    for msg in &history[start..] {
+        if let Some(tcs) = &msg.tool_calls {
+            merged.extend(tcs.clone());
+        }
+    }
+    let last = history[start + trailing - 1].clone();
+    history.truncate(start);
+    let collapsed = if merged.is_empty() {
+        last
+    } else {
+        Message {
+            role: "assistant".to_string(),
+            content: last.content.clone(),
+            thinking: last.thinking.clone(),
+            tool_calls: Some(merged),
+        }
+    };
+    history.push(collapsed);
+    history
+}
+
 /// Verdict returned by [`DoomLoopGuard::record`] after one tool execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoomLoopVerdict {
@@ -1237,7 +1274,8 @@ impl Agent {
     /// tool calls and quality checks normally.
     async fn llm_call_no_thinking(&self) -> Result<ChatResponse> {
         info!("Retrying LLM call with thinking disabled");
-        let mut messages = self.messages.clone();
+        // B1-400: sanitize the cloned history before wiring (tail-only, idempotent).
+        let mut messages = sanitize_trailing_assistants(self.messages.clone());
         messages.insert(
             0,
             Message {
@@ -1299,12 +1337,14 @@ impl Agent {
 
     /// Make an LLM call and handle the response.
     async fn llm_call(&self) -> Result<ChatResponse> {
+        // B1-400: transport sanitizer — never wire a trailing [assistant, assistant] (Ollama 400).
+        let messages = sanitize_trailing_assistants(self.messages.clone());
         self.client
             .chat_with_options(
                 &self.config.model,
-                self.messages.clone(),
+                messages.clone(),
                 Some(self.tools.clone()),
-                Some(self.request_options(&self.messages)),
+                Some(self.request_options(&messages)),
             )
             .await
             .context("LLM call failed")
@@ -1312,7 +1352,9 @@ impl Agent {
 
     /// Force the model to respond with text (no tools).
     async fn force_response(&self, instruction: &str) -> Result<String> {
-        let mut messages = self.messages.clone();
+        // B1-400: sanitize the base history tail BEFORE pushing the forcing user turn
+        // (keeps interior duplicates intact; wire ends with user so stays valid).
+        let mut messages = sanitize_trailing_assistants(self.messages.clone());
         messages.push(Message {
             role: "user".to_string(),
             content: Some(instruction.to_string()),
@@ -1454,6 +1496,7 @@ impl Agent {
     /// Uses real tokenization when the server is reachable; falls back to the
     /// heuristic (chars/4). Every token consumed by the conversation flows
     /// through this one call — no separate `budget.consume()` elsewhere.
+    // B1-400 decision: keep push_message as-is — wire sanitizer (idempotent tail-only) is sufficient and avoids touching episode/tool ordering invariants.
     async fn push_message(&mut self, msg: Message) {
         if let Some(content) = msg.content.as_deref() {
             let tokens = self.count_tokens(content).await;
@@ -1815,6 +1858,10 @@ mod tests {
         last_messages: std::sync::Arc<std::sync::Mutex<Option<Vec<Message>>>>,
         last_options:
             std::sync::Arc<std::sync::Mutex<Option<kitty_runtime::client::RequestOptions>>>,
+        /// EVERY chat payload in order (G5: lets tests inspect intermediate
+        /// requests, e.g. the third call where double-trailing-assistant
+        /// payloads first appear).
+        all_calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
     }
 
     impl CapturingClient {
@@ -1823,6 +1870,7 @@ mod tests {
                 inner: MockClient::new(responses),
                 last_messages: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 last_options: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                all_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
@@ -1837,6 +1885,7 @@ mod tests {
         {
             Box::pin(async move {
                 *self.last_messages.lock().unwrap() = Some(messages.clone());
+                self.all_calls.lock().unwrap().push(messages.clone());
                 self.inner.chat(model, messages, tools).await
             })
         }
@@ -1851,6 +1900,7 @@ mod tests {
         {
             Box::pin(async move {
                 *self.last_messages.lock().unwrap() = Some(messages.clone());
+                self.all_calls.lock().unwrap().push(messages.clone());
                 *self.last_options.lock().unwrap() = options.clone();
                 self.inner
                     .chat_with_options(model, messages, tools, options)
@@ -3240,6 +3290,121 @@ mod tests {
         let captured = last_messages.lock().unwrap().clone().unwrap();
         let prompt = captured[0].content.as_deref().unwrap();
         assert!(prompt.contains("280 words"), "prompt: {prompt}");
+    }
+
+    // -----------------------------------------------------------------------
+    // G5: never send consecutive trailing assistant messages (B1 400 bug)
+    // -----------------------------------------------------------------------
+
+    /// Reproduction of the B1-l15 production 400: a reasoning model that
+    /// emits TWO content-only responses in a row made the THIRD request end
+    /// with `[assistant, assistant]` — Ollama rejects it with
+    /// "Cannot have 2 or more assistant messages at the end of the list."
+    #[tokio::test]
+    async fn two_prose_responses_never_send_double_trailing_assistant() {
+        let capturing = CapturingClient::new(vec![
+            dummy_response("alpha"),
+            dummy_response("beta"),
+            dummy_response("forced final"),
+        ]);
+        let all_calls = capturing.all_calls.clone();
+        let cfg = AgentConfig {
+            workspace: std::path::PathBuf::from("/tmp"),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(capturing, cfg);
+        agent.config_mut().max_iterations = 2;
+
+        let out = agent.run("goal").await.unwrap();
+        assert_eq!(out, "forced final");
+
+        let calls = all_calls.lock().unwrap();
+        assert!(
+            calls.len() >= 3,
+            "expected 3 LLM calls (2 prose cycles + forced), got {}",
+            calls.len()
+        );
+        for (i, payload) in calls.iter().enumerate() {
+            let trailing_assistants = payload
+                .iter()
+                .rev()
+                .take_while(|m| m.role == "assistant")
+                .count();
+            assert!(
+                trailing_assistants <= 1,
+                "request #{i} ends with {trailing_assistants} consecutive assistant \
+                 messages — Ollama HTTP 400 (invalid_request_error)"
+            );
+        }
+        // The surviving trailing assistant carries the LAST response's text.
+        let last_payload = calls.last().unwrap();
+        let last_assistant = last_payload
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .expect("history must still contain an assistant message");
+        assert_eq!(last_assistant.content.as_deref(), Some("beta"));
+    }
+
+    /// G5 sanitizer, direct table: merge case (tool_calls concatenated),
+    /// drop case (plain duplicates), normal case unchanged.
+    #[test]
+    fn sanitize_trailing_assistants_merge_drop_and_noop() {
+        let m = |role: &str, content: &str| Message {
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            thinking: None,
+            tool_calls: None,
+        };
+        let a_tc = |name: &str| Message {
+            role: "assistant".to_string(),
+            content: None,
+            thinking: None,
+            tool_calls: Some(vec![kitty_runtime::ToolCall {
+                id: None,
+                function: kitty_runtime::ToolCallFunction {
+                    name: name.to_string(),
+                    arguments: serde_json::json!({}),
+                },
+            }]),
+        };
+
+        // MERGE case: [user, assistant(tool), assistant(text)] → tool_calls
+        // carried onto the kept LAST assistant.
+        let history = vec![
+            m("user", "goal"),
+            a_tc("Read"),
+            m("assistant", "later text"),
+        ];
+        let out = sanitize_trailing_assistants(history);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].content.as_deref(), Some("later text"));
+        let tcs = out[1].tool_calls.as_ref().expect("tool_calls carried over");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "Read");
+
+        // DROP case: plain consecutive assistants keep only the LAST content.
+        let history = vec![
+            m("user", "goal"),
+            m("assistant", "first"),
+            m("assistant", "second"),
+        ];
+        let out = sanitize_trailing_assistants(history);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].content.as_deref(), Some("second"));
+        assert!(out[1].tool_calls.is_none());
+
+        // NORMAL cases untouched.
+        let history = vec![m("user", "q"), m("assistant", "a"), m("user", "q2")];
+        let out = sanitize_trailing_assistants(history.clone());
+        assert_eq!(out, history);
+        let single = vec![m("assistant", "only")];
+        assert_eq!(sanitize_trailing_assistants(single.clone()), single);
+        assert!(sanitize_trailing_assistants(Vec::new()).is_empty());
+        // Interior duplicates are NOT touched (wire constraint is about the tail).
+        let history = vec![m("assistant", "x"), m("assistant", "y"), m("user", "z")];
+        let out = sanitize_trailing_assistants(history);
+        assert_eq!(out.len(), 3);
     }
 
     // -----------------------------------------------------------------------

@@ -289,20 +289,20 @@ pub trait ChatClient: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Tool call returned by Ollama.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: Option<String>,
     pub function: ToolCallFunction,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallFunction {
     pub name: String,
     pub arguments: serde_json::Value,
 }
 
 /// Chat message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
