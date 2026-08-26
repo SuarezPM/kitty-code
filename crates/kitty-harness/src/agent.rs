@@ -180,10 +180,15 @@ pub fn clamp_autorun_hops(hops: usize) -> usize {
 /// Fixed-machine rule (f8 AD1): after verification FAILS and the revision
 /// budget is exhausted, one autorun hop may buy one more full cycle.
 ///
-/// Note on reachability: because hops are consumed on ITERATION EXHAUSTION
-/// (before any verification can run), a strictly-serial run usually arrives
-/// here with `hops_remaining == 0`; the rule keeps its guarantee for any path
-/// that still holds hops at verification time. Unit-tested directly.
+/// Reachability (G1 rider): UNREACHABLE on every current live path. The
+/// `'autorun` loop provably exits ONLY through its `break`, and that break is
+/// guarded by `hops_remaining == 0` (any positive balance is spent one hop
+/// earlier to restart the inner loop instead of falling through). The
+/// verification section runs strictly after that break, so it always observes
+/// `hops_remaining == 0` and this predicate is constant-false in practice.
+/// The arm is retained deliberately: it encodes the AD1 machine rule for any
+/// future path where hops may legitimately survive into verification, and it
+/// stays unit-tested so the invariant is pinned.
 #[must_use]
 fn autorun_hop_retries_after_revisions_exhausted(
     hops_remaining: usize,
@@ -397,6 +402,8 @@ impl Agent {
         });
         // Read before moving `config` into the struct (no Copy).
         let bash_timeout_secs = config.bash_timeout_secs;
+        // f8 T2.3: the active profile governs the default Read window.
+        let read_cap = config.profile.read_cap;
         // Gate-4: the Bash-sandbox FS allow-root must follow the configured
         // workspace explicitly — never silently inherit the process cwd
         // (launching from `$HOME` would otherwise make all of HOME writable).
@@ -408,7 +415,9 @@ impl Agent {
             messages: Vec::new(),
             tools,
             budget,
-            registry: ToolRegistry::with_timeout(bash_timeout_secs).with_workspace(workspace),
+            registry: ToolRegistry::with_timeout(bash_timeout_secs)
+                .with_workspace(workspace)
+                .with_read_cap(read_cap),
             parser: ToolCallParser::new(),
             thinking_budget,
             quality_monitor,

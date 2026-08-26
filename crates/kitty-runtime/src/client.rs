@@ -652,6 +652,47 @@ impl OllamaClient {
         Ok(info)
     }
 
+    /// Extract the model's native context length from an `/api/show` payload.
+    ///
+    /// Pure helper behind [`OllamaClient::show_model`] (f8 T2.1).
+    /// `model_info` keys are family-prefixed (`llama.context_length`,
+    /// `qwen2.context_length`, `qwen3.context_length`, …), so ANY key ending
+    /// in `.context_length` is accepted — a literal `llama.` lookup would be
+    /// dead for qwen-family models. When several family keys appear, the
+    /// smallest value wins. Falls back to a `num_ctx <N>` entry in the
+    /// `parameters` string. Returns `None` when neither source yields a
+    /// positive number.
+    pub fn parse_native_context_length(show_payload: &serde_json::Value) -> Option<u32> {
+        if let Some(info) = show_payload.get("model_info").and_then(|v| v.as_object()) {
+            let mut best: Option<u32> = None;
+            for (key, val) in info {
+                if !key.ends_with(".context_length") {
+                    continue;
+                }
+                // as_u64 filters negatives, floats and non-numeric types.
+                if let Some(n) = val.as_u64() {
+                    if n == 0 || n > u64::from(u32::MAX) {
+                        continue;
+                    }
+                    let n = n as u32;
+                    best = Some(best.map_or(n, |b| b.min(n)));
+                }
+            }
+            if best.is_some() {
+                return best;
+            }
+        }
+        // Fallback: `parameters` is a plain "key value\n" string.
+        let params = show_payload.get("parameters")?.as_str()?;
+        let mut tokens = params.split_whitespace();
+        while let Some(tok) = tokens.next() {
+            if tok.eq_ignore_ascii_case("num_ctx") {
+                return tokens.next()?.parse::<u32>().ok().filter(|n| *n > 0);
+            }
+        }
+        None
+    }
+
     /// Count tokens of `prompt` using the model's own tokenizer via Ollama's
     /// `/api/tokenize` endpoint. This is the *real* token count for the model,
     /// far more accurate than a character/word heuristic and required for
@@ -902,6 +943,86 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RuntimeError::Api { status: 500, .. }));
+    }
+
+    #[test]
+    fn native_context_length_llama_style_payload() {
+        // f8 T2.1: classic unprefixed-family payload.
+        let payload = serde_json::json!({
+            "model_info": {
+                "llama.context_length": 131072,
+                "general.architecture": "llama"
+            },
+            "parameters": "stop <|im_end|>\nnum_ctx 4096"
+        });
+        assert_eq!(
+            OllamaClient::parse_native_context_length(&payload),
+            Some(131072),
+            "model_info wins over the parameters fallback"
+        );
+    }
+
+    #[test]
+    fn native_context_length_qwen_style_prefixed_key() {
+        // f8 T2.1 (Oracle-corrected): family-prefixed keys are the norm for
+        // qwen models — a literal `llama.` lookup would be dead here.
+        let payload = serde_json::json!({
+            "model_info": {
+                "qwen3.context_length": 40960,
+                "qwen3.embedding_length": 4096,
+                "general.architecture": "qwen3"
+            }
+        });
+        assert_eq!(
+            OllamaClient::parse_native_context_length(&payload),
+            Some(40960)
+        );
+
+        // Several family keys present → smallest numeric value wins.
+        let multi = serde_json::json!({
+            "model_info": {
+                "qwen2.context_length": 32768,
+                "qwen3.context_length": 131072
+            }
+        });
+        assert_eq!(
+            OllamaClient::parse_native_context_length(&multi),
+            Some(32768)
+        );
+    }
+
+    #[test]
+    fn native_context_length_empty_or_weird_types_yield_none() {
+        // Empty object / missing model_info.
+        assert_eq!(
+            OllamaClient::parse_native_context_length(&serde_json::json!({})),
+            None
+        );
+        // Wrong value types under a matching key.
+        let weird = serde_json::json!({
+            "model_info": {
+                "llama.context_length": "very long",
+                "qwen3.context_length": null,
+                "qwen2.context_length": -5,
+                "qwen2.context_length_f": 1.5
+            }
+        });
+        assert_eq!(OllamaClient::parse_native_context_length(&weird), None);
+        // Zero and absurdly large values are rejected too.
+        let zero = serde_json::json!({"model_info": {"llama.context_length": 0}});
+        assert_eq!(OllamaClient::parse_native_context_length(&zero), None);
+
+        // Fallback path: `parameters` carries num_ctx when model_info doesn't.
+        let params_only = serde_json::json!({
+            "parameters": "temperature 0.7\nnum_ctx 8192\nstop <s>"
+        });
+        assert_eq!(
+            OllamaClient::parse_native_context_length(&params_only),
+            Some(8192)
+        );
+        // Neither source usable → None.
+        let junk = serde_json::json!({"parameters": "temperature 0.7", "model_info": {}});
+        assert_eq!(OllamaClient::parse_native_context_length(&junk), None);
     }
 
     #[tokio::test]

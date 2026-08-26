@@ -316,8 +316,8 @@ mod tests {
             .unwrap_or("");
         let first_line = output
             .lines()
-            .next()
-            .expect("Read output should have at least one line");
+            .nth(1) // skip the honest-window header (f8 T2.3)
+            .expect("Read output should have tagged lines after the header");
         let hash = first_line
             .split(':')
             .nth(1)

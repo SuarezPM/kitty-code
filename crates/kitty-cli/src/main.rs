@@ -15,7 +15,7 @@ use kitty_memory::{Episode, EpisodeStore};
 use kitty_runtime::OllamaClient;
 use std::path::PathBuf;
 use std::time::Instant;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Default path for episodic memory database.
 fn default_db_path() -> String {
@@ -54,6 +54,101 @@ pub(crate) fn resolve_project_root() -> PathBuf {
          found at or above CWD — sandbox fs_allow falls back to CWD itself"
     );
     start
+}
+
+// ── Session context-window resolution (f8 T2.2) ─────────────────────
+
+/// Resolved session context window plus where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NumCtxResolution {
+    num_ctx: u32,
+    /// Provenance of the value: `"env"` | `"native"` | `"fallback"`.
+    source: &'static str,
+}
+
+/// Floor for a natively probed window (tiny-profile sessions legitimately go
+/// lower, but only via explicit env — a probe result is never trusted below).
+const NUM_CTX_PROBE_FLOOR: u32 = 4096;
+/// Ceiling applied to a probed native length (matches DEFAULT_NUM_CTX).
+const NUM_CTX_PROBE_CEILING: u32 = 32768;
+/// Short timeout for the one-shot `/api/show` probe: startup must not stall
+/// on an unresponsive server.
+const SHOW_PROBE_TIMEOUT_SECS: u64 = 5;
+
+/// Pure core of the once-per-process resolution order (unit-tested without
+/// env or network):
+/// 1. explicit `KITTY_NUM_CTX` wins verbatim — NO probe call;
+/// 2. else the probed native context length, clamped to [4096, 32768];
+/// 3. else the runtime default ([`kitty_runtime::client::DEFAULT_NUM_CTX`]).
+///
+/// An env var that is set but unparsable is treated as absent here (the
+/// caller warns); `native: None` covers both probe failure and parse failure.
+fn resolve_effective_num_ctx(env_raw: Option<&str>, native: Option<u32>) -> NumCtxResolution {
+    if let Some(raw) = env_raw {
+        let parsed = raw.trim().parse::<u32>().ok().filter(|v| *v > 0);
+        if let Some(v) = parsed {
+            return NumCtxResolution {
+                num_ctx: v,
+                source: "env",
+            };
+        }
+    }
+    if let Some(n) = native {
+        return NumCtxResolution {
+            num_ctx: n.clamp(NUM_CTX_PROBE_FLOOR, NUM_CTX_PROBE_CEILING),
+            source: "native",
+        };
+    }
+    NumCtxResolution {
+        num_ctx: kitty_runtime::client::DEFAULT_NUM_CTX,
+        source: "fallback",
+    }
+}
+
+/// Async wrapper around [`resolve_effective_num_ctx`]: reads the env override
+/// and, only when unset-or-invalid, makes ONE short-timeout `show_model`
+/// probe. Network errors and timeouts degrade to the fallback loudly.
+async fn resolve_session_num_ctx(client: &OllamaClient, model: &str) -> NumCtxResolution {
+    let env_raw = std::env::var(kitty_runtime::client::ENV_NUM_CTX).ok();
+    let env_usable = env_raw
+        .as_deref()
+        .map(|raw| raw.trim().parse::<u32>().ok().filter(|v| *v > 0).is_some());
+    match (env_raw.as_deref(), env_usable) {
+        // 1. Explicit valid override: no probe at all.
+        (Some(_), Some(true)) => return resolve_effective_num_ctx(env_raw.as_deref(), None),
+        // Set but unparsable: warn, then fall through to probe/fallback.
+        (Some(raw), _) => {
+            warn!(raw = %raw, "KITTY_NUM_CTX is not a valid u32 — probing the model instead")
+        }
+        _ => {}
+    }
+
+    // 2. One-shot native probe with a short timeout.
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(SHOW_PROBE_TIMEOUT_SECS),
+        client.show_model(model),
+    )
+    .await;
+    match probe {
+        Ok(Ok(payload)) => {
+            let native = OllamaClient::parse_native_context_length(&payload);
+            if native.is_none() {
+                warn!("probe payload carried no usable .context_length — using default window");
+            }
+            return resolve_effective_num_ctx(None, native);
+        }
+        Ok(Err(e)) => {
+            warn!(error = %e, "/api/show probe failed — using default window")
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = SHOW_PROBE_TIMEOUT_SECS,
+                "/api/show probe timed out — using default window"
+            )
+        }
+    }
+    // 3. Fallback.
+    resolve_effective_num_ctx(None, None)
 }
 
 #[derive(Parser)]
@@ -189,24 +284,45 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let client = OllamaClient::new(&cli.url);
 
+    // f8 T2.2: resolve the session context window ONCE per process, BEFORE
+    // any Agent/client construction, shared by Run/Bench/BenchAb. The value
+    // is applied via with_num_ctx() before the first request; the client
+    // stays frozen afterward (num_ctx is never injected per-request).
+    let ctx_resolution = if matches!(
+        cli.command,
+        Commands::Run { .. } | Commands::Bench { .. } | Commands::BenchAb { .. }
+    ) {
+        let res = resolve_session_num_ctx(&client, &cli.model).await;
+        info!(
+            num_ctx = res.num_ctx,
+            source = res.source,
+            "context window resolved"
+        );
+        Some(res)
+    } else {
+        None
+    };
+    let client = match &ctx_resolution {
+        Some(res) => client.with_num_ctx(res.num_ctx),
+        None => client,
+    };
+
     match cli.command {
         Commands::Run { prompt, no_memory } => {
             let prompt = prompt.join(" ");
-            // F2 KV preflight: the client cannot introspect the Ollama
-            // server's env, so warn (never fail) when a large explicit window
-            // risks OOM on 8GB GPUs without acknowledged KV quantization.
-            let num_ctx = kitty_runtime::client::parse_num_ctx(
-                std::env::var(kitty_runtime::client::ENV_NUM_CTX)
-                    .ok()
-                    .as_deref(),
-            );
-            if let Some(warning) = kitty_runtime::client::kv_cache_preflight_warning(
-                num_ctx,
-                std::env::var(kitty_runtime::client::ENV_KV_QUANT_ACK)
-                    .ok()
-                    .as_deref(),
-            ) {
-                warn!("{}", warning);
+            // F2 KV preflight, routed through the T2.2 resolver: the warning
+            // must report the RESOLVED window (env/native/fallback), not a
+            // raw env read — warn (never fail) when a large window risks OOM
+            // on 8GB GPUs without acknowledged KV quantization.
+            if let Some(res) = &ctx_resolution {
+                if let Some(warning) = kitty_runtime::client::kv_cache_preflight_warning(
+                    res.num_ctx,
+                    std::env::var(kitty_runtime::client::ENV_KV_QUANT_ACK)
+                        .ok()
+                        .as_deref(),
+                ) {
+                    warn!("{}", warning);
+                }
             }
             let memory_db_path = if no_memory {
                 None
@@ -1491,5 +1607,85 @@ mod language_breakdown_tests {
     #[test]
     fn tally_empty_results_is_empty() {
         assert!(tally_by_language(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod num_ctx_resolution_tests {
+    use super::{resolve_effective_num_ctx, NumCtxResolution};
+    use kitty_runtime::client::DEFAULT_NUM_CTX;
+
+    #[test]
+    fn env_override_wins_without_probe() {
+        // G3/T2.2 AC: env set → used verbatim, native value irrelevant
+        // (None here models "no probe was made").
+        assert_eq!(
+            resolve_effective_num_ctx(Some("8192"), None),
+            NumCtxResolution {
+                num_ctx: 8192,
+                source: "env"
+            }
+        );
+        // Env even beats a (hypothetical) probe result.
+        assert_eq!(
+            resolve_effective_num_ctx(Some("4096"), Some(131072)),
+            NumCtxResolution {
+                num_ctx: 4096,
+                source: "env"
+            }
+        );
+    }
+
+    #[test]
+    fn native_probe_clamped_to_floor_and_ceiling() {
+        // min(native, 32768), floored at 4096.
+        assert_eq!(
+            resolve_effective_num_ctx(None, Some(131072)),
+            NumCtxResolution {
+                num_ctx: 32768,
+                source: "native"
+            }
+        );
+        assert_eq!(
+            resolve_effective_num_ctx(None, Some(2048)),
+            NumCtxResolution {
+                num_ctx: 4096,
+                source: "native"
+            }
+        );
+        assert_eq!(
+            resolve_effective_num_ctx(None, Some(16384)),
+            NumCtxResolution {
+                num_ctx: 16384,
+                source: "native"
+            }
+        );
+    }
+
+    #[test]
+    fn fallback_when_env_invalid_and_probe_failed() {
+        // Probe failure/network error → default window, loud fallback source.
+        assert_eq!(
+            resolve_effective_num_ctx(None, None),
+            NumCtxResolution {
+                num_ctx: DEFAULT_NUM_CTX,
+                source: "fallback"
+            }
+        );
+        // Set-but-unparsable env is treated as absent by the pure core.
+        assert_eq!(
+            resolve_effective_num_ctx(Some("not-a-number"), None),
+            NumCtxResolution {
+                num_ctx: DEFAULT_NUM_CTX,
+                source: "fallback"
+            }
+        );
+        assert_eq!(
+            resolve_effective_num_ctx(Some("0"), None),
+            NumCtxResolution {
+                num_ctx: DEFAULT_NUM_CTX,
+                source: "fallback"
+            }
+        );
     }
 }

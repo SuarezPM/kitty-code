@@ -126,6 +126,14 @@ impl ToolRegistry {
         }
     }
 
+    /// Override the default Read window cap (chainable). f8 T2.3: the agent
+    /// wires [`ModelProfile::read_cap`] here so the active profile actually
+    /// governs the default window instead of a hard-coded 300.
+    pub fn with_read_cap(mut self, max_read_lines: usize) -> Self {
+        self.max_read_lines = max_read_lines;
+        self
+    }
+
     /// Rebuild the Bash sandbox with `root` as the FS allowlist workspace.
     pub fn with_workspace(mut self, root: impl Into<PathBuf>) -> Self {
         self.bash_sandbox = Some(Sandbox::new(SandboxConfig::new(root)));
@@ -207,6 +215,20 @@ impl ToolRegistry {
     }
 
     /// Execute a Read tool call.
+    ///
+    /// Output is an HONEST window (f8 T2.3): the FIRST line is a header
+    /// `"{path}: lines {start}-{end} of {total}"` naming the exact returned
+    /// range, followed by hashline-tagged `LINE:hash|content` lines.
+    ///
+    /// Optional args (weak-model tolerant — invalid values are CLAMPED,
+    /// never strict errors):
+    /// - `offset`: 1-based first line, default 1 (`<1` → 1; non-numeric
+    ///   strings → default).
+    /// - `limit`: max lines returned, default = registry read cap
+    ///   ([`Self::with_read_cap`], profile-driven) (`<1` → cap).
+    ///
+    /// The hashline snapshot is always the FULL file, so edits outside the
+    /// displayed window succeed normally — the window is display-only.
     fn execute_read(&mut self, args: &serde_json::Value) -> Result<ToolResult, ToolError> {
         let path =
             args.get("path")
@@ -218,13 +240,42 @@ impl ToolRegistry {
 
         let path_buf = PathBuf::from(path);
 
-        // Read with hashline tagging
+        // Read with hashline tagging (full-file snapshot regardless of window)
         let snapshot = self.hashline.read_file(&path_buf)?;
         self.read_files.insert(path_buf);
 
-        // Format output with line numbers and hashes
-        let tagged: Vec<String> = snapshot
+        // Lenient numeric coercion: real numbers and string numerals both
+        // work; anything else yields None → caller default.
+        let lenient_usize = |v: Option<&serde_json::Value>| -> Option<usize> {
+            let v = v?;
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .map(|n| n as usize)
+        };
+
+        let total_lines = snapshot.lines.len();
+        let cap = self.max_read_lines;
+
+        let offset = lenient_usize(args.get("offset")).unwrap_or(1).max(1);
+        let limit_requested = lenient_usize(args.get("limit")).unwrap_or(cap);
+        let limit = if limit_requested == 0 {
+            cap
+        } else {
+            limit_requested.min(cap)
+        };
+
+        // Clamp the requested start into the file (offset beyond EOF reads
+        // from EOF backwards by one line rather than erroring).
+        let idx0 = offset.saturating_sub(1).min(total_lines.saturating_sub(1));
+        let idx_end = (idx0 + limit).min(total_lines);
+        let first_line = snapshot.lines.get(idx0).map_or(0, |l| l.line_num);
+        let last_line = snapshot
             .lines
+            .get(idx_end.saturating_sub(1))
+            .map_or(0, |l| l.line_num);
+
+        // Format output with line numbers and hashes
+        let tagged: Vec<String> = snapshot.lines[idx0..idx_end]
             .iter()
             .map(|l| {
                 format!(
@@ -236,14 +287,15 @@ impl ToolRegistry {
             })
             .collect();
 
-        let total_lines = tagged.len();
-        let capped = &tagged[..total_lines.min(self.max_read_lines)];
+        let mut output = format!("{path}: lines {first_line}-{last_line} of {total_lines}\n");
+        output.push_str(&tagged.join("\n"));
 
-        let mut output = capped.join("\n");
-        if total_lines > self.max_read_lines {
-            let omitted = total_lines - self.max_read_lines;
+        let omitted_after = total_lines - idx_end;
+        if omitted_after > 0 || idx0 > 0 {
             output.push_str(&format!(
-                "\n... ({omitted} lines omitted — use Grep to search specific content)"
+                "\n... ({omitted_after} lines after this window — retry Read with \
+                 \"offset\": {}, \"limit\": {limit}, or use Grep to search specific content)",
+                idx_end + 1
             ));
         }
 
@@ -1897,7 +1949,8 @@ mod tests {
 
     #[test]
     fn read_truncates_large_file() {
-        // F3.1: Read output is capped at max_read_lines with a truncation message.
+        // F3.1 + f8 T2.3: Read output is capped at max_read_lines, opens with
+        // an honest window header, and the omission note suggests offset/limit.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.txt");
         let lines: Vec<String> = (1..=500).map(|i| format!("line {i}")).collect();
@@ -1907,9 +1960,20 @@ mod tests {
         let args = serde_json::json!({"path": path.to_str().unwrap()});
         let result = registry.execute_read(&args).unwrap();
         assert!(result.success);
+        let expected_header = format!("{}: lines 1-300 of 500", path.display());
         assert!(
-            result.output.contains("200 lines omitted"),
+            result.output.starts_with(&expected_header),
+            "header expected first line, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("200 lines after this window"),
             "got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("\"offset\": 301"),
+            "omission note must suggest offset/limit retry, got: {}",
             result.output
         );
         assert!(
@@ -1925,6 +1989,130 @@ mod tests {
         assert!(result.output.contains("300:"));
         // Line 301 absent (truncated)
         assert!(!result.output.contains("301:"));
+    }
+
+    #[test]
+    fn read_offset_limit_returns_exact_window() {
+        // f8 T2.3 AC: offset=50 & limit=20 → exactly numbered lines 50-69,
+        // header first, omission note pointing at the next window.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hundred.txt");
+        let lines: Vec<String> = (1..=100).map(|i| format!("content {i}")).collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "offset": 50,
+            "limit": 20
+        });
+        let result = registry.execute_read(&args).unwrap();
+        assert!(result.success);
+        let expected_header = format!("{}: lines 50-69 of 100", path.display());
+        assert!(
+            result.output.starts_with(&expected_header),
+            "got: {}",
+            result.output
+        );
+        let body_lines: Vec<&str> = result.output.lines().skip(1).collect();
+        assert_eq!(body_lines.len(), 21, "20 tagged lines + 1 note"); // 20 + omission note
+        assert!(body_lines[0].starts_with("50:"), "got: {}", body_lines[0]);
+        assert!(body_lines[0].contains("content 50"));
+        assert!(body_lines[19].starts_with("69:"));
+        assert!(body_lines[19].contains("content 69"));
+        assert!(result.output.contains("\"offset\": 70"), "next-window hint");
+    }
+
+    #[test]
+    fn read_clamps_malformed_paging_args_instead_of_erroring() {
+        // f8 T2.3 AC: weak-model tolerance — offset<1→1, limit<1→cap,
+        // non-numeric strings → defaults; NEVER InvalidArgs.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ten.txt");
+        let lines: Vec<String> = (1..=10).map(|i| format!("l {i}")).collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let mut registry = ToolRegistry::new();
+
+        // String numerals tolerated.
+        let result = registry
+            .execute_read(&serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": "3",
+                "limit": "2"
+            }))
+            .unwrap();
+        assert!(result
+            .output
+            .starts_with(&format!("{}: lines 3-4 of 10", path.display())));
+
+        // offset=0 clamps to 1; negative limit clamps to cap.
+        let result = registry
+            .execute_read(&serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 0,
+                "limit": -5
+            }))
+            .unwrap();
+        assert!(result
+            .output
+            .starts_with(&format!("{}: lines 1-10 of 10", path.display())));
+
+        // Non-numeric strings fall back to defaults (whole file).
+        let result = registry
+            .execute_read(&serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": "beginning",
+                "limit": "lots"
+            }))
+            .unwrap();
+        assert!(result
+            .output
+            .starts_with(&format!("{}: lines 1-10 of 10", path.display())));
+
+        // Offset beyond EOF clamps to the last line rather than erroring.
+        let result = registry
+            .execute_read(&serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 999
+            }))
+            .unwrap();
+        assert!(result
+            .output
+            .starts_with(&format!("{}: lines 10-10 of 10", path.display())));
+    }
+
+    #[test]
+    fn read_cap_builder_governs_default_window() {
+        // f8 T2.3 AC: the profile value plumbed via with_read_cap actually
+        // governs the default window (tiny=100 / medium=300 / large=500 are
+        // asserted on the profile side in model_profile tests).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("five.txt");
+        std::fs::write(&path, "a\nb\nc\nd\ne").unwrap();
+
+        let mut registry = ToolRegistry::with_timeout(60).with_read_cap(2);
+        let result = registry
+            .execute_read(&serde_json::json!({"path": path.to_str().unwrap()}))
+            .unwrap();
+        assert!(result
+            .output
+            .starts_with(&format!("{}: lines 1-2 of 5", path.display())));
+
+        // Edits OUTSIDE the displayed window still succeed — the snapshot is
+        // full-file and the window is display-only.
+        let hash_args = serde_json::json!({"path": path.to_str().unwrap()});
+        registry.execute_read(&hash_args).unwrap();
+        let snapshot = registry.hashline.get_snapshot(path.as_path()).unwrap();
+        let e_hash = snapshot.lines[4].hash.clone();
+        let edit = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "hash": &e_hash[..8],
+            "new": "E"
+        });
+        let edit_result = registry.execute_edit(&edit).unwrap();
+        assert!(edit_result.success, "got: {}", edit_result.output);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\nc\nd\nE");
     }
 
     #[test]
@@ -1987,8 +2175,8 @@ mod tests {
         let read_args = serde_json::json!({"path": f.path().to_str().unwrap()});
         let read_res = registry.execute_read(&read_args).unwrap();
         assert!(read_res.success);
-        // Extract hash from first line
-        let first_line = read_res.output.lines().next().unwrap();
+        // Extract hash from the first TAGGED line (skip the honest-window header)
+        let first_line = read_res.output.lines().nth(1).unwrap();
         // Format is "1:HASH|content"
         let hash = first_line
             .split(':')
@@ -2035,7 +2223,7 @@ mod tests {
         let hash = read_res
             .output
             .lines()
-            .next()
+            .nth(1) // skip the honest-window header (f8 T2.3)
             .unwrap()
             .split(':')
             .nth(1)
@@ -2675,7 +2863,7 @@ mod tests {
         let hash = read_res
             .output
             .lines()
-            .next()
+            .nth(1) // skip the honest-window header (f8 T2.3)
             .unwrap()
             .split(':')
             .nth(1)
