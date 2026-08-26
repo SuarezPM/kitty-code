@@ -230,6 +230,10 @@ pub enum Commands {
         /// exhaustion; worst-case LLM calls ≈ iterations × 3 × (hops+1).
         #[arg(long, default_value = "0")]
         hops: usize,
+        /// Per-exercise wall-clock cap in seconds. Overrides the
+        /// KITTY_BENCH_TIMEOUT_SECS env fallback; both absent ⇒ 30.
+        #[arg(long, default_value = "30")]
+        timeout_secs: u64,
         /// Output file for results
         #[arg(short, long, default_value = "bench_results.json")]
         out: PathBuf,
@@ -252,6 +256,10 @@ pub enum Commands {
         /// Autorun continuation hops for every exercise (default 0 = off).
         #[arg(long, default_value = "0")]
         hops: usize,
+        /// Per-exercise wall-clock cap in seconds. Overrides the
+        /// KITTY_BENCH_TIMEOUT_SECS env fallback; both absent ⇒ 30.
+        #[arg(long, default_value = "30")]
+        timeout_secs: u64,
         /// Repetitions per (task,budget) pair
         #[arg(long, default_value = "1")]
         reps: usize,
@@ -420,6 +428,7 @@ async fn main() -> Result<()> {
             suite,
             limit,
             hops,
+            timeout_secs,
             out,
             exercises: exercises_path,
             no_memory,
@@ -454,11 +463,19 @@ async fn main() -> Result<()> {
             if is_small_model && !no_memory {
                 warn!(model = %cli.model, "small model detected — auto-disabling episodic memory for bench (use explicit --no-memory to silence)");
             }
+            // f9 calibration: per-exercise timeout — flag > env > default.
+            let (exercise_timeout_secs, env_invalid) = resolve_timeout_from_flag(timeout_secs);
+            if env_invalid {
+                warn!(
+                    "per-exercise timeout falling back to {DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS}s"
+                );
+            }
 
             let cfg = BenchConfig {
                 client: client.clone(),
                 model: cli.model.clone(),
                 limit,
+                exercise_timeout_secs,
                 use_memory: !effective_no_memory,
                 thinking_budget: cli.thinking_budget,
                 context_window: cli.context_window,
@@ -618,6 +635,7 @@ async fn main() -> Result<()> {
             thinking,
             limit,
             hops,
+            timeout_secs,
             reps,
             suite,
             out,
@@ -637,11 +655,19 @@ async fn main() -> Result<()> {
             if is_small_model {
                 warn!(model = %cli.model, "small model detected — auto-disabling episodic memory for bench-ab");
             }
+            // f9 calibration: per-exercise timeout — flag > env > default.
+            let (exercise_timeout_secs, env_invalid) = resolve_timeout_from_flag(timeout_secs);
+            if env_invalid {
+                warn!(
+                    "per-exercise timeout falling back to {DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS}s"
+                );
+            }
 
             let base_cfg = BenchConfig {
                 client: client.clone(),
                 model: cli.model.clone(),
                 limit,
+                exercise_timeout_secs,
                 use_memory: !effective_no_memory,
                 thinking_budget: 2048, // overridden per run below
                 context_window: cli.context_window,
@@ -1008,6 +1034,9 @@ struct BenchConfig {
     /// harness never reads `KITTY_AUTORUN_HOPS`, so ambient env cannot leak
     /// into benchmark runs. Default 0.
     autorun_hops: usize,
+    /// Per-exercise wall-clock cap in seconds (f9 calibration: resolved via
+    /// flag > KITTY_BENCH_TIMEOUT_SECS > default 30).
+    exercise_timeout_secs: u64,
     bash_timeout: u64,
     profile: &'static ModelProfile,
     enable_knowledge: bool,
@@ -1047,6 +1076,51 @@ fn sync_budget_threshold(agent: &mut Agent, profile_threshold: f32) {
             profile_threshold,
             effective_window,
         ));
+}
+
+/// Default per-exercise bench wall-clock cap (seconds). Calibration showed
+/// real 9B-model tasks on split-GPU hardware routinely exceed this; raise
+/// via `--timeout-secs` or `KITTY_BENCH_TIMEOUT_SECS`.
+pub const DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS: u64 = 30;
+
+/// Env fallback for the per-exercise bench timeout (f9 calibration).
+pub const ENV_BENCH_TIMEOUT_SECS: &str = "KITTY_BENCH_TIMEOUT_SECS";
+
+/// Pure resolver for the per-exercise timeout — precedence: explicit CLI
+/// flag > `KITTY_BENCH_TIMEOUT_SECS` env > default 30.
+///
+/// Returns `(resolved_secs, env_invalid)` so the caller can warn exactly
+/// once when the env var was present but unparsable (or non-positive): such
+/// values fall back to the default rather than producing a zero timeout.
+#[must_use]
+fn resolve_exercise_timeout_secs(explicit_flag: Option<u64>, env_raw: Option<&str>) -> (u64, bool) {
+    if let Some(secs) = explicit_flag {
+        return (secs, false);
+    }
+    match env_raw.map(str::trim) {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(secs) if secs > 0 => (secs, false),
+            _ => (DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS, true),
+        },
+        None => (DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS, false),
+    }
+}
+
+/// Resolve the effective timeout for a bench command from the parsed flag:
+/// the flag counts as EXPLICIT only when it differs from the clap default
+/// (same sentinel pattern as the other CLI overlays in this binary).
+fn resolve_timeout_from_flag(flag_secs: u64) -> (u64, bool) {
+    let explicit = (flag_secs != DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS).then_some(flag_secs);
+    let env_raw = std::env::var(ENV_BENCH_TIMEOUT_SECS).ok();
+    let (resolved, invalid) = resolve_exercise_timeout_secs(explicit, env_raw.as_deref());
+    if invalid {
+        warn!(
+            raw = ?env_raw,
+            default = DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS,
+            "{ENV_BENCH_TIMEOUT_SECS} is not a positive integer — using default"
+        );
+    }
+    (resolved, invalid)
 }
 
 async fn run_one_bench(
@@ -1125,8 +1199,11 @@ async fn run_one_bench(
     // NOT the raw CLI argument, which silently undid AD5's small-window
     // protection on tiny-profile bench runs.
     sync_budget_threshold(&mut agent, cfg.profile.compact_threshold);
-    let outcome =
-        tokio::time::timeout(std::time::Duration::from_secs(30), agent.run(&prompt)).await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(cfg.exercise_timeout_secs),
+        agent.run(&prompt),
+    )
+    .await;
 
     // Determine pass/fail and persist an episode for memory.
     let (passed, verdict, latency_ms) = match outcome {
@@ -1485,6 +1562,42 @@ mod bench_ab_tests {
         agent.config_mut().context_window = 4096;
         sync_budget_threshold(&mut agent, ModelProfile::medium().compact_threshold);
         assert!((agent.budget().threshold() - 0.62).abs() < 1e-6);
+    }
+
+    /// f9 calibration AC: per-exercise timeout resolution honors
+    /// flag > env > default, with invalid env falling back to the default.
+    #[test]
+    fn resolve_exercise_timeout_flag_wins_over_env_over_default() {
+        const DEFAULT: u64 = super::DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS;
+
+        // Explicit flag wins over ANY env (valid or garbage).
+        let (got, invalid) = super::resolve_exercise_timeout_secs(Some(900), Some("60"));
+        assert_eq!(got, 900);
+        assert!(!invalid);
+        let (got, invalid) = super::resolve_exercise_timeout_secs(Some(900), Some("garbage"));
+        assert_eq!(got, 900);
+        assert!(!invalid);
+
+        // No flag + valid env (trimmed) ⇒ env value.
+        let (got, invalid) = super::resolve_exercise_timeout_secs(None, Some("900"));
+        assert_eq!(got, 900);
+        assert!(!invalid);
+        let (got, invalid) = super::resolve_exercise_timeout_secs(None, Some(" 600 "));
+        assert_eq!(got, 600);
+        assert!(!invalid);
+
+        // No flag + INVALID env (unparsable, empty, zero, negative) ⇒
+        // default + invalid marker so the caller warns once.
+        for bad in ["abc", "", "   ", "0", "-5", "12.5"] {
+            let (got, invalid) = super::resolve_exercise_timeout_secs(None, Some(bad));
+            assert_eq!(got, DEFAULT, "bad env {bad:?} must fall back to default");
+            assert!(invalid, "bad env {bad:?} must be flagged invalid");
+        }
+
+        // Neither flag nor env ⇒ default, not invalid.
+        let (got, invalid) = super::resolve_exercise_timeout_secs(None, None);
+        assert_eq!(got, DEFAULT);
+        assert!(!invalid);
     }
 
     /// f8 T1.3 AC: `--hops` propagates; absent flag ⇒ 0.

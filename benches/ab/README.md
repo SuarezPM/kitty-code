@@ -91,7 +91,19 @@ kitty-cli --model "$MODEL" bench-ab \
 ```
 
 (`bench-ab` flags: `--thinking`, `-l/--limit`, `--reps`, `--suite`,
-`-o/--out`, `--interleave`, `--hops`; there is no per-subcommand model flag.)
+`-o/--out`, `--interleave`, `--hops`, `--timeout-secs`; there is no
+per-subcommand model flag.)
+
+**Per-exercise timeout (`--timeout-secs` / `KITTY_BENCH_TIMEOUT_SECS`, f9
+calibration):** every exercise runs under a wall-clock cap. Precedence:
+explicit CLI flag > env fallback > default 30s; an invalid env value warns
+once and falls back to the default; the launcher strips the env var from
+BOTH arms and sets its own symmetric value (`TIMEOUT_SECS`, default 900).
+Guidance from calibration: polyglot tasks on a ~9B hybrid model over a
+split GPU take **60–1200 s per task** — the old hard-coded 30s cap voided
+real measurement runs almost immediately. Use **≥900 s for measurement
+runs** (and size N accordingly, see §2); shorter values are fine only for
+smoke checks.
 
 **`--hops` arm lever (f8):** autorun continuation hops grant each exercise
 extra FULL tool-loop cycles on iteration exhaustion. Bench autorun is

@@ -21,6 +21,9 @@ N="${3:-15}"
 SUITE="${SUITE:-polyglot}"
 THINKING="${THINKING:-2048}"
 PROFILE="${PROFILE:-medium}"
+# f9 calibration: real 9B-model polyglot tasks on split-GPU hardware run
+# 60-1200s; the 30s binary default voids most runs. Measurement default: 900.
+TIMEOUT_SECS="${TIMEOUT_SECS:-900}"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
@@ -54,10 +57,11 @@ cat > "$MANIFEST" <<EOF
   "n_per_arm": $N,
   "selection_rule": "first-N exercises in dataset order (-l N); chosen before launch, no post-hoc re-selection",
   "thinking_budget": $THINKING,
+  "timeout_secs": $TIMEOUT_SECS,
   "profile": "$PROFILE",
   "interleave": true,
   "valid_run_gate": "errored trials <= 10% of N per arm; no early cuts",
-  "env_baseline": "both arms launched from one normalized prefix; stripped: KITTY_NUM_CTX, KITTY_KV_QUANT_ACK, KITTY_MODEL_TURN_CAPS, KITTY_NO_THINK, KITTY_LINT_GATE, KITTY_EDIT_CHECK, KITTY_AUTORUN_HOPS",
+  "env_baseline": "both arms launched from one normalized prefix; stripped: KITTY_NUM_CTX, KITTY_KV_QUANT_ACK, KITTY_MODEL_TURN_CAPS, KITTY_NO_THINK, KITTY_LINT_GATE, KITTY_EDIT_CHECK, KITTY_AUTORUN_HOPS, KITTY_BENCH_TIMEOUT_SECS",
   "arm_a": {
     "model": "$MODEL_A",
     "levers": "none — normalized baseline only"
@@ -77,12 +81,13 @@ echo "pre-registration manifest: $MANIFEST"
 OUT_A="benches/ab/results/${TS}-armA.json"
 OUT_B="benches/ab/results/${TS}-armB.json"
 
-# ── Symmetric normalized env baseline (G4-FIX2 + f8 T1.3) ───────────────────
+# ── Symmetric normalized env baseline (G4-FIX2 + f8 T1.3 + f9 timeout) ──────
 # BOTH arms launch from this exact prefix so ambient operator env can never
 # leak into one arm and not the other (the manifest's "levers" claim must be
 # true). Stripped set: every harness lever env var, INCLUDING the interactive-
-# only KITTY_AUTORUN_HOPS (bench autorun is flag-only via --hops).
-CLEAN_ENV=(env -u KITTY_NUM_CTX -u KITTY_KV_QUANT_ACK -u KITTY_MODEL_TURN_CAPS -u KITTY_NO_THINK -u KITTY_LINT_GATE -u KITTY_EDIT_CHECK -u KITTY_AUTORUN_HOPS)
+# only KITTY_AUTORUN_HOPS and the bench timeout fallback KITTY_BENCH_TIMEOUT_
+# SECS (arms set their own timeout via --timeout-secs / TIMEOUT_SECS below).
+CLEAN_ENV=(env -u KITTY_NUM_CTX -u KITTY_KV_QUANT_ACK -u KITTY_MODEL_TURN_CAPS -u KITTY_NO_THINK -u KITTY_LINT_GATE -u KITTY_EDIT_CHECK -u KITTY_AUTORUN_HOPS -u KITTY_BENCH_TIMEOUT_SECS)
 
 # NOTE: `--model` is a TOP-LEVEL argument and must precede the subcommand.
 
@@ -90,7 +95,7 @@ echo "=== ARM A: $MODEL_A (normalized baseline, declared levers: none) ==="
 "${CLEAN_ENV[@]}" \
     "$BIN" --model "$MODEL_A" bench-ab \
     --thinking "$THINKING" -l "$N" --suite "$SUITE" \
-    --profile "$PROFILE" --interleave \
+    --profile "$PROFILE" --interleave --timeout-secs "$TIMEOUT_SECS" \
     -o "$OUT_A"
 
 echo "=== ARM B: $MODEL_B (same normalized baseline + declared levers on top) ==="
@@ -99,7 +104,7 @@ echo "=== ARM B: $MODEL_B (same normalized baseline + declared levers on top) ==
     KITTY_KV_QUANT_ACK="${ARM_B_KV_ACK:-q8_0}" \
     "$BIN" --model "$MODEL_B" bench-ab \
     --thinking "$THINKING" -l "$N" --suite "$SUITE" \
-    --profile "$PROFILE" --interleave \
+    --profile "$PROFILE" --interleave --timeout-secs "$TIMEOUT_SECS" \
     -o "$OUT_B"
 
 echo "done."
