@@ -202,8 +202,20 @@ protocolo pre-registrado (`benches/ab/README.md`) y se publicarán vía
 | Fuzzy edit ladder + guard de match desproporcionado | **DONE** (código; sin medir) | `9bac5c0`, `baa286e` |
 | Parser salvage P8/P13-P15 + tool aliases | **DONE** (código; sin medir) | `d80bc95` |
 | Normalización upstream de tool calls + ladder bounds + dedup semantics | **DONE** (código; sin medir) | `baa286e` |
+| Autorun continuation hops (recuperación de turn-cap; bench flag-only `--hops`) | **DONE** (código; sin medir) — batch f8 | `9f6d3ce` |
+| Native context probe (`/api/show` suffix-match) + resolución startup + KV warning por resolutor | **DONE** (código; sin medir) — batch f8 | `880bc22` |
+| Read windows honestos (header líneas + offset/limit con clamp + read_cap por perfil) | **DONE** (código; sin medir) — batch f8 | `880bc22` |
+| Suite de compactación: summarizer barato (temp 0.1 / predict 400 / ≤280 palabras) + threshold derivado min(profile, max(0.62,(ctx−2048)/ctx)) solo bajo default del perfil + prune seguro en frontera de usuario (walk-back K=12, aterrizaje exacto) | **DONE** (código; sin medir) — batch f8 | `5bb22d5`, `27aea98` |
+| Fix reenvío `Box<T>` chat_with_options (RequestOptions se descartaban en clientes boxed — bug de wire-format) | **DONE** (código; sin medir) — batch f8 | `5bb22d5` |
+| Tier nano minimal-prompt (PromptStyle, auto-detección colon-aware, gated bajo small-model bench guard) | **DONE** (código; sin medir) — batch f8 | `c2d8573`, `391de55` |
+| Lint gate asíncrono (spawn_blocking) + cache LRU de conteo de tokens + eliminación campo muerto max_thinking_tokens | **DONE** (código; sin medir) — batch f8 | `c2d8573` |
 | Medición A/B bajo el harness nuevo (selección de modelo) | **PENDIENTE** — runbook listo en `benches/ab/`, no ejecutado; el par mide modelo-vs-modelo bajo el harness nuevo, NO una ablación por palanca (num_ctx 32768 + truncate:false son inyectados incondicionalmente; la ack KV es solo warning; ladder/parser no tienen toggles) | — |
 
 North-star targets, exactamente como publicados (sin cambios): little-coder
 **45.56%** Aider Polyglot (Qwen3.5-9B Q4_K_M, num_ctx 32768, temp 0.3) ·
 gate TB2.0 **9.2%±2.4** · ornith-1.5 9B oficial TB2.1 **46.2** / SWE-V **70.6**.
+
+Campaña de benchmarks autónomos planificada post-cierre, en orden:
+**B1** A/B propio → **B3** GPQA/HLE → **B2** TB2.1 → **B4** agentic-web →
+**B5** familia SWE-bench; todo resultado se etiquetará como *local-harness
+reproduction* y pasará por el protocolo pre-registrado antes de publicarse.

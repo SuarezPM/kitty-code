@@ -236,6 +236,23 @@ little-coder **45.56%** Aider Polyglot (Qwen3.5-9B Q4_K_M, num_ctx 32768,
 temp 0.3) · TB2.0 gate **9.2%±2.4** · ornith-1.5 9B official TB2.1 **46.2**
 and SWE-V **70.6**.
 
+### 7.1 Landed harness levers (batch f8, 2026-08-26)
+
+Same contract as above: **código aterrizado ≠ tasa medida** hasta una
+corrida pre-registrada (`benches/ab/README.md`) — nothing in this table
+carries a rate claim.
+
+| Lever | Commits | What changed |
+|-------|---------|--------------|
+| Autorun continuation hops | `9f6d3ce` | Fixed state machine in `Agent::run`: hop budget (`AgentConfig.autorun_hops`, default 0, clamp 0..=12) consumed ONLY on iteration exhaustion — force_response skipped, `AUTORUN_CONTINUE_PROMPT` pushed into history, inner loop restarts; MAX_STEPS suppressed while hops remain; verification still runs exclusively post-force_response; Failed-with-revisions-exhausted consumes one hop iff any remain. Recovers turn-cap hits without losing context. Bench wiring is FLAG-ONLY (`--hops`); interactive run/TUI read `KITTY_AUTORUN_HOPS`. Worst-case ≈ iterations × 3 × (hops+1). |
+| Native context probe + startup resolution | `880bc22` | `parse_native_context_length` matches ANY `/api/show` model_info key ending in `.context_length` (family-prefixed: llama/qwen2/qwen3…, smallest wins) with parameters-num_ctx fallback; once-per-process startup resolution (explicit `KITTY_NUM_CTX` ⇒ no probe; else min(native, 32768) floor 4096) applied via `with_num_ctx()` before the first request — client frozen afterward; KV preflight warning rerouted through the resolver so it reports the RESOLVED window. |
+| Honest read windows | `880bc22` | Read output opens with `{path}: lines {start}-{end} of {total}`; optional offset (1-based) and limit args with weak-model clamp tolerance (invalid/string numerals clamped, not rejected); omission note suggests the offset retry with Grep secondary; profile `read_cap` plumbed via `ToolRegistry::with_read_cap`; hashline snapshot stays full-file so edits outside the displayed window succeed unchanged. |
+| Compaction suite (cheap summarizer + derived threshold + safe prune) | `5bb22d5`, `27aea98` | Summary call overrides ONLY temperature=0.1 and num_predict=400 with a ≤280-word prose cap (num_ctx untouched — session-frozen). Derived compaction threshold `min(profile, max(0.62, (ctx−2048)/ctx))`, never raising above the profile value and inactive when the ratio already exceeds it (table: tiny@4096=0.62 · medium@4096=0.62 · medium@16384=0.80 · large@32768=0.80). Prune boundary walks back up to K=12 messages to the nearest USER turn start (exact landing kept as-is per G3 fix), so tool results are never orphaned and the last user turns stay complete; freed/summary accounting derives from the SAME final boundary. Bench re-sync derives from the EFFECTIVE post-overlay window (G3 fix). |
+| `Box<T>` chat_with_options forwarding fix | `5bb22d5` | WIRE-FORMAT BUG: the blanket `impl ChatClient for Box<T>` forwarded chat/count_tokens/health_check but NOT chat_with_options — its DEFAULT impl degraded every boxed client to plain chat, silently dropping ALL RequestOptions (dynamic num_predict caps, sampling/thinking flags) between agent and backend. Forwarding added; discovered by the AD4 capture test. |
+| Nano minimal-prompt tier | `c2d8573`, `391de55` | Preset nano (4K ctx, 5 iter, 4 tools, read_cap 80) + `PromptStyle::{Full,Minimal}`: conservative auto-detection for ~0.5–3B models, Minimal system prompt ≤1600 chars omitting verbose bootstrap sections; gated under the small-model bench guard (memory-off auto + grammar force-enable preserved). |
+| Async lint gate + token-count LRU cache | `c2d8573` | `cargo check/lint` verification moved to `spawn_blocking` (no blocking calls on the async runtime, timeout semantics preserved); token counting cached via LRU (~256 entries keyed model+content) so repeated pushes skip `/api/tokenize` round-trips. |
+| Dead-field removal | `c2d8573` | `AgentConfig.max_thinking_tokens` (dead since the f7 live-thinking-channel change) deleted — single source of truth remains `tuning.thinking`. |
+
 ---
 
 ## 8. Roadmap
