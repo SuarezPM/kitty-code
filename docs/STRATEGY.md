@@ -215,7 +215,9 @@ North-star targets, exactamente como publicados (sin cambios): little-coder
 **45.56%** Aider Polyglot (Qwen3.5-9B Q4_K_M, num_ctx 32768, temp 0.3) ·
 gate TB2.0 **9.2%±2.4** · ornith-1.5 9B oficial TB2.1 **46.2** / SWE-V **70.6**.
 
-Campaña de benchmarks autónomos planificada post-cierre, en orden:
-**B1** A/B propio → **B3** GPQA/HLE → **B2** TB2.1 → **B4** agentic-web →
-**B5** familia SWE-bench; todo resultado se etiquetará como *local-harness
+Campaña de benchmarks autónomos — ejecución F2 (2026-08-30, HEAD `b690cf9`):
+- **B1-l225 mix real** `b1-l225-rerun-20260830T042258Z.json` **221/225 98.2%** (0 errored, `grep400=0`, wall 182m21s, G1 APPROVE) — escala validada, fingerprint `0d38e3c` (50py→50js→30ts→45rust→30go→10cpp→10java→3py-bonus). Gaps explícitos: **GPQA Diamond 198q** y **ClawEval 300t** sin harness en `kitty bench` (`polyglot/tb2/smoke` only, `huggingface-cli` no instalado) — marcados `blocked-harness`, no bench, no tasa. Requieren loader mínimo futuro.
+- Siguiente: **B3** GPQA/HLE → **B2** TB2.1 → **B4** agentic-web → **B5** SWE-bench (todo `local-harness-reproduction` vía pre-registro).
+
+Campaña planificada originalmente: **B1** A/B propio → **B3** GPQA/HLE → **B2** TB2.1 → **B4** agentic-web → **B5** familia SWE-bench; todo resultado se etiquetará como *local-harness
 reproduction* y pasará por el protocolo pre-registrado antes de publicarse.

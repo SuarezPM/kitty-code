@@ -253,6 +253,20 @@ carries a rate claim.
 | Async lint gate + token-count LRU cache | `c2d8573` | `cargo check/lint` verification moved to `spawn_blocking` (no blocking calls on the async runtime, timeout semantics preserved); token counting cached via LRU (~256 entries keyed model+content) so repeated pushes skip `/api/tokenize` round-trips. |
 | Dead-field removal | `c2d8573` | `AgentConfig.max_thinking_tokens` (dead since the f7 live-thinking-channel change) deleted — single source of truth remains `tuning.thinking`. |
 
+### 7.1b Medición B1-l225 escala (2026-08-30 04:22, G1 APPROVE)
+
+**Misma tasa que l15/l50 pero escala mix real.** `kitty --model ornith-1.5:9b bench polyglot --exercises benches/exercises_polyglot.json -l 225 --timeout-secs 900` con manifiesto pre-registrado fingerprint `0d38e3c` (228, 50py→50js→30ts→45rust→30go→10cpp→10java→3py-bonus). No `hops`, no `knowledge`.
+
+| Run | N | Passed | Rate | Errored | Failed | By-language | Gate |
+|-----|---|--------|------|---------|--------|-------------|------|
+| **B1-l225** `b1-l225-rerun-20260830T042258Z.json` | 225 | **221** | **98.2%** | 0 ≤22 PASS | 4 | `py 50/50 100% · js 50/50 100% · ts 30/30 100% · cpp 10/10 100% · java 10/10 100% · rust 43/45 95.6% (rust-impl_display, rust-impl_add) · go 28/30 93.3% (go-struct_result, go-struct_option)` | G1 APPROVE |
+
+Wall **182m21s = Σlatency (Σ 10941.2s, log 04:23:02Z→07:25:14Z =182m12s ±5-9s setup)** avg ~48s/ex, `grep -c "Cannot have 2 or more assistant" =0` (HTTP 400 pattern exacto; `grep -c "400"` naive matchea timestamps `.220400Z`), no `finished_at` field en JSON (Σlatency exacto). Los 4 failed son límites del modelo 9B (agotamiento iteraciones en trait-impl/struct con hermanos pasando), no errores de harness. Comparabilidad: **l15-json 15/15 100% python-only → l50 49/50 98% python-only → l225 221/225 98.2% mix** (mismo fingerprint `0d38e3c`).
+
+**Gaps explícitos Fase 2 (no cerrados, honestos):**
+- **GPQA Diamond 198q:** harness `kitty bench` solo soporta `polyglot/tb2/smoke` — no hay loader GPQA; `huggingface-cli` no instalado, dataset `Idavidrein/gpqa` no cacheado. Marcado `blocked-harness`, no bench, no tasa. Requiere implementación mínima (`benches/gpqa/` loader + grading exact-match) para futuro.
+- **ClawEval 300t:** idem — no hay suite `claw-eval` en `kitty bench`; sin loader, sin tasks públicas cacheadas. Marcado `blocked-harness`. Estimación original 5-6h permanece, pero sin harness es gap, no resultado.
+
 ### 7.2 Caveats campaña B (G2 2026-08-26 — fingerprint + sesgo)
 
 - **Exercises fingerprint (F1 MATERIAL):** `benches/ab/manifests/*.json` ahora incluye `exercises:{path, sha256, loaded}`. Built-in polyglot solo tiene 15 items; `N>15` requiere `--exercises benches/exercises_polyglot.json` (228 ejercicios, sha256 `0d38e3c…`). Sin fingerprint, l15-builtin (mix 6 langs) vs l50-json (first-50 = 50 python-only por orden dataset) son incomparables — prohibido citar progresión 100%→98% sin distinguir.
