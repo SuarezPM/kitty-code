@@ -47,6 +47,15 @@ fi
 mkdir -p benches/ab/manifests benches/ab/results
 MANIFEST="benches/ab/manifests/manifest-${TS}.json"
 
+# ── Exercises fingerprint (F1 MATERIAL, G2 2026-08-26) ───────────────────────
+# Built-in polyglot suite has only 15 items; N>15 requires
+# `--exercises benches/exercises_polyglot.json` (228 exercises). Record the
+# fingerprint so manifests are reproducible and comparable (l15-builtin mix of
+# 6 langs vs l50-json first-50 = 50 python-only by dataset order).
+EXERCISES_PATH="benches/exercises_polyglot.json"
+EXERCISES_SHA="$(sha256sum "$EXERCISES_PATH" 2>/dev/null | cut -d' ' -f1 || echo "unknown")"
+EXERCISES_LOADED="$(jq -r 'length' "$EXERCISES_PATH" 2>/dev/null || echo 228)"
+
 # ── Pre-registration manifest: written BEFORE any launch ────────────────────
 cat > "$MANIFEST" <<EOF
 {
@@ -55,12 +64,21 @@ cat > "$MANIFEST" <<EOF
   "tree": "clean",
   "suite": "$SUITE",
   "n_per_arm": $N,
+  "exercises": {
+    "path": "$EXERCISES_PATH",
+    "sha256": "$EXERCISES_SHA",
+    "loaded": $EXERCISES_LOADED
+  },
   "selection_rule": "first-N exercises in dataset order (-l N); chosen before launch, no post-hoc re-selection",
   "thinking_budget": $THINKING,
   "timeout_secs": $TIMEOUT_SECS,
   "profile": "$PROFILE",
   "interleave": true,
   "valid_run_gate": "errored trials <= 10% of N per arm; no early cuts",
+  "harness_config": {
+    "max_iterations": 5,
+    "note": "kitty bench polyglot uses bench override (5), not the 16 default"
+  },
   "env_baseline": "both arms launched from one normalized prefix; stripped: KITTY_NUM_CTX, KITTY_KV_QUANT_ACK, KITTY_MODEL_TURN_CAPS, KITTY_NO_THINK, KITTY_LINT_GATE, KITTY_EDIT_CHECK, KITTY_AUTORUN_HOPS, KITTY_BENCH_TIMEOUT_SECS",
   "arm_a": {
     "model": "$MODEL_A",

@@ -1,0 +1,34 @@
+{
+  "type": "measurement-pre-registration",
+  "campaign": "B1",
+  "run_id": "b1-l15-json-rerun-6890a7d",
+  "created_utc": "20260830T034709Z",
+  "git_head": "6890a7d5cb9d52e5af94a24f406d579fa0a1fba8",
+  "model": "ornith-1.5:9b",
+  "suite": "polyglot",
+  "n": 15,
+  "exercises": {
+    "path": "benches/exercises_polyglot.json",
+    "sha256": "0d38e3cc18c3acbeeb3b6ef605de6f8afe5d74aeb0eeafc1ed840ec77a6fa3b3",
+    "loaded": 228
+  },
+  "selection_rule": "first-N-by-dataset-order",
+  "harness_config": {
+    "num_ctx_client_frozen": 32768,
+    "context_window_budget": 32768,
+    "max_iterations": 5,
+    "exercise_timeout_secs": 900,
+    "profile": "auto->medium (ornith-1.5:9b no nano match)",
+    "tuning": "ornith family: thinking On, temp 0.6, top_p 0.95, num_predict 8192",
+    "verify_loop": "off (bench)",
+    "autorun_hops": 0,
+    "memory": "on",
+    "lint_gate": "off"
+  },
+  "server_env": {"OLLAMA_KV_CACHE_TYPE": "q8_0", "OLLAMA_FLASH_ATTENTION": "1", "gpu_split": "12CPU/88GPU inherent to hybrid model"},
+  "comparators": {"little_coder_polyglot": 45.56, "vanilla_aider_floor": 19.11},
+  "label": "local-harness-reproduction",
+  "fix": "6890a7d sanitize_trailing_assistants wire sanitizer",
+  "baseline_manifest": "manifest-20260826T182907Z-b1l15-rerun-6890a7d.json",
+  "note": "l15-json apples-to-apples vs l15-builtin: same N=15 but exercises=benches/exercises_polyglot.json (228) vs built-in 15; G2 F1 MATERIAL re-baseline"
+}

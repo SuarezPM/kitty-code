@@ -253,6 +253,13 @@ carries a rate claim.
 | Async lint gate + token-count LRU cache | `c2d8573` | `cargo check/lint` verification moved to `spawn_blocking` (no blocking calls on the async runtime, timeout semantics preserved); token counting cached via LRU (~256 entries keyed model+content) so repeated pushes skip `/api/tokenize` round-trips. |
 | Dead-field removal | `c2d8573` | `AgentConfig.max_thinking_tokens` (dead since the f7 live-thinking-channel change) deleted — single source of truth remains `tuning.thinking`. |
 
+### 7.2 Caveats campaña B (G2 2026-08-26 — fingerprint + sesgo)
+
+- **Exercises fingerprint (F1 MATERIAL):** `benches/ab/manifests/*.json` ahora incluye `exercises:{path, sha256, loaded}`. Built-in polyglot solo tiene 15 items; `N>15` requiere `--exercises benches/exercises_polyglot.json` (228 ejercicios, sha256 `0d38e3c…`). Sin fingerprint, l15-builtin (mix 6 langs) vs l50-json (first-50 = 50 python-only por orden dataset) son incomparables — prohibido citar progresión 100%→98% sin distinguir.
+- **Sesgo first-N python-only (F2 MINOR):** dataset `exercises_polyglot.json` orden real `50py→50js→30ts→45rust→30go→10cpp→10java→3py-bonus` (225 base +3) → `first-50 = 50 python-only`, `first-225 = 225 base mix real (3py bonus excluidos)`. Cualquier cita `polyglot 98% (N=50)` debe anotar `N=50 python-only`; primer mix real es `N=225`.
+- **harness_config 16 vs 5 (F3 MINOR):** manifiesto decía `max_iterations 16` pero `kitty bench polyglot` con override bench usa `5`. Alineado a `5` (cosmético).
+- **Quirk `errored:null` (M3):** `benches/ab/results/*.json` serializa `errored:null` cuando 0 (no `0`) — el gate debe leer `jq '.errored // 0'` para tratar `null` como `0`; no es fallo del bench.
+
 ---
 
 ## 8. Roadmap
