@@ -1,0 +1,65 @@
+{
+    "id": "797a9da3-c6b0-4b28-8eca-e7dc89c69ea4",
+    "started_at": "2026-08-22T21:02:52.388976",
+    "updated_at": "2026-08-23T02:52:51.229809Z",
+    "finished_at": null,
+    "n_total_trials": 15,
+    "stats": {
+        "n_completed_trials": 15,
+        "n_errored_trials": 7,
+        "n_running_trials": 0,
+        "n_pending_trials": 0,
+        "n_cancelled_trials": 1,
+        "n_retries": 0,
+        "evals": {
+            "kitty__aider-polyglot": {
+                "n_trials": 11,
+                "n_errors": 7,
+                "metrics": [
+                    {
+                        "mean": 0.0
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {
+                    "reward": {
+                        "0.0": [
+                            "polyglot_python_list-ops__5aqeD6k",
+                            "polyglot_go_error-handling__HfQTenr",
+                            "polyglot_go_pig-latin__RoAAyxj",
+                            "polyglot_javascript_space-age__scSCMrd",
+                            "polyglot_javascript_wordy__VnVbCvy",
+                            "polyglot_javascript_grep__FKrZSUu",
+                            "polyglot_javascript_rectangles__D2gWYEP",
+                            "polyglot_java_alphametics__2qQKd8p",
+                            "polyglot_java_phone-number__M53fzfn",
+                            "polyglot_go_say__Bs8XNFA",
+                            "polyglot_rust_acronym__Yo9epDk"
+                        ]
+                    }
+                },
+                "exception_stats": {
+                    "RewardFileNotFoundError": [
+                        "polyglot_cpp_queen-attack__XbUhWCw",
+                        "polyglot_cpp_phone-number__gN2dNxN",
+                        "polyglot_cpp_kindergarten-garden__JL4SE2L"
+                    ],
+                    "UnknownApiError": [
+                        "polyglot_javascript_space-age__scSCMrd",
+                        "polyglot_javascript_grep__FKrZSUu"
+                    ],
+                    "AgentTimeoutError": [
+                        "polyglot_javascript_rectangles__D2gWYEP"
+                    ],
+                    "CancelledError": [
+                        "polyglot_cpp_clock__qbTjprG"
+                    ]
+                }
+            }
+        },
+        "n_input_tokens": null,
+        "n_cache_tokens": null,
+        "n_output_tokens": null,
+        "cost_usd": null
+    }
+}

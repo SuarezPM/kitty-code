@@ -10,6 +10,7 @@ use kitty_runtime::{
     ChatClient, ChatResponse, GrammarClient, GrammarConfig, Message, ToolDefinition,
 };
 use std::path::Path;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::bootstrap::Bootstrap;
@@ -1335,19 +1336,43 @@ impl Agent {
         }
     }
 
-    /// Make an LLM call and handle the response.
+    /// Make an LLM call with bounded retry for transient errors (F3.3).
+    ///
+    /// Retries on transient failures (rate limits, 5xx, connection resets) with
+    /// exponential backoff. Non-transient errors (bad request, auth, etc.) fail
+    /// immediately. Maximum 3 retries with 500ms → 1s → 2s backoff.
     async fn llm_call(&self) -> Result<ChatResponse> {
         // B1-400: transport sanitizer — never wire a trailing [assistant, assistant] (Ollama 400).
         let messages = sanitize_trailing_assistants(self.messages.clone());
-        self.client
-            .chat_with_options(
-                &self.config.model,
-                messages.clone(),
-                Some(self.tools.clone()),
-                Some(self.request_options(&messages)),
-            )
-            .await
-            .context("LLM call failed")
+        let model = &self.config.model;
+        let tools = Some(self.tools.clone());
+        let options = Some(self.request_options(&messages));
+
+        const MAX_RETRIES: usize = 3;
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for attempt in 0..=MAX_RETRIES {
+            match self
+                .client
+                .chat_with_options(model, messages.clone(), tools.clone(), options.clone())
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) if e.is_transient() && attempt < MAX_RETRIES => {
+                    let backoff = Duration::from_millis(500 * 2u64.pow(attempt as u32));
+                    warn!(
+                        attempt,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %e,
+                        "Transient LLM error, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    last_err = Some(e.into());
+                }
+                Err(e) => return Err(e).context("LLM call failed"),
+            }
+        }
+        Err(last_err.unwrap())
     }
 
     /// Force the model to respond with text (no tools).

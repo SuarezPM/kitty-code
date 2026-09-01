@@ -1,0 +1,26 @@
+{
+  "type": "measurement-pre-registration",
+  "campaign": "B1",
+  "run_id": "b1-l15-baseline",
+  "created_utc": "20260826T042201Z",
+  "git_head": "9effc3e2b7b63d0f482d83cc26aa597cba25c505",
+  "model": "ornith-1.5:9b",
+  "suite": "polyglot",
+  "n": 15,
+  "selection_rule": "first-N-by-dataset-order",
+  "harness_config": {
+    "num_ctx_client_frozen": 32768,
+    "context_window_budget": 32768,
+    "max_iterations": 16,
+    "exercise_timeout_secs": 900,
+    "profile": "auto->medium (ornith-1.5:9b no nano match)",
+    "tuning": "ornith family: thinking On, temp 0.6, top_p 0.95, num_predict 8192",
+    "verify_loop": "off (bench)",
+    "autorun_hops": 0,
+    "memory": "on",
+    "lint_gate": "off"
+  },
+  "server_env": {"OLLAMA_KV_CACHE_TYPE": "q8_0", "OLLAMA_FLASH_ATTENTION": "1", "gpu_split": "12CPU/88GPU inherent to hybrid model"},
+  "comparators": {"little_coder_polyglot": 45.56, "vanilla_aider_floor": 19.11, "prior_kitty_s1v2_l50_partial": 17.39},
+  "label": "local-harness-reproduction"
+}

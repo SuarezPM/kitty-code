@@ -42,3 +42,69 @@ pub enum RuntimeError {
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
+
+impl RuntimeError {
+    /// Whether this error is transient and worth retrying (F3.3).
+    pub fn is_transient(&self) -> bool {
+        match self {
+            RuntimeError::Api { status, .. } => {
+                matches!(status, 429 | 500 | 502 | 503 | 504)
+            }
+            RuntimeError::ConnectionRefused(_) => true,
+            RuntimeError::Io(e) => {
+                // Connection reset, broken pipe, etc.
+                e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::ConnectionAborted
+                    || e.kind() == std::io::ErrorKind::BrokenPipe
+            }
+            // Http errors from reqwest include timeouts and network failures.
+            // Treat reqwest::Error as transient for connection-level issues.
+            RuntimeError::Http(e) => e.is_timeout() || e.is_connect(),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api_err(status: u16) -> RuntimeError {
+        RuntimeError::Api { status, message: "test".into() }
+    }
+
+    #[test]
+    fn transient_429() { assert!(api_err(429).is_transient()); }
+    #[test]
+    fn transient_500() { assert!(api_err(500).is_transient()); }
+    #[test]
+    fn transient_502() { assert!(api_err(502).is_transient()); }
+    #[test]
+    fn transient_503() { assert!(api_err(503).is_transient()); }
+    #[test]
+    fn transient_504() { assert!(api_err(504).is_transient()); }
+    #[test]
+    fn non_transient_400() { assert!(!api_err(400).is_transient()); }
+    #[test]
+    fn non_transient_401() { assert!(!api_err(401).is_transient()); }
+    #[test]
+    fn non_transient_404() { assert!(!api_err(404).is_transient()); }
+    #[test]
+    fn transient_connection_refused() {
+        assert!(RuntimeError::ConnectionRefused("test".into()).is_transient());
+    }
+    #[test]
+    fn transient_io_connection_reset() {
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert!(RuntimeError::Io(io).is_transient());
+    }
+    #[test]
+    fn non_transient_io_other() {
+        let io = std::io::Error::new(std::io::ErrorKind::Other, "other");
+        assert!(!RuntimeError::Io(io).is_transient());
+    }
+    #[test]
+    fn non_transient_context_overflow() {
+        assert!(!RuntimeError::ContextOverflow { requested: 0, message: "test".into() }.is_transient());
+    }
+}

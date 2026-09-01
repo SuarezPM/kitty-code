@@ -1,0 +1,100 @@
+{
+  "details": [
+    {
+      "id": "py-fib",
+      "lang": "python",
+      "latency_ms": 19847.0,
+      "passed": true
+    },
+    {
+      "id": "py-class",
+      "lang": "python",
+      "latency_ms": 10889.0,
+      "passed": true
+    },
+    {
+      "id": "py-sort",
+      "lang": "python",
+      "latency_ms": 11255.0,
+      "passed": true
+    },
+    {
+      "id": "py-decorator",
+      "lang": "python",
+      "latency_ms": 20826.0,
+      "passed": true
+    },
+    {
+      "id": "py-context",
+      "lang": "python",
+      "latency_ms": 17622.0,
+      "passed": false
+    },
+    {
+      "id": "js-promise",
+      "lang": "javascript",
+      "latency_ms": 11655.0,
+      "passed": true
+    },
+    {
+      "id": "js-debounce",
+      "lang": "javascript",
+      "latency_ms": 11111.0,
+      "passed": true
+    },
+    {
+      "id": "js-async",
+      "lang": "javascript",
+      "latency_ms": 6359.0,
+      "passed": true
+    },
+    {
+      "id": "ts-interface",
+      "lang": "typescript",
+      "latency_ms": 6662.0,
+      "passed": true
+    },
+    {
+      "id": "ts-generic",
+      "lang": "typescript",
+      "latency_ms": 5881.0,
+      "passed": true
+    },
+    {
+      "id": "sh-backup",
+      "lang": "bash",
+      "latency_ms": 25975.0,
+      "passed": true
+    },
+    {
+      "id": "sh-replace",
+      "lang": "bash",
+      "latency_ms": 25552.0,
+      "passed": false
+    },
+    {
+      "id": "rust-struct",
+      "lang": "rust",
+      "latency_ms": 15624.0,
+      "passed": true
+    },
+    {
+      "id": "rust-enum",
+      "lang": "rust",
+      "latency_ms": 10640.0,
+      "passed": true
+    },
+    {
+      "id": "go-struct",
+      "lang": "go",
+      "latency_ms": 7921.0,
+      "passed": true
+    }
+  ],
+  "memory": true,
+  "model": "ornith:9b",
+  "passed": 13,
+  "rate_pct": 86.66666666666667,
+  "suite": "polyglot",
+  "total": 15
+}

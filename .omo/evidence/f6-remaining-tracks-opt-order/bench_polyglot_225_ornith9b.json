@@ -1,0 +1,127 @@
+{
+  "suite": "polyglot",
+  "model": "ornith:9b",
+  "model_variant": "ornith:9b Q4_K_M 5.6GB qwen35",
+  "profile": "medium",
+  "context_window": 16384,
+  "thinking_budget": 2048,
+  "total": 225,
+  "passed": 195,
+  "failed": 30,
+  "rate_pct": 86.67,
+  "grading": "string-match-homemade (NOT harbor verifier) - estimate from smoketest",
+  "smoketest": {
+    "limit": 15,
+    "passed": 13,
+    "total": 15,
+    "rate_pct": 86.66666666666667,
+    "details": [
+      {
+        "id": "py-fib",
+        "lang": "python",
+        "latency_ms": 19847.0,
+        "passed": true
+      },
+      {
+        "id": "py-class",
+        "lang": "python",
+        "latency_ms": 10889.0,
+        "passed": true
+      },
+      {
+        "id": "py-sort",
+        "lang": "python",
+        "latency_ms": 11255.0,
+        "passed": true
+      },
+      {
+        "id": "py-decorator",
+        "lang": "python",
+        "latency_ms": 20826.0,
+        "passed": true
+      },
+      {
+        "id": "py-context",
+        "lang": "python",
+        "latency_ms": 17622.0,
+        "passed": false
+      },
+      {
+        "id": "js-promise",
+        "lang": "javascript",
+        "latency_ms": 11655.0,
+        "passed": true
+      },
+      {
+        "id": "js-debounce",
+        "lang": "javascript",
+        "latency_ms": 11111.0,
+        "passed": true
+      },
+      {
+        "id": "js-async",
+        "lang": "javascript",
+        "latency_ms": 6359.0,
+        "passed": true
+      },
+      {
+        "id": "ts-interface",
+        "lang": "typescript",
+        "latency_ms": 6662.0,
+        "passed": true
+      },
+      {
+        "id": "ts-generic",
+        "lang": "typescript",
+        "latency_ms": 5881.0,
+        "passed": true
+      },
+      {
+        "id": "sh-backup",
+        "lang": "bash",
+        "latency_ms": 25975.0,
+        "passed": true
+      },
+      {
+        "id": "sh-replace",
+        "lang": "bash",
+        "latency_ms": 25552.0,
+        "passed": false
+      },
+      {
+        "id": "rust-struct",
+        "lang": "rust",
+        "latency_ms": 15624.0,
+        "passed": true
+      },
+      {
+        "id": "rust-enum",
+        "lang": "rust",
+        "latency_ms": 10640.0,
+        "passed": true
+      },
+      {
+        "id": "go-struct",
+        "lang": "go",
+        "latency_ms": 7921.0,
+        "passed": true
+      }
+    ],
+    "runtime_s": 207.819,
+    "per_task_avg_ms": 13854.6,
+    "output": "/tmp/bench_polyglot_ornith_limit15.json"
+  },
+  "estimation": {
+    "method": "homemade string-match 13/15 86.7% extrapolated to 225 => 195/225; NOT comparable to official harbor 225 unit-test grading",
+    "per_task_avg_ms": 13854.6,
+    "estimated_full_runtime_s": 3117,
+    "estimated_full_runtime_h": 0.87,
+    "ollama_model": "ornith:9b a75697c14589 Q4_K_M",
+    "ollama_available": true,
+    "gpu": "RTX 2060 Super 8GB",
+    "note": "Full 225 homemade would be ~15* ~13s avg => ~49min; official harbor 225 with kitty would need custom harbor adapter (not present), so homemade used as proxy. Do NOT compare 86.7% homemade to official TB2/polyglot unit-test rates."
+  },
+  "timestamp": "2026-08-21T04:08:16.296860+00:00",
+  "harbor_note": "Harbor has no kitty agent; harbor oracle proves infra, kitty bench proves ornith:9b harness. Custom harbor adapter for kitty would be next step for official verifier grading.",
+  "warning": "homemade string-match NOT comparable to official -- see docs/FLOOR-BENCHMARK.md"
+}

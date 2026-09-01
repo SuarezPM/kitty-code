@@ -1,0 +1,100 @@
+{
+    "id": "5b608a8d-273b-4313-b63e-34eef3dfab4f",
+    "started_at": "2026-08-24T11:42:11.909889",
+    "updated_at": "2026-08-24T18:13:00.988801",
+    "finished_at": "2026-08-24T18:13:00.988801",
+    "n_total_trials": 50,
+    "stats": {
+        "n_completed_trials": 50,
+        "n_errored_trials": 10,
+        "n_running_trials": 0,
+        "n_pending_trials": 0,
+        "n_cancelled_trials": 0,
+        "n_retries": 0,
+        "evals": {
+            "kitty__aider-polyglot": {
+                "n_trials": 43,
+                "n_errors": 10,
+                "metrics": [
+                    {
+                        "mean": 0.14
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {
+                    "reward": {
+                        "0.0": [
+                            "polyglot_python_list-ops__Xm2xffP",
+                            "polyglot_go_pig-latin__kFkvPcC",
+                            "polyglot_go_error-handling__xK9eakg",
+                            "polyglot_javascript_space-age__ip8FN3z",
+                            "polyglot_java_alphametics__sTQ5FPa",
+                            "polyglot_javascript_grep__cJDSUjr",
+                            "polyglot_java_phone-number__ueBiCPh",
+                            "polyglot_go_say__epC29Zx",
+                            "polyglot_java_bowling__XJz779R",
+                            "polyglot_java_go-counting__KNkbgH7",
+                            "polyglot_python_react__QtJq5Wu",
+                            "polyglot_python_two-bucket__MDSrw9M",
+                            "polyglot_java_pig-latin__tgVgsWy",
+                            "polyglot_go_variable-length-quan__KWiJBn4",
+                            "polyglot_java_mazy-mice__Akt4HVX",
+                            "polyglot_go_bowling__Vs6EBmA",
+                            "polyglot_java_state-of-tic-tac-t__nMysYuZ",
+                            "polyglot_java_word-search__FmvWzaF",
+                            "polyglot_python_grep__jJ5refR",
+                            "polyglot_python_beer-song__qd6eapV",
+                            "polyglot_java_circular-buffer__Dx3tXtq",
+                            "polyglot_go_protein-translation__nWma3Au",
+                            "polyglot_go_palindrome-products__R2AvwL8",
+                            "polyglot_java_connect__8BQqxK6",
+                            "polyglot_javascript_zebra-puzzle__EiwajbS",
+                            "polyglot_javascript_react__ao8Fq3S",
+                            "polyglot_rust_forth__roeBiG7",
+                            "polyglot_go_poker__yLS6ZpL",
+                            "polyglot_go_pov__f4kaVLw",
+                            "polyglot_python_forth__adBDdfk",
+                            "polyglot_javascript_transpose__CtLrHdX",
+                            "polyglot_javascript_twelve-days__7HVbBzf",
+                            "polyglot_go_wordy__RQA5UcZ",
+                            "polyglot_rust_robot-name__eufdbg2",
+                            "polyglot_javascript_ocr-numbers__psfXeUU",
+                            "polyglot_go_alphametics__AKFvcCY"
+                        ],
+                        "1.0": [
+                            "polyglot_javascript_wordy__cXWVSmp",
+                            "polyglot_javascript_rectangles__kkM36C9",
+                            "polyglot_rust_acronym__VSSGWxB",
+                            "polyglot_javascript_promises__mqynfLy",
+                            "polyglot_javascript_simple-linke__poh7viw",
+                            "polyglot_javascript_phone-number__9Cfewkj",
+                            "polyglot_javascript_rest-api__TEz2HoN"
+                        ]
+                    }
+                },
+                "exception_stats": {
+                    "RewardFileNotFoundError": [
+                        "polyglot_cpp_queen-attack__prg9rD4",
+                        "polyglot_cpp_phone-number__pojtQBf",
+                        "polyglot_cpp_kindergarten-garden__2XyRwsz",
+                        "polyglot_cpp_clock__DsBDW68",
+                        "polyglot_cpp_grade-school__CJLa7Aa",
+                        "polyglot_cpp_dnd-character__JCjFXVG"
+                    ],
+                    "AgentTimeoutError": [
+                        "polyglot_java_pig-latin__tgVgsWy",
+                        "polyglot_java_mazy-mice__Akt4HVX",
+                        "polyglot_go_bowling__Vs6EBmA"
+                    ],
+                    "NonZeroAgentExitCodeError": [
+                        "polyglot_cpp_parallel-letter-fre__EaVFypK"
+                    ]
+                }
+            }
+        },
+        "n_input_tokens": null,
+        "n_cache_tokens": null,
+        "n_output_tokens": null,
+        "cost_usd": null
+    }
+}

@@ -1,0 +1,13 @@
+{
+  "type": "calibration-pre-registration",
+  "created_utc": "20260826T040844Z",
+  "git_head": "16611b482b7e577d6aa25b90179fde6d24dcdabf",
+  "model": "ornith-1.5:9b",
+  "suite": "polyglot",
+  "n": 1,
+  "selection_rule": "first-N-by-dataset-order",
+  "purpose": "wall-clock calibration under 12/88 CPU/GPU split before l50 campaign commitment",
+  "server_env": {"OLLAMA_KV_CACHE_TYPE": "q8_0", "OLLAMA_FLASH_ATTENTION": "1"},
+  "harness_config": {"num_ctx_resolved": 32768, "profile": "medium(auto)", "thinking": "On(ornith tuning)", "temp": 0.6, "verify_loop": "off(bench)", "autorun_hops": 0, "memory": "on(medium)"},
+  "notes": "single-model mandate: A/B degenerate, this measures baseline only; 30s per-exercise cap is the known constraint being calibrated"
+}

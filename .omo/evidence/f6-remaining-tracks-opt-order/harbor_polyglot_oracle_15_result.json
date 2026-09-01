@@ -1,0 +1,53 @@
+{
+    "id": "6540c52c-7094-413b-bf85-fc6a4f2c879b",
+    "started_at": "2026-08-21T00:58:37.908329",
+    "updated_at": "2026-08-21T01:03:44.137854",
+    "finished_at": "2026-08-21T01:03:44.137854",
+    "n_total_trials": 15,
+    "stats": {
+        "n_completed_trials": 15,
+        "n_errored_trials": 0,
+        "n_running_trials": 0,
+        "n_pending_trials": 0,
+        "n_cancelled_trials": 0,
+        "n_retries": 0,
+        "evals": {
+            "oracle__aider-polyglot": {
+                "n_trials": 15,
+                "n_errors": 0,
+                "metrics": [
+                    {
+                        "mean": 1.0
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {
+                    "reward": {
+                        "1.0": [
+                            "polyglot_cpp_queen-attack__VmW6xJv",
+                            "polyglot_python_list-ops__koxBfT3",
+                            "polyglot_go_pig-latin__jGEaYgv",
+                            "polyglot_go_error-handling__VANTA8H",
+                            "polyglot_javascript_wordy__9zXJF8V",
+                            "polyglot_javascript_space-age__GjGUguR",
+                            "polyglot_javascript_rectangles__gTnNmQA",
+                            "polyglot_java_alphametics__5ULQSoR",
+                            "polyglot_javascript_grep__zsnCf6t",
+                            "polyglot_java_phone-number__o26caVU",
+                            "polyglot_cpp_phone-number__ZRsZBym",
+                            "polyglot_cpp_kindergarten-garden__juMxTaM",
+                            "polyglot_go_say__vRkD7ey",
+                            "polyglot_rust_acronym__H3Wcvcj",
+                            "polyglot_cpp_clock__JqkaQ4P"
+                        ]
+                    }
+                },
+                "exception_stats": {}
+            }
+        },
+        "n_input_tokens": null,
+        "n_cache_tokens": null,
+        "n_output_tokens": null,
+        "cost_usd": null
+    }
+}

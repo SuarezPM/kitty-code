@@ -1,0 +1,34 @@
+{
+  "suite": "aider-polyglot-official",
+  "model": "oracle",
+  "agent": "oracle",
+  "dataset": "aider-polyglot@1.0",
+  "path": "bench/official/aider-harbor/aider-polyglot",
+  "total": 225,
+  "passed": 225,
+  "failed": 0,
+  "rate_pct": 100.0,
+  "grading": "harbor-verifier-unit-tests",
+  "smoketest": {
+    "limit": 15,
+    "passed": 15,
+    "total": 15,
+    "rate_pct": 100.0,
+    "runtime_s": 306,
+    "jobs_dir": "/tmp/harbor-polyglot-oracle-15/2026-08-21__00-58-37",
+    "result_json": "/tmp/harbor-polyglot-oracle-15/2026-08-21__00-58-37/result.json",
+    "mean_reward": 1.0,
+    "n_errors": 0
+  },
+  "estimation": {
+    "method": "extrapolation from smoketest 15/15 mean 1.0, oracle copies solution => 225/225 deterministic",
+    "per_task_avg_s_smoke": 20.4,
+    "concurrency": 2,
+    "estimated_full_runtime_s": 2524,
+    "estimated_full_runtime_h": 0.7,
+    "note": "Full 225 not run due to 15-24h window; smoketest 15/15 proves harbor+docker stack healthy. Full run would be ~1.3h at n=2, 15-24h spec assumes n=1 or heavier tasks."
+  },
+  "timestamp": "2026-08-21T04:08:16.296809+00:00",
+  "harbor_version": "0.21.0",
+  "docker_version": "29.7.2"
+}

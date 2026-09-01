@@ -1,0 +1,117 @@
+{
+    "id": "8b68ded3-2aa5-49df-a332-307da9b084df",
+    "started_at": "2026-08-22T10:40:19.609177",
+    "updated_at": "2026-08-22T15:37:05.118195",
+    "finished_at": "2026-08-22T15:37:05.118195",
+    "n_total_trials": 50,
+    "stats": {
+        "n_completed_trials": 50,
+        "n_errored_trials": 28,
+        "n_running_trials": 0,
+        "n_pending_trials": 0,
+        "n_cancelled_trials": 0,
+        "n_retries": 0,
+        "evals": {
+            "kitty__aider-polyglot": {
+                "n_trials": 44,
+                "n_errors": 28,
+                "metrics": [
+                    {
+                        "mean": 0.14
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {
+                    "reward": {
+                        "0.0": [
+                            "polyglot_python_list-ops__briScPm",
+                            "polyglot_go_pig-latin__7EH77No",
+                            "polyglot_go_error-handling__TNb5WsP",
+                            "polyglot_java_alphametics__sx2sdY4",
+                            "polyglot_javascript_grep__HGLTSuF",
+                            "polyglot_java_phone-number__8wBv9m8",
+                            "polyglot_go_say__tPKVcKy",
+                            "polyglot_rust_acronym__Hk3Bzda",
+                            "polyglot_java_bowling__rks2SvS",
+                            "polyglot_java_go-counting__bH2HLVW",
+                            "polyglot_python_react__Wo7bYqz",
+                            "polyglot_java_pig-latin__TRVVGhj",
+                            "polyglot_go_variable-length-quan__GVQvLJS",
+                            "polyglot_java_mazy-mice__Mk4qYee",
+                            "polyglot_go_bowling__TwnJanQ",
+                            "polyglot_java_state-of-tic-tac-t__i6APqA3",
+                            "polyglot_javascript_simple-linke__4bR8rkm",
+                            "polyglot_java_word-search__Q7nSMPE",
+                            "polyglot_python_grep__KQ5JahW",
+                            "polyglot_python_beer-song__dY9aMZT",
+                            "polyglot_java_circular-buffer__4NWsE7G",
+                            "polyglot_go_protein-translation__eiEW4aY",
+                            "polyglot_go_palindrome-products__Tie4xhM",
+                            "polyglot_java_connect__YJe8nQp",
+                            "polyglot_javascript_zebra-puzzle__V9iRTYM",
+                            "polyglot_javascript_rest-api__hmivxWt",
+                            "polyglot_javascript_react__AhiBhHR",
+                            "polyglot_rust_forth__ZZBYMKU",
+                            "polyglot_go_poker__TtFamuv",
+                            "polyglot_go_pov__FbAKTtd",
+                            "polyglot_python_forth__o67theK",
+                            "polyglot_javascript_transpose__mrbx82T",
+                            "polyglot_javascript_twelve-days__HtPtXvH",
+                            "polyglot_go_wordy__eq2Y9FQ",
+                            "polyglot_rust_robot-name__BJQzHct",
+                            "polyglot_javascript_ocr-numbers__L4iLBbV",
+                            "polyglot_go_alphametics__iPUwWpE"
+                        ],
+                        "1.0": [
+                            "polyglot_javascript_wordy__fmmZaNJ",
+                            "polyglot_javascript_space-age__U7wBWpV",
+                            "polyglot_javascript_rectangles__2ahDM3K",
+                            "polyglot_python_two-bucket__jMnGhVB",
+                            "polyglot_javascript_promises__HFKMeAa",
+                            "polyglot_javascript_phone-number__CG3UNSX",
+                            "polyglot_cpp_dnd-character__WWVUbvp"
+                        ]
+                    }
+                },
+                "exception_stats": {
+                    "RewardFileNotFoundError": [
+                        "polyglot_cpp_queen-attack__pPM2J54",
+                        "polyglot_cpp_phone-number__YDjia8B",
+                        "polyglot_cpp_kindergarten-garden__4QdxEC7",
+                        "polyglot_cpp_clock__Uz4wZFK",
+                        "polyglot_cpp_grade-school__d8nf8r4"
+                    ],
+                    "AgentTimeoutError": [
+                        "polyglot_go_pig-latin__7EH77No",
+                        "polyglot_java_go-counting__bH2HLVW",
+                        "polyglot_python_react__Wo7bYqz",
+                        "polyglot_python_two-bucket__jMnGhVB",
+                        "polyglot_java_pig-latin__TRVVGhj",
+                        "polyglot_go_variable-length-quan__GVQvLJS",
+                        "polyglot_java_mazy-mice__Mk4qYee",
+                        "polyglot_go_bowling__TwnJanQ",
+                        "polyglot_java_state-of-tic-tac-t__i6APqA3",
+                        "polyglot_java_connect__YJe8nQp",
+                        "polyglot_javascript_zebra-puzzle__V9iRTYM",
+                        "polyglot_javascript_rest-api__hmivxWt",
+                        "polyglot_javascript_react__AhiBhHR",
+                        "polyglot_rust_forth__ZZBYMKU",
+                        "polyglot_go_poker__TtFamuv",
+                        "polyglot_cpp_parallel-letter-fre__PGsR3ed",
+                        "polyglot_go_pov__FbAKTtd",
+                        "polyglot_python_forth__o67theK",
+                        "polyglot_javascript_transpose__mrbx82T",
+                        "polyglot_javascript_twelve-days__HtPtXvH",
+                        "polyglot_go_wordy__eq2Y9FQ",
+                        "polyglot_rust_robot-name__BJQzHct",
+                        "polyglot_go_alphametics__iPUwWpE"
+                    ]
+                }
+            }
+        },
+        "n_input_tokens": null,
+        "n_cache_tokens": null,
+        "n_output_tokens": null,
+        "cost_usd": null
+    }
+}

@@ -1,0 +1,56 @@
+{
+    "id": "c88146bb-2405-4aca-be6e-3ab8c1baefae",
+    "started_at": "2026-08-22T01:25:56.555211",
+    "updated_at": "2026-08-22T04:28:09.586176Z",
+    "finished_at": null,
+    "n_total_trials": 89,
+    "stats": {
+        "n_completed_trials": 13,
+        "n_errored_trials": 4,
+        "n_running_trials": 0,
+        "n_pending_trials": 76,
+        "n_cancelled_trials": 4,
+        "n_retries": 0,
+        "evals": {
+            "oracle__terminal-bench-2": {
+                "n_trials": 9,
+                "n_errors": 4,
+                "metrics": [
+                    {
+                        "mean": 0.46153846153846156
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {
+                    "reward": {
+                        "1.0": [
+                            "break-filter-js-from-html__TLGxcmc",
+                            "adaptive-rejection-sampler__4d9tFLT",
+                            "bn-fit-modify__rj7Fzob",
+                            "cancel-async-tasks__kKH5T95",
+                            "chess-best-move__NaDQTuA",
+                            "cobol-modernization__bjjPFWf"
+                        ],
+                        "0.0": [
+                            "build-pmars__AVs7dtJ",
+                            "build-pov-ray__fMK38ns",
+                            "build-cython-ext__XzbVgu9"
+                        ]
+                    }
+                },
+                "exception_stats": {
+                    "CancelledError": [
+                        "code-from-image__y3zAHcy",
+                        "caffe-cifar-10__D4jwYF3",
+                        "circuit-fibsqrt__LGuMrZd",
+                        "compile-compcert__284uU4f"
+                    ]
+                }
+            }
+        },
+        "n_input_tokens": null,
+        "n_cache_tokens": null,
+        "n_output_tokens": null,
+        "cost_usd": null
+    }
+}

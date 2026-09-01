@@ -23,6 +23,7 @@ use thiserror::Error;
 use crate::guard::{Guard, GuardVerdict};
 use crate::hashline::HashlineEditor;
 use crate::parser::ParsedToolCall;
+use crate::redact::redact_secrets;
 use crate::sandbox::{Sandbox, SandboxConfig, SandboxError};
 
 #[derive(Error, Debug)]
@@ -821,56 +822,76 @@ impl ToolRegistry {
             (sb_opt, _) => sb_opt.as_ref(),
         };
 
-        // Execute the command with a timeout. `kill_on_drop(true)` guarantees
-        // the child is killed if the future is dropped by the timeout.
-        let run = async {
-            let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-c")
-                .arg(command)
-                .kill_on_drop(true)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            if let Some(dir) = dir {
-                cmd.current_dir(dir);
-            }
-            if let Some(sb) = sandbox {
-                sb.apply(&mut cmd).map_err(|e| match e {
-                    SandboxError::Unsupported(_) | SandboxError::Setup(_) => {
-                        ToolError::Sandbox(format!(
-                            "{e}; command NOT executed (fail-closed). Fix the host \
-                             (needs Linux >= 5.13 with unprivileged user namespaces) \
-                             or set KITTY_SANDBOX=off to disable containment explicitly"
-                        ))
-                    }
-                    other => ToolError::Sandbox(other.to_string()),
-                })?;
-            }
-            // When containment is armed, a spawn failure usually means the
-            // kernel refused the namespace/seccomp chain at exec time even
-            // though the cheap preflight passed (e.g. Docker's default
-            // seccomp profile blocks unshare(CLONE_NEWUSER) while the sysctl
-            // files still look permissive). Surface that as an actionable
-            // sandbox error instead of a bare errno.
-            let child = cmd.spawn().map_err(|e| {
-                if sandbox.is_some() {
+        // Execute the command with a timeout. The child is spawned in its own
+        // process group via `setsid()` so we can kill the entire tree on timeout.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(command)
+            .kill_on_drop(false)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(dir) = dir {
+            cmd.current_dir(dir);
+        }
+        if let Some(sb) = sandbox {
+            sb.apply(&mut cmd).map_err(|e| match e {
+                SandboxError::Unsupported(_) | SandboxError::Setup(_) => {
                     ToolError::Sandbox(format!(
-                        "spawn failed while arming containment: {e}. This host \
-                         or container likely blocks user namespaces; set \
-                         KITTY_SANDBOX=off to disable containment explicitly"
+                        "{e}; command NOT executed (fail-closed). Fix the host \
+                         (needs Linux >= 5.13 with unprivileged user namespaces) \
+                         or set KITTY_SANDBOX=off to disable containment explicitly"
                     ))
-                } else {
-                    ToolError::Io(e)
                 }
+                other => ToolError::Sandbox(other.to_string()),
             })?;
-            child.wait_with_output().await.map_err(ToolError::Io)
-        };
+        }
+        // F3.1: Create a new process group so we can kill the entire tree on
+        // timeout. The hook runs inside the forked child before exec.
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                let ret = nix::libc::setsid();
+                if ret == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // When containment is armed, a spawn failure usually means the
+        // kernel refused the namespace/seccomp chain at exec time even
+        // though the cheap preflight passed (e.g. Docker's default
+        // seccomp profile blocks unshare(CLONE_NEWUSER) while the sysctl
+        // files still look permissive). Surface that as an actionable
+        // sandbox error instead of a bare errno.
+        let child = cmd.spawn().map_err(|e| {
+            if sandbox.is_some() {
+                ToolError::Sandbox(format!(
+                    "spawn failed while arming containment: {e}. This host \
+                     or container likely blocks user namespaces; set \
+                     KITTY_SANDBOX=off to disable containment explicitly"
+                ))
+            } else {
+                ToolError::Io(e)
+            }
+        })?;
+        // Save PID before consuming child with wait_with_output.
+        let child_pid = child.id();
 
-        let output = match tokio::time::timeout(timeout, run).await {
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => return Err(ToolError::Io(e)),
             Err(_elapsed) => {
-                // Timed out: the child was killed by kill_on_drop when the
-                // future was dropped. Report as a failed tool result.
+                // F3.1: Explicitly kill the entire process group on timeout.
+                // SIGTERM first for graceful shutdown, then SIGKILL after 2s grace.
+                #[cfg(unix)]
+                if let Some(id) = child_pid {
+                    use nix::sys::signal::{kill, Signal};
+                    use nix::unistd::Pid;
+                    let pgid = Pid::from_raw(-(id as i32)); // negative = process group
+                    let _ = kill(pgid, Signal::SIGTERM);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = kill(pgid, Signal::SIGKILL);
+                }
                 return Ok(ToolResult {
                     success: false,
                     output: format!("command timed out after {}s (killed)", timeout.as_secs()),
@@ -899,6 +920,9 @@ impl ToolRegistry {
             result.truncate(max_output);
             result.push_str("\n... (output truncated)");
         }
+
+        // F3.2: Redact secrets before returning output to the agent.
+        let result = redact_secrets(&result);
 
         Ok(ToolResult {
             success: output.status.success(),

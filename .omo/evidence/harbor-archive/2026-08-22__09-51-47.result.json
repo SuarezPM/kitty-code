@@ -1,0 +1,54 @@
+{
+    "id": "7306f0a7-95f2-4a76-ae06-3fa3074fd86f",
+    "started_at": "2026-08-22T09:51:47.442172",
+    "updated_at": "2026-08-22T13:38:12.903148Z",
+    "finished_at": null,
+    "n_total_trials": 50,
+    "stats": {
+        "n_completed_trials": 8,
+        "n_errored_trials": 8,
+        "n_running_trials": 0,
+        "n_pending_trials": 42,
+        "n_cancelled_trials": 4,
+        "n_retries": 0,
+        "evals": {
+            "kitty__aider-polyglot": {
+                "n_trials": 3,
+                "n_errors": 8,
+                "metrics": [
+                    {
+                        "mean": 0.0
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {
+                    "reward": {
+                        "0.0": [
+                            "polyglot_python_list-ops__W5keGWd",
+                            "polyglot_go_error-handling__pQxDAz2",
+                            "polyglot_go_pig-latin__wVb9trX"
+                        ]
+                    }
+                },
+                "exception_stats": {
+                    "AgentTimeoutError": [
+                        "polyglot_cpp_queen-attack__Ab5fQqL",
+                        "polyglot_python_list-ops__W5keGWd",
+                        "polyglot_go_error-handling__pQxDAz2",
+                        "polyglot_go_pig-latin__wVb9trX"
+                    ],
+                    "CancelledError": [
+                        "polyglot_javascript_space-age__dqokPfq",
+                        "polyglot_javascript_wordy__49fUpVj",
+                        "polyglot_javascript_rectangles__Es6HKM7",
+                        "polyglot_java_alphametics__EEjbv3m"
+                    ]
+                }
+            }
+        },
+        "n_input_tokens": null,
+        "n_cache_tokens": null,
+        "n_output_tokens": null,
+        "cost_usd": null
+    }
+}
