@@ -496,7 +496,7 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
 
     #[inline]
     fn rotr(x: u32, n: u32) -> u32 {
-        (x >> n) | (x << (32 - n))
+        x.rotate_right(n)
     }
 
     // Padding
@@ -678,13 +678,13 @@ pub fn preflight_gpqa_with_prereg(pre_reg_path: &Path) -> Result<(GpqaPreRegistr
             pre.dataset_id, manifest.dataset_id
         )));
     }
-    if manifest.revision.to_ascii_lowercase() != pre.revision.to_ascii_lowercase() {
+    if !manifest.revision.eq_ignore_ascii_case(&pre.revision) {
         return Err(GpqaError::RevisionMismatch {
             expected: pre.revision.clone(),
             found: manifest.revision.clone(),
         });
     }
-    if manifest.sha256.to_ascii_lowercase() != pre.sha256.to_ascii_lowercase() {
+    if !manifest.sha256.eq_ignore_ascii_case(&pre.sha256) {
         return Err(GpqaError::HashMismatch {
             expected: pre.sha256.clone(),
             got: manifest.sha256.clone(),

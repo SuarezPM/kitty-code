@@ -1460,7 +1460,7 @@ async fn run_gpqa_suite(
     );
     println!("  Grading: {} | Permutation: {} | Template: {}", manifest.grading_method, manifest.permutation, manifest.template);
     println!("  Cache: {} (outside repo, sha256 {}...)", cache_path.display(), &manifest.sha256[..8.min(manifest.sha256.len())]);
-    println!("  Label: {}", "aproximación local no oficial — no leaderboard oficial");
+    println!("  Label: aproximación local no oficial — no leaderboard oficial");
     println!();
 
     let mut results: Vec<BenchResult> = Vec::with_capacity(take);

@@ -14,23 +14,23 @@
 
 ## 3. Robustez y telemetría del harness
 
-- [ ] 3.1 Añadir cancelación y terminación/recolección de grupos de procesos para herramientas Bash.
-- [ ] 3.2 Redactar secretos antes de spills, errores, telemetría y resultados de herramientas.
-- [ ] 3.3 Clasificar errores de runtime y aplicar reintentos acotados solo a fallos transitorios de chat.
-- [ ] 3.4 Registrar telemetría JSONL local rotada y sin prompts, con métricas por turno y benchmark.
-- [ ] 3.5 Escribir pruebas de cancelación, redacción, clasificación y rotación sin ejecutar la batería completa.
+- [x] 3.1 Añadir cancelación y terminación/recolección de grupos de procesos para herramientas Bash.
+- [x] 3.2 Redactar secretos antes de spills, errores, telemetría y resultados de herramientas.
+- [x] 3.3 Clasificar errores de runtime y aplicar reintentos acotados solo a fallos transitorios de chat.
+- [x] 3.4 Registrar telemetría JSONL local rotada y sin prompts, con métricas por turno y benchmark.
+- [x] 3.5 Escribir pruebas de cancelación, redacción, clasificación y rotación sin ejecutar la batería completa.
 
 ## 4. Eficiencia para perfiles pequeños
 
-- [ ] 4.1 Añadir caps de output y masking de resultados antiguos configurados por perfil.
-- [ ] 4.2 Crear snapshot operativo acotado antes de compactar contexto.
-- [ ] 4.3 Añadir breaker de schema y reducción temporal de superficie de herramientas.
-- [ ] 4.4 Escribir pruebas del breaker, masking y snapshots sin ejecutar la batería completa.
+- [x] 4.1 Añadir caps de output y masking de resultados antiguos configurados por perfil.
+- [x] 4.2 Crear snapshot operativo acotado antes de compactar contexto.
+- [x] 4.3 Añadir breaker de schema y reducción temporal de superficie de herramientas.
+- [x] 4.4 Escribir pruebas del breaker, masking y snapshots sin ejecutar la batería completa.
 
 ## 5. Verificación final y medición
 
-- [ ] 5.1 Ejecutar una única batería final de formato, Clippy, tests del workspace y diagnósticos Rust.
-- [ ] 5.2 Crear manifiestos pre-registrados y ejecutar GPQA cuando el dataset gated esté disponible.
-- [ ] 5.3 Ejecutar ClawEval solo si el preflight oficial queda satisfecho; de otro modo registrar bloqueo honesto.
+- [x] 5.1 Ejecutar una única batería final de formato, Clippy, tests del workspace y diagnósticos Rust.
+- [x] 5.2 Crear manifiestos pre-registrados y ejecutar GPQA cuando el dataset gated esté disponible.
+- [x] 5.3 Ejecutar ClawEval solo si el preflight oficial queda satisfecho; de otro modo registrar bloqueo honesto.
 - [ ] 5.4 Comprobar disco antes de cada descarga/benchmark pesado y ejecutar las baterías aprobadas con telemetría.
 - [ ] 5.5 Actualizar AUDIT, STRATEGY, codemaps y el estado de OpenSpec con evidencia y limitaciones.
