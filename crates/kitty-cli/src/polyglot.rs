@@ -193,9 +193,14 @@ pub fn test_command(lang: &str) -> &'static str {
 pub fn retry_prompt(test_output: &str, config: &ExerciseConfig) -> String {
     let file_list = config.files.solution.join(", ");
     let truncated = if test_output.len() > 4000 {
-        &test_output[test_output.len() - 4000..]
-    } else {
+        // Take last 4000 chars, UTF-8 safe
         test_output
+            .chars()
+            .rev()
+            .take(4000)
+            .collect::<String>()
+    } else {
+        test_output.to_string()
     };
     format!(
         "The tests failed. Output:\n```\n{truncated}\n```\n\

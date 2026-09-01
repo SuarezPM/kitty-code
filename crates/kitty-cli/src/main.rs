@@ -1793,32 +1793,64 @@ async fn run_polyglot_bench(
         let mut last_test_output = String::new();
         let mut error_msg: Option<String> = None;
 
+        // Create tempdir ONCE before the retry loop so the agent's work
+        // is preserved across retries (not recreated from original stubs).
+        let tmp_dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(e) => {
+                error_msg = Some(format!("tempdir failed: {e}"));
+                // Skip to result processing
+                let latency_ms = start.elapsed().as_millis() as u64;
+                let verdict = "error";
+                let status_char = "FAIL";
+                println!("{status_char} ({latency_ms:.0}ms, {attempts} attempt(s))");
+                results.push(polyglot::PolyglotResult {
+                    id: ex.id.clone(),
+                    lang: ex.lang.clone(),
+                    passed: false,
+                    latency_ms,
+                    attempts,
+                    verdict: verdict.to_string(),
+                    error: error_msg,
+                });
+                continue;
+            }
+        };
+
+        // Copy ONLY solution files (NO test files, NO .meta/)
+        if let Err(e) =
+            polyglot::copy_solution_files_only(&ex.exercise_dir, tmp_dir.path(), &ex.config)
+        {
+            error_msg = Some(format!("copy solution files failed: {e}"));
+            let latency_ms = start.elapsed().as_millis() as u64;
+            let verdict = "error";
+            let status_char = "FAIL";
+            println!("{status_char} ({latency_ms:.0}ms, {attempts} attempt(s))");
+            results.push(polyglot::PolyglotResult {
+                id: ex.id.clone(),
+                lang: ex.lang.clone(),
+                passed: false,
+                latency_ms,
+                attempts,
+                verdict: verdict.to_string(),
+                error: error_msg,
+            });
+            continue;
+        }
+
         while attempts < max_attempts {
             attempts += 1;
 
-            // Step 1: Create tempdir
-            let tmp_dir = match tempfile::tempdir() {
-                Ok(d) => d,
-                Err(e) => {
-                    error_msg = Some(format!("tempdir failed: {e}"));
-                    break;
-                }
-            };
-
-            // Step 2: Copy ONLY solution files (NO test files, NO .meta/)
-            if let Err(e) =
-                polyglot::copy_solution_files_only(&ex.exercise_dir, tmp_dir.path(), &ex.config)
-            {
-                error_msg = Some(format!("copy solution files failed: {e}"));
-                break;
-            }
-
-            // Step 3: Build prompt (from .docs/ + file list)
+            // Step 3: Build prompt — always include original instructions
             let prompt = if attempts == 1 {
                 ex.prompt.clone()
             } else {
-                // Retry: include test output from previous attempt
-                polyglot::retry_prompt(&last_test_output, &ex.config)
+                // Retry: original instructions + test output from previous attempt
+                format!(
+                    "{}\n\n{}",
+                    ex.prompt,
+                    polyglot::retry_prompt(&last_test_output, &ex.config)
+                )
             };
 
             // Step 4: Run agent (workspace = tempdir)
