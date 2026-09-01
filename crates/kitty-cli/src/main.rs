@@ -1809,12 +1809,18 @@ async fn run_polyglot_bench(
         }
 
         // Build the prompt with workspace instructions pointing at the tempdir copy
-        // Key: tell the agent to use Edit for existing files, not Write
+        // Key: tell the agent exactly what files exist and what to do
         let prompt = format!(
-            "{}\n\nWork in directory: {}.\n\
-             IMPORTANT: The source file(s) already exist. Use Edit to modify them, NOT Write.\n\
-             Read the existing file first, then use Edit to implement the solution.\n\
-             After implementing, run the tests to verify.",
+            "{}\n\n\
+             Work in directory: {}.\n\n\
+             FILES IN THIS DIRECTORY:\n\
+             - The source file to edit (read it first, then use Edit to implement)\n\
+             - The test file (DO NOT modify this)\n\n\
+             STEPS:\n\
+             1. Read the source file to see what needs to be implemented\n\
+             2. Use Edit to implement the solution in the source file\n\
+             3. Run the test file to verify: python3 -m pytest <test_file> -x\n\n\
+             IMPORTANT: Use Edit (not Write) for existing files. Read before Edit.",
             ex.prompt,
             tmp_dir.path().display(),
         );
