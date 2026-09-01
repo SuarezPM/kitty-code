@@ -204,10 +204,12 @@ fn whitespace_normalized_candidates(content: &str, find: &str) -> Vec<String> {
     let find_line_count = find.split('\n').count();
     if find_line_count > 1 {
         let lines: Vec<&str> = content.split('\n').collect();
-        for i in 0..=lines.len().saturating_sub(find_line_count) {
-            let block = lines[i..i + find_line_count].join("\n");
-            if normalize_whitespace(&block) == normalized_find {
-                out.push(block);
+        if find_line_count <= lines.len() {
+            for i in 0..=lines.len() - find_line_count {
+                let block = lines[i..i + find_line_count].join("\n");
+                if normalize_whitespace(&block) == normalized_find {
+                    out.push(block);
+                }
             }
         }
     }

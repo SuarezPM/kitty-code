@@ -1124,7 +1124,7 @@ fn sync_budget_threshold(agent: &mut Agent, profile_threshold: f32) {
 /// Default per-exercise bench wall-clock cap (seconds). Calibration showed
 /// real 9B-model tasks on split-GPU hardware routinely exceed this; raise
 /// via `--timeout-secs` or `KITTY_BENCH_TIMEOUT_SECS`.
-pub const DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS: u64 = 120;
 
 /// Env fallback for the per-exercise bench timeout (f9 calibration).
 pub const ENV_BENCH_TIMEOUT_SECS: &str = "KITTY_BENCH_TIMEOUT_SECS";
