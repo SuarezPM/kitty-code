@@ -1826,6 +1826,9 @@ async fn run_polyglot_bench(
             model: cfg.model.clone(),
             profile: cfg.profile,
             enable_knowledge: cfg.enable_knowledge,
+            // Set workspace to tempdir so Bootstrap detects the exercise language,
+            // not the parent Kitty-Code repo (which has Cargo.toml)
+            workspace: tmp_dir.path().to_path_buf(),
             knowledge_config: KnowledgeConfig {
                 enabled: cfg.enable_knowledge,
                 knowledge_dir: cfg.knowledge_dir.clone(),
