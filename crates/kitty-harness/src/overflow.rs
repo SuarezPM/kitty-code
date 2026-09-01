@@ -55,7 +55,7 @@ fn overflow_patterns() -> &'static [Regex] {
             Regex::new(r"(?i)input.*length.*limit").unwrap(),
             Regex::new(r"(?i)sequence.*length").unwrap(),
             Regex::new(r"(?i)max.*tokens.*exceeded").unwrap(),
-            Regex::new(r"(?i)truncat.*(context|token|input|prompt|length)").unwrap(),
+            Regex::new(r"(?i)(?:context|input|prompt|length).{0,30}truncat(?:ed|ion)").unwrap(),
         ]
     })
 }
