@@ -1,19 +1,37 @@
-//! Aider Polyglot benchmark loader — 225 Exercism exercises with unit test grading.
+//! Aider Polyglot benchmark loader — official pattern with config.json parsing,
+//! test file hiding, retry loop, and subprocess timeouts.
 //!
 //! Loads exercises from bench/official/polyglot-benchmark/<lang>/exercises/practice/
-//! Extracts prompts from .docs/ directories (instructions.md + instructions.append.md)
-//! Runs real unit tests (pytest, go test, cargo test, etc.)
-//! Generates results comparable to the public leaderboard.
+//! Reads .meta/config.json for file lists, copies only solution files to tempdir,
+//! runs the agent, materializes tests AFTER agent finishes, then runs unit tests.
+//! Retries once on failure with test output fed back.
 
 use std::path::{Path, PathBuf};
+use serde::Deserialize;
 
-/// A Polyglot exercise loaded from Exercism format.
+/// Parsed .meta/config.json for an Exercism exercise.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExerciseConfig {
+    pub files: ExerciseFiles,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExerciseFiles {
+    pub solution: Vec<String>,
+    pub test: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub example: Vec<String>,
+}
+
+/// A Polyglot exercise loaded from official Exercism format.
 #[derive(Debug, Clone)]
 pub struct PolyglotExercise {
     pub id: String,
     pub lang: String,
-    pub prompt: String,
     pub exercise_dir: PathBuf,
+    pub config: ExerciseConfig,
+    pub prompt: String,
 }
 
 /// Result of running one exercise.
@@ -23,8 +41,182 @@ pub struct PolyglotResult {
     pub lang: String,
     pub passed: bool,
     pub latency_ms: u64,
+    pub attempts: usize,
     pub verdict: String,
     pub error: Option<String>,
+}
+
+/// Load exercise config from .meta/config.json.
+pub fn load_exercise_config(exercise_dir: &Path) -> Option<ExerciseConfig> {
+    let config_path = exercise_dir.join(".meta").join("config.json");
+    let content = std::fs::read_to_string(&config_path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Build prompt from .docs/ directory files.
+pub fn build_prompt(exercise_dir: &Path, config: &ExerciseConfig) -> String {
+    let mut prompt = String::new();
+
+    // Read introduction.md (optional)
+    let intro = exercise_dir.join(".docs").join("introduction.md");
+    if intro.exists() {
+        if let Ok(content) = std::fs::read_to_string(&intro) {
+            prompt.push_str(&content);
+            prompt.push_str("\n\n");
+        }
+    }
+
+    // Read instructions.md (required)
+    let instructions = exercise_dir.join(".docs").join("instructions.md");
+    if let Ok(content) = std::fs::read_to_string(&instructions) {
+        prompt.push_str(&content);
+        prompt.push_str("\n\n");
+    }
+
+    // Read instructions.append.md (optional)
+    let append = exercise_dir.join(".docs").join("instructions.append.md");
+    if append.exists() {
+        if let Ok(content) = std::fs::read_to_string(&append) {
+            prompt.push_str(&content);
+            prompt.push_str("\n\n");
+        }
+    }
+
+    // Add suffix with file list
+    let file_list = config.files.solution.join(", ");
+    prompt.push_str(&format!(
+        "Use the above instructions to modify the supplied files: {file_list}\n\
+         Don't change the names of existing functions or classes.\n\
+         Only use standard libraries."
+    ));
+
+    prompt
+}
+
+/// Copy only solution files + .docs/ to tempdir (NO test files, NO .meta/).
+pub fn copy_solution_files_only(
+    src: &Path,
+    dst: &Path,
+    config: &ExerciseConfig,
+) -> std::io::Result<()> {
+    // Copy solution files
+    for file in &config.files.solution {
+        let src_path = src.join(file);
+        let dst_path = dst.join(file);
+        if let Some(parent) = dst_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if src_path.exists() {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+
+    // Copy .docs/ directory (for reference)
+    let docs_src = src.join(".docs");
+    let docs_dst = dst.join(".docs");
+    if docs_src.exists() {
+        copy_dir_all(&docs_src, &docs_dst)?;
+    }
+
+    Ok(())
+}
+
+/// Copy test files from original to tempdir (AFTER agent finishes).
+pub fn materialize_tests(
+    src: &Path,
+    dst: &Path,
+    config: &ExerciseConfig,
+) -> std::io::Result<()> {
+    for file in &config.files.test {
+        let src_path = src.join(file);
+        let dst_path = dst.join(file);
+        if let Some(parent) = dst_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if src_path.exists() {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Run tests with timeout.
+pub async fn run_test_with_timeout(
+    exercise_dir: &Path,
+    lang: &str,
+    timeout_secs: u64,
+) -> (bool, String) {
+    let cmd = test_command(lang);
+    let args: Vec<&str> = cmd.split_whitespace().collect();
+    let program = args[0];
+    let extra_args: Vec<&str> = args[1..].to_vec();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        tokio::process::Command::new(program)
+            .args(&extra_args)
+            .current_dir(exercise_dir)
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let combined = if stderr.is_empty() {
+                stdout
+            } else {
+                format!("{stdout}\n--- stderr ---\n{stderr}")
+            };
+            (output.status.success(), combined)
+        }
+        Ok(Err(e)) => (false, format!("Failed to run test: {e}")),
+        Err(_) => (false, format!("Test timed out after {timeout_secs}s")),
+    }
+}
+
+/// Get test command for a language.
+pub fn test_command(lang: &str) -> &'static str {
+    match lang {
+        "python" => "python3 -m pytest -x -q",
+        "rust" => "cargo test -- --include-ignored",
+        "go" => "go test ./...",
+        "javascript" => "npm test --silent",
+        "cpp" => "make test",
+        "java" => "./gradlew test",
+        _ => "echo 'unknown language'",
+    }
+}
+
+/// Build retry prompt with test output.
+pub fn retry_prompt(test_output: &str, config: &ExerciseConfig) -> String {
+    let file_list = config.files.solution.join(", ");
+    let truncated = if test_output.len() > 4000 {
+        &test_output[test_output.len() - 4000..]
+    } else {
+        test_output
+    };
+    format!(
+        "The tests failed. Output:\n```\n{truncated}\n```\n\
+         The tests are correct, don't try to change them.\n\
+         Fix the implementation in {file_list}."
+    )
+}
+
+/// Copy directory recursively.
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Load all Polyglot exercises from the benchmark directory.
@@ -38,27 +230,34 @@ pub fn load_polyglot_exercises(base_dir: &Path) -> Vec<PolyglotExercise> {
             continue;
         }
 
-        let entries: Vec<_> = std::fs::read_dir(&practice_dir)
+        for entry in std::fs::read_dir(&practice_dir)
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .collect();
-
-        for entry in entries {
+        {
             let exercise_dir = entry.path();
+            if !exercise_dir.is_dir() {
+                continue;
+            }
+
             let exercise_name = exercise_dir
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown")
                 .to_string();
 
-            if let Some(prompt) = extract_prompt(&exercise_dir) {
+            if let Some(config) = load_exercise_config(&exercise_dir) {
+                let prompt = build_prompt(&exercise_dir, &config);
                 exercises.push(PolyglotExercise {
-                    id: format!("polyglot_{}-{}", lang, exercise_name),
+                    id: format!(
+                        "{}-{}",
+                        lang.chars().next().unwrap_or('x'),
+                        exercise_name
+                    ),
                     lang: lang.to_string(),
-                    prompt,
                     exercise_dir,
+                    config,
+                    prompt,
                 });
             }
         }
@@ -67,268 +266,7 @@ pub fn load_polyglot_exercises(base_dir: &Path) -> Vec<PolyglotExercise> {
     exercises
 }
 
-/// Extract the prompt from an exercise's .docs/ directory.
-fn extract_prompt(exercise_dir: &Path) -> Option<String> {
-    let docs_dir = exercise_dir.join(".docs");
-    if !docs_dir.exists() {
-        return None;
-    }
-
-    let instructions = docs_dir.join("instructions.md");
-    let append = docs_dir.join("instructions.append.md");
-
-    let mut parts = Vec::new();
-
-    if let Ok(content) = std::fs::read_to_string(&instructions) {
-        parts.push(content);
-    }
-    if let Ok(content) = std::fs::read_to_string(&append) {
-        parts.push(content);
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n\n"))
-    }
-}
-
-/// Run the test suite for an exercise and return the result.
-pub async fn run_polyglot_exercise(exercise: &PolyglotExercise) -> PolyglotResult {
-    let start = std::time::Instant::now();
-
-    let (success, error) = match exercise.lang.as_str() {
-        "python" => run_pytest(&exercise.exercise_dir).await,
-        "go" => run_go_test(&exercise.exercise_dir).await,
-        "rust" => run_cargo_test(&exercise.exercise_dir).await,
-        "javascript" => run_node_test(&exercise.exercise_dir).await,
-        "java" => run_java_test(&exercise.exercise_dir).await,
-        "cpp" => run_cpp_test(&exercise.exercise_dir).await,
-        _ => (false, Some(format!("unsupported language: {}", exercise.lang))),
-    };
-
-    let latency = start.elapsed().as_millis() as u64;
-
-    PolyglotResult {
-        id: exercise.id.clone(),
-        lang: exercise.lang.clone(),
-        passed: success,
-        latency_ms: latency,
-        verdict: if success { "pass" } else { "fail" }.to_string(),
-        error,
-    }
-}
-
-async fn run_pytest(exercise_dir: &Path) -> (bool, Option<String>) {
-    let output = tokio::process::Command::new("python3")
-        .args(["-m", "pytest", "-x", "--tb=short", "-q"])
-        .current_dir(exercise_dir)
-        .output()
-        .await;
-
-    match output {
-        Ok(o) => (
-            o.status.success(),
-            Some(String::from_utf8_lossy(&o.stderr).to_string()),
-        ),
-        Err(e) => (false, Some(e.to_string())),
-    }
-}
-
-async fn run_go_test(exercise_dir: &Path) -> (bool, Option<String>) {
-    let output = tokio::process::Command::new("go")
-        .args(["test", "-v", "./..."])
-        .current_dir(exercise_dir)
-        .output()
-        .await;
-
-    match output {
-        Ok(o) => (
-            o.status.success(),
-            Some(String::from_utf8_lossy(&o.stderr).to_string()),
-        ),
-        Err(e) => (false, Some(e.to_string())),
-    }
-}
-
-async fn run_cargo_test(exercise_dir: &Path) -> (bool, Option<String>) {
-    let output = tokio::process::Command::new("cargo")
-        .args(["test", "--quiet"])
-        .current_dir(exercise_dir)
-        .output()
-        .await;
-
-    match output {
-        Ok(o) => (
-            o.status.success(),
-            Some(String::from_utf8_lossy(&o.stderr).to_string()),
-        ),
-        Err(e) => (false, Some(e.to_string())),
-    }
-}
-
-async fn run_node_test(exercise_dir: &Path) -> (bool, Option<String>) {
-    // Check if package.json exists (Exercism JS format)
-    if exercise_dir.join("package.json").exists() {
-        // Check if node_modules exists, if not install
-        if !exercise_dir.join("node_modules").exists() {
-            let install = tokio::process::Command::new("npm")
-                .arg("install")
-                .current_dir(exercise_dir)
-                .output()
-                .await;
-
-            if let Err(e) = install {
-                return (false, Some(format!("npm install failed: {}", e)));
-            }
-        }
-
-        let output = tokio::process::Command::new("npm")
-            .arg("test")
-            .current_dir(exercise_dir)
-            .output()
-            .await;
-
-        match output {
-            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
-            Err(e) => (false, Some(e.to_string())),
-        }
-    } else {
-        // Fallback: node --test
-        let output = tokio::process::Command::new("node")
-            .args(["--test"])
-            .current_dir(exercise_dir)
-            .output()
-            .await;
-
-        match output {
-            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
-            Err(e) => (false, Some(e.to_string())),
-        }
-    }
-}
-
-async fn run_java_test(exercise_dir: &Path) -> (bool, Option<String>) {
-    // Check if gradlew exists (Exercism Java format)
-    let gradlew = exercise_dir.join("gradlew");
-    if gradlew.exists() {
-        // Make gradlew executable
-        let _ = tokio::process::Command::new("chmod")
-            .arg("+x")
-            .arg(&gradlew)
-            .output()
-            .await;
-
-        let output = tokio::process::Command::new(&gradlew)
-            .arg("test")
-            .current_dir(exercise_dir)
-            .output()
-            .await;
-
-        match output {
-            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
-            Err(e) => (false, Some(e.to_string())),
-        }
-    } else {
-        // Fallback: manual compile + run
-        let compile = tokio::process::Command::new("javac")
-            .args(["-d", "bin", "src/main/java/*.java"])
-            .current_dir(exercise_dir)
-            .output()
-            .await;
-
-        match compile {
-            Ok(o) if !o.status.success() => {
-                return (false, Some(String::from_utf8_lossy(&o.stderr).to_string()));
-            }
-            Err(e) => return (false, Some(e.to_string())),
-            _ => {}
-        }
-
-        let run = tokio::process::Command::new("java")
-            .args(["-cp", "bin", "Main"])
-            .current_dir(exercise_dir)
-            .output()
-            .await;
-
-        match run {
-            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
-            Err(e) => (false, Some(e.to_string())),
-        }
-    }
-}
-
-async fn run_cpp_test(exercise_dir: &Path) -> (bool, Option<String>) {
-    // Check if CMakeLists.txt exists (Exercism C++ format)
-    if exercise_dir.join("CMakeLists.txt").exists() {
-        // CMake build
-        let configure = tokio::process::Command::new("cmake")
-            .args(["-B", "build", "-DEXERCISM_COMMON_CATCH=ON"])
-            .current_dir(exercise_dir)
-            .output()
-            .await;
-
-        match configure {
-            Ok(o) if !o.status.success() => {
-                return (false, Some(format!("cmake configure failed: {}", String::from_utf8_lossy(&o.stderr))));
-            }
-            Err(e) => return (false, Some(format!("cmake not found: {}", e))),
-            _ => {}
-        }
-
-        let build = tokio::process::Command::new("cmake")
-            .args(["--build", "build"])
-            .current_dir(exercise_dir)
-            .output()
-            .await;
-
-        match build {
-            Ok(o) if !o.status.success() => {
-                return (false, Some(format!("cmake build failed: {}", String::from_utf8_lossy(&o.stderr))));
-            }
-            Err(e) => return (false, Some(e.to_string())),
-            _ => {}
-        }
-
-        let test = tokio::process::Command::new("ctest")
-            .args(["--test-dir", "build", "--output-on-failure"])
-            .current_dir(exercise_dir)
-            .output()
-            .await;
-
-        match test {
-            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
-            Err(e) => (false, Some(e.to_string())),
-        }
-    } else {
-        // Fallback: compile and run (no Catch2)
-        let compile = tokio::process::Command::new("g++")
-            .args(["-std=c++17", "-o", "test", "src/*.cpp"])
-            .current_dir(exercise_dir)
-            .output()
-            .await;
-
-        match compile {
-            Ok(o) if !o.status.success() => {
-                return (false, Some(String::from_utf8_lossy(&o.stderr).to_string()));
-            }
-            Err(e) => return (false, Some(e.to_string())),
-            _ => {}
-        }
-
-        let run = tokio::process::Command::new("./test")
-            .current_dir(exercise_dir)
-            .output()
-            .await;
-
-        match run {
-            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
-            Err(e) => (false, Some(e.to_string())),
-        }
-    }
-}
-
-/// Generate a Polyglot benchmark report in Aider-compatible format.
+/// Generate Aider-compatible report.
 pub fn generate_polyglot_report(results: &[PolyglotResult]) -> serde_json::Value {
     let total = results.len();
     let passed = results.iter().filter(|r| r.passed).count();
@@ -338,29 +276,26 @@ pub fn generate_polyglot_report(results: &[PolyglotResult]) -> serde_json::Value
         0.0
     };
 
-    let mut by_language: std::collections::BTreeMap<String, serde_json::Value> =
-        std::collections::BTreeMap::new();
-    for r in results {
-        let entry = by_language
-            .entry(r.lang.clone())
-            .or_insert_with(|| {
-                serde_json::json!({
-                    "attempted": 0,
-                    "passed": 0,
-                    "failed": 0,
-                })
-            });
-        let obj = entry.as_object_mut().unwrap();
-        *obj.get_mut("attempted").unwrap() =
-            serde_json::json!(obj["attempted"].as_i64().unwrap_or(0) + 1);
-        if r.passed {
-            *obj.get_mut("passed").unwrap() =
-                serde_json::json!(obj["passed"].as_i64().unwrap_or(0) + 1);
-        } else {
-            *obj.get_mut("failed").unwrap() =
-                serde_json::json!(obj["failed"].as_i64().unwrap_or(0) + 1);
-        }
-    }
+    let by_language: std::collections::HashMap<String, serde_json::Value> =
+        results.iter().fold(
+            std::collections::HashMap::new(),
+            |mut acc, r| {
+                let entry = acc.entry(r.lang.clone()).or_insert_with(|| {
+                    serde_json::json!({"attempted": 0, "passed": 0, "failed": 0})
+                });
+                let obj = entry.as_object_mut().unwrap();
+                *obj.get_mut("attempted").unwrap() =
+                    serde_json::json!(obj["attempted"].as_i64().unwrap_or(0) + 1);
+                if r.passed {
+                    *obj.get_mut("passed").unwrap() =
+                        serde_json::json!(obj["passed"].as_i64().unwrap_or(0) + 1);
+                } else {
+                    *obj.get_mut("failed").unwrap() =
+                        serde_json::json!(obj["failed"].as_i64().unwrap_or(0) + 1);
+                }
+                acc
+            },
+        );
 
     serde_json::json!({
         "suite": "polyglot",
@@ -376,76 +311,134 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_prompt_from_instructions_md() {
-        let dir = PathBuf::from("/tmp/test-exercise-polyglot");
-        std::fs::create_dir_all(dir.join(".docs")).unwrap();
-        std::fs::write(dir.join(".docs").join("instructions.md"), "Test prompt").unwrap();
-
-        let prompt = extract_prompt(&dir);
-        assert_eq!(prompt, Some("Test prompt".to_string()));
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn extract_prompt_combines_instructions_and_append() {
-        let dir = PathBuf::from("/tmp/test-exercise-polyglot-append");
-        std::fs::create_dir_all(dir.join(".docs")).unwrap();
+    fn load_config_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join(".meta");
+        std::fs::create_dir_all(&meta).unwrap();
         std::fs::write(
-            dir.join(".docs").join("instructions.md"),
-            "Base instructions",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join(".docs").join("instructions.append.md"),
-            "Extra details",
+            meta.join("config.json"),
+            r#"{"files":{"solution":["src/lib.rs"],"test":["tests/test.rs"],"example":[]}}"#,
         )
         .unwrap();
 
-        let prompt = extract_prompt(&dir);
-        assert_eq!(
-            prompt,
-            Some("Base instructions\n\nExtra details".to_string())
-        );
-
-        std::fs::remove_dir_all(&dir).unwrap();
+        let config = load_exercise_config(dir.path()).unwrap();
+        assert_eq!(config.files.solution, vec!["src/lib.rs"]);
+        assert_eq!(config.files.test, vec!["tests/test.rs"]);
     }
 
     #[test]
-    fn extract_prompt_none_when_no_docs() {
-        let dir = PathBuf::from("/tmp/test-exercise-polyglot-nodocs");
-        std::fs::create_dir_all(&dir).unwrap();
+    fn build_prompt_includes_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join(".docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("instructions.md"), "Implement the exercise.").unwrap();
 
-        let prompt = extract_prompt(&dir);
-        assert_eq!(prompt, None);
+        let config = ExerciseConfig {
+            files: ExerciseFiles {
+                solution: vec!["lib.rs".into()],
+                test: vec!["tests/test.rs".into()],
+                example: vec![],
+            },
+        };
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        let prompt = build_prompt(dir.path(), &config);
+        assert!(prompt.contains("Implement the exercise."));
+        assert!(prompt.contains("lib.rs"));
+        assert!(prompt.contains("Don't change the names"));
     }
 
     #[test]
-    fn generate_report() {
-        let results = vec![
-            PolyglotResult {
-                id: "polyglot_python-test1".into(),
-                lang: "python".into(),
-                passed: true,
-                latency_ms: 100,
-                verdict: "pass".into(),
-                error: None,
-            },
-            PolyglotResult {
-                id: "polyglot_python-test2".into(),
-                lang: "python".into(),
-                passed: false,
-                latency_ms: 200,
-                verdict: "fail".into(),
-                error: None,
-            },
-        ];
+    fn test_command_per_language() {
+        assert_eq!(test_command("python"), "python3 -m pytest -x -q");
+        assert_eq!(test_command("rust"), "cargo test -- --include-ignored");
+        assert_eq!(test_command("go"), "go test ./...");
+    }
 
-        let report = generate_polyglot_report(&results);
-        assert_eq!(report["total"], 2);
-        assert_eq!(report["passed"], 1);
-        assert!((report["rate_pct"].as_f64().unwrap() - 50.0).abs() < 1e-9);
+    #[test]
+    fn retry_prompt_includes_output() {
+        let config = ExerciseConfig {
+            files: ExerciseFiles {
+                solution: vec!["lib.rs".into()],
+                test: vec!["tests/test.rs".into()],
+                example: vec![],
+            },
+        };
+        let prompt = retry_prompt("test failed: assertion error", &config);
+        assert!(prompt.contains("test failed"));
+        assert!(prompt.contains("lib.rs"));
+        assert!(prompt.contains("don't try to change them"));
+    }
+
+    #[test]
+    fn copy_solution_files_excludes_tests() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        // Create source files
+        std::fs::create_dir_all(src.path().join("src")).unwrap();
+        std::fs::write(src.path().join("src/lib.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir_all(src.path().join("tests")).unwrap();
+        std::fs::write(src.path().join("tests/test.rs"), "#[test] fn t() {}").unwrap();
+        std::fs::create_dir_all(src.path().join(".docs")).unwrap();
+        std::fs::write(src.path().join(".docs/instructions.md"), "docs").unwrap();
+        std::fs::create_dir_all(src.path().join(".meta")).unwrap();
+        std::fs::write(src.path().join(".meta/config.json"), "{}").unwrap();
+
+        let config = ExerciseConfig {
+            files: ExerciseFiles {
+                solution: vec!["src/lib.rs".into()],
+                test: vec!["tests/test.rs".into()],
+                example: vec![],
+            },
+        };
+
+        copy_solution_files_only(src.path(), dst.path(), &config).unwrap();
+
+        // Solution file present
+        assert!(dst.path().join("src/lib.rs").exists());
+        // .docs/ present
+        assert!(dst.path().join(".docs/instructions.md").exists());
+        // Test file NOT present
+        assert!(!dst.path().join("tests/test.rs").exists());
+        // .meta/ NOT present
+        assert!(!dst.path().join(".meta").exists());
+    }
+
+    #[test]
+    fn materialize_tests_copies_test_files() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        std::fs::create_dir_all(src.path().join("tests")).unwrap();
+        std::fs::write(src.path().join("tests/test.rs"), "#[test] fn t() {}").unwrap();
+
+        let config = ExerciseConfig {
+            files: ExerciseFiles {
+                solution: vec!["src/lib.rs".into()],
+                test: vec!["tests/test.rs".into()],
+                example: vec![],
+            },
+        };
+
+        materialize_tests(src.path(), dst.path(), &config).unwrap();
+        assert!(dst.path().join("tests/test.rs").exists());
+        let content = std::fs::read_to_string(dst.path().join("tests/test.rs")).unwrap();
+        assert_eq!(content, "#[test] fn t() {}");
+    }
+
+    #[test]
+    fn retry_prompt_truncates_long_output() {
+        let config = ExerciseConfig {
+            files: ExerciseFiles {
+                solution: vec!["lib.rs".into()],
+                test: vec![],
+                example: vec![],
+            },
+        };
+        let long_output = "x".repeat(8000);
+        let prompt = retry_prompt(&long_output, &config);
+        // Should be truncated to ~4000 chars + framing
+        assert!(prompt.len() < 8000);
+        assert!(prompt.contains("The tests failed"));
     }
 }

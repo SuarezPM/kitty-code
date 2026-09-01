@@ -1744,22 +1744,14 @@ async fn run_claweval_suite(
 
 // ── Polyglot (Aider-style unit test grading) ──────────────────────
 
-/// Recursively copy a directory tree from `src` to `dst`.
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-        } else {
-            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
-        }
-    }
-    Ok(())
-}
-
-/// Run the Aider Polyglot benchmark: 225 Exercism exercises with real unit test grading.
+/// Run the Aider Polyglot benchmark — official pattern:
+/// 1. Load exercises from .meta/config.json
+/// 2. Copy ONLY solution files to tempdir (hide test files)
+/// 3. Build prompt from .docs/ + file list
+/// 4. Run agent (edits solution files in tempdir)
+/// 5. Materialize test files AFTER agent finishes
+/// 6. Run unit tests (180s timeout)
+/// 7. If fail AND retries remain → feed test output back, retry
 async fn run_polyglot_bench(
     cfg: &BenchConfig,
     out: &PathBuf,
@@ -1788,97 +1780,142 @@ async fn run_polyglot_bench(
     };
 
     let mut results: Vec<polyglot::PolyglotResult> = Vec::with_capacity(take);
+    let agent_timeout_secs = 900u64;
+    let test_timeout_secs = 180u64;
+    let max_attempts = 2usize;
 
     for (i, ex) in exercises.iter().take(take).enumerate() {
         print!("[{:2}/{:2}] {} ...", i + 1, take, ex.id);
 
-        // Copy exercise to a tempdir so the agent's changes don't contaminate
-        // the original exercise directory — tests run against the copy.
-        let tmp_dir = tempfile::tempdir().context("Failed to create temp dir for polyglot exercise")?;
-        if let Err(e) = copy_dir_all(&ex.exercise_dir, tmp_dir.path()) {
-            println!(" (copy failed: {})", e);
-            results.push(polyglot::PolyglotResult {
-                id: ex.id.clone(),
-                lang: ex.lang.clone(),
-                passed: false,
-                latency_ms: 0,
-                verdict: "error".to_string(),
-                error: Some(format!("copy_dir_all failed: {}", e)),
-            });
-            continue;
-        }
-
-        // Build the prompt with workspace instructions pointing at the tempdir copy
-        // Key: tell the agent exactly what files exist and what to do
-        let prompt = format!(
-            "{}\n\n\
-             Work in directory: {}.\n\n\
-             FILES IN THIS DIRECTORY:\n\
-             - The source file to edit (read it first, then use Edit to implement)\n\
-             - The test file (DO NOT modify this)\n\n\
-             STEPS:\n\
-             1. Read the source file to see what needs to be implemented\n\
-             2. Use Edit to implement the solution in the source file\n\
-             3. Run the test file to verify: python3 -m pytest <test_file> -x\n\n\
-             IMPORTANT: Use Edit (not Write) for existing files. Read before Edit.",
-            ex.prompt,
-            tmp_dir.path().display(),
-        );
-
         let start = Instant::now();
-        std::env::set_var(kitty_harness::agent::ENV_VERIFY_LOOP, "off");
+        let mut attempts = 0usize;
+        let mut passed = false;
+        let mut last_test_output = String::new();
+        let mut error_msg: Option<String> = None;
 
-        let base_config = AgentConfig {
-            model: cfg.model.clone(),
-            profile: cfg.profile,
-            enable_knowledge: cfg.enable_knowledge,
-            // Set workspace to tempdir so Bootstrap detects the exercise language,
-            // not the parent Kitty-Code repo (which has Cargo.toml)
-            workspace: tmp_dir.path().to_path_buf(),
-            knowledge_config: KnowledgeConfig {
-                enabled: cfg.enable_knowledge,
-                knowledge_dir: cfg.knowledge_dir.clone(),
+        while attempts < max_attempts {
+            attempts += 1;
+
+            // Step 1: Create tempdir
+            let tmp_dir = match tempfile::tempdir() {
+                Ok(d) => d,
+                Err(e) => {
+                    error_msg = Some(format!("tempdir failed: {e}"));
+                    break;
+                }
+            };
+
+            // Step 2: Copy ONLY solution files (NO test files, NO .meta/)
+            if let Err(e) =
+                polyglot::copy_solution_files_only(&ex.exercise_dir, tmp_dir.path(), &ex.config)
+            {
+                error_msg = Some(format!("copy solution files failed: {e}"));
+                break;
+            }
+
+            // Step 3: Build prompt (from .docs/ + file list)
+            let prompt = if attempts == 1 {
+                ex.prompt.clone()
+            } else {
+                // Retry: include test output from previous attempt
+                polyglot::retry_prompt(&last_test_output, &ex.config)
+            };
+
+            // Step 4: Run agent (workspace = tempdir)
+            std::env::set_var(kitty_harness::agent::ENV_VERIFY_LOOP, "off");
+
+            let base_config = AgentConfig {
+                model: cfg.model.clone(),
+                profile: cfg.profile,
+                enable_knowledge: cfg.enable_knowledge,
+                workspace: tmp_dir.path().to_path_buf(),
+                knowledge_config: KnowledgeConfig {
+                    enabled: cfg.enable_knowledge,
+                    knowledge_dir: cfg.knowledge_dir.clone(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
+            };
+            let mut agent = Agent::new(cfg.client.clone(), base_config);
+            agent.config_mut().max_iterations = cfg.max_iterations.max(10);
+            agent.config_mut().autorun_hops = clamp_autorun_hops(cfg.autorun_hops);
+            if cfg.context_window != 16384 {
+                agent.config_mut().context_window = cfg.context_window;
+                agent.budget_mut().set_max(cfg.context_window);
+            }
+            if cfg.thinking_budget != 2048 {
+                agent.config_mut().tuning.thinking =
+                    ThinkingMode::Budget(cfg.thinking_budget as u32);
+            }
+            if cfg.bash_timeout != 60 {
+                agent.config_mut().bash_timeout_secs = cfg.bash_timeout;
+            }
+            agent.config_mut().compact_threshold = cfg.profile.compact_threshold;
+            sync_budget_threshold(&mut agent, cfg.profile.compact_threshold);
+
+            let agent_result = tokio::time::timeout(
+                std::time::Duration::from_secs(agent_timeout_secs),
+                agent.run(&prompt),
+            )
+            .await;
+
+            match agent_result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    error_msg = Some(format!("agent error: {e}"));
+                    break;
+                }
+                Err(_) => {
+                    error_msg = Some(format!("agent timed out after {agent_timeout_secs}s"));
+                    break;
+                }
+            }
+
+            // Step 5: Materialize test files AFTER agent finishes
+            if let Err(e) =
+                polyglot::materialize_tests(&ex.exercise_dir, tmp_dir.path(), &ex.config)
+            {
+                error_msg = Some(format!("materialize tests failed: {e}"));
+                break;
+            }
+
+            // Step 6: Run unit tests
+            let (test_passed, test_output) =
+                polyglot::run_test_with_timeout(tmp_dir.path(), &ex.lang, test_timeout_secs)
+                    .await;
+
+            last_test_output = test_output;
+
+            if test_passed {
+                passed = true;
+                break;
+            }
+
+            // Step 7: If fail AND retries remain → loop back for retry
+            // (the while condition handles this)
+        }
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+        let verdict = if passed {
+            "pass"
+        } else if error_msg.is_some() {
+            "error"
+        } else {
+            "fail"
         };
-        let mut agent = Agent::new(cfg.client.clone(), base_config);
-        // Polyglot exercises need more iterations — some require Read + Edit + test
-        agent.config_mut().max_iterations = cfg.max_iterations.max(10);
-        agent.config_mut().autorun_hops = clamp_autorun_hops(cfg.autorun_hops);
-        if cfg.context_window != 16384 {
-            agent.config_mut().context_window = cfg.context_window;
-            agent.budget_mut().set_max(cfg.context_window);
-        }
-        if cfg.thinking_budget != 2048 {
-            agent.config_mut().tuning.thinking =
-                ThinkingMode::Budget(cfg.thinking_budget as u32);
-        }
-        if cfg.bash_timeout != 60 {
-            agent.config_mut().bash_timeout_secs = cfg.bash_timeout;
-        }
-        agent.config_mut().compact_threshold = cfg.profile.compact_threshold;
-        sync_budget_threshold(&mut agent, cfg.profile.compact_threshold);
 
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(cfg.exercise_timeout_secs),
-            agent.run(&prompt),
-        )
-        .await;
+        let status_char = if passed { "PASS" } else { "FAIL" };
+        println!("{} ({:.0}ms, {attempts} attempt(s))", status_char, latency_ms);
 
-        // Let the agent work, then run the actual unit tests against the tempdir copy
-        let _ = outcome; // agent already ran; now grade with real tests
-        let tmp_exercise = polyglot::PolyglotExercise {
+        let result = polyglot::PolyglotResult {
             id: ex.id.clone(),
             lang: ex.lang.clone(),
-            prompt: ex.prompt.clone(),
-            exercise_dir: tmp_dir.path().to_path_buf(),
+            passed,
+            latency_ms,
+            attempts,
+            verdict: verdict.to_string(),
+            error: error_msg,
         };
-        let mut result = polyglot::run_polyglot_exercise(&tmp_exercise).await;
-        result.latency_ms = start.elapsed().as_millis() as u64;
-
-        let status = if result.passed { "PASS" } else { "FAIL" };
-        println!("{} ({:.0}ms)", status, result.latency_ms);
 
         // Persist episode for memory
         if let Some(store) = &store {
@@ -1887,7 +1924,7 @@ async fn run_polyglot_bench(
                 vec![],
                 Some(result.verdict.clone()),
                 format!(
-                    "{} {} (latency {:.0}ms)",
+                    "{} {} (latency {:.0}ms, {attempts} attempt(s))",
                     ex.id, result.verdict, result.latency_ms
                 ),
             );
@@ -1949,6 +1986,7 @@ async fn run_polyglot_bench(
             "passed": r.passed,
             "verdict": r.verdict,
             "latency_ms": r.latency_ms,
+            "attempts": r.attempts,
             "error": r.error,
         })).collect::<Vec<_>>(),
         "report": report,
