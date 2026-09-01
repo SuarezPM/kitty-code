@@ -10,7 +10,7 @@ use kitty_runtime::{
     ChatClient, ChatResponse, GrammarClient, GrammarConfig, Message, ToolDefinition,
 };
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::bootstrap::Bootstrap;
@@ -600,6 +600,9 @@ impl Agent {
         // Bootstrap: detect workspace on first turn
         self.run_bootstrap();
 
+        // F3.4: telemetry writer (JSONL, rotates at 10MB, disabled by KITTY_TELEMETRY=off)
+        let mut telemetry = crate::telemetry::TelemetryWriter::new(None);
+
         // Preflight FIRST so the system message is the first message in the
         // conversation (recall/knowledge injections below must follow it).
         self.preflight(user_prompt);
@@ -680,8 +683,10 @@ impl Agent {
                         self.push_message(Message::user(MAX_STEPS_PROMPT)).await;
                     }
 
-                    // LLM call
+                    // LLM call (F3.4: track turn start for telemetry latency)
+                    let turn_start = std::time::Instant::now();
                     let response = self.llm_call().await?;
+                    let turn_latency = turn_start.elapsed();
 
                     // Extract thinking tokens for budget tracking (thinking is metadata,
                     // not a conversation message — tracked via explicit budget.consume).
@@ -708,6 +713,17 @@ impl Agent {
                         self.budget.consume(tokens);
                     }
 
+                    // F3.4: extract telemetry fields before process_response takes ownership
+                    let t_tool_calls = response.message.tool_calls.as_ref().map_or(0, |tc| tc.len());
+                    let t_tool_names: Vec<String> = response
+                        .message
+                        .tool_calls
+                        .as_ref()
+                        .map(|tc| tc.iter().map(|t| t.function.name.clone()).collect())
+                        .unwrap_or_default();
+                    let t_tokens_in = response.prompt_eval_count.map(|c| c as usize);
+                    let t_tokens_out = response.eval_count.map(|c| c as usize);
+
                     self.process_response(user_prompt, response).await?;
 
                     // Fail-fast: 2 consecutive empty responses → terminate quickly
@@ -720,6 +736,24 @@ impl Agent {
                         // Episode already saved as failure in process_response.
                         return Ok("no response (empty after 2 retries)".to_string());
                     }
+
+                    // F3.4: write telemetry for this turn (after process_response)
+                    telemetry.write_turn(&crate::telemetry::TurnEvent {
+                        ts: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        model: self.config.model.clone(),
+                        turn: iteration,
+                        tool_calls: t_tool_calls,
+                        tool_names: t_tool_names,
+                        latency_ms: turn_latency.as_millis() as u64,
+                        tokens_in: t_tokens_in,
+                        tokens_out: t_tokens_out,
+                        error: None,
+                        bench_suite: None,
+                        compacted: false,
+                    });
 
                     // Reset thinking budget for next turn
                     self.thinking_budget.reset_turn();

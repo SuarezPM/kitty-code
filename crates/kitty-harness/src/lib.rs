@@ -18,6 +18,7 @@ pub mod plugin;
 pub mod quality_monitor;
 pub mod redact;
 pub mod router;
+pub mod telemetry;
 pub mod sandbox;
 pub mod thinking_budget;
 pub mod tools;
