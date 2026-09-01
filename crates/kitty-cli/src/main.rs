@@ -1809,8 +1809,12 @@ async fn run_polyglot_bench(
         }
 
         // Build the prompt with workspace instructions pointing at the tempdir copy
+        // Key: tell the agent to use Edit for existing files, not Write
         let prompt = format!(
-            "{}\n\nWork in directory: {} — implement the exercise in the existing source file(s)",
+            "{}\n\nWork in directory: {}.\n\
+             IMPORTANT: The source file(s) already exist. Use Edit to modify them, NOT Write.\n\
+             Read the existing file first, then use Edit to implement the solution.\n\
+             After implementing, run the tests to verify.",
             ex.prompt,
             tmp_dir.path().display(),
         );
@@ -1830,7 +1834,8 @@ async fn run_polyglot_bench(
             ..Default::default()
         };
         let mut agent = Agent::new(cfg.client.clone(), base_config);
-        agent.config_mut().max_iterations = cfg.max_iterations;
+        // Polyglot exercises need more iterations — some require Read + Edit + test
+        agent.config_mut().max_iterations = cfg.max_iterations.max(10);
         agent.config_mut().autorun_hops = clamp_autorun_hops(cfg.autorun_hops);
         if cfg.context_window != 16384 {
             agent.config_mut().context_window = cfg.context_window;
