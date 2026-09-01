@@ -17,7 +17,7 @@ pub use client::{
     ToolCallFunction,
 };
 pub use cloud::{CloudClient, MockCloud};
-pub use error::{Result, RuntimeError};
+pub use error::{ErrorClass, Result, RuntimeError};
 pub use grammar::{GrammarClient, GrammarConfig};
 #[cfg(feature = "llama")]
 pub use llama::LlamaCppClient;

@@ -1,5 +1,20 @@
 use thiserror::Error;
 
+/// Classification of errors for retry decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// Retryable: timeout, connection reset, 5xx
+    Transient,
+    /// Rate limited: 429
+    RateLimit,
+    /// Permanent: 400, 401, 403, unknown
+    Permanent,
+    /// Context overflow: needs compaction
+    Overflow,
+    /// Quota/billing: don't retry
+    Quota,
+}
+
 /// Errors that can occur in the kitty-runtime crate.
 #[derive(Error, Debug)]
 pub enum RuntimeError {
@@ -62,6 +77,46 @@ impl RuntimeError {
             RuntimeError::Http(e) => e.is_timeout() || e.is_connect(),
             _ => false,
         }
+    }
+
+    /// Classify the error type for retry decisions.
+    pub fn error_class(&self) -> ErrorClass {
+        match self {
+            RuntimeError::Api { status, .. } => match status {
+                429 => ErrorClass::RateLimit,
+                500 | 502 | 503 | 504 => ErrorClass::Transient,
+                _ => ErrorClass::Permanent,
+            },
+            RuntimeError::ConnectionRefused(_) => ErrorClass::Transient,
+            RuntimeError::ContextOverflow { .. } => ErrorClass::Overflow,
+            RuntimeError::Io(e) => match e.kind() {
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe => ErrorClass::Transient,
+                _ => ErrorClass::Permanent,
+            },
+            RuntimeError::Http(e) => {
+                if e.is_timeout() || e.is_connect() {
+                    ErrorClass::Transient
+                } else {
+                    ErrorClass::Permanent
+                }
+            }
+            _ => ErrorClass::Permanent,
+        }
+    }
+
+    /// Check if error is retryable (transient or rate-limit).
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self.error_class(),
+            ErrorClass::Transient | ErrorClass::RateLimit
+        )
+    }
+
+    /// Check if error is an overflow that needs compaction.
+    pub fn is_overflow(&self) -> bool {
+        matches!(self.error_class(), ErrorClass::Overflow)
     }
 }
 

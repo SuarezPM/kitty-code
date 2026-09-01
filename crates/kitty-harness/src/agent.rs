@@ -1455,7 +1455,7 @@ impl Agent {
                 .await
             {
                 Ok(resp) => return Ok(resp),
-                Err(e) if e.is_transient() && attempt < MAX_RETRIES => {
+                Err(e) if e.is_retryable() && attempt < MAX_RETRIES => {
                     let backoff = Duration::from_millis(500 * 2u64.pow(attempt as u32));
                     warn!(
                         attempt,
