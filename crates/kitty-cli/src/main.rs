@@ -6,6 +6,7 @@ mod tui;
 mod claweval;
 mod gpqa;
 mod mcp;
+mod polyglot;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -221,7 +222,8 @@ pub enum Commands {
     },
     /// Run benchmarks
     Bench {
-        /// Benchmark suite: polyglot, tb2, smoke, gpqa, gpqa_diamond, claweval
+        /// Benchmark suite: polyglot (225 Exercism exercises with unit test grading),
+        /// tb2 (terminal-bench), smoke, gpqa, gpqa_diamond, claweval
         /// (gpqa requires --pre-registration <PATH>;
         ///  claweval requires OPENROUTER_API_KEY + claw-eval CLI)
         #[arg(default_value = "polyglot")]
@@ -521,6 +523,11 @@ async fn main() -> Result<()> {
                     claweval_sandbox,
                 )
                 .await;
+            }
+
+            // --- Polyglot unit test grading (Aider-style 225 Exercism exercises) ---
+            if suite == "polyglot" {
+                return run_polyglot_bench(&cfg, &out, limit).await;
             }
 
             println!("Kitty Code Benchmark");
@@ -1733,6 +1740,171 @@ async fn run_claweval_suite(
             anyhow::bail!("ClawEval failed: {e}");
         }
     }
+}
+
+// ── Polyglot (Aider-style unit test grading) ──────────────────────
+
+/// Run the Aider Polyglot benchmark: 225 Exercism exercises with real unit test grading.
+async fn run_polyglot_bench(
+    cfg: &BenchConfig,
+    out: &PathBuf,
+    limit: usize,
+) -> Result<()> {
+    let base_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../bench/official/polyglot-benchmark");
+    if !base_dir.exists() {
+        anyhow::bail!(
+            "Polyglot benchmark directory not found: {}",
+            base_dir.display()
+        );
+    }
+
+    let exercises = polyglot::load_polyglot_exercises(&base_dir);
+    let take = limit.min(exercises.len());
+
+    println!("Kitty Code Polyglot (unit test grading)");
+    println!("  Model: {}", cfg.model);
+    println!("  Exercises: {} available, running {}", exercises.len(), take);
+
+    let store = if cfg.use_memory {
+        Some(EpisodeStore::open(&default_db_path())?)
+    } else {
+        None
+    };
+
+    let mut results: Vec<polyglot::PolyglotResult> = Vec::with_capacity(take);
+
+    for (i, ex) in exercises.iter().take(take).enumerate() {
+        print!("[{:2}/{:2}] {} ...", i + 1, take, ex.id);
+
+        // Build the prompt with workspace instructions
+        let prompt = format!(
+            "{}\n\nWork in directory: {} — implement the exercise in the existing source file(s)",
+            ex.prompt,
+            ex.exercise_dir.display(),
+        );
+
+        let start = Instant::now();
+        std::env::set_var(kitty_harness::agent::ENV_VERIFY_LOOP, "off");
+
+        let base_config = AgentConfig {
+            model: cfg.model.clone(),
+            profile: cfg.profile,
+            enable_knowledge: cfg.enable_knowledge,
+            knowledge_config: KnowledgeConfig {
+                enabled: cfg.enable_knowledge,
+                knowledge_dir: cfg.knowledge_dir.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut agent = Agent::new(cfg.client.clone(), base_config);
+        agent.config_mut().max_iterations = cfg.max_iterations;
+        agent.config_mut().autorun_hops = clamp_autorun_hops(cfg.autorun_hops);
+        if cfg.context_window != 16384 {
+            agent.config_mut().context_window = cfg.context_window;
+            agent.budget_mut().set_max(cfg.context_window);
+        }
+        if cfg.thinking_budget != 2048 {
+            agent.config_mut().tuning.thinking =
+                ThinkingMode::Budget(cfg.thinking_budget as u32);
+        }
+        if cfg.bash_timeout != 60 {
+            agent.config_mut().bash_timeout_secs = cfg.bash_timeout;
+        }
+        agent.config_mut().compact_threshold = cfg.profile.compact_threshold;
+        sync_budget_threshold(&mut agent, cfg.profile.compact_threshold);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(cfg.exercise_timeout_secs),
+            agent.run(&prompt),
+        )
+        .await;
+
+        // Let the agent work, then run the actual unit tests
+        let _ = outcome; // agent already ran; now grade with real tests
+        let mut result = polyglot::run_polyglot_exercise(ex).await;
+        result.latency_ms = start.elapsed().as_millis() as u64;
+
+        let status = if result.passed { "PASS" } else { "FAIL" };
+        println!("{} ({:.0}ms)", status, result.latency_ms);
+
+        // Persist episode for memory
+        if let Some(store) = &store {
+            let ep = Episode::new(
+                ex.prompt.clone(),
+                vec![],
+                Some(result.verdict.clone()),
+                format!(
+                    "{} {} (latency {:.0}ms)",
+                    ex.id, result.verdict, result.latency_ms
+                ),
+            );
+            store.save(&ep).ok();
+        }
+
+        results.push(result);
+    }
+
+    // Print summary
+    let total = results.len();
+    let passed = results.iter().filter(|r| r.passed).count();
+    let rate = if total > 0 {
+        100.0 * passed as f64 / total as f64
+    } else {
+        0.0
+    };
+
+    println!();
+    println!("RESULTS (Polyglot unit test grading)");
+    println!("Passed: {}/{} ({:.1}%)", passed, total, rate);
+
+    // Per-language breakdown
+    let mut by_lang: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for r in &results {
+        let entry = by_lang.entry(r.lang.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        if r.passed {
+            entry.1 += 1;
+        }
+    }
+    for (lang, (attempted, lang_passed)) in &by_lang {
+        let lang_rate = 100.0 * *lang_passed as f64 / *attempted as f64;
+        println!(
+            "  {lang}: attempted={} passed={} ({:.1}%)",
+            attempted, lang_passed, lang_rate
+        );
+    }
+
+    // Generate Aider-compatible report
+    let report = polyglot::generate_polyglot_report(&results);
+    let output = serde_json::json!({
+        "model": cfg.model,
+        "suite": "polyglot",
+        "total": total,
+        "passed": passed,
+        "rate_pct": rate,
+        "by_language": by_lang.iter().map(|(lang, (attempted, lang_passed))| {
+            (lang.clone(), serde_json::json!({
+                "attempted": attempted,
+                "passed": lang_passed,
+                "failed": attempted - lang_passed,
+            }))
+        }).collect::<std::collections::BTreeMap<String, serde_json::Value>>(),
+        "details": results.iter().map(|r| serde_json::json!({
+            "id": r.id,
+            "lang": r.lang,
+            "passed": r.passed,
+            "verdict": r.verdict,
+            "latency_ms": r.latency_ms,
+            "error": r.error,
+        })).collect::<Vec<_>>(),
+        "report": report,
+    });
+    std::fs::write(out, serde_json::to_string_pretty(&output)?)?;
+    println!("Results saved to {}", out.display());
+    Ok(())
 }
 
 // ── TB2: Terminal-Bench 2.0 ──────────────────────────────────────────
