@@ -55,7 +55,7 @@ fn overflow_patterns() -> &'static [Regex] {
             Regex::new(r"(?i)input.*length.*limit").unwrap(),
             Regex::new(r"(?i)sequence.*length").unwrap(),
             Regex::new(r"(?i)max.*tokens.*exceeded").unwrap(),
-            Regex::new(r"(?i)truncat").unwrap(),
+            Regex::new(r"(?i)truncat.*(context|token|input|prompt|length)").unwrap(),
         ]
     })
 }
@@ -102,7 +102,8 @@ mod tests {
 
     #[test]
     fn detect_generic_truncation() {
-        assert!(detect_overflow("output was truncated"));
+        assert!(detect_overflow("context was truncated due to token limit"));
+        assert!(!detect_overflow("output was truncated due to max_tokens"));
     }
 
     #[test]

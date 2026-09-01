@@ -1121,9 +1121,9 @@ fn raw_only_arguments(args: &serde_json::Value) -> Option<&str> {
 
 /// Attempt to repair a `_raw` salvage body into usable JSON arguments.
 ///
-/// Uses [`crate::json_repair::repair_and_coerce`] to fix control chars,
-/// invalid escapes, and apply type coercion. Returns `Some(repaired_value)`
-/// on success, `None` if the body cannot be salvaged.
+/// Uses [`crate::json_repair::repair_json`] to fix control chars and
+/// invalid escapes. Returns `Some(repaired_value)` on success,
+/// `None` if the body cannot be salvaged.
 fn attempt_raw_repair(raw: &str) -> Option<serde_json::Value> {
     // First try the parser's structural repair (smart quotes, trailing commas)
     let structurally_repaired = crate::parser::repair_json(raw);
