@@ -3142,6 +3142,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
     async fn execute_write_appends_lint_section_when_enabled() {
         let _g = lint_env_lock();
         let prev = std::env::var("KITTY_LINT_GATE").ok();
@@ -3174,6 +3175,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
     async fn execute_write_has_no_lint_section_when_disabled() {
         let _g = lint_env_lock();
         let prev = std::env::var("KITTY_LINT_GATE").ok();
