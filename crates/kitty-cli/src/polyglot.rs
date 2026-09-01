@@ -168,139 +168,163 @@ async fn run_cargo_test(exercise_dir: &Path) -> (bool, Option<String>) {
 }
 
 async fn run_node_test(exercise_dir: &Path) -> (bool, Option<String>) {
-    let output = tokio::process::Command::new("node")
-        .args(["--test"])
-        .current_dir(exercise_dir)
-        .output()
-        .await;
+    // Check if package.json exists (Exercism JS format)
+    if exercise_dir.join("package.json").exists() {
+        // Check if node_modules exists, if not install
+        if !exercise_dir.join("node_modules").exists() {
+            let install = tokio::process::Command::new("npm")
+                .arg("install")
+                .current_dir(exercise_dir)
+                .output()
+                .await;
 
-    match output {
-        Ok(o) => (
-            o.status.success(),
-            Some(String::from_utf8_lossy(&o.stderr).to_string()),
-        ),
-        Err(e) => (false, Some(e.to_string())),
+            if let Err(e) = install {
+                return (false, Some(format!("npm install failed: {}", e)));
+            }
+        }
+
+        let output = tokio::process::Command::new("npm")
+            .arg("test")
+            .current_dir(exercise_dir)
+            .output()
+            .await;
+
+        match output {
+            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
+            Err(e) => (false, Some(e.to_string())),
+        }
+    } else {
+        // Fallback: node --test
+        let output = tokio::process::Command::new("node")
+            .args(["--test"])
+            .current_dir(exercise_dir)
+            .output()
+            .await;
+
+        match output {
+            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
+            Err(e) => (false, Some(e.to_string())),
+        }
     }
 }
 
 async fn run_java_test(exercise_dir: &Path) -> (bool, Option<String>) {
-    // Find all .java files for compilation
-    let mut java_files: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(exercise_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".java") {
-                    java_files.push(name.to_string());
-                }
+    // Check if gradlew exists (Exercism Java format)
+    let gradlew = exercise_dir.join("gradlew");
+    if gradlew.exists() {
+        // Make gradlew executable
+        let _ = tokio::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&gradlew)
+            .output()
+            .await;
+
+        let output = tokio::process::Command::new(&gradlew)
+            .arg("test")
+            .current_dir(exercise_dir)
+            .output()
+            .await;
+
+        match output {
+            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
+            Err(e) => (false, Some(e.to_string())),
+        }
+    } else {
+        // Fallback: manual compile + run
+        let compile = tokio::process::Command::new("javac")
+            .args(["-d", "bin", "src/main/java/*.java"])
+            .current_dir(exercise_dir)
+            .output()
+            .await;
+
+        match compile {
+            Ok(o) if !o.status.success() => {
+                return (false, Some(String::from_utf8_lossy(&o.stderr).to_string()));
             }
+            Err(e) => return (false, Some(e.to_string())),
+            _ => {}
         }
-    }
-    if java_files.is_empty() {
-        return (false, Some("no .java files found".to_string()));
-    }
 
-    // Compile
-    let mut cmd = tokio::process::Command::new("javac");
-    cmd.arg("-d").arg("bin");
-    for f in &java_files {
-        cmd.arg(f);
-    }
-    cmd.current_dir(exercise_dir);
-    let compile = cmd.output().await;
+        let run = tokio::process::Command::new("java")
+            .args(["-cp", "bin", "Main"])
+            .current_dir(exercise_dir)
+            .output()
+            .await;
 
-    match compile {
-        Ok(o) if !o.status.success() => {
-            return (
-                false,
-                Some(String::from_utf8_lossy(&o.stderr).to_string()),
-            );
+        match run {
+            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
+            Err(e) => (false, Some(e.to_string())),
         }
-        Err(e) => return (false, Some(e.to_string())),
-        _ => {}
-    }
-
-    // Find the class with main (first .java file without "Test" in name)
-    let main_class = java_files
-        .iter()
-        .find(|f| !f.contains("Test"))
-        .and_then(|f| f.strip_suffix(".java"))
-        .unwrap_or("Main");
-
-    let run = tokio::process::Command::new("java")
-        .args(["-cp", "bin", main_class])
-        .current_dir(exercise_dir)
-        .output()
-        .await;
-
-    match run {
-        Ok(o) => (
-            o.status.success(),
-            Some(String::from_utf8_lossy(&o.stderr).to_string()),
-        ),
-        Err(e) => (false, Some(e.to_string())),
     }
 }
 
 async fn run_cpp_test(exercise_dir: &Path) -> (bool, Option<String>) {
-    // Find .cpp files
-    let mut cpp_files: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(exercise_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".cpp") && !name.contains("test") {
-                    cpp_files.push(name.to_string());
-                }
+    // Check if CMakeLists.txt exists (Exercism C++ format)
+    if exercise_dir.join("CMakeLists.txt").exists() {
+        // CMake build
+        let configure = tokio::process::Command::new("cmake")
+            .args(["-B", "build", "-DEXERCISM_COMMON_CATCH=ON"])
+            .current_dir(exercise_dir)
+            .output()
+            .await;
+
+        match configure {
+            Ok(o) if !o.status.success() => {
+                return (false, Some(format!("cmake configure failed: {}", String::from_utf8_lossy(&o.stderr))));
             }
+            Err(e) => return (false, Some(format!("cmake not found: {}", e))),
+            _ => {}
         }
-    }
-    if cpp_files.is_empty() {
-        // Try src/ subdirectory
-        let src_dir = exercise_dir.join("src");
-        if let Ok(entries) = std::fs::read_dir(&src_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".cpp") {
-                        cpp_files.push(format!("src/{}", name));
-                    }
-                }
+
+        let build = tokio::process::Command::new("cmake")
+            .args(["--build", "build"])
+            .current_dir(exercise_dir)
+            .output()
+            .await;
+
+        match build {
+            Ok(o) if !o.status.success() => {
+                return (false, Some(format!("cmake build failed: {}", String::from_utf8_lossy(&o.stderr))));
             }
+            Err(e) => return (false, Some(e.to_string())),
+            _ => {}
         }
-    }
-    if cpp_files.is_empty() {
-        return (false, Some("no .cpp files found".to_string()));
-    }
 
-    let sources = cpp_files.join(" ");
+        let test = tokio::process::Command::new("ctest")
+            .args(["--test-dir", "build", "--output-on-failure"])
+            .current_dir(exercise_dir)
+            .output()
+            .await;
 
-    // Also include header file base names without extension
-    let compile = tokio::process::Command::new("g++")
-        .args(["-std=c++17", "-o", "test", &sources])
-        .current_dir(exercise_dir)
-        .output()
-        .await;
-
-    match compile {
-        Ok(o) if !o.status.success() => {
-            return (
-                false,
-                Some(String::from_utf8_lossy(&o.stderr).to_string()),
-            );
+        match test {
+            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
+            Err(e) => (false, Some(e.to_string())),
         }
-        Err(e) => return (false, Some(e.to_string())),
-        _ => {}
-    }
+    } else {
+        // Fallback: compile and run (no Catch2)
+        let compile = tokio::process::Command::new("g++")
+            .args(["-std=c++17", "-o", "test", "src/*.cpp"])
+            .current_dir(exercise_dir)
+            .output()
+            .await;
 
-    let run = tokio::process::Command::new("./test")
-        .current_dir(exercise_dir)
-        .output()
-        .await;
+        match compile {
+            Ok(o) if !o.status.success() => {
+                return (false, Some(String::from_utf8_lossy(&o.stderr).to_string()));
+            }
+            Err(e) => return (false, Some(e.to_string())),
+            _ => {}
+        }
 
-    match run {
-        Ok(o) => (
-            o.status.success(),
-            Some(String::from_utf8_lossy(&o.stderr).to_string()),
-        ),
-        Err(e) => (false, Some(e.to_string())),
+        let run = tokio::process::Command::new("./test")
+            .current_dir(exercise_dir)
+            .output()
+            .await;
+
+        match run {
+            Ok(o) => (o.status.success(), Some(String::from_utf8_lossy(&o.stderr).to_string())),
+            Err(e) => (false, Some(e.to_string())),
+        }
     }
 }
 

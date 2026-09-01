@@ -1744,6 +1744,21 @@ async fn run_claweval_suite(
 
 // ── Polyglot (Aider-style unit test grading) ──────────────────────
 
+/// Recursively copy a directory tree from `src` to `dst`.
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Run the Aider Polyglot benchmark: 225 Exercism exercises with real unit test grading.
 async fn run_polyglot_bench(
     cfg: &BenchConfig,
@@ -1777,11 +1792,27 @@ async fn run_polyglot_bench(
     for (i, ex) in exercises.iter().take(take).enumerate() {
         print!("[{:2}/{:2}] {} ...", i + 1, take, ex.id);
 
-        // Build the prompt with workspace instructions
+        // Copy exercise to a tempdir so the agent's changes don't contaminate
+        // the original exercise directory — tests run against the copy.
+        let tmp_dir = tempfile::tempdir().context("Failed to create temp dir for polyglot exercise")?;
+        if let Err(e) = copy_dir_all(&ex.exercise_dir, tmp_dir.path()) {
+            println!(" (copy failed: {})", e);
+            results.push(polyglot::PolyglotResult {
+                id: ex.id.clone(),
+                lang: ex.lang.clone(),
+                passed: false,
+                latency_ms: 0,
+                verdict: "error".to_string(),
+                error: Some(format!("copy_dir_all failed: {}", e)),
+            });
+            continue;
+        }
+
+        // Build the prompt with workspace instructions pointing at the tempdir copy
         let prompt = format!(
             "{}\n\nWork in directory: {} — implement the exercise in the existing source file(s)",
             ex.prompt,
-            ex.exercise_dir.display(),
+            tmp_dir.path().display(),
         );
 
         let start = Instant::now();
@@ -1821,9 +1852,15 @@ async fn run_polyglot_bench(
         )
         .await;
 
-        // Let the agent work, then run the actual unit tests
+        // Let the agent work, then run the actual unit tests against the tempdir copy
         let _ = outcome; // agent already ran; now grade with real tests
-        let mut result = polyglot::run_polyglot_exercise(ex).await;
+        let tmp_exercise = polyglot::PolyglotExercise {
+            id: ex.id.clone(),
+            lang: ex.lang.clone(),
+            prompt: ex.prompt.clone(),
+            exercise_dir: tmp_dir.path().to_path_buf(),
+        };
+        let mut result = polyglot::run_polyglot_exercise(&tmp_exercise).await;
         result.latency_ms = start.elapsed().as_millis() as u64;
 
         let status = if result.passed { "PASS" } else { "FAIL" };
