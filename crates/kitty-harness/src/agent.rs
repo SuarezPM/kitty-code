@@ -18,6 +18,7 @@ use crate::context::{ContextBudget, ContextError};
 use crate::contract::{contract_guard_enabled, looks_like_done_claim, Contract};
 use crate::knowledge::{KnowledgeBase, KnowledgeConfig};
 use crate::model_profile::{ModelProfile, ModelTuning, PromptStyle, ThinkingMode};
+use crate::overflow;
 use crate::parser::{ParsedToolCall, ToolCallParser};
 use crate::quality_monitor::{QualityConfig, QualityMonitor, QualityViolation};
 use crate::router::{tools_for_category, ToolRouter};
@@ -349,6 +350,22 @@ fn model_stance_overlay(model: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Check whether an anyhow error represents a context overflow.
+///
+/// Matches both the typed [`kitty_runtime::RuntimeError::ContextOverflow`] variant
+/// and string-based overflow patterns from other providers (via
+/// [`crate::overflow::detect_overflow`]).
+fn is_context_overflow_error(e: &anyhow::Error) -> bool {
+    // Check for the typed ContextOverflow variant first
+    if let Some(runtime_err) = e.downcast_ref::<kitty_runtime::RuntimeError>() {
+        if matches!(runtime_err, kitty_runtime::RuntimeError::ContextOverflow { .. }) {
+            return true;
+        }
+    }
+    // Fall back to string-based pattern matching for non-runtime errors
+    overflow::detect_overflow(&e.to_string())
 }
 
 /// Effective per-turn thinking-token cap for a [`ThinkingMode`].
@@ -704,7 +721,19 @@ impl Agent {
                         saved_tools = Vec::new();
                     }
                     let turn_start = std::time::Instant::now();
-                    let response = self.llm_call().await?;
+                    let response = match self.llm_call().await {
+                        Ok(resp) => resp,
+                        Err(e) if is_context_overflow_error(&e) => {
+                            warn!(error = %e, "Context overflow detected, attempting compaction + retry");
+                            if let Err(compact_err) = self.trigger_compaction().await {
+                                warn!(error = %compact_err, "Compaction after overflow failed");
+                            }
+                            self.llm_call()
+                                .await
+                                .context("LLM call failed after overflow compaction")?
+                        }
+                        Err(e) => return Err(e),
+                    };
                     // Restore tools after the breaker turn.
                     if !saved_tools.is_empty() {
                         self.tools = saved_tools;

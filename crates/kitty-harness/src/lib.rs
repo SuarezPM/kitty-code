@@ -21,6 +21,8 @@ pub mod router;
 pub mod telemetry;
 pub mod sandbox;
 pub mod thinking_budget;
+pub mod json_repair;
+pub mod overflow;
 pub mod tools;
 
 pub use agent::{Agent, AgentEvent};

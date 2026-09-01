@@ -162,22 +162,32 @@ impl ToolRegistry {
         let call = normalize_tool_call(tc);
 
         // G3-5: a salvaged `_raw`-only arguments object means the model's
-        // JSON body could not be parsed. Surface WHAT was wrong (with the
-        // truncated recovered body) instead of letting the tool emit a
-        // generic missing-key error.
-        if let Some(raw) = raw_only_arguments(&call.arguments) {
-            return Ok(ToolResult {
-                success: false,
-                output: format!(
-                    "Tool call arguments were not valid JSON, so the call \
-                     could not be applied.\nRecovered body (truncated):\n{}\n\n\
-                     Re-send the call as proper JSON: \
-                     {{\"name\": \"<Tool>\", \"arguments\": {{...}}}}.",
-                    truncate_lines(raw, 6)
-                ),
-                retry: true,
-            });
-        }
+        // JSON body could not be parsed. Attempt JSON repair pipeline before
+        // giving up: parse the raw body, then apply schema-aware coercion.
+        let call = if let Some(raw) = raw_only_arguments(&call.arguments) {
+            if let Some(repaired) = attempt_raw_repair(raw) {
+                // Repair succeeded — rebuild the call with repaired arguments
+                // and re-normalize (aliases may have been in the raw body).
+                normalize_tool_call(&ParsedToolCall {
+                    name: call.name,
+                    arguments: repaired,
+                })
+            } else {
+                return Ok(ToolResult {
+                    success: false,
+                    output: format!(
+                        "Tool call arguments were not valid JSON, so the call \
+                         could not be applied.\nRecovered body (truncated):\n{}\n\n\
+                         Re-send the call as proper JSON: \
+                         {{\"name\": \"<Tool>\", \"arguments\": {{...}}}}.",
+                        truncate_lines(raw, 6)
+                    ),
+                    retry: true,
+                });
+            }
+        } else {
+            call
+        };
 
         let result = match call.name.as_str() {
             "Read" => self.execute_read(&call.arguments)?,
@@ -1107,6 +1117,29 @@ fn raw_only_arguments(args: &serde_json::Value) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// Attempt to repair a `_raw` salvage body into usable JSON arguments.
+///
+/// Uses [`crate::json_repair::repair_and_coerce`] to fix control chars,
+/// invalid escapes, and apply type coercion. Returns `Some(repaired_value)`
+/// on success, `None` if the body cannot be salvaged.
+fn attempt_raw_repair(raw: &str) -> Option<serde_json::Value> {
+    // First try the parser's structural repair (smart quotes, trailing commas)
+    let structurally_repaired = crate::parser::repair_json(raw);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&structurally_repaired) {
+        if v.is_object() {
+            return Some(v);
+        }
+    }
+    // Then try the low-level repair (control chars, invalid escapes)
+    let repaired = crate::json_repair::repair_json(raw);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&repaired) {
+        if v.is_object() {
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// Fold one incoming call onto canonical tool/argument naming.
