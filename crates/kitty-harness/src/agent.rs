@@ -1504,6 +1504,10 @@ impl Agent {
     }
 
     /// Trigger context compaction: summarize old messages and free tokens.
+    ///
+    /// Uses [`CompactionSummary`] for structured output — the LLM provides
+    /// prose, and file operations are extracted deterministically from tool
+    /// results to give small models a clear session-state snapshot.
     async fn trigger_compaction(&mut self) -> Result<()> {
         info!("Triggering context compaction");
 
@@ -1548,6 +1552,20 @@ impl Agent {
             .collect::<Vec<_>>()
             .join("\n");
 
+        // P2: extract file operations deterministically from tool results
+        let tool_outputs: Vec<String> = self.messages[..final_split]
+            .iter()
+            .filter_map(|m| {
+                if m.role == "tool" {
+                    m.content.clone()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let (read_files, modified_files) =
+            crate::compaction::extract_file_operations(&tool_outputs);
+
         let old_messages: Vec<Message> = self.messages.drain(..final_split).collect();
         debug_assert_eq!(old_messages.len(), final_split);
 
@@ -1583,8 +1601,17 @@ impl Agent {
             .content
             .unwrap_or_else(|| "[compaction summary unavailable]".to_string());
 
+        // P2: build structured summary with file operations
+        let structured = crate::compaction::CompactionSummary {
+            goal: summary_text,
+            read_files,
+            modified_files,
+            ..crate::compaction::CompactionSummary::empty()
+        };
+        let formatted_summary = structured.format_markdown();
+
         let freed = ContextBudget::estimate_tokens(&freed_text);
-        let needed = ContextBudget::estimate_tokens(&summary_text) + 100;
+        let needed = ContextBudget::estimate_tokens(&formatted_summary) + 100;
 
         // Record compaction
         if let Err(ContextError::InsufficientCompaction {
@@ -1604,7 +1631,7 @@ impl Agent {
             0,
             Message {
                 role: "system".to_string(),
-                content: Some(format!("[Context Summary]\n{summary_text}")),
+                content: Some(format!("[Context Summary]\n{formatted_summary}")),
                 thinking: None,
                 tool_calls: None,
             },

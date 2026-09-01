@@ -332,6 +332,46 @@ impl ToolRouter {
     }
 }
 
+// ── Tool-gated prompt guidelines ──────────────────────────────────
+
+/// Get prompt guidelines for active tools only.
+///
+/// Returns usage hints scoped to the tools that will actually be available
+/// in the current turn. This avoids wasting tokens on guidelines for tools
+/// that the router has excluded (e.g. no Write/Edit hints when only Read
+/// tools are active).
+pub fn active_tool_guidelines(active_tools: &[&str]) -> String {
+    let mut guidelines = String::new();
+
+    for tool in active_tools {
+        match *tool {
+            "Read" => {
+                guidelines
+                    .push_str("Read files before editing them. Use offset/limit for large files.\n");
+            }
+            "Write" => {
+                guidelines
+                    .push_str("Write creates new files only. Use Edit for existing files.\n");
+            }
+            "Edit" => {
+                guidelines.push_str("Edit requires exact text matching. Read the file first.\n");
+            }
+            "Bash" => {
+                guidelines.push_str("Bash commands run in a sandbox. Timeout per profile.\n");
+            }
+            "Grep" => {
+                guidelines.push_str("Grep uses regex. Respects .gitignore via ignore crate.\n");
+            }
+            "Glob" => {
+                guidelines.push_str("Glob finds files by pattern. Use ** for recursive.\n");
+            }
+            _ => {}
+        }
+    }
+
+    guidelines
+}
+
 // ── Free function required by spec ────────────────────────────────
 
 /// Free function `get_tools_for_prompt` (stateless, no affirmation guard).
@@ -476,5 +516,37 @@ mod tests {
         // explain maps to Plan or Read? Might be Plan (no tools) due to negative signals
         // Not asserting strict, just that function works and doesn't panic
         let _ = empty;
+    }
+
+    #[test]
+    fn active_tool_guidelines_empty() {
+        assert_eq!(active_tool_guidelines(&[]), "");
+    }
+
+    #[test]
+    fn active_tool_guidelines_read_only() {
+        let g = active_tool_guidelines(&["Read"]);
+        assert!(g.contains("Read files before editing"));
+        assert!(!g.contains("Write"));
+    }
+
+    #[test]
+    fn active_tool_guidelines_write_tools() {
+        let g = active_tool_guidelines(&["Read", "Write", "Edit"]);
+        assert!(g.contains("Read files before editing"));
+        assert!(g.contains("Write creates new files"));
+        assert!(g.contains("Edit requires exact text"));
+    }
+
+    #[test]
+    fn active_tool_guidelines_bash() {
+        let g = active_tool_guidelines(&["Bash"]);
+        assert!(g.contains("sandbox"));
+    }
+
+    #[test]
+    fn active_tool_guidelines_unknown_tool_ignored() {
+        let g = active_tool_guidelines(&["NonExistent"]);
+        assert!(g.is_empty());
     }
 }
