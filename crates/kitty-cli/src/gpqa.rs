@@ -867,6 +867,7 @@ pub fn idx_to_letter(idx: usize) -> Result<char, GpqaError> {
 
 // ── Normalización y grading A-D ───────────────────────────────────
 
+#[allow(dead_code)]
 pub fn normalize_answer(raw: &str) -> Option<char> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
