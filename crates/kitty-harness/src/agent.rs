@@ -388,6 +388,8 @@ pub struct Agent {
     /// 2-stage tool router (affirmation guard, stateful).
     router: ToolRouter,
     contract: Option<Contract>,
+    /// Consecutive invalid tool calls (NotFound, InvalidArgs) — breaker mechanism (F4.3).
+    invalid_streak: usize,
 }
 
 impl Agent {
@@ -505,6 +507,8 @@ impl Agent {
         let bash_timeout_secs = config.bash_timeout_secs;
         // f8 T2.3: the active profile governs the default Read window.
         let read_cap = config.profile.read_cap;
+        // F4.1: the active profile governs the Bash output cap.
+        let bash_output_cap = config.profile.bash_output_cap;
         // Gate-4: the Bash-sandbox FS allow-root must follow the configured
         // workspace explicitly — never silently inherit the process cwd
         // (launching from `$HOME` would otherwise make all of HOME writable).
@@ -518,7 +522,8 @@ impl Agent {
             budget,
             registry: ToolRegistry::with_timeout(bash_timeout_secs)
                 .with_workspace(workspace)
-                .with_read_cap(read_cap),
+                .with_read_cap(read_cap)
+                .with_bash_output_cap(bash_output_cap),
             parser: ToolCallParser::new(),
             thinking_budget,
             quality_monitor,
@@ -530,6 +535,7 @@ impl Agent {
             doom_loop: DoomLoopGuard::default(),
             router: ToolRouter::new(),
             contract: None,
+            invalid_streak: 0,
         }
     }
 
@@ -684,8 +690,25 @@ impl Agent {
                     }
 
                     // LLM call (F3.4: track turn start for telemetry latency)
+                    // F4.3: schema breaker — after 3 consecutive invalid tool calls,
+                    // restrict to no tools (Plan category) for the next turn.
+                    let saved_tools;
+                    if self.invalid_streak >= 3 {
+                        warn!(
+                            streak = self.invalid_streak,
+                            "Schema breaker: restricting tools for next turn"
+                        );
+                        saved_tools = std::mem::take(&mut self.tools);
+                        self.invalid_streak = 0;
+                    } else {
+                        saved_tools = Vec::new();
+                    }
                     let turn_start = std::time::Instant::now();
                     let response = self.llm_call().await?;
+                    // Restore tools after the breaker turn.
+                    if !saved_tools.is_empty() {
+                        self.tools = saved_tools;
+                    }
                     let turn_latency = turn_start.elapsed();
 
                     // Extract thinking tokens for budget tracking (thinking is metadata,
@@ -1064,10 +1087,21 @@ impl Agent {
     /// Returns `true` when the caller should break and re-read (retry).
     async fn execute_and_push_tool_result(&mut self, tc: &ParsedToolCall) -> Result<bool> {
         // F2.2: Tool errors become failed results, never abort.
+        // F4.3: Track invalid streak for schema breaker.
         let result = match self.registry.execute(tc).await {
-            Ok(r) => r,
+            Ok(r) => {
+                self.invalid_streak = 0;
+                r
+            }
             Err(e) => {
-                warn!(error = %e, name = tc.name, "Tool execution failed");
+                // F4.3: increment invalid streak on NotFound/InvalidArgs.
+                if matches!(
+                    e,
+                    crate::tools::ToolError::NotFound(_) | crate::tools::ToolError::InvalidArgs { .. }
+                ) {
+                    self.invalid_streak += 1;
+                }
+                warn!(error = %e, name = tc.name, streak = self.invalid_streak, "Tool execution failed");
                 crate::tools::ToolResult {
                     success: false,
                     output: format!("Tool '{}' failed: {e}", tc.name),

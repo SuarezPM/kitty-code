@@ -15,6 +15,17 @@ pub enum ContextError {
     InsufficientCompaction { freed: usize, needed: usize },
 }
 
+/// Lightweight snapshot saved before compaction for continuity.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionSnapshot {
+    /// Last N tool results (truncated to 200 chars each).
+    pub recent_tool_results: Vec<String>,
+    /// File currently being edited (if any).
+    pub active_file: Option<String>,
+    /// Current benchmark exercise (if any).
+    pub bench_exercise: Option<String>,
+}
+
 /// Context budget tracker.
 pub struct ContextBudget {
     max_tokens: usize,
@@ -24,6 +35,8 @@ pub struct ContextBudget {
     /// Maximum consecutive compactions before hard-stopping.
     max_consecutive_compactions: usize,
     compact_threshold: f32,
+    /// Lightweight snapshot saved before compaction for continuity.
+    snapshot: Option<CompactionSnapshot>,
 }
 
 impl ContextBudget {
@@ -71,6 +84,7 @@ impl ContextBudget {
             consecutive_compactions: 0,
             max_consecutive_compactions: 3,
             compact_threshold: threshold.clamp(0.1, 0.95),
+            snapshot: None,
         }
     }
 
@@ -154,6 +168,21 @@ impl ContextBudget {
     pub fn reset(&mut self) {
         self.used_tokens = 0;
         self.consecutive_compactions = 0;
+    }
+
+    /// Save a snapshot before compaction.
+    pub fn save_snapshot(&mut self, snapshot: CompactionSnapshot) {
+        self.snapshot = Some(snapshot);
+    }
+
+    /// Take the snapshot (returns None if not set, clears it).
+    pub fn take_snapshot(&mut self) -> Option<CompactionSnapshot> {
+        self.snapshot.take()
+    }
+
+    /// Get a reference to the snapshot without consuming it.
+    pub fn snapshot(&self) -> Option<&CompactionSnapshot> {
+        self.snapshot.as_ref()
     }
 
     /// Estimate tokens from a string (rough: 4 chars ≈ 1 token).

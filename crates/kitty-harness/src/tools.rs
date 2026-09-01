@@ -83,6 +83,8 @@ pub struct ToolRegistry {
     pub hashline: HashlineEditor,
     /// Bash command timeout in seconds (F1.3). Default: 60.
     bash_timeout_secs: u64,
+    /// Max characters returned by Bash output (F4.1). Default: 5_000.
+    bash_output_cap: usize,
     /// Max lines for Read tool output (F3.1). Default: 300.
     max_read_lines: usize,
     /// Kernel containment armed on every Bash child before spawn
@@ -109,6 +111,7 @@ impl ToolRegistry {
             file_modifications: 0,
             hashline: HashlineEditor::new(),
             bash_timeout_secs,
+            bash_output_cap: 5_000,
             max_read_lines: 300,
             bash_sandbox: Some(Sandbox::new(SandboxConfig::new(default_workspace_root()))),
         }
@@ -119,6 +122,14 @@ impl ToolRegistry {
     /// actually governs the default window; tests use it directly.
     pub fn with_read_cap(mut self, max_read_lines: usize) -> Self {
         self.max_read_lines = max_read_lines;
+        self
+    }
+
+    /// Override the default Bash output cap (F4.1).
+    /// The agent wires [`ModelProfile::bash_output_cap`] here so the active
+    /// profile governs the truncation threshold.
+    pub fn with_bash_output_cap(mut self, bash_output_cap: usize) -> Self {
+        self.bash_output_cap = bash_output_cap;
         self
     }
 
@@ -914,8 +925,8 @@ impl ToolRegistry {
             result.push_str(&stderr);
         }
 
-        // Truncate very long output
-        let max_output = 10_000;
+        // Truncate very long output (F4.1: profile-driven cap).
+        let max_output = self.bash_output_cap;
         if result.len() > max_output {
             result.truncate(max_output);
             result.push_str("\n... (output truncated)");

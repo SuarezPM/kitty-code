@@ -32,6 +32,8 @@ pub struct ModelProfile {
     pub read_cap: usize,
     /// Bash command timeout in seconds.
     pub bash_timeout_secs: u64,
+    /// Maximum characters returned by any single tool call.
+    pub bash_output_cap: usize,
     /// Compaction threshold (0.0-1.0).
     pub compact_threshold: f32,
     /// System-prompt verbosity for this tier (f8 T4.1).
@@ -48,6 +50,7 @@ static NANO: ModelProfile = ModelProfile {
     use_native_tools: false,
     read_cap: 80,
     bash_timeout_secs: 30,
+    bash_output_cap: 2_000,
     compact_threshold: 0.7,
     prompt_style: PromptStyle::Minimal,
 };
@@ -60,6 +63,7 @@ static TINY: ModelProfile = ModelProfile {
     use_native_tools: false,
     read_cap: 100,
     bash_timeout_secs: 30,
+    bash_output_cap: 3_000,
     compact_threshold: 0.7,
     prompt_style: PromptStyle::Full,
 };
@@ -72,6 +76,7 @@ static MEDIUM: ModelProfile = ModelProfile {
     use_native_tools: true,
     read_cap: 300,
     bash_timeout_secs: 60,
+    bash_output_cap: 5_000,
     compact_threshold: 0.8,
     prompt_style: PromptStyle::Full,
 };
@@ -84,6 +89,7 @@ static LARGE: ModelProfile = ModelProfile {
     use_native_tools: true,
     read_cap: 500,
     bash_timeout_secs: 120,
+    bash_output_cap: 10_000,
     compact_threshold: 0.8,
     prompt_style: PromptStyle::Full,
 };
