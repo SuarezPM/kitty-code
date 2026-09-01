@@ -517,6 +517,7 @@ async fn main() -> Result<()> {
             // --- ClawEval integration (F2: offline-first, local approximation) ---
             if suite == "claweval" {
                 return run_claweval_suite(
+                    &cli.model,
                     &out,
                     claweval_trials,
                     claweval_parallel,
@@ -1529,7 +1530,7 @@ async fn run_gpqa_suite(
 
         let (passed, verdict, latency_ms, normalized) = match outcome {
             Ok(Ok(response)) => {
-                let norm = crate::gpqa::normalize_answer(&response);
+                let norm = crate::gpqa::extract_answer_strict(&response);
                 let ok = crate::gpqa::grade_answer(norm, correct_letter);
                 // No logueamos el prompt ni la respuesta cruda más allá de la letra normalizada
                 (ok, if ok { "pass" } else { "fail" }, start.elapsed().as_millis() as f64, norm)
@@ -1627,6 +1628,7 @@ async fn run_gpqa_suite(
 /// ClawEval suite: offline-first preflight, wraps `claw-eval batch`.
 /// Results tagged as "local approximation — not official ClawEval leaderboard".
 async fn run_claweval_suite(
+    model: &str,
     out: &PathBuf,
     trials: usize,
     parallel: usize,
@@ -1667,7 +1669,7 @@ async fn run_claweval_suite(
     println!("  ClawEval version: {version_str}");
 
     let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
-    let model = "openrouter/default".to_string();
+    let model = model.to_string();
 
     let output_dir = {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());

@@ -906,9 +906,32 @@ pub fn grade_answer(normalized: Option<char>, correct_letter: char) -> bool {
     }
 }
 
+/// Extrae la respuesta estrictamente del formato `ANSWER: X` donde X es A-D.
+/// A diferencia de `normalize_answer`, solo acepta el patrón exacto y rechaza
+/// cualquier otro formato de respuesta para scoring comparable al leaderboard.
+pub fn extract_answer_strict(response: &str) -> Option<char> {
+    // Buscar "ANSWER:" (case-insensitive) seguido de opcionalmente espacios y una letra A-D
+    let upper = response.to_uppercase();
+    // Buscar la posición de "ANSWER:"
+    let marker = "ANSWER:";
+    let start = upper.find(marker)?;
+    let rest = &response[start + marker.len()..];
+    // Saltar espacios en blanco
+    let trimmed = rest.trim_start();
+    // Primer carácter debe ser A-D
+    let first = trimmed.chars().next()?;
+    if ('A'..='D').contains(&first.to_ascii_uppercase()) {
+        Some(first.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
 // ── Formato de prompt ──────────────────────────────────────────────
 
 /// Construye el prompt para una pregunta con opciones ya permutadas.
+/// Incluye instrucción CoT (Think step by step) para alinear con el
+/// formato oficial del leaderboard de GPQA.
 /// Retorna error si no hay exactamente 4 opciones, nunca panic.
 pub fn format_prompt(question: &str, options: &[String]) -> Result<String, GpqaError> {
     if options.len() != 4 {
@@ -918,13 +941,17 @@ pub fn format_prompt(question: &str, options: &[String]) -> Result<String, GpqaE
         )));
     }
     let mut out = String::new();
+    out.push_str("Think step by step before answering.\n\n\
+         Answer the following multiple choice question. The entire content of your response \n\
+         should be of the following format: 'ANSWER: $LETTER' (without quotes) where \n\
+         LETTER is one of A,B,C,D.\n\n\
+         Question\n\n");
     out.push_str(question.trim());
     out.push_str("\n\nOptions:\n");
     for (idx, opt) in options.iter().enumerate() {
         let letter = idx_to_letter(idx)?;
         out.push_str(&format!("{} ) {}\n", letter, opt.trim()));
     }
-    out.push_str("\nRespond with a single letter A, B, C, or D.");
     Ok(out)
 }
 
@@ -1278,6 +1305,49 @@ mod tests {
         assert_eq!(normalize_answer(""), None);
         assert!(grade_answer(Some('A'), 'A'));
         assert!(!grade_answer(Some('B'), 'A'));
+    }
+
+    #[test]
+    fn extract_answer_strict_valid() {
+        assert_eq!(extract_answer_strict("ANSWER: A"), Some('A'));
+        assert_eq!(extract_answer_strict("answer: b"), Some('B'));
+        assert_eq!(extract_answer_strict("Answer: C"), Some('C'));
+        assert_eq!(extract_answer_strict("ANSWER:D"), Some('D'));
+        // With leading text (CoT reasoning before the answer)
+        assert_eq!(
+            extract_answer_strict("Let me think about this...\nThe correct answer is...\n\nANSWER: B"),
+            Some('B')
+        );
+        assert_eq!(
+            extract_answer_strict("Step 1: analyze\nStep 2: conclude\n\nANSWER: C"),
+            Some('C')
+        );
+    }
+
+    #[test]
+    fn extract_answer_strict_rejects_invalid() {
+        // No marker
+        assert_eq!(extract_answer_strict("A"), None);
+        assert_eq!(extract_answer_strict("The answer is A"), None);
+        assert_eq!(extract_answer_strict("I think B is correct"), None);
+        // Invalid letter
+        assert_eq!(extract_answer_strict("ANSWER: X"), None);
+        assert_eq!(extract_answer_strict("ANSWER: E"), None);
+        // Empty
+        assert_eq!(extract_answer_strict(""), None);
+        assert_eq!(extract_answer_strict("ANSWER:"), None);
+    }
+
+    #[test]
+    fn format_prompt_contains_cot() {
+        let prompt = format_prompt("What is 2+2?", &["2".into(), "4".into(), "6".into(), "8".into()]).unwrap();
+        assert!(prompt.contains("Think step by step before answering"), "prompt must contain CoT instruction");
+        assert!(prompt.contains("ANSWER: $LETTER"), "prompt must describe ANSWER: format");
+        assert!(prompt.contains("What is 2+2?"), "prompt must contain the question");
+        assert!(prompt.contains("A ) 2"), "prompt must contain options");
+        assert!(prompt.contains("D ) 8"), "prompt must contain all options");
+        // Old footer should NOT be present
+        assert!(!prompt.contains("Respond with a single letter"), "old footer must be removed");
     }
 
     #[test]
