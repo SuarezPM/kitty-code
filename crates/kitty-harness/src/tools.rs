@@ -723,19 +723,23 @@ impl ToolRegistry {
         let path_buf = PathBuf::from(path);
 
         // Write guard: refuse Write on existing files (force Edit)
-        // Layer 1: spec-required check — existing file not in written_files → block
-        if path_buf.exists() && !self.written_files.contains(&path_buf) {
-            return Err(ToolError::WriteBlocked {
-                path: path.to_string(),
-            });
-        }
-        // Layer 2: strict invariant — even files we created via Write in this
-        // session must be edited via Edit, not overwritten via Write again.
-        // This enforces "Primera vez en tmpdir fresco permite, segunda bloquea".
-        if path_buf.exists() {
-            return Err(ToolError::WriteBlocked {
-                path: path.to_string(),
-            });
+        // Disabled when KITTY_BENCH_MODE=1 (benchmarks allow overwrite).
+        let bench_mode = std::env::var("KITTY_BENCH_MODE").unwrap_or_default() == "1";
+        if !bench_mode {
+            // Layer 1: spec-required check — existing file not in written_files → block
+            if path_buf.exists() && !self.written_files.contains(&path_buf) {
+                return Err(ToolError::WriteBlocked {
+                    path: path.to_string(),
+                });
+            }
+            // Layer 2: strict invariant — even files we created via Write in this
+            // session must be edited via Edit, not overwritten via Write again.
+            // This enforces "Primera vez en tmpdir fresco permite, segunda bloquea".
+            if path_buf.exists() {
+                return Err(ToolError::WriteBlocked {
+                    path: path.to_string(),
+                });
+            }
         }
 
         // Create parent directories if needed

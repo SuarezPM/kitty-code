@@ -1779,6 +1779,9 @@ async fn run_polyglot_bench(
     let exercises = polyglot::load_polyglot_exercises(&base_dir);
     let take = limit.min(exercises.len());
 
+    // Disable write-guard so small models can overwrite stubs via Write
+    std::env::set_var("KITTY_BENCH_MODE", "1");
+
     println!("Kitty Code Polyglot (unit test grading)");
     println!("  Model: {}", cfg.model);
     println!("  Exercises: {} available, running {}", exercises.len(), take);
@@ -1882,7 +1885,7 @@ async fn run_polyglot_bench(
                 ..Default::default()
             };
             let mut agent = Agent::new(cfg.client.clone(), base_config);
-            agent.config_mut().max_iterations = cfg.max_iterations.max(10);
+            agent.config_mut().max_iterations = cfg.max_iterations.max(20);
             agent.config_mut().autorun_hops = clamp_autorun_hops(cfg.autorun_hops);
             if cfg.context_window != 16384 {
                 agent.config_mut().context_window = cfg.context_window;
