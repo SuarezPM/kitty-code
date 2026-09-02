@@ -1801,6 +1801,7 @@ async fn run_polyglot_bench(
         let mut attempts = 0usize;
         let mut passed = false;
         let mut last_test_output = String::new();
+        let mut last_prompt = String::new();
         let mut error_msg: Option<String> = None;
 
         // Create tempdir ONCE before the retry loop so the agent's work
@@ -1827,9 +1828,10 @@ async fn run_polyglot_bench(
             }
         };
 
-        // Copy ONLY solution files (NO test files, NO .meta/)
+        // Copy ENTIRE exercise tree (NO .meta/) — test files visible as reference
+        // like little-coder. Agent sees stubs + tests, but prompt says "DO NOT edit tests".
         if let Err(e) =
-            polyglot::copy_solution_files_only(&ex.exercise_dir, tmp_dir.path(), &ex.config)
+            polyglot::copy_exercise_tree(&ex.exercise_dir, tmp_dir.path())
         {
             error_msg = Some(format!("copy solution files failed: {e}"));
             let latency_ms = start.elapsed().as_millis() as u64;
@@ -1851,17 +1853,18 @@ async fn run_polyglot_bench(
         while attempts < max_attempts {
             attempts += 1;
 
-            // Step 3: Build prompt — always include original instructions
+            // Step 3: Build prompt — always include original instructions (with tempdir absolute paths)
             let prompt = if attempts == 1 {
-                ex.prompt.clone()
+                polyglot::build_prompt(&ex.exercise_dir, &ex.config, tmp_dir.path())
             } else {
                 // Retry: original instructions + test output from previous attempt
                 format!(
                     "{}\n\n{}",
-                    ex.prompt,
-                    polyglot::retry_prompt(&last_test_output, &ex.config)
+                    polyglot::build_prompt(&ex.exercise_dir, &ex.config, tmp_dir.path()),
+                    polyglot::retry_prompt(&last_test_output)
                 )
             };
+            last_prompt = prompt.clone();
 
             // Step 4: Run agent (workspace = tempdir)
             std::env::set_var(kitty_harness::agent::ENV_VERIFY_LOOP, "off");
@@ -1962,7 +1965,7 @@ async fn run_polyglot_bench(
         // Persist episode for memory
         if let Some(store) = &store {
             let ep = Episode::new(
-                ex.prompt.clone(),
+                last_prompt,
                 vec![],
                 Some(result.verdict.clone()),
                 format!(

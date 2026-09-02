@@ -25,13 +25,13 @@ pub struct ExerciseFiles {
 }
 
 /// A Polyglot exercise loaded from official Exercism format.
+/// Prompt is built per-run with the tempdir path (not stored here).
 #[derive(Debug, Clone)]
 pub struct PolyglotExercise {
     pub id: String,
     pub lang: String,
     pub exercise_dir: PathBuf,
     pub config: ExerciseConfig,
-    pub prompt: String,
 }
 
 /// Result of running one exercise.
@@ -53,8 +53,15 @@ pub fn load_exercise_config(exercise_dir: &Path) -> Option<ExerciseConfig> {
     serde_json::from_str(&content).ok()
 }
 
-/// Build prompt from .docs/ directory files.
-pub fn build_prompt(exercise_dir: &Path, config: &ExerciseConfig) -> String {
+/// Build prompt from .docs/ directory files and absolute paths to tempdir.
+/// Follows little-coder's proven pattern: absolute stub paths + test paths
+/// labelled "for reference only — DO NOT edit" + syntax hint per language.
+pub fn build_prompt(exercise_dir: &Path, config: &ExerciseConfig, tempdir: &Path) -> String {
+    let exercise_name = exercise_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("exercise");
+
     let mut prompt = String::new();
 
     // Read introduction.md (optional)
@@ -82,42 +89,85 @@ pub fn build_prompt(exercise_dir: &Path, config: &ExerciseConfig) -> String {
         }
     }
 
-    // Add suffix with file list
-    let file_list = config.files.solution.join(", ");
+    // Build absolute path lists (like little-coder — agent sees real paths)
+    let stub_paths: Vec<String> = config
+        .files
+        .solution
+        .iter()
+        .map(|f| format!("{}/{}", tempdir.display(), f))
+        .collect();
+    let test_paths: Vec<String> = config
+        .files
+        .test
+        .iter()
+        .map(|f| format!("{}/{}", tempdir.display(), f))
+        .collect();
+
+    let stubs_list = stub_paths
+        .iter()
+        .map(|p| format!("  - {p}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tests_list = test_paths
+        .iter()
+        .map(|p| format!("  - {p}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Get syntax hint per language
+    let lang = exercise_dir
+        .ancestors()
+        .find(|p| p.join(".docs").exists())
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("python");
+    let syntax_hint = match lang {
+        "python" => "Use Python 3. Run tests with `python3 -m pytest -x -q`.",
+        "rust" => "Use Rust 2021 edition. Run tests with `cargo test --include-ignored`.",
+        "go" => "Use Go. Run tests with `go test ./...`.",
+        "javascript" => "Use Node.js. Run tests with `npm test`.",
+        "cpp" => "Use C++17. Run tests with `make test` or `cmake --build build && ctest`.",
+        "java" => "Use Java. Run tests with `./gradlew test`.",
+        _ => "Implement the exercise and run the tests.",
+    };
+
+    // Build the prompt following little-coder's pattern exactly
     prompt.push_str(&format!(
-        "Use the above instructions to modify the supplied files: {file_list}\n\
-         Don't change the names of existing functions or classes.\n\
-         Only use standard libraries."
+        "Implement the Exercism exercise `{exercise_name}`.\n\n\
+         Stub file(s) to implement:\n{stubs_list}\n\n\
+         Test file(s) (for reference only — DO NOT edit):\n{tests_list}\n\n\
+         {syntax_hint}\n\n\
+         Read the stubs + any `.docs/instructions.md` in the workspace, \
+         then implement the solution. When you believe the code is correct, \
+         stop calling tools."
     ));
 
     prompt
 }
 
-/// Copy only solution files + .docs/ to tempdir (NO test files, NO .meta/).
-pub fn copy_solution_files_only(
-    src: &Path,
-    dst: &Path,
-    config: &ExerciseConfig,
-) -> std::io::Result<()> {
-    // Copy solution files
-    for file in &config.files.solution {
-        let src_path = src.join(file);
-        let dst_path = dst.join(file);
-        if let Some(parent) = dst_path.parent() {
-            std::fs::create_dir_all(parent)?;
+/// Copy entire exercise tree excluding .meta/ (like little-coder pattern).
+/// Test files ARE visible to agent as reference — only .meta/ is hidden.
+pub fn copy_exercise_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    copy_dir_excluding(src, dst, ".meta")
+}
+
+fn copy_dir_excluding(src: &Path, dst: &Path, exclude: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy() == exclude {
+            continue;
         }
-        if src_path.exists() {
-            std::fs::copy(&src_path, &dst_path)?;
+        let ty = entry.file_type()?;
+        let dst_path = dst.join(&name);
+        if ty.is_dir() {
+            copy_dir_excluding(&entry.path(), &dst_path, exclude)?;
+        } else {
+            std::fs::copy(entry.path(), &dst_path)?;
         }
     }
-
-    // Copy .docs/ directory (for reference)
-    let docs_src = src.join(".docs");
-    let docs_dst = dst.join(".docs");
-    if docs_src.exists() {
-        copy_dir_all(&docs_src, &docs_dst)?;
-    }
-
     Ok(())
 }
 
@@ -189,39 +239,20 @@ pub fn test_command(lang: &str) -> &'static str {
     }
 }
 
-/// Build retry prompt with test output.
-pub fn retry_prompt(test_output: &str, config: &ExerciseConfig) -> String {
-    let file_list = config.files.solution.join(", ");
-    let truncated = if test_output.len() > 4000 {
-        // Take last 4000 chars, UTF-8 safe
-        test_output
-            .chars()
-            .rev()
-            .take(4000)
-            .collect::<String>()
-    } else {
-        test_output.to_string()
-    };
+/// Build retry prompt with test output (simplified, like little-coder).
+pub fn retry_prompt(test_output: &str) -> String {
+    let truncated: String = test_output
+        .chars()
+        .rev()
+        .take(4000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     format!(
-        "The tests failed. Output:\n```\n{truncated}\n```\n\
-         The tests are correct, don't try to change them.\n\
-         Fix the implementation in {file_list}."
+        "The tests failed. Output:\n\n```\n{truncated}\n```\n\n\
+         Fix the implementation and try again."
     )
-}
-
-/// Copy directory recursively.
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-        } else {
-            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
-        }
-    }
-    Ok(())
 }
 
 /// Load all Polyglot exercises from the benchmark directory.
@@ -252,7 +283,6 @@ pub fn load_polyglot_exercises(base_dir: &Path) -> Vec<PolyglotExercise> {
                 .to_string();
 
             if let Some(config) = load_exercise_config(&exercise_dir) {
-                let prompt = build_prompt(&exercise_dir, &config);
                 exercises.push(PolyglotExercise {
                     id: format!(
                         "{}-{}",
@@ -262,7 +292,6 @@ pub fn load_polyglot_exercises(base_dir: &Path) -> Vec<PolyglotExercise> {
                     lang: lang.to_string(),
                     exercise_dir,
                     config,
-                    prompt,
                 });
             }
         }
@@ -338,6 +367,7 @@ mod tests {
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("instructions.md"), "Implement the exercise.").unwrap();
 
+        let tmpdir = tempfile::tempdir().unwrap();
         let config = ExerciseConfig {
             files: ExerciseFiles {
                 solution: vec!["lib.rs".into()],
@@ -346,10 +376,14 @@ mod tests {
             },
         };
 
-        let prompt = build_prompt(dir.path(), &config);
+        let prompt = build_prompt(dir.path(), &config, tmpdir.path());
         assert!(prompt.contains("Implement the exercise."));
-        assert!(prompt.contains("lib.rs"));
-        assert!(prompt.contains("Don't change the names"));
+        // Must contain absolute paths in tempdir
+        let abs_stub = format!("{}/lib.rs", tmpdir.path().display());
+        assert!(prompt.contains(&abs_stub));
+        assert!(prompt.contains("Implement the Exercism exercise"));
+        // Test files labelled "for reference only"
+        assert!(prompt.contains("for reference only"));
     }
 
     #[test]
@@ -361,25 +395,17 @@ mod tests {
 
     #[test]
     fn retry_prompt_includes_output() {
-        let config = ExerciseConfig {
-            files: ExerciseFiles {
-                solution: vec!["lib.rs".into()],
-                test: vec!["tests/test.rs".into()],
-                example: vec![],
-            },
-        };
-        let prompt = retry_prompt("test failed: assertion error", &config);
+        let prompt = retry_prompt("test failed: assertion error");
         assert!(prompt.contains("test failed"));
-        assert!(prompt.contains("lib.rs"));
-        assert!(prompt.contains("don't try to change them"));
+        assert!(prompt.contains("The tests failed"));
     }
 
     #[test]
-    fn copy_solution_files_excludes_tests() {
+    fn copy_exercise_tree_excludes_meta() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
 
-        // Create source files
+        // Create a realistic exercise tree
         std::fs::create_dir_all(src.path().join("src")).unwrap();
         std::fs::write(src.path().join("src/lib.rs"), "fn main() {}").unwrap();
         std::fs::create_dir_all(src.path().join("tests")).unwrap();
@@ -389,23 +415,15 @@ mod tests {
         std::fs::create_dir_all(src.path().join(".meta")).unwrap();
         std::fs::write(src.path().join(".meta/config.json"), "{}").unwrap();
 
-        let config = ExerciseConfig {
-            files: ExerciseFiles {
-                solution: vec!["src/lib.rs".into()],
-                test: vec!["tests/test.rs".into()],
-                example: vec![],
-            },
-        };
-
-        copy_solution_files_only(src.path(), dst.path(), &config).unwrap();
+        copy_exercise_tree(src.path(), dst.path()).unwrap();
 
         // Solution file present
         assert!(dst.path().join("src/lib.rs").exists());
+        // Test file present (agent sees them as reference)
+        assert!(dst.path().join("tests/test.rs").exists());
         // .docs/ present
         assert!(dst.path().join(".docs/instructions.md").exists());
-        // Test file NOT present
-        assert!(!dst.path().join("tests/test.rs").exists());
-        // .meta/ NOT present
+        // .meta/ NOT present (excluded)
         assert!(!dst.path().join(".meta").exists());
     }
 
@@ -433,15 +451,8 @@ mod tests {
 
     #[test]
     fn retry_prompt_truncates_long_output() {
-        let config = ExerciseConfig {
-            files: ExerciseFiles {
-                solution: vec!["lib.rs".into()],
-                test: vec![],
-                example: vec![],
-            },
-        };
         let long_output = "x".repeat(8000);
-        let prompt = retry_prompt(&long_output, &config);
+        let prompt = retry_prompt(&long_output);
         // Should be truncated to ~4000 chars + framing
         assert!(prompt.len() < 8000);
         assert!(prompt.contains("The tests failed"));
