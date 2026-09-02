@@ -145,6 +145,7 @@ fn line_trimmed_candidates(content: &str, find: &str) -> Vec<String> {
     let mut out = Vec::new();
 
     for i in 0..=original_lines.len().saturating_sub(search_lines.len()) {
+        if i + search_lines.len() > original_lines.len() { break; }
         let matches = search_lines
             .iter()
             .zip(original_lines[i..].iter())
@@ -236,10 +237,12 @@ fn trimmed_boundary_candidates(content: &str, find: &str) -> Vec<String> {
 
     let find_line_count = find.split('\n').count();
     let lines: Vec<&str> = content.split('\n').collect();
-    for i in 0..=lines.len().saturating_sub(find_line_count) {
-        let block = lines[i..i + find_line_count].join("\n");
-        if block.trim() == trimmed_find {
-            out.push(block);
+    if find_line_count <= lines.len() {
+        for i in 0..=lines.len() - find_line_count {
+            let block = lines[i..i + find_line_count].join("\n");
+            if block.trim() == trimmed_find {
+                out.push(block);
+            }
         }
     }
     out
@@ -294,10 +297,12 @@ fn escape_normalized_candidates(content: &str, find: &str) -> Vec<String> {
 
     let find_line_count = unescaped_find.split('\n').count();
     let lines: Vec<&str> = content.split('\n').collect();
-    for i in 0..=lines.len().saturating_sub(find_line_count) {
-        let block = lines[i..i + find_line_count].join("\n");
-        if unescape_literal_escapes(&block) == unescaped_find {
-            out.push(block);
+    if find_line_count <= lines.len() {
+        for i in 0..=lines.len() - find_line_count {
+            let block = lines[i..i + find_line_count].join("\n");
+            if unescape_literal_escapes(&block) == unescaped_find {
+                out.push(block);
+            }
         }
     }
     out
@@ -338,10 +343,12 @@ fn indentation_flexible_candidates(content: &str, find: &str) -> Vec<String> {
     let find_line_count = find.split('\n').count();
     let lines: Vec<&str> = content.split('\n').collect();
     let mut out = Vec::new();
-    for i in 0..=lines.len().saturating_sub(find_line_count) {
-        let block = lines[i..i + find_line_count].join("\n");
-        if dedent(&block) == normalized_find {
-            out.push(block);
+    if find_line_count <= lines.len() {
+        for i in 0..=lines.len() - find_line_count {
+            let block = lines[i..i + find_line_count].join("\n");
+            if dedent(&block) == normalized_find {
+                out.push(block);
+            }
         }
     }
     out
