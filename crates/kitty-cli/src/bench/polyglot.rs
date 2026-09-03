@@ -40,7 +40,7 @@ pub(crate) async fn run_polyglot_bench(
     let take = limit.min(exercises.len());
 
     // Disable write-guard so small models can overwrite stubs via Write
-    std::env::set_var("KITTY_BENCH_MODE", "1");
+    std::env::set_var(kitty_harness::config::ENV_BENCH_MODE, "1");
 
     println!("Kitty Code Polyglot (unit test grading)");
     println!("  Model: {}", cfg.model);

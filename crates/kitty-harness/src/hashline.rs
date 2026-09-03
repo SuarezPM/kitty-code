@@ -449,4 +449,22 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, HashlineError::HashNotFound(_)));
     }
+
+    /// Mutation-testing regression (found by cargo-mutants): the
+    /// short-hash path (`old_hash.len() < 6`, exact comparison) must always
+    /// reject, because a sub-6-char hash can never equal a 64-char line
+    /// hash. Flipping `==` to `!=` there would silently accept any short
+    /// hash — this test pins the rejection.
+    #[test]
+    fn edit_by_hash_and_line_rejects_short_hash() {
+        let f = temp_file("aaa\nbbb\nccc");
+        let mut editor = HashlineEditor::new();
+        editor.read_file(f.path()).unwrap();
+        for short in ["a", "abc", "abcde"] {
+            let err = editor
+                .edit_by_hash_and_line(f.path(), short, 1, "XXX")
+                .unwrap_err();
+            assert!(matches!(err, HashlineError::HashNotFound(_)));
+        }
+    }
 }

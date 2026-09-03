@@ -34,3 +34,7 @@ results/
 *~
 .DS_Store
 .kitty/
+
+# --- Mutation testing scratch (cargo-mutants) ---
+mutants.out/
+mutants.out.old/

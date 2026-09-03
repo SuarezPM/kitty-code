@@ -5,6 +5,7 @@
 //! dispatch layer.
 
 use anyhow::{Context, Result};
+use kitty_harness::config::ENV_BENCH_TIMEOUT_SECS;
 use kitty_harness::ModelProfile;
 use kitty_runtime::OllamaClient;
 use std::path::PathBuf;
@@ -274,9 +275,6 @@ pub(crate) struct BenchConfig {
 /// real 9B-model tasks on split-GPU hardware routinely exceed this; raise
 /// via `--timeout-secs` or `KITTY_BENCH_TIMEOUT_SECS`.
 pub const DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS: u64 = 120;
-
-/// Env fallback for the per-exercise bench timeout (f9 calibration).
-pub const ENV_BENCH_TIMEOUT_SECS: &str = "KITTY_BENCH_TIMEOUT_SECS";
 
 /// Pure resolver for the per-exercise timeout — precedence: explicit CLI
 /// flag > `KITTY_BENCH_TIMEOUT_SECS` env > default 30.
