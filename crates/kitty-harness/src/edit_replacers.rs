@@ -145,7 +145,9 @@ fn line_trimmed_candidates(content: &str, find: &str) -> Vec<String> {
     let mut out = Vec::new();
 
     for i in 0..=original_lines.len().saturating_sub(search_lines.len()) {
-        if i + search_lines.len() > original_lines.len() { break; }
+        if i + search_lines.len() > original_lines.len() {
+            break;
+        }
         let matches = search_lines
             .iter()
             .zip(original_lines[i..].iter())

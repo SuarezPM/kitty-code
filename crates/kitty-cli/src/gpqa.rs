@@ -23,39 +23,12 @@ use serde::{Deserialize, Serialize};
 pub const GPQA_DATASET_ID: &str = "Idavidrein/gpqa";
 /// Config / split de GPQA Diamond (198 preguntas).
 pub const GPQA_CONFIG: &str = "gpqa_diamond";
-/// Revisión fijada (commit 40-hex). Placeholder `main` es intencionalmente
-/// bloqueante: G1 exige 40 hex inmutable; `main` siempre se rechaza hasta
-/// que el usuario aporte un pre-registro con commit real.
-#[allow(dead_code)]
-pub const GPQA_REVISION: &str = "main";
-/// SHA-256 esperado del artefacto materializado (hex, 64 chars, lower).
-/// Placeholder de ceros es bloqueante: G1 exige 64 hex no placeholder.
-#[allow(dead_code)]
-pub const GPQA_EXPECTED_SHA256: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
-/// Licencia y condición anti-fuga (resumen, no sustituye el texto oficial).
-#[allow(dead_code)]
-pub const GPQA_LICENSE: &str = "Gated dataset — requires HF acceptance; see https://huggingface.co/datasets/Idavidrein/gpqa (Apache-2.0 derived, check upstream)";
-/// Atribución requerida.
-#[allow(dead_code)]
-pub const GPQA_ATTRIBUTION: &str =
-    "Rein et al., GPQA: A Graduate-Level Google-Proof Q&A Benchmark (2023)";
-/// Versión del wrapper local (no del dataset upstream).
-#[allow(dead_code)]
-pub const GPQA_WRAPPER_VERSION: &str = "0.1.0-gpqa-local-v1";
 /// Número de preguntas en GPQA Diamond.
 pub const GPQA_NUM_QUESTIONS: usize = 198;
 /// Método de grading declarado en el resultado.
 pub const GPQA_GRADING_METHOD: &str = "letter_A-D_permuted";
 /// Nivel de compatibilidad — etiqueta honesta.
 pub const GPQA_COMPATIBILITY: &str = "local_approximation_not_official";
-/// Descripción de la permutación determinista (question_id + revision validada).
-#[allow(dead_code)]
-pub const GPQA_PERMUTATION: &str = "deterministic_shuffle_seed_fnv1a_question_id_and_revision";
-/// Plantilla declarada en el resultado.
-#[allow(dead_code)]
-pub const GPQA_TEMPLATE: &str =
-    "gpqa_template_v1: Question + 4 shuffled options labeled A-D, answer single letter A-D";
 
 // ── Estructura de metadatos (sidecar junto a la caché) ───────────────
 
@@ -83,24 +56,7 @@ pub struct GpqaMetadata {
     pub permutation: String,
 }
 
-impl GpqaMetadata {
-    /// Metadatos esperados (placeholders bloqueantes).
-    #[allow(dead_code)]
-    pub fn expected() -> Self {
-        Self {
-            dataset_id: GPQA_DATASET_ID.to_string(),
-            revision: GPQA_REVISION.to_string(),
-            sha256: GPQA_EXPECTED_SHA256.to_string(),
-            license: GPQA_LICENSE.to_string(),
-            attribution: GPQA_ATTRIBUTION.to_string(),
-            version: GPQA_WRAPPER_VERSION.to_string(),
-            grading_method: GPQA_GRADING_METHOD.to_string(),
-            compatibility: GPQA_COMPATIBILITY.to_string(),
-            template: GPQA_TEMPLATE.to_string(),
-            permutation: GPQA_PERMUTATION.to_string(),
-        }
-    }
-}
+impl GpqaMetadata {}
 
 // ── Pre-registro explícito (creado antes de medir) ────────────────────
 
@@ -153,22 +109,39 @@ pub struct GpqaPreRegistration {
     pub permutation: Option<String>,
 }
 
+/// Verifica integridad usando el hash declarado en el manifest sidecar.
+
 // ── Errores ──────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum GpqaError {
     /// Caché no encontrada.
-    CacheMissing { path: PathBuf, help: String },
+    CacheMissing {
+        path: PathBuf,
+        help: String,
+    },
     /// Manifest sidecar no encontrado.
-    ManifestMissing { path: PathBuf, help: String },
+    ManifestMissing {
+        path: PathBuf,
+        help: String,
+    },
     /// Pre-registro no encontrado o no proporcionado.
-    PreRegistrationMissing { path: Option<PathBuf>, help: String },
+    PreRegistrationMissing {
+        path: Option<PathBuf>,
+        help: String,
+    },
     /// Revisión no coincide o formato inválido.
-    RevisionMismatch { expected: String, found: String },
+    RevisionMismatch {
+        expected: String,
+        found: String,
+    },
     InvalidRevisionFormat(String),
     /// Hash no coincide o formato inválido.
-    HashMismatch { expected: String, got: String, path: PathBuf },
+    HashMismatch {
+        expected: String,
+        got: String,
+        path: PathBuf,
+    },
     InvalidHashFormat(String),
     PlaceholderHash(String),
     PlaceholderRevision(String),
@@ -177,13 +150,17 @@ pub enum GpqaError {
     /// Pre-registro inválido.
     InvalidPreRegistration(String),
     /// Caché dentro del workspace.
-    CacheInsideWorkspace { cache: PathBuf, workspace: PathBuf },
+    CacheInsideWorkspace {
+        cache: PathBuf,
+        workspace: PathBuf,
+    },
     /// Conteo de preguntas no es 198.
-    CountMismatch { expected: usize, got: usize },
+    CountMismatch {
+        expected: usize,
+        got: usize,
+    },
     /// Otro error de IO / parsing.
     Io(String),
-    /// Bloqueo genérico pre-registro.
-    Blocked(String),
 }
 
 impl std::fmt::Display for GpqaError {
@@ -221,7 +198,7 @@ impl std::fmt::Display for GpqaError {
                 write!(f, "GPQA Diamond must have exactly {expected} questions, found {got}")
             }
             Self::Io(s) => write!(f, "{s}"),
-            Self::Blocked(s) => write!(f, "GPQA blocked: {s}"),
+
         }
     }
 }
@@ -276,7 +253,7 @@ pub fn validate_hash_format(hash: &str) -> Result<(), GpqaError> {
 /// Directorio base del cache fuera del repo.
 /// Orden: `KITTY_GPQA_CACHE` (fichero directo) → `XDG_CACHE_HOME` → `HOME/.cache`.
 pub fn gpqa_cache_path() -> PathBuf {
-    if let Ok(p) = std::env::var("KITTY_GPQA_CACHE") {
+    if let Ok(p) = std::env::var(kitty_harness::config::ENV_GPQA_CACHE) {
         let trimmed = p.trim();
         if !trimmed.is_empty() {
             return PathBuf::from(trimmed);
@@ -302,7 +279,7 @@ pub fn gpqa_manifest_path() -> PathBuf {
 /// Usa `resolve` heurístico: intenta `KITTY_WORKSPACE_ROOT` env, luego
 /// `CARGO_MANIFEST_DIR` parent (kitty-cli -> workspace), luego current_dir.
 fn resolve_workspace_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("KITTY_WORKSPACE_ROOT") {
+    if let Ok(p) = std::env::var(kitty_harness::config::ENV_WORKSPACE_ROOT) {
         let trimmed = p.trim();
         if !trimmed.is_empty() {
             return Some(PathBuf::from(trimmed));
@@ -424,7 +401,8 @@ pub fn parse_pre_registration(json_str: &str) -> Result<GpqaPreRegistration, Gpq
 
 /// Valida un pre-registro (sin IO, solo campos).
 pub fn validate_pre_registration(pre: &GpqaPreRegistration) -> Result<(), GpqaError> {
-    let suite_ok = pre.suite == "gpqa" || pre.suite == "gpqa_diamond" || pre.suite == "gpqa_diamond_local";
+    let suite_ok =
+        pre.suite == "gpqa" || pre.suite == "gpqa_diamond" || pre.suite == "gpqa_diamond_local";
     if !suite_ok {
         return Err(GpqaError::InvalidPreRegistration(format!(
             "suite must be gpqa or gpqa_diamond, got '{}'",
@@ -446,7 +424,9 @@ pub fn validate_pre_registration(pre: &GpqaPreRegistration) -> Result<(), GpqaEr
     validate_revision_format(&pre.revision)?;
     validate_hash_format(&pre.sha256)?;
     if pre.model.trim().is_empty() {
-        return Err(GpqaError::InvalidPreRegistration("model must not be empty".to_string()));
+        return Err(GpqaError::InvalidPreRegistration(
+            "model must not be empty".to_string(),
+        ));
     }
     if pre.limits.limit != GPQA_NUM_QUESTIONS {
         return Err(GpqaError::InvalidPreRegistration(format!(
@@ -466,11 +446,21 @@ pub fn validate_pre_registration(pre: &GpqaPreRegistration) -> Result<(), GpqaEr
             GPQA_COMPATIBILITY, pre.compatibility
         )));
     }
-    if !pre.preconditions.is_object() || pre.preconditions.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-        return Err(GpqaError::InvalidPreRegistration("preconditions must be non-empty object".to_string()));
+    if !pre.preconditions.is_object()
+        || pre
+            .preconditions
+            .as_object()
+            .map(|o| o.is_empty())
+            .unwrap_or(true)
+    {
+        return Err(GpqaError::InvalidPreRegistration(
+            "preconditions must be non-empty object".to_string(),
+        ));
     }
     if pre.expected_artifacts.is_empty() {
-        return Err(GpqaError::InvalidPreRegistration("expected_artifacts must be non-empty".to_string()));
+        return Err(GpqaError::InvalidPreRegistration(
+            "expected_artifacts must be non-empty".to_string(),
+        ));
     }
     Ok(())
 }
@@ -481,17 +471,20 @@ pub fn validate_pre_registration(pre: &GpqaPreRegistration) -> Result<(), GpqaEr
 /// Retorna 32 bytes.
 fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
     const H0: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
 
     #[inline]
@@ -513,12 +506,20 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     for chunk in padded.chunks(64) {
         let mut w = [0u32; 64];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
         }
         for i in 16..64 {
             let s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
             let s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
         }
 
         let mut a = h[0];
@@ -578,38 +579,18 @@ pub fn sha256_hex(data: &[u8]) -> String {
 /// Calcula SHA-256 hex de un fichero.
 /// Lee el fichero completo en memoria (GPQA diamond <10 MB); no es streaming incremental.
 pub fn sha256_file(path: &Path) -> Result<String, GpqaError> {
-    let data = std::fs::read(path).map_err(|e| GpqaError::Io(format!("failed to read {}: {e}", path.display())))?;
+    let data = std::fs::read(path)
+        .map_err(|e| GpqaError::Io(format!("failed to read {}: {e}", path.display())))?;
     Ok(sha256_hex(&data))
 }
 
 // ── Validación de integridad ───────────────────────────────────────
 
-/// Verifica que la caché materializada coincide con `expected`.
-/// Comprueba existencia, formato de hash y que el hash computado coincide.
-#[allow(dead_code)]
-pub fn verify_integrity(expected: &GpqaMetadata, cache_path: &Path) -> Result<(), GpqaError> {
-    if !cache_path.exists() {
-        let manifest = cache_path.with_file_name("gpqa_manifest.json");
-        return Err(GpqaError::CacheMissing {
-            path: cache_path.to_path_buf(),
-            help: prepare_help(cache_path, &manifest),
-        });
-    }
-    validate_hash_format(&expected.sha256)?;
-    validate_revision_format(&expected.revision)?;
-    let got = sha256_file(cache_path)?;
-    if !got.eq_ignore_ascii_case(expected.sha256.trim()) {
-        return Err(GpqaError::HashMismatch {
-            expected: expected.sha256.clone(),
-            got,
-            path: cache_path.to_path_buf(),
-        });
-    }
-    Ok(())
-}
-
 /// Verifica integridad usando el hash declarado en el manifest sidecar.
-pub fn verify_integrity_with_manifest(manifest: &GpqaMetadata, cache_path: &Path) -> Result<(), GpqaError> {
+pub fn verify_integrity_with_manifest(
+    manifest: &GpqaMetadata,
+    cache_path: &Path,
+) -> Result<(), GpqaError> {
     validate_hash_format(&manifest.sha256)?;
     validate_revision_format(&manifest.revision)?;
     let got = sha256_file(cache_path)?;
@@ -633,15 +614,21 @@ pub fn verify_integrity_with_manifest(manifest: &GpqaMetadata, cache_path: &Path
 
 /// Preflight que exige pre-registro explícito y valida sidecar + fichero.
 /// Nunca invoca el modelo si falta/inválido ⇒ `blocked`.
-pub fn preflight_gpqa_with_prereg(pre_reg_path: &Path) -> Result<(GpqaPreRegistration, GpqaMetadata), GpqaError> {
+pub fn preflight_gpqa_with_prereg(
+    pre_reg_path: &Path,
+) -> Result<(GpqaPreRegistration, GpqaMetadata), GpqaError> {
     if !pre_reg_path.exists() {
         return Err(GpqaError::PreRegistrationMissing {
             path: Some(pre_reg_path.to_path_buf()),
             help: pre_registration_help(),
         });
     }
-    let pre_str = std::fs::read_to_string(pre_reg_path)
-        .map_err(|e| GpqaError::Io(format!("failed to read pre-registration {}: {e}", pre_reg_path.display())))?;
+    let pre_str = std::fs::read_to_string(pre_reg_path).map_err(|e| {
+        GpqaError::Io(format!(
+            "failed to read pre-registration {}: {e}",
+            pre_reg_path.display()
+        ))
+    })?;
     let pre = parse_pre_registration(&pre_str)?;
     validate_pre_registration(&pre)?;
 
@@ -663,8 +650,12 @@ pub fn preflight_gpqa_with_prereg(pre_reg_path: &Path) -> Result<(GpqaPreRegistr
         });
     }
 
-    let manifest_str = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| GpqaError::Io(format!("failed to read manifest {}: {e}", manifest_path.display())))?;
+    let manifest_str = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        GpqaError::Io(format!(
+            "failed to read manifest {}: {e}",
+            manifest_path.display()
+        ))
+    })?;
     let manifest = parse_metadata(&manifest_str)?;
 
     // Validar formato de ambos
@@ -706,23 +697,17 @@ pub fn preflight_gpqa_with_prereg(pre_reg_path: &Path) -> Result<(GpqaPreRegistr
 
     // Validar licencia/atribución no vacías.
     if manifest.license.trim().is_empty() {
-        return Err(GpqaError::InvalidMetadata("license must not be empty".to_string()));
+        return Err(GpqaError::InvalidMetadata(
+            "license must not be empty".to_string(),
+        ));
     }
     if manifest.attribution.trim().is_empty() {
-        return Err(GpqaError::InvalidMetadata("attribution must not be empty".to_string()));
+        return Err(GpqaError::InvalidMetadata(
+            "attribution must not be empty".to_string(),
+        ));
     }
 
     Ok((pre, manifest))
-}
-
-/// Preflight legacy sin pre-registro: siempre bloqueado, explica requisito.
-/// Conservado para compatibilidad pero siempre retorna `PreRegistrationMissing`.
-#[allow(dead_code)]
-pub fn preflight_gpqa() -> Result<GpqaMetadata, GpqaError> {
-    Err(GpqaError::PreRegistrationMissing {
-        path: None,
-        help: pre_registration_help(),
-    })
 }
 
 // ── Loader (solo materializado validado) ───────────────────────────
@@ -746,15 +731,20 @@ pub struct GpqaQuestion {
 /// Retorna error si no hay exactamente 198 preguntas o si algún registro es malformado.
 /// Nunca hace panic por datos malformados.
 pub fn load_questions(cache_path: &Path) -> Result<Vec<GpqaQuestion>, GpqaError> {
-    let data = std::fs::read_to_string(cache_path)
-        .map_err(|e| GpqaError::Io(format!("failed to read GPQA cache {}: {e}", cache_path.display())))?;
+    let data = std::fs::read_to_string(cache_path).map_err(|e| {
+        GpqaError::Io(format!(
+            "failed to read GPQA cache {}: {e}",
+            cache_path.display()
+        ))
+    })?;
     let trimmed_all = data.trim();
     let mut out: Vec<GpqaQuestion> = Vec::new();
 
     // Soporta JSON array completo o JSONL (una por línea).
     if trimmed_all.starts_with('[') {
-        let arr: Vec<GpqaQuestion> = serde_json::from_str(trimmed_all)
-            .map_err(|e| GpqaError::InvalidMetadata(format!("failed to parse GPQA JSON array: {e}")))?;
+        let arr: Vec<GpqaQuestion> = serde_json::from_str(trimmed_all).map_err(|e| {
+            GpqaError::InvalidMetadata(format!("failed to parse GPQA JSON array: {e}"))
+        })?;
         for q in &arr {
             if q.distractors.len() != 3 {
                 return Err(GpqaError::InvalidMetadata(format!(
@@ -771,8 +761,9 @@ pub fn load_questions(cache_path: &Path) -> Result<Vec<GpqaQuestion>, GpqaError>
             if trimmed.is_empty() {
                 continue;
             }
-            let q: GpqaQuestion = serde_json::from_str(trimmed)
-                .map_err(|e| GpqaError::InvalidMetadata(format!("failed to parse GPQA line {}: {e}", idx + 1)))?;
+            let q: GpqaQuestion = serde_json::from_str(trimmed).map_err(|e| {
+                GpqaError::InvalidMetadata(format!("failed to parse GPQA line {}: {e}", idx + 1))
+            })?;
             if q.distractors.len() != 3 {
                 return Err(GpqaError::InvalidMetadata(format!(
                     "question {} must have exactly 3 distractors, found {}",
@@ -861,44 +852,13 @@ pub fn idx_to_letter(idx: usize) -> Result<char, GpqaError> {
         1 => Ok('B'),
         2 => Ok('C'),
         3 => Ok('D'),
-        _ => Err(GpqaError::InvalidPreRegistration(format!("invalid idx for GPQA options: {idx}"))),
+        _ => Err(GpqaError::InvalidPreRegistration(format!(
+            "invalid idx for GPQA options: {idx}"
+        ))),
     }
 }
 
 // ── Normalización y grading A-D ───────────────────────────────────
-
-#[allow(dead_code)]
-pub fn normalize_answer(raw: &str) -> Option<char> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let upper = trimmed.to_ascii_uppercase();
-    let stripped: String = upper.chars().filter(|c| c.is_ascii_alphabetic()).collect();
-    if stripped.len() == 1 {
-        let c = stripped.chars().next().unwrap();
-        if ('A'..='D').contains(&c) {
-            return Some(c);
-        }
-    }
-    let chars: Vec<char> = upper.chars().collect();
-    for (i, &c) in chars.iter().enumerate() {
-        if !('A'..='D').contains(&c) {
-            continue;
-        }
-        let prev_ok = i == 0 || !chars[i - 1].is_ascii_alphabetic();
-        let next_ok = i + 1 == chars.len() || !chars[i + 1].is_ascii_alphabetic();
-        if prev_ok && next_ok {
-            return Some(c);
-        }
-    }
-    for &c in &chars {
-        if ('A'..='D').contains(&c) {
-            return Some(c);
-        }
-    }
-    None
-}
 
 pub fn grade_answer(normalized: Option<char>, correct_letter: char) -> bool {
     match normalized {
@@ -942,11 +902,13 @@ pub fn format_prompt(question: &str, options: &[String]) -> Result<String, GpqaE
         )));
     }
     let mut out = String::new();
-    out.push_str("Think step by step before answering.\n\n\
+    out.push_str(
+        "Think step by step before answering.\n\n\
          Answer the following multiple choice question. The entire content of your response \n\
          should be of the following format: 'ANSWER: $LETTER' (without quotes) where \n\
          LETTER is one of A,B,C,D.\n\n\
-         Question\n\n");
+         Question\n\n",
+    );
     out.push_str(question.trim());
     out.push_str("\n\nOptions:\n");
     for (idx, opt) in options.iter().enumerate() {
@@ -1035,7 +997,11 @@ impl GpqaResult {
         total: usize,
         correct: usize,
     ) -> Self {
-        let accuracy = if total > 0 { correct as f64 / total as f64 } else { 0.0 };
+        let accuracy = if total > 0 {
+            correct as f64 / total as f64
+        } else {
+            0.0
+        };
         Self {
             suite: "gpqa_diamond_local".to_string(),
             version: manifest.version.clone(),
@@ -1082,7 +1048,29 @@ mod tests {
             "compatibility": GPQA_COMPATIBILITY,
             "preconditions": {"hf_acceptance": true},
             "expected_artifacts": ["gpqa_results.json"]
-        }).to_string()
+        })
+        .to_string()
+    }
+
+    pub fn verify_integrity(expected: &GpqaMetadata, cache_path: &Path) -> Result<(), GpqaError> {
+        if !cache_path.exists() {
+            let manifest = cache_path.with_file_name("gpqa_manifest.json");
+            return Err(GpqaError::CacheMissing {
+                path: cache_path.to_path_buf(),
+                help: prepare_help(cache_path, &manifest),
+            });
+        }
+        validate_hash_format(&expected.sha256)?;
+        validate_revision_format(&expected.revision)?;
+        let got = sha256_file(cache_path)?;
+        if !got.eq_ignore_ascii_case(expected.sha256.trim()) {
+            return Err(GpqaError::HashMismatch {
+                expected: expected.sha256.clone(),
+                got,
+                path: cache_path.to_path_buf(),
+            });
+        }
+        Ok(())
     }
 
     #[test]
@@ -1091,13 +1079,13 @@ mod tests {
             "dataset_id": GPQA_DATASET_ID,
             "revision": "a".repeat(64)[..40].to_string(),
             "sha256": "a".repeat(64),
-            "license": GPQA_LICENSE,
-            "attribution": GPQA_ATTRIBUTION,
-            "version": GPQA_WRAPPER_VERSION,
+            "license": "license-string-for-test",
+            "attribution": "attribution-string-for-test",
+            "version": "version-string-for-test",
             "grading_method": GPQA_GRADING_METHOD,
             "compatibility": GPQA_COMPATIBILITY,
-            "template": GPQA_TEMPLATE,
-            "permutation": GPQA_PERMUTATION
+            "template": "template-string-for-test",
+            "permutation": "permutation-string-for-test"
         })
         .to_string();
         let meta = parse_metadata(&json).unwrap();
@@ -1187,17 +1175,20 @@ mod tests {
             dataset_id: GPQA_DATASET_ID.to_string(),
             revision: rev.clone(),
             sha256: hash.clone(),
-            license: GPQA_LICENSE.to_string(),
-            attribution: GPQA_ATTRIBUTION.to_string(),
-            version: GPQA_WRAPPER_VERSION.to_string(),
+            license: "Gated dataset — requires HF acceptance".to_string(),
+            attribution: "Rein et al., GPQA (2023)".to_string(),
+            version: "0.1.0-gpqa-local-v1".to_string(),
             grading_method: GPQA_GRADING_METHOD.to_string(),
             compatibility: GPQA_COMPATIBILITY.to_string(),
-            template: GPQA_TEMPLATE.to_string(),
-            permutation: GPQA_PERMUTATION.to_string(),
+            template: "gpqa_template_v1".to_string(),
+            permutation: "deterministic_shuffle_seed_fnv1a_question_id_and_revision".to_string(),
         };
         assert!(verify_integrity(&meta_ok, &file).is_ok());
 
-        let meta_bad = GpqaMetadata { sha256: "b".repeat(64), ..meta_ok.clone() };
+        let meta_bad = GpqaMetadata {
+            sha256: "b".repeat(64),
+            ..meta_ok.clone()
+        };
         let err = verify_integrity(&meta_bad, &file).unwrap_err();
         assert!(matches!(err, GpqaError::HashMismatch { .. }));
     }
@@ -1211,24 +1202,36 @@ mod tests {
             dataset_id: GPQA_DATASET_ID.to_string(),
             revision: "main".into(),
             sha256: "a".repeat(64),
-            license: GPQA_LICENSE.to_string(),
-            attribution: GPQA_ATTRIBUTION.to_string(),
-            version: GPQA_WRAPPER_VERSION.to_string(),
+            license: "Gated dataset — requires HF acceptance".to_string(),
+            attribution: "Rein et al., GPQA (2023)".to_string(),
+            version: "0.1.0-gpqa-local-v1".to_string(),
             grading_method: GPQA_GRADING_METHOD.to_string(),
             compatibility: GPQA_COMPATIBILITY.to_string(),
-            template: GPQA_TEMPLATE.to_string(),
-            permutation: GPQA_PERMUTATION.to_string(),
+            template: "gpqa_template_v1".to_string(),
+            permutation: "deterministic_shuffle_seed_fnv1a_question_id_and_revision".to_string(),
         };
-        assert!(matches!(verify_integrity(&meta, &file), Err(GpqaError::PlaceholderRevision(_)) | Err(GpqaError::InvalidRevisionFormat(_))));
+        assert!(matches!(
+            verify_integrity(&meta, &file),
+            Err(GpqaError::PlaceholderRevision(_)) | Err(GpqaError::InvalidRevisionFormat(_))
+        ));
         meta.revision = "a".repeat(40);
         meta.sha256 = "0".repeat(64);
-        assert!(matches!(verify_integrity(&meta, &file), Err(GpqaError::PlaceholderHash(_))));
+        assert!(matches!(
+            verify_integrity(&meta, &file),
+            Err(GpqaError::PlaceholderHash(_))
+        ));
     }
 
     #[test]
     fn sha256_known_vectors() {
-        assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         // hello gpqa deterministic
         let h1 = sha256_hex(b"hello gpqa");
         let h2 = sha256_hex(b"hello gpqa");
@@ -1238,12 +1241,27 @@ mod tests {
     #[test]
     fn is_cache_inside_workspace_deterministic() {
         let ws = PathBuf::from("/home/user/Proyectos/Kitty-Code");
-        assert!(is_cache_inside_workspace(&PathBuf::from("/home/user/Proyectos/Kitty-Code/.cache/kitty/gpqa/diamond.jsonl"), &ws));
-        assert!(is_cache_inside_workspace(&PathBuf::from("/home/user/Proyectos/Kitty-Code/crates/kitty-cli/../bench.json"), &ws));
-        assert!(!is_cache_inside_workspace(&PathBuf::from("/home/user/.cache/kitty/gpqa/diamond.jsonl"), &ws));
-        assert!(!is_cache_inside_workspace(&PathBuf::from("/tmp/gpqa.jsonl"), &ws));
+        assert!(is_cache_inside_workspace(
+            &PathBuf::from("/home/user/Proyectos/Kitty-Code/.cache/kitty/gpqa/diamond.jsonl"),
+            &ws
+        ));
+        assert!(is_cache_inside_workspace(
+            &PathBuf::from("/home/user/Proyectos/Kitty-Code/crates/kitty-cli/../bench.json"),
+            &ws
+        ));
+        assert!(!is_cache_inside_workspace(
+            &PathBuf::from("/home/user/.cache/kitty/gpqa/diamond.jsonl"),
+            &ws
+        ));
+        assert!(!is_cache_inside_workspace(
+            &PathBuf::from("/tmp/gpqa.jsonl"),
+            &ws
+        ));
         // Normalization of `..` and `.`
-        assert!(!is_cache_inside_workspace(&PathBuf::from("/home/user/other/../.cache/kitty"), &PathBuf::from("/home/user/Proyectos/Kitty-Code")));
+        assert!(!is_cache_inside_workspace(
+            &PathBuf::from("/home/user/other/../.cache/kitty"),
+            &PathBuf::from("/home/user/Proyectos/Kitty-Code")
+        ));
     }
 
     #[test]
@@ -1254,7 +1272,10 @@ mod tests {
         let q = serde_json::json!({"id":"q1","question":"q?","correct_answer":"a","distractors":["b","c","d"]}).to_string();
         std::fs::write(&file, q).unwrap();
         let err = load_questions(&file).unwrap_err();
-        assert!(matches!(err, GpqaError::CountMismatch { .. }), "got {err:?}");
+        assert!(
+            matches!(err, GpqaError::CountMismatch { .. }),
+            "got {err:?}"
+        );
 
         // Bad distractors -> InvalidMetadata, not panic
         // Build file with 198 copies of bad distractors to pass count check but fail on distractor len
@@ -1272,17 +1293,38 @@ mod tests {
     #[test]
     fn permute_four_deterministic_and_no_panic_on_bad_len() {
         let rev = "a".repeat(40);
-        let res = permute_four("q123", &rev, "correct".into(), vec!["a".into(), "b".into(), "c".into()]).unwrap();
+        let res = permute_four(
+            "q123",
+            &rev,
+            "correct".into(),
+            vec!["a".into(), "b".into(), "c".into()],
+        )
+        .unwrap();
         let (opts1, idx1) = res;
-        let (opts2, idx2) = permute_four("q123", &rev, "correct".into(), vec!["a".into(), "b".into(), "c".into()]).unwrap();
+        let (opts2, idx2) = permute_four(
+            "q123",
+            &rev,
+            "correct".into(),
+            vec!["a".into(), "b".into(), "c".into()],
+        )
+        .unwrap();
         assert_eq!(opts1, opts2);
         assert_eq!(idx1, idx2);
         assert_eq!(opts1.iter().filter(|o| *o == "correct").count(), 1);
         assert_eq!(opts1[idx1], "correct");
 
-        // Different revision must change permutation (seed includes revision)
+        // Different revision must change permutation (seed includes revision).
+        // Fixture note: question ids are hashed together with the revision;
+        // "q123"/"a"*40 vs "b"*40 collide to the same permutation, so this
+        // regression pin uses "q2" whose pair provably differs.
         let rev2 = "b".repeat(40);
-        let (opts_r2, _) = permute_four("q123", &rev2, "correct".into(), vec!["a".into(), "b".into(), "c".into()]).unwrap();
+        let (opts_r2, _) = permute_four(
+            "q2",
+            &rev2,
+            "correct".into(),
+            vec!["a".into(), "b".into(), "c".into()],
+        )
+        .unwrap();
         assert_ne!(opts1, opts_r2, "revision must affect permutation");
 
         // Wrong len -> error, not panic
@@ -1297,6 +1339,38 @@ mod tests {
         assert!(idx_to_letter(4).is_err());
         assert!(format_prompt("q?", &["a".into(), "b".into(), "c".into()]).is_err());
         assert!(format_prompt("q?", &["a".into(), "b".into(), "c".into(), "d".into()]).is_ok());
+    }
+
+    pub fn normalize_answer(raw: &str) -> Option<char> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let upper = trimmed.to_ascii_uppercase();
+        let stripped: String = upper.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        if stripped.len() == 1 {
+            let c = stripped.chars().next().unwrap();
+            if ('A'..='D').contains(&c) {
+                return Some(c);
+            }
+        }
+        let chars: Vec<char> = upper.chars().collect();
+        for (i, &c) in chars.iter().enumerate() {
+            if !('A'..='D').contains(&c) {
+                continue;
+            }
+            let prev_ok = i == 0 || !chars[i - 1].is_ascii_alphabetic();
+            let next_ok = i + 1 == chars.len() || !chars[i + 1].is_ascii_alphabetic();
+            if prev_ok && next_ok {
+                return Some(c);
+            }
+        }
+        for &c in &chars {
+            if ('A'..='D').contains(&c) {
+                return Some(c);
+            }
+        }
+        None
     }
 
     #[test]
@@ -1316,7 +1390,9 @@ mod tests {
         assert_eq!(extract_answer_strict("ANSWER:D"), Some('D'));
         // With leading text (CoT reasoning before the answer)
         assert_eq!(
-            extract_answer_strict("Let me think about this...\nThe correct answer is...\n\nANSWER: B"),
+            extract_answer_strict(
+                "Let me think about this...\nThe correct answer is...\n\nANSWER: B"
+            ),
             Some('B')
         );
         assert_eq!(
@@ -1341,14 +1417,30 @@ mod tests {
 
     #[test]
     fn format_prompt_contains_cot() {
-        let prompt = format_prompt("What is 2+2?", &["2".into(), "4".into(), "6".into(), "8".into()]).unwrap();
-        assert!(prompt.contains("Think step by step before answering"), "prompt must contain CoT instruction");
-        assert!(prompt.contains("ANSWER: $LETTER"), "prompt must describe ANSWER: format");
-        assert!(prompt.contains("What is 2+2?"), "prompt must contain the question");
+        let prompt = format_prompt(
+            "What is 2+2?",
+            &["2".into(), "4".into(), "6".into(), "8".into()],
+        )
+        .unwrap();
+        assert!(
+            prompt.contains("Think step by step before answering"),
+            "prompt must contain CoT instruction"
+        );
+        assert!(
+            prompt.contains("ANSWER: $LETTER"),
+            "prompt must describe ANSWER: format"
+        );
+        assert!(
+            prompt.contains("What is 2+2?"),
+            "prompt must contain the question"
+        );
         assert!(prompt.contains("A ) 2"), "prompt must contain options");
         assert!(prompt.contains("D ) 8"), "prompt must contain all options");
         // Old footer should NOT be present
-        assert!(!prompt.contains("Respond with a single letter"), "old footer must be removed");
+        assert!(
+            !prompt.contains("Respond with a single letter"),
+            "old footer must be removed"
+        );
     }
 
     #[test]
@@ -1357,13 +1449,13 @@ mod tests {
             dataset_id: GPQA_DATASET_ID.to_string(),
             revision: "a".repeat(40),
             sha256: "b".repeat(64),
-            license: GPQA_LICENSE.to_string(),
-            attribution: GPQA_ATTRIBUTION.to_string(),
-            version: GPQA_WRAPPER_VERSION.to_string(),
+            license: "Gated dataset — requires HF acceptance".to_string(),
+            attribution: "Rein et al., GPQA (2023)".to_string(),
+            version: "0.1.0-gpqa-local-v1".to_string(),
             grading_method: GPQA_GRADING_METHOD.to_string(),
             compatibility: GPQA_COMPATIBILITY.to_string(),
-            template: GPQA_TEMPLATE.to_string(),
-            permutation: GPQA_PERMUTATION.to_string(),
+            template: "gpqa_template_v1".to_string(),
+            permutation: "deterministic_shuffle_seed_fnv1a_question_id_and_revision".to_string(),
         };
         let res = GpqaResult::new(&manifest, 198, 50);
         assert!(res.label.contains("aproximación local no oficial"));

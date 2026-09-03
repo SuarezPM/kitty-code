@@ -59,9 +59,7 @@ impl TelemetryWriter {
     /// Create a new writer. If `dir` is None, uses `.kitty/telemetry/` in the workspace.
     /// Checks `KITTY_TELEMETRY=off` to disable.
     pub fn new(dir: Option<&Path>) -> Self {
-        let enabled = std::env::var("KITTY_TELEMETRY")
-            .map(|v| v != "off")
-            .unwrap_or(true);
+        let enabled = crate::config::telemetry_enabled();
 
         let default_dir = PathBuf::from(".kitty/telemetry");
         let base = match dir {
@@ -124,13 +122,20 @@ impl TelemetryWriter {
                             .extension()
                             .map(|ext| ext == "jsonl")
                             .unwrap_or(false)
-                            && e.path().file_name().map(|n| n != "current.jsonl").unwrap_or(false)
+                            && e.path()
+                                .file_name()
+                                .map(|n| n != "current.jsonl")
+                                .unwrap_or(false)
                     })
                     .collect()
             })
             .unwrap_or_default();
 
-        entries.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH));
+        entries.sort_by_key(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH)
+        });
 
         while entries.len() >= MAX_ROTATIONS {
             if let Some(oldest) = entries.first() {
@@ -153,9 +158,7 @@ impl TelemetryWriter {
 
 /// Check if telemetry is enabled (for callers that want to skip expensive prep).
 pub fn is_telemetry_enabled() -> bool {
-    std::env::var("KITTY_TELEMETRY")
-        .map(|v| v != "off")
-        .unwrap_or(true)
+    crate::config::telemetry_enabled()
 }
 
 #[cfg(test)]
@@ -280,7 +283,12 @@ mod tests {
         let entries: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|ext| ext == "jsonl").unwrap_or(false))
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "jsonl")
+                    .unwrap_or(false)
+            })
             .collect();
         assert!(entries.len() >= 2, "should have rotated file");
         let _ = fs::remove_dir_all(&dir);

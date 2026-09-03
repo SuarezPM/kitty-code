@@ -125,25 +125,44 @@ mod tests {
     use super::*;
 
     fn api_err(status: u16) -> RuntimeError {
-        RuntimeError::Api { status, message: "test".into() }
+        RuntimeError::Api {
+            status,
+            message: "test".into(),
+        }
     }
 
     #[test]
-    fn transient_429() { assert!(api_err(429).is_transient()); }
+    fn transient_429() {
+        assert!(api_err(429).is_transient());
+    }
     #[test]
-    fn transient_500() { assert!(api_err(500).is_transient()); }
+    fn transient_500() {
+        assert!(api_err(500).is_transient());
+    }
     #[test]
-    fn transient_502() { assert!(api_err(502).is_transient()); }
+    fn transient_502() {
+        assert!(api_err(502).is_transient());
+    }
     #[test]
-    fn transient_503() { assert!(api_err(503).is_transient()); }
+    fn transient_503() {
+        assert!(api_err(503).is_transient());
+    }
     #[test]
-    fn transient_504() { assert!(api_err(504).is_transient()); }
+    fn transient_504() {
+        assert!(api_err(504).is_transient());
+    }
     #[test]
-    fn non_transient_400() { assert!(!api_err(400).is_transient()); }
+    fn non_transient_400() {
+        assert!(!api_err(400).is_transient());
+    }
     #[test]
-    fn non_transient_401() { assert!(!api_err(401).is_transient()); }
+    fn non_transient_401() {
+        assert!(!api_err(401).is_transient());
+    }
     #[test]
-    fn non_transient_404() { assert!(!api_err(404).is_transient()); }
+    fn non_transient_404() {
+        assert!(!api_err(404).is_transient());
+    }
     #[test]
     fn transient_connection_refused() {
         assert!(RuntimeError::ConnectionRefused("test".into()).is_transient());
@@ -155,11 +174,15 @@ mod tests {
     }
     #[test]
     fn non_transient_io_other() {
-        let io = std::io::Error::new(std::io::ErrorKind::Other, "other");
+        let io = std::io::Error::other("other");
         assert!(!RuntimeError::Io(io).is_transient());
     }
     #[test]
     fn non_transient_context_overflow() {
-        assert!(!RuntimeError::ContextOverflow { requested: 0, message: "test".into() }.is_transient());
+        assert!(!RuntimeError::ContextOverflow {
+            requested: 0,
+            message: "test".into()
+        }
+        .is_transient());
     }
 }

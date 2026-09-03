@@ -79,8 +79,9 @@ pub struct ToolRegistry {
     /// by the verification loop to decide whether test failures are the
     /// agent's doing.
     file_modifications: usize,
-    /// The hashline editor for file operations.
-    pub hashline: HashlineEditor,
+    /// The hashline editor for file operations (private — external code goes
+    /// through ToolRegistry methods so the read-before-edit invariant holds).
+    hashline: HashlineEditor,
     /// Bash command timeout in seconds (F1.3). Default: 60.
     bash_timeout_secs: u64,
     /// Max characters returned by Bash output (F4.1). Default: 5_000.
@@ -724,7 +725,7 @@ impl ToolRegistry {
 
         // Write guard: refuse Write on existing files (force Edit)
         // Disabled when KITTY_BENCH_MODE=1 (benchmarks allow overwrite).
-        let bench_mode = std::env::var("KITTY_BENCH_MODE").unwrap_or_default() == "1";
+        let bench_mode = crate::config::bench_mode();
         if !bench_mode {
             // Layer 1: spec-required check — existing file not in written_files → block
             if path_buf.exists() && !self.written_files.contains(&path_buf) {
@@ -833,11 +834,8 @@ impl ToolRegistry {
         // at `Sandbox::apply`). `KITTY_SANDBOX=off` is honored ONLY when set;
         // every activation logs a warning so an unsandboxed run is never
         // silent.
-        let sandbox: Option<&Sandbox> = match (
-            &self.bash_sandbox,
-            std::env::var("KITTY_SANDBOX").as_deref(),
-        ) {
-            (Some(_), Ok("off")) => {
+        let sandbox: Option<&Sandbox> = match (&self.bash_sandbox, crate::config::sandbox_off()) {
+            (Some(_), true) => {
                 tracing::warn!(
                     "KITTY_SANDBOX=off: Bash command runs WITHOUT kernel \
                          containment (explicit opt-out)"
@@ -1190,13 +1188,13 @@ fn rekey_arg_aliases(args: serde_json::Value) -> serde_json::Value {
 /// Whether per-edit syntax checks are enabled (`KITTY_EDIT_CHECK=1`).
 /// Off by default: checks cost a subprocess per edit; benchmarks opt in.
 fn edit_check_enabled() -> bool {
-    std::env::var("KITTY_EDIT_CHECK").as_deref() == Ok("1")
+    crate::config::edit_check()
 }
 
 /// Whether the post-edit lint gate is enabled (`KITTY_LINT_GATE=1`).
 /// Off by default (same cost rationale as [`edit_check_enabled`]).
 fn lint_gate_enabled() -> bool {
-    std::env::var("KITTY_LINT_GATE").as_deref() == Ok("1")
+    crate::config::lint_gate()
 }
 
 /// Append the lint-gate section to a tool output when `KITTY_LINT_GATE=1`.
@@ -2409,7 +2407,7 @@ mod tests {
             );
             return;
         }
-        if std::env::var("KITTY_SANDBOX").as_deref() == Ok("off") {
+        if crate::config::sandbox_off() {
             println!("SKIP: KITTY_SANDBOX=off set — containment intentionally disabled");
             return;
         }
@@ -3007,7 +3005,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_check_disabled_by_default() {
-        if std::env::var("KITTY_EDIT_CHECK").as_deref() == Ok("1") {
+        if crate::config::edit_check() {
             println!("SKIP: KITTY_EDIT_CHECK=1 set in ambient environment");
             return;
         }

@@ -40,7 +40,7 @@ use crate::client::{ChatResponse, Message, ToolCall, ToolCallFunction, ENV_TIMEO
 use crate::error::{Result, RuntimeError};
 use crate::tools::ToolDefinition;
 
-const ENV_API_KEY: &str = "KITTY_CLOUD_API_KEY";
+pub const ENV_API_KEY: &str = "KITTY_CLOUD_API_KEY";
 const ENV_BASE_URL: &str = "KITTY_CLOUD_BASE_URL";
 
 /// Default request timeout for [`CloudClient`] — 120s.
@@ -205,20 +205,15 @@ struct CloudChatRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct CloudChatResponse {
-    id: Option<String>,
     model: Option<String>,
     choices: Vec<CloudChoice>,
     usage: Option<CloudUsage>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct CloudChoice {
     message: CloudMessage,
-    #[serde(default)]
-    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,11 +255,7 @@ struct CloudUsage {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct CloudModelsResponse {
-    #[serde(default)]
-    data: Vec<serde_json::Value>,
-}
+struct CloudModelsResponse {}
 
 // ---------------------------------------------------------------------------
 // CloudClient — generic frontier

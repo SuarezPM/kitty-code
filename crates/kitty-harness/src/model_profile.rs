@@ -360,7 +360,7 @@ impl ModelTuning {
 /// leniently (invalid ones skipped silently); the first entry whose prefix
 /// matches the model id wins; when the variable is set but nothing matches,
 /// the static [`MODEL_TURN_CAPS`] table applies.
-pub const ENV_MODEL_TURN_CAPS: &str = "KITTY_MODEL_TURN_CAPS";
+pub use crate::config::ENV_MODEL_TURN_CAPS;
 
 /// Iteration cap for `model_id`, if one is configured.
 ///

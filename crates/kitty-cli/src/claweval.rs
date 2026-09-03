@@ -20,10 +20,6 @@ pub const CLAWEVAL_COMPATIBILITY: &str = "local_approximation_not_official";
 /// Default number of trials per task.
 pub const CLAWEVAL_DEFAULT_TRIALS: usize = 3;
 
-/// Default parallelism.
-#[allow(dead_code)]
-pub const CLAWEVAL_DEFAULT_PARALLEL: usize = 1;
-
 // ── Preflight ──────────────────────────────────────────────────────
 
 /// Status of ClawEval preflight checks.
@@ -212,7 +208,12 @@ impl std::fmt::Display for ClawEvalError {
                 )
             }
             Self::OutputDirError { path, help } => {
-                write!(f, "ClawEval output dir error at {}\n{}", path.display(), help)
+                write!(
+                    f,
+                    "ClawEval output dir error at {}\n{}",
+                    path.display(),
+                    help
+                )
             }
             Self::BatchSummaryMissing { path, help } => {
                 write!(
@@ -304,7 +305,10 @@ pub enum ClawEvalStatus {
     /// Missing CLI, Docker, or API key — cannot run.
     Blocked { reasons: Vec<String> },
     /// Executed locally — results are local approximation, not official.
-    Executed { result: ClawEvalResult, official: bool },
+    Executed {
+        result: ClawEvalResult,
+        official: bool,
+    },
 }
 
 // ── Execution ──────────────────────────────────────────────────────
@@ -377,12 +381,11 @@ pub fn parse_batch_output(
     summary_path: &Path,
     results_path: &Path,
 ) -> Result<ClawEvalResult, ClawEvalError> {
-    let summary_json = std::fs::read_to_string(summary_path).map_err(|e| {
-        ClawEvalError::BatchSummaryMissing {
+    let summary_json =
+        std::fs::read_to_string(summary_path).map_err(|e| ClawEvalError::BatchSummaryMissing {
             path: summary_path.to_path_buf(),
             help: format!("failed to read: {e}"),
-        }
-    })?;
+        })?;
 
     let per_task = parse_batch_results(results_path)?;
 
@@ -433,10 +436,11 @@ pub fn parse_batch_output(
 
 /// Parse per-task results from `batch_results.json`.
 pub fn parse_batch_results(path: &Path) -> Result<Vec<ClawEvalTaskResult>, ClawEvalError> {
-    let content = std::fs::read_to_string(path).map_err(|e| ClawEvalError::BatchResultsMissing {
-        path: path.to_path_buf(),
-        help: format!("failed to read: {e}"),
-    })?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| ClawEvalError::BatchResultsMissing {
+            path: path.to_path_buf(),
+            help: format!("failed to read: {e}"),
+        })?;
 
     let raw: Vec<serde_json::Value> = serde_json::from_str(&content)
         .map_err(|e| ClawEvalError::ParseError(format!("batch_results.json: {e}")))?;
@@ -509,11 +513,16 @@ mod tests {
         // claw-eval is not installed, so cli_available should be false
         let pf = preflight_claweval();
         // In the test env, claw-eval is NOT available (per context)
-        assert!(!pf.cli_available, "claw-eval CLI should not be present in test env");
+        assert!(
+            !pf.cli_available,
+            "claw-eval CLI should not be present in test env"
+        );
         assert!(!is_ready(&pf), "should not be ready when CLI missing");
         let reasons = blocked_reasons(&pf);
         assert!(
-            reasons.iter().any(|r| r.contains("claw-eval CLI not found")),
+            reasons
+                .iter()
+                .any(|r| r.contains("claw-eval CLI not found")),
             "should mention CLI missing, got: {reasons:?}"
         );
     }
@@ -589,7 +598,10 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].task_id, "eval_math");
         assert_eq!(tasks[0].trials.len(), 1);
-        assert_eq!(tasks[0].trials[0].trace_file.as_deref(), Some("traces/t0.json"));
+        assert_eq!(
+            tasks[0].trials[0].trace_file.as_deref(),
+            Some("traces/t0.json")
+        );
         assert!(tasks[0].trials[0].passed);
     }
 

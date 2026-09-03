@@ -82,9 +82,7 @@ pub fn is_ready(pf: &Preflight) -> bool {
 pub fn blocked_reasons(pf: &Preflight) -> Vec<String> {
     let mut issues = Vec::new();
     if !pf.harbor_ok {
-        issues.push(
-            "harbor CLI not found — install: uv tool install harbor".to_string(),
-        );
+        issues.push("harbor CLI not found — install: uv tool install harbor".to_string());
     }
     if !pf.docker_ok {
         issues.push("Docker not running or not accessible".to_string());
@@ -217,16 +215,10 @@ pub async fn run_tb2(config: &Tb2Config) -> Result<Tb2Result> {
     let pf = preflight();
     if !is_ready(&pf) {
         let reasons = blocked_reasons(&pf);
-        anyhow::bail!(
-            "TB2 preflight failed:\n  {}",
-            reasons.join("\n  ")
-        );
+        anyhow::bail!("TB2 preflight failed:\n  {}", reasons.join("\n  "));
     }
 
-    let version_str = pf
-        .harbor_version
-        .as_deref()
-        .unwrap_or("unknown");
+    let version_str = pf.harbor_version.as_deref().unwrap_or("unknown");
     println!("  Harbor version: {version_str}");
 
     // Build and display command
@@ -252,10 +244,7 @@ pub async fn run_tb2(config: &Tb2Config) -> Result<Tb2Result> {
 
     if !output.status.success() {
         eprintln!("Harbor stderr:\n{stderr}");
-        anyhow::bail!(
-            "harbor exited with status {}",
-            output.status
-        );
+        anyhow::bail!("harbor exited with status {}", output.status);
     }
 
     // Parse results

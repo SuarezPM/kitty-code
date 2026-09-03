@@ -188,8 +188,9 @@ pub fn tool_schemas_to_gbnf_pub(tools: &[ToolDefinition]) -> String {
 
 #[cfg(feature = "llama")]
 struct Inner {
-    #[allow(dead_code)]
-    backend: LlamaBackend,
+    /// Load-bearing RAII: `LlamaModel` requires the backend to outlive it.
+    /// Never read directly — held here so the model stays valid.
+    _backend: LlamaBackend,
     model: LlamaModel,
 }
 
@@ -289,7 +290,10 @@ impl LlamaCppClient {
                 )];
                 // json_schema_to_grammar + grammar_lazy exercised here (required)
                 let _sampler = build_grammar_lazy_sampler(&model, &dummy_tools);
-                *self.state.lock().unwrap() = Some(Inner { backend, model });
+                *self.state.lock().unwrap() = Some(Inner {
+                    _backend: backend,
+                    model,
+                });
                 true
             }
             Err(e) => {

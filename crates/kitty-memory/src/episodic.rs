@@ -109,7 +109,6 @@ impl bm25::Tokenizer for KittyTokenizer {
 /// BM25 index with IDF + TF and length normalization.
 /// k1=1.2, b=0.75 are standard defaults (Robertson / Zaragoza).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Bm25Index {
     k1: f32,
     b: f32,
@@ -117,7 +116,6 @@ pub struct Bm25Index {
     n: usize,
     doc_freq: HashMap<String, usize>,
     doc_lens: Vec<usize>,
-    doc_tokens: Vec<Vec<String>>,
     doc_term_freqs: Vec<HashMap<String, usize>>,
 }
 
@@ -127,7 +125,6 @@ impl Bm25Index {
         let n = docs.len();
         let mut doc_freq: HashMap<String, usize> = HashMap::new();
         let mut doc_lens = Vec::with_capacity(n);
-        let mut doc_tokens = Vec::with_capacity(n);
         let mut doc_term_freqs = Vec::with_capacity(n);
         let mut total_len: usize = 0;
 
@@ -135,7 +132,6 @@ impl Bm25Index {
             let len = tokens.len();
             doc_lens.push(len);
             total_len = total_len.saturating_add(len);
-            doc_tokens.push(tokens.clone());
             let mut tf: HashMap<String, usize> = HashMap::new();
             let mut seen: HashSet<String> = HashSet::new();
             for tok in tokens {
@@ -162,7 +158,6 @@ impl Bm25Index {
             n,
             doc_freq,
             doc_lens,
-            doc_tokens,
             doc_term_freqs,
         }
     }
@@ -231,9 +226,19 @@ impl Bm25Index {
     }
 }
 
+/// Cached BM25 index over the recall candidates (Fase 3.2: rebuilt only
+/// when a write invalidates it, never on every recall).
+struct Bm25Cache {
+    index: Bm25Index,
+}
+
 /// Store for episodic memory.
 pub struct EpisodeStore {
     conn: Connection,
+    /// Interior mutability is safe here: `EpisodeStore` is `Send` (owned
+    /// `Connection`) and used from a single owner at a time; `!Sync` is
+    /// inherited from `Connection` and preserved by `RefCell`.
+    bm25_cache: std::cell::RefCell<Option<Bm25Cache>>,
 }
 
 impl EpisodeStore {
@@ -258,7 +263,10 @@ impl EpisodeStore {
             CREATE INDEX IF NOT EXISTS idx_episodes_ts ON episodes(timestamp DESC);",
         )?;
         let _ = conn.execute("ALTER TABLE episodes ADD COLUMN embedding BLOB", []);
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            bm25_cache: std::cell::RefCell::new(None),
+        })
     }
 
     /// Save an episode (insert or replace).
@@ -276,6 +284,7 @@ impl EpisodeStore {
                 episode.timestamp,
             ],
         )?;
+        self.bm25_cache.borrow_mut().take();
         Ok(())
     }
 
@@ -337,6 +346,9 @@ impl EpisodeStore {
     }
 
     /// Recall with BM25 ranking (IDF+TF, length-normalized).
+    /// Fase 3.2: the index is cached and rebuilt only when a write
+    /// invalidates it, so repeated recalls between writes stop paying the
+    /// O(candidates) index construction on every turn.
     pub fn recall_bm25(&self, goal: &str, limit: usize) -> Result<Vec<Episode>> {
         let candidates = self.recall_recent(MAX_RECALL_CANDIDATES)?;
         if candidates.is_empty() {
@@ -346,27 +358,31 @@ impl EpisodeStore {
         if query_tokens.is_empty() {
             return Ok(candidates.into_iter().take(limit).collect());
         }
-        let doc_tokens: Vec<Vec<String>> = candidates.iter().map(|ep| tokenize(&ep.goal)).collect();
-        let index = Bm25Index::new(&doc_tokens);
+        if self.bm25_cache.borrow().is_none() {
+            let doc_tokens: Vec<Vec<String>> =
+                candidates.iter().map(|ep| tokenize(&ep.goal)).collect();
+            *self.bm25_cache.borrow_mut() = Some(Bm25Cache {
+                index: Bm25Index::new(&doc_tokens),
+            });
+        }
+        let cache = self.bm25_cache.borrow();
+        let index = &cache.as_ref().expect("index rebuilt above").index;
         let mut scored: Vec<(f32, &Episode)> = candidates
             .iter()
             .enumerate()
             .map(|(idx, ep)| (index.score(&query_tokens, idx), ep))
             .filter(|(s, _)| *s > 0.0)
             .collect();
-
         scored.sort_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(b.1.timestamp.cmp(&a.1.timestamp))
         });
-
         let top: Vec<Episode> = scored
             .into_iter()
             .take(limit)
             .map(|(_, ep)| ep.clone())
             .collect();
-
         if top.is_empty() {
             return Ok(candidates.into_iter().take(limit).collect());
         }
@@ -383,6 +399,46 @@ impl EpisodeStore {
 }
 
 pub const RRF_K: f32 = 60.0;
+#[cfg(test)]
+mod bm25_cache_tests {
+    use super::*;
+
+    fn ep(goal: &str, ts: i64) -> Episode {
+        Episode {
+            id: format!("id-{ts}-{goal}"),
+            goal: goal.to_string(),
+            files_touched: vec![],
+            test_verdict: None,
+            outcome: "pass".into(),
+            hash: "h".into(),
+            timestamp: ts,
+        }
+    }
+
+    #[test]
+    fn bm25_recall_is_stable_across_cached_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        store.save(&ep("write fibonacci python", 1)).unwrap();
+        store.save(&ep("parse json rust", 2)).unwrap();
+        let a = store.recall_bm25("fibonacci", 2).unwrap();
+        let b = store.recall_bm25("fibonacci", 2).unwrap();
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a[0].goal, b[0].goal);
+    }
+
+    #[test]
+    fn bm25_write_invalidates_cache_so_new_episode_is_eligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        store.save(&ep("unrelated first", 1)).unwrap();
+        let before = store.recall_bm25("quicksort", 5).unwrap();
+        assert!(before.is_empty() || !before.iter().any(|e| e.goal == "write quicksort"));
+        store.save(&ep("write quicksort", 2)).unwrap();
+        let after = store.recall_bm25("quicksort", 5).unwrap();
+        assert!(after.iter().any(|e| e.goal == "write quicksort"));
+    }
+}
 
 /// Reciprocal Rank Fusion (Cormack et al.). fuses multiple rankings.
 /// Each ranking is Vec<String> of ids ordered best->worst (rank 1 = index 0).
@@ -458,6 +514,7 @@ impl EpisodeStore {
     }
 
     pub fn save_with_embedding(&self, episode: &Episode, embedding: &[f32]) -> Result<()> {
+        self.bm25_cache.borrow_mut().take();
         self.ensure_embedding_column()?;
         let blob = encode_embedding(embedding);
         self.conn.execute(
@@ -477,6 +534,7 @@ impl EpisodeStore {
     }
 
     pub fn update_embedding(&self, id: &str, embedding: &[f32]) -> Result<()> {
+        self.bm25_cache.borrow_mut().take();
         self.ensure_embedding_column()?;
         let blob = encode_embedding(embedding);
         let n = self.conn.execute(

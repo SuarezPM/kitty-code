@@ -37,17 +37,19 @@ ollama pull ornith:9b
 ./target/release/kitty-cli run "Write a Rust function that reverses a string"
 ```
 
-Other commands: `info` (status + tool list), `bench polyglot|tb2`
-(homemade benchmarks), and `tui` (status display, opt-in feature).
+Other commands: `info` (status + tool list), `bench polyglot|tb2|tb2-official|gpqa|claweval`
+(benchmark suites; gpqa/claweval are gated, offline-first approximations),
+`bench-ab` (interleaved A/B with Wilson CI), `mcp` (stdio MCP server exposing
+the 6 tools via the Guard), and `tui` (status display, opt-in feature).
 
 ## Project layout
 
 | Crate | Responsibility |
 |-------|----------------|
-| `kitty-runtime` | Ollama HTTP client + tool wire types |
-| `kitty-harness` | Agent loop, tools, hashline edits, parser, guard, quality monitor, budgets, knowledge, bootstrap |
-| `kitty-memory`  | Episodic memory (BLAKE3 + SQLite) |
-| `kitty-cli`     | CLI, benchmark suites, TUI |
+| `kitty-runtime` | Ollama HTTP client + tool wire types + cloud/llama fallbacks |
+| `kitty-harness` | Agent loop (`agent/`), tools + hashline edits, parser, guard (`guard/`), sandbox (Landlock+seccomp), quality monitor, budgets, config, knowledge, bootstrap |
+| `kitty-memory`  | Episodic memory (BLAKE3 + SQLite, BM25 with cached index) |
+| `kitty-cli`     | CLI, benchmark suites (`bench/`), MCP server, TUI |
 
 See [`codemap.md`](./codemap.md) for the full architecture map.
 

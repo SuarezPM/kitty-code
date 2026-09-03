@@ -5,9 +5,17 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  # Weekly dependency-advisory sweep (consumed by the `audit` job).
+  schedule:
+    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # rust-toolchain.toml pins the toolchain; rustup resolves it per-invocation.
+  RUSTUP_TOOLCHAIN: stable
 
 jobs:
   test:
@@ -17,12 +25,12 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
-      - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0ca39d26cca967362 # v1
-        with:
-          toolchain: stable
-          override: true
+      - name: Install Rust toolchain (rustup, no archived actions)
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
 
   clippy:
     name: clippy
@@ -31,13 +39,15 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
-      - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0ca39d26cca967362 # v1
-        with:
-          toolchain: stable
-          override: true
-          components: clippy
-      - name: cargo clippy
-        run: cargo clippy -- -D warnings
+      - name: Install Rust toolchain (rustup, no archived actions)
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+      # Fase 5.2 (audit 2026-09): --all-targets gates TEST code too, and
+      # --all-features gates the opt-in features (embedding) — closing the
+      # documented gap between the repo's own standard and the old CI gate.
+      - name: cargo clippy (strict)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   fmt:
     name: fmt
@@ -46,11 +56,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
-      - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0ca39d26cca967362 # v1
-        with:
-          toolchain: stable
-          override: true
-          components: rustfmt
+      - name: Install Rust toolchain (rustup, no archived actions)
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
       - name: cargo fmt
         run: cargo fmt --check
 
@@ -61,10 +70,62 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
-      - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0ca39d26cca967362 # v1
-        with:
-          toolchain: stable
-          override: true
       - uses: EmbarkStudios/cargo-deny-action@1ad33e49304de844c2c6cc106246e37cb1c21dc4e # v2.0.5
         with:
           command: check
+
+  sbom:
+    name: sbom (CycloneDX)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - name: Install Rust toolchain (rustup, no archived actions)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+      - name: Generate SBOM
+        run: cargo cyclonedx --all-features --format json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-cyclonedx
+          path: target/**/*.cdx.json
+
+  coverage:
+    name: coverage (kitty-harness ≥ 70%)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - name: Install Rust toolchain (rustup, no archived actions)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        run: cargo install --locked cargo-llvm-cov
+      - name: Coverage gate
+        run: cargo llvm-cov --package kitty-harness --all-features --summary-only --fail-under-lines 70
+
+  audit:
+    name: advisory audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Weekly sweep via the workflow-level `schedule` trigger; also runs on
+    # every PR (audit is cheap and stricter than the spec minimum).
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - name: Install Rust toolchain (rustup, no archived actions)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: cargo audit
+        run: cargo audit

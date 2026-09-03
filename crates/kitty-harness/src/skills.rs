@@ -32,7 +32,11 @@ pub fn discover_skills(skill_dirs: &[&Path]) -> Vec<Skill> {
             continue;
         }
 
-        for entry in std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| e.ok()) {
+        for entry in std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if path.is_file() && path.file_name().and_then(|n| n.to_str()) == Some("SKILL.md") {
                 if let Some(skill) = parse_skill_file(&path) {

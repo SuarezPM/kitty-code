@@ -146,3 +146,27 @@ Do not open a public issue for vulnerabilities. See [SECURITY.md](SECURITY.md) f
 ## License
 
 By contributing you agree that your contributions are licensed under the same license as the project ([MIT](LICENSE)).
+
+## Mutation testing (guard/hashline hardening)
+
+The two highest-risk modules are pattern/logic heavy (`guard`, `hashline`).
+Unit tests alone do not prove the assertions kill mutants; run mutation
+scoring locally before merging changes to either module:
+
+```bash
+cargo install --locked cargo-mutants
+cargo mutants --package kitty-harness --file crates/kitty-harness/src/guard/*.rs
+cargo mutants --package kitty-harness --file crates/kitty-harness/src/hashline.rs
+```
+
+Target: caught-mutant ratio > 70% on both surfaces. New tests for a behavior
+must be written against the mutant, not just the happy path.
+
+## Property-based and contract tests
+
+- `crates/kitty-harness/tests/property_tests.rs` fuzzes the tool-call parser,
+  hashline edits, and guard invariants with `proptest` (never-panic +
+  stale-edit-detection + interpreter-wrapped-payload-blocking).
+- `crates/kitty-runtime/tests/ollama_contract.rs` pins the Ollama HTTP
+  contract with `wiremock` (`truncate:false` + session `num_ctx`, typed
+  overflow on 400, transport-timeout mapping).

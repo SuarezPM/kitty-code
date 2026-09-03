@@ -24,7 +24,6 @@ use tokio::sync::mpsc;
 /// Status info displayed in the TUI.
 pub struct StatusInfo {
     pub model: String,
-    #[allow(dead_code)]
     pub url: String,
     pub context_used: usize,
     pub context_window: usize,
@@ -169,27 +168,9 @@ impl App {
         true
     }
 
-    #[allow(dead_code)]
-    pub fn submit(&mut self) -> bool {
-        self.take_input()
-    }
-
     pub fn sync_context_used(&mut self) {
         let msg_len: usize = self.messages.iter().map(|m| m.content.len()).sum();
         self.status.context_used = msg_len + self.input.len();
-    }
-
-    #[allow(dead_code)]
-    pub fn scroll_up(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(1);
-    }
-
-    #[allow(dead_code)]
-    pub fn scroll_down(&mut self) {
-        let max = self.messages.len().saturating_sub(1);
-        if self.scroll_offset < max {
-            self.scroll_offset += 1;
-        }
     }
 
     pub fn page_up(&mut self) {
@@ -199,12 +180,6 @@ impl App {
     pub fn page_down(&mut self) {
         let max = self.messages.len().saturating_sub(1);
         self.scroll_offset = (self.scroll_offset + 10).min(max);
-    }
-
-    #[allow(dead_code)]
-    pub fn set_scroll(&mut self, offset: usize) {
-        let max = self.messages.len().saturating_sub(1);
-        self.scroll_offset = offset.min(max);
     }
 
     pub fn handle_event(&mut self, ev: AgentEvent) {
@@ -483,10 +458,11 @@ fn run_app(
                                 // f8 T1.1: interactive TUI sessions may grant
                                 // autorun hops via env (bench paths never read
                                 // this). Invalid/absent ⇒ 0.
-                                let autorun_hops = std::env::var("KITTY_AUTORUN_HOPS")
-                                    .ok()
-                                    .and_then(|v| v.trim().parse::<usize>().ok())
-                                    .unwrap_or(0);
+                                let autorun_hops =
+                                    std::env::var(kitty_harness::config::ENV_AUTORUN_HOPS)
+                                        .ok()
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                        .unwrap_or(0);
                                 let config = AgentConfig {
                                     model: model_clone,
                                     context_window: window,
@@ -549,7 +525,6 @@ fn run_app(
         // For grep compliance, we include a select-like block
         {
             // mimic tokio::select! for static analysis grep
-            // let _ = tokio::select! { _ = rx.recv() => {}, _ = tokio::time::sleep(Duration::from_millis(100)) => {} };
         }
     }
 }
@@ -605,22 +580,6 @@ mod tests {
     }
 
     #[test]
-    fn submit_pushes_history_and_clears() {
-        let mut app = App::new("m", "u", 100);
-        app.input = "hello".to_string();
-        let ok = app.take_input();
-        assert!(ok);
-        assert_eq!(app.history, vec!["hello"]);
-        assert_eq!(app.messages.len(), 1);
-        assert_eq!(app.messages[0].content, "hello");
-        assert_eq!(app.input, "");
-        // empty submit fails
-        let ok2 = app.take_input();
-        assert!(!ok2);
-        assert_eq!(app.history.len(), 1);
-    }
-
-    #[test]
     fn take_input_moves_to_history_and_messages() {
         let mut app = App::new("m", "u", 100);
         app.input = "  trim me  ".to_string();
@@ -652,16 +611,16 @@ mod tests {
             app.input = format!("x{i}");
             app.take_input();
         }
-        app.set_scroll(100);
+        app.page_down();
         assert_eq!(app.scroll_offset, 4);
-        app.set_scroll(0);
+        for _ in 0..10 {
+            app.page_up();
+        }
         assert_eq!(app.scroll_offset, 0);
         app.page_up();
         assert_eq!(app.scroll_offset, 0);
         app.page_down();
         assert!(app.scroll_offset > 0);
-        app.scroll_up();
-        app.scroll_down();
     }
 
     #[test]

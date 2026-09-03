@@ -10,7 +10,7 @@ use kitty_runtime::{
     ChatClient, ChatResponse, GrammarClient, GrammarConfig, Message, ToolDefinition,
 };
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::bootstrap::Bootstrap;
@@ -24,6 +24,11 @@ use crate::quality_monitor::{QualityConfig, QualityMonitor, QualityViolation};
 use crate::router::{tools_for_category, ToolRouter};
 use crate::thinking_budget::ThinkingBudget;
 use crate::tools::ToolRegistry;
+
+mod response;
+mod run;
+
+pub use run::ENV_VERIFY_LOOP;
 
 /// Streaming events emitted during `run_with_events`.
 #[derive(Debug, Clone)]
@@ -78,7 +83,7 @@ pub struct AgentConfig {
     /// Per-model inference settings (F2): sampling, thinking mode, and the
     /// unified per-model iteration cap. Resolved from the model id in
     /// [`Agent::new`] (exact → family → default); post-construction
-    /// `config_mut()` overrides still win.
+    /// per-run overrides (Fase 2.1) still win.
     pub tuning: ModelTuning,
     /// Whether to use 2-stage tool routing (router ready but gated behind this flag).
     pub use_routing: bool,
@@ -194,6 +199,9 @@ pub fn clamp_autorun_hops(hops: usize) -> usize {
 /// The arm is retained deliberately: it encodes the AD1 machine rule for any
 /// future path where hops may legitimately survive into verification, and it
 /// stays unit-tested so the invariant is pinned.
+/// Maximum revision cycles after a failed verification (spec: up to 2).
+const VERIFY_MAX_REVISIONS: usize = 2;
+
 #[must_use]
 fn autorun_hop_retries_after_revisions_exhausted(
     hops_remaining: usize,
@@ -360,7 +368,10 @@ fn model_stance_overlay(model: &str) -> Option<&'static str> {
 fn is_context_overflow_error(e: &anyhow::Error) -> bool {
     // Check for the typed ContextOverflow variant first
     if let Some(runtime_err) = e.downcast_ref::<kitty_runtime::RuntimeError>() {
-        if matches!(runtime_err, kitty_runtime::RuntimeError::ContextOverflow { .. }) {
+        if matches!(
+            runtime_err,
+            kitty_runtime::RuntimeError::ContextOverflow { .. }
+        ) {
             return true;
         }
     }
@@ -379,6 +390,32 @@ fn per_turn_thinking_cap(mode: ThinkingMode) -> Option<usize> {
         ThinkingMode::Budget(n) => Some(n as usize),
         ThinkingMode::On | ThinkingMode::Off => None,
     }
+}
+
+/// Per-run overrides applied at a single point at the start of
+/// [`Agent::run_with`] (audit 2026-09 Fase 2.1). Absent fields mean "use the
+/// configured defaults"; there are no sentinel values, so an invalid state is
+/// unrepresentable.
+///
+/// This replaces the former `config_mut()`/`budget_mut()` escape hatches
+/// whose post-construction mutations were the root cause of the G2-FIX3
+/// dead-store bug class: overrides now flow through one auditable path and
+/// the thinking-budget re-seed reads the post-override tuning.
+#[derive(Debug, Clone, Default)]
+pub struct RunOverrides {
+    /// Full tuning replacement (sampling, thinking mode, turn caps).
+    pub tuning: Option<ModelTuning>,
+    /// Compaction threshold; combined with `context_window` it re-derives the
+    /// effective threshold via `ContextBudget::derive_compaction_threshold`.
+    pub compact_threshold: Option<f32>,
+    /// Autorun continuation hops (clamped into 0..=MAX_AUTORUN_HOPS).
+    pub autorun_hops: Option<usize>,
+    /// Context window; resizes the budget to match.
+    pub context_window: Option<usize>,
+    /// Iteration cap for the tool loop.
+    pub max_iterations: Option<usize>,
+    /// Bash command timeout in seconds.
+    pub bash_timeout: Option<u64>,
 }
 
 /// The core agent loop.
@@ -454,8 +491,8 @@ impl Agent {
         // F2: per-model inference settings — sampling, thinking mode, and the
         // UNIFIED iteration cap (absorbs the former standalone Tier-4
         // turn-cap override; env KITTY_MODEL_TURN_CAPS + KITTY_NO_THINK apply
-        // inside the resolver). Post-construction `config_mut()` overrides
-        // still win: they run later.
+        // inside the resolver). Per-run overrides (Fase 2.1) still win:
+        // they apply later through the single auditable path.
         //
         // G2-FIX2: only overwrite max_iterations when a per-model turn-cap
         // entry ACTUALLY matched (exact table hit or env spec hit). Family/
@@ -590,607 +627,11 @@ impl Agent {
         self.router.last_category()
     }
 
-    /// Mutable access to config (used for bench overrides that must survive profile sync).
-    pub fn config_mut(&mut self) -> &mut AgentConfig {
-        &mut self.config
-    }
-
-    /// Mutable access to budget (used for bench threshold sync).
-    pub fn budget_mut(&mut self) -> &mut ContextBudget {
-        &mut self.budget
-    }
-
     /// Immutable access to config.
     pub fn config(&self) -> &AgentConfig {
         &self.config
     }
 
-    /// Run the agent loop with a user prompt.
-    ///
-    /// Returns the final text response after tool calls are resolved.
-    ///
-    /// F2 fixes applied:
-    /// - F2.2: Tool errors → failed result messages, never abort session
-    /// - F2.3: `push_message` is the sole token accounting point (no double count)
-    /// - F2.4: Quality monitor window persists across turns
-    /// - F2.5: Tool results pushed before corrective user messages
-    /// - F2.6: Thinking budget exceeded retries inline, doesn't return raw text
-    pub async fn run(&mut self, user_prompt: &str) -> Result<String> {
-        // Fase 0 remediation: reset empty streak per run (prevents cross-run contamination)
-        self.empty_response_streak = 0;
-        // E3: reset the deterministic doom-loop detector per run as well.
-        self.doom_loop.reset();
-        // Bootstrap: detect workspace on first turn
-        self.run_bootstrap();
-
-        // F3.4: telemetry writer (JSONL, rotates at 10MB, disabled by KITTY_TELEMETRY=off)
-        let mut telemetry = crate::telemetry::TelemetryWriter::new(None);
-
-        // Preflight FIRST so the system message is the first message in the
-        // conversation (recall/knowledge injections below must follow it).
-        self.preflight(user_prompt);
-
-        // Episodic memory: recall past episodes for this goal (context, not a
-        // user turn — injected after the system message and budget-tracked).
-        self.recall_episodes(user_prompt).await;
-
-        // Knowledge injection: inject on first user message if enabled.
-        self.inject_knowledge(user_prompt).await;
-
-        // F2.3: push_message is the sole token accounting point.
-        self.push_message(Message {
-            role: "user".to_string(),
-            content: Some(user_prompt.to_string()),
-            thinking: None,
-            tool_calls: None,
-        })
-        .await;
-
-        // G2-FIX3: re-seed the per-turn thinking cap from the CURRENT
-        // tuning before every run — the CLI/bench thinking axis mutates
-        // `config_mut().tuning.thinking` AFTER construction, and that must
-        // reach the live budget tracker (the old max_thinking_tokens field
-        // was dead-stored and silently ignored).
-        self.thinking_budget
-            .set_per_turn_cap(per_turn_thinking_cap(self.config.tuning.thinking));
-        // Reset thinking budget for this turn
-        self.thinking_budget.reset_turn();
-
-        // Verification loop (P0): outer revision cycle around the tool loop.
-        // After the agent finishes, workspace tests grade the work; failures
-        // are fed back as a user message so the model can revise (up to
-        // VERIFY_MAX_REVISIONS cycles). See `verify_workspace`.
-        let mut revision_cycles: usize = 0;
-        // f8 AD1: autorun hop budget. Consumed ONLY on iteration exhaustion
-        // (never by verification revisions); 0 = byte-identical legacy run.
-        let mut hops_remaining = self.config.autorun_hops;
-        'verify: loop {
-            // Fixed state machine (f8 AD1): the inner for restarts on hop
-            // consumption; force_response + Verification run ONLY on real
-            // completion paths — natural terminal return, or exhaustion with
-            // no hops left.
-            'autorun: loop {
-                // Bounded tool loop: EVERY iteration processes the response —
-                // tool calls are executed and fed back, text responses still
-                // consume an iteration (the loop never breaks on text; it runs
-                // to `max_iterations`). Only when the budget is EXHAUSTED does
-                // the post-loop code below extract a final answer. The outer
-                // cycles multiply worst-case LLM calls per prompt: revisions
-                // (×VERIFY_MAX_REVISIONS) and hops (see ModelTuning docs).
-                for iteration in 0..self.config.max_iterations {
-                    debug!(iteration, "Agent loop iteration");
-
-                    // Check context budget before LLM call. Compaction fires when the
-                    // tracked usage reaches the compaction threshold (default 80% of
-                    // the context limit — `ContextBudget::DEFAULT_THRESHOLD`).
-                    if self.budget.should_compact() {
-                        self.trigger_compaction().await?;
-                    }
-
-                    if self.budget.should_halt() {
-                        warn!("Context halting: compaction exhausted");
-                        return self
-                            .force_response(
-                                "Context limit reached. Please start a new conversation.",
-                            )
-                            .await;
-                    }
-
-                    // E3 step cap: on the final iteration, tell the model to wrap up
-                    // now instead of being cut mid-action (runs exactly once, since
-                    // `iteration + 1 == max_iterations` matches a single iteration).
-                    // SUPPRESSED while autorun hops remain (f8 AD1/m6): this cycle
-                    // would continue rather than finish, and contradictory
-                    // "finish now"/"continue" signals confuse small models.
-                    if iteration + 1 == self.config.max_iterations && hops_remaining == 0 {
-                        self.push_message(Message::user(MAX_STEPS_PROMPT)).await;
-                    }
-
-                    // LLM call (F3.4: track turn start for telemetry latency)
-                    // F4.3: schema breaker — after 3 consecutive invalid tool calls,
-                    // restrict to no tools (Plan category) for the next turn.
-                    let saved_tools;
-                    if self.invalid_streak >= 3 {
-                        warn!(
-                            streak = self.invalid_streak,
-                            "Schema breaker: restricting tools for next turn"
-                        );
-                        saved_tools = std::mem::take(&mut self.tools);
-                        self.invalid_streak = 0;
-                    } else {
-                        saved_tools = Vec::new();
-                    }
-                    let turn_start = std::time::Instant::now();
-                    let response = match self.llm_call().await {
-                        Ok(resp) => resp,
-                        Err(e) if is_context_overflow_error(&e) => {
-                            warn!(error = %e, "Context overflow detected, attempting compaction + retry");
-                            if let Err(compact_err) = self.trigger_compaction().await {
-                                warn!(error = %compact_err, "Compaction after overflow failed");
-                            }
-                            self.llm_call()
-                                .await
-                                .context("LLM call failed after overflow compaction")?
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    // Restore tools after the breaker turn.
-                    if !saved_tools.is_empty() {
-                        self.tools = saved_tools;
-                    }
-                    let turn_latency = turn_start.elapsed();
-
-                    // Extract thinking tokens for budget tracking (thinking is metadata,
-                    // not a conversation message — tracked via explicit budget.consume).
-                    if let Some(thinking) = response.message.thinking.as_deref() {
-                        let tokens = self.count_tokens(thinking).await;
-                        // Apply thinking budget cap
-                        if let Err(e) = self.thinking_budget.record(tokens) {
-                            warn!(error = %e, streak = self.empty_response_streak, "Thinking budget exceeded, retrying without thinking");
-                            // F2.6: Retry without thinking — re-call LLM, then fall through
-                            // to normal processing (tool calls and all). Max 1 retry per turn.
-                            // Note: empty_response_streak is NOT reset here; thinking retry counts toward streak.
-                            let retry_response = self.llm_call_no_thinking().await?;
-                            self.process_response(user_prompt, retry_response).await?;
-                            // Fail-fast after retry as well (handoff §6). Warn with streak always.
-                            if should_fail_fast(self.empty_response_streak) {
-                                warn!(streak = self.empty_response_streak, "Empty response streak cap reached (2) after thinking retry, failing fast");
-                                return Ok("no response (empty after 2 retries)".to_string());
-                            }
-                            // Don't reset thinking budget — we already retried once
-                            continue;
-                        }
-                        // Thinking tokens are consumed against budget but not pushed as
-                        // a message — explicit consume here is correct (F2.3 exception).
-                        self.budget.consume(tokens);
-                    }
-
-                    // F3.4: extract telemetry fields before process_response takes ownership
-                    let t_tool_calls = response.message.tool_calls.as_ref().map_or(0, |tc| tc.len());
-                    let t_tool_names: Vec<String> = response
-                        .message
-                        .tool_calls
-                        .as_ref()
-                        .map(|tc| tc.iter().map(|t| t.function.name.clone()).collect())
-                        .unwrap_or_default();
-                    let t_tokens_in = response.prompt_eval_count.map(|c| c as usize);
-                    let t_tokens_out = response.eval_count.map(|c| c as usize);
-
-                    self.process_response(user_prompt, response).await?;
-
-                    // Fail-fast: 2 consecutive empty responses → terminate quickly
-                    // instead of looping until max_iterations/timeout (handoff §6).
-                    if should_fail_fast(self.empty_response_streak) {
-                        warn!(
-                            streak = self.empty_response_streak,
-                            "Empty response streak cap reached (2), failing fast"
-                        );
-                        // Episode already saved as failure in process_response.
-                        return Ok("no response (empty after 2 retries)".to_string());
-                    }
-
-                    // F3.4: write telemetry for this turn (after process_response)
-                    telemetry.write_turn(&crate::telemetry::TurnEvent {
-                        ts: SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        model: self.config.model.clone(),
-                        turn: iteration,
-                        tool_calls: t_tool_calls,
-                        tool_names: t_tool_names,
-                        latency_ms: turn_latency.as_millis() as u64,
-                        tokens_in: t_tokens_in,
-                        tokens_out: t_tokens_out,
-                        error: None,
-                        bench_suite: None,
-                        compacted: false,
-                    });
-
-                    // Reset thinking budget for next turn
-                    self.thinking_budget.reset_turn();
-                    // F2.4: Do NOT clear the quality monitor window — it persists
-                    // across turns to detect cross-turn tool loops.
-                }
-
-                // Iteration budget exhausted WITHOUT a natural terminal return.
-                if hops_remaining > 0 {
-                    // AD1 hop path: NO force_response, NO verification, NO episode
-                    // save — push the continuation prompt into history so context
-                    // persists, spend one hop, restart the full inner loop.
-                    hops_remaining -= 1;
-                    info!(
-                        remaining = hops_remaining,
-                        total = self.config.autorun_hops,
-                        "autorun: iterations exhausted — continuing with a fresh cycle"
-                    );
-                    self.push_message(Message::user(AUTORUN_CONTINUE_PROMPT))
-                        .await;
-                    continue 'autorun;
-                }
-                break 'autorun;
-            }
-
-            // Exhausted iterations with no hops left — force a final response.
-            warn!(
-                iterations = self.config.max_iterations,
-                "Agent loop exhausted iterations"
-            );
-            let text = self
-                .force_response("Please provide your final answer now.")
-                .await?;
-
-            // Verification gate: only meaningful when the agent actually
-            // touched files — otherwise failures are pre-existing and not
-            // the model's to fix.
-            let verification = if self.registry.file_modifications() == 0 {
-                debug!("verification skipped: no file modifications this session");
-                Verification::Skipped
-            } else {
-                self.verify_workspace().await
-            };
-
-            match verification {
-                Verification::Failed(output) if revision_cycles < VERIFY_MAX_REVISIONS => {
-                    revision_cycles += 1;
-                    warn!(
-                        revision_cycles,
-                        max_revisions = VERIFY_MAX_REVISIONS,
-                        "Verification failed — feeding test output back for revision"
-                    );
-                    self.push_message(Message::user(format!(
-                        "Your changes caused test failures:\n\n{output}\n\nPlease fix."
-                    )))
-                    .await;
-                    continue 'verify;
-                }
-                Verification::Failed(output) => {
-                    // Revision budget exhausted (or gate disabled mid-flight):
-                    // consume ONE autorun hop iff any remain — a full fresh
-                    // cycle retries with the LATEST failure output fed back;
-                    // no save here (intermediate). Otherwise return the work
-                    // as-is, recorded as a failure (terminal).
-                    if autorun_hop_retries_after_revisions_exhausted(
-                        hops_remaining,
-                        revision_cycles,
-                    ) {
-                        hops_remaining -= 1;
-                        warn!(remaining = hops_remaining, "Verification failed and revisions exhausted — autorun hop spent, retrying full cycle");
-                        self.push_message(Message::user(format!(
-                            "Your changes caused test failures:\n\n{output}\n\nPlease fix."
-                        )))
-                        .await;
-                        continue 'verify;
-                    }
-                    self.save_episode(user_prompt, &text, false);
-                    return Ok(text);
-                }
-                Verification::Passed => {
-                    self.save_episode(user_prompt, &text, true);
-                    return Ok(text);
-                }
-                Verification::Skipped => {
-                    // No test command / loop disabled / nothing modified —
-                    // historical behavior: exhausted iterations count as fail.
-                    self.save_episode(user_prompt, &text, false);
-                    return Ok(text);
-                }
-            }
-        }
-    }
-
-    pub async fn run_with_events(
-        &mut self,
-        user_prompt: &str,
-        tx: tokio::sync::mpsc::Sender<AgentEvent>,
-    ) -> Result<String> {
-        self.run_inner(user_prompt, Some(tx)).await
-    }
-
-    async fn run_inner(
-        &mut self,
-        user_prompt: &str,
-        tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
-    ) -> Result<String> {
-        let result = self.run(user_prompt).await;
-        if let Some(sender) = tx {
-            match &result {
-                Ok(text) => {
-                    let _ = sender.send(AgentEvent::Done(text.clone())).await;
-                }
-                Err(e) => {
-                    let _ = sender.send(AgentEvent::Error(e.to_string())).await;
-                }
-            }
-        }
-        result
-    }
-
-    /// Process a single LLM response within the agent loop.
-    ///
-    /// Handles tool execution, quality checks, and message ordering.
-    /// Returns Ok(true) when a final text response was produced, Ok(false) to
-    /// continue the loop (tool calls were processed).
-    async fn process_response(&mut self, user_prompt: &str, response: ChatResponse) -> Result<()> {
-        // Check for tool calls — any tool call resets the empty streak
-        // (progress was made, handoff §6).
-        if let Some(tool_calls) = &response.message.tool_calls {
-            if !tool_calls.is_empty() {
-                self.empty_response_streak = 0;
-                // Add assistant message with tool calls (F2.3: push handles tokens)
-                self.push_message(response.message.clone()).await;
-
-                // Also parse text content for XML-style tool calls
-                let mut all_tool_calls: Vec<ParsedToolCall> = Vec::new();
-
-                // Native tool calls from Ollama
-                for tc in tool_calls {
-                    all_tool_calls.push(ParsedToolCall {
-                        name: tc.function.name.clone(),
-                        arguments: tc.function.arguments.clone(),
-                    });
-                }
-
-                // Also parse content for XML-style tool calls (with diagnostics for malformed)
-                if let Some(content) = response.message.content.as_deref() {
-                    let (parsed, diagnostics) = self.parser.parse_with_diagnostics(content);
-                    if !diagnostics.is_empty() {
-                        for diag in diagnostics {
-                            warn!(diagnostic = %diag, "Malformed tool call detected");
-                            self.push_message(Message::user(diag)).await;
-                        }
-                    }
-                    all_tool_calls.extend(parsed);
-                }
-
-                // G3-1: fold synonym/aliased tool names and argument keys onto
-                // the canonical forms UPSTREAM of every consumer that inspects
-                // tool-call identity — quality monitoring, corrective
-                // diagnostics, episode memory, and dispatch. ToolRegistry::
-                // execute re-normalizes harmlessly (the operation is
-                // idempotent), so hallucinated names never leak through.
-                for tc in &mut all_tool_calls {
-                    *tc = crate::tools::normalize_tool_call(tc);
-                }
-
-                // Quality monitor: check for hallucinated tools before execution.
-                // F2.4: window is NOT cleared — persists across turns.
-                let violations = self
-                    .quality_monitor
-                    .check_response(response.message.content.as_deref(), &all_tool_calls);
-
-                // F2.5: Push tool results FIRST, then corrective user messages.
-                // Ollama message order: assistant(tool_calls) → tool* → next.
-                for tc in &all_tool_calls {
-                    // Skip hallucinated tools
-                    if violations.iter().any(|v| {
-                        matches!(
-                            v,
-                            QualityViolation::HallucinatedTool { tool_name }
-                                if tool_name == &tc.name
-                        )
-                    }) {
-                        continue;
-                    }
-
-                    // If retry requested, the file changed — break to re-read
-                    if self.execute_and_push_tool_result(tc).await? {
-                        break;
-                    }
-                }
-
-                // F2.5: NOW push corrective user messages (after all tool results).
-                for violation in &violations {
-                    warn!(violation = ?violation, "Quality violation detected");
-                    match violation {
-                        QualityViolation::HallucinatedTool { tool_name } => {
-                            let msg = format!(
-                                "The tool '{tool_name}' does not exist. Available tools are: \
-                                 Read, Edit, Write, Bash, Glob, Grep. Please use one of these tools."
-                            );
-                            self.push_message(Message::user(msg)).await;
-                        }
-                        QualityViolation::ToolLoop { tool_name, count } => {
-                            let msg = format!(
-                                "You have called {tool_name} {count} times in a row with the \
-                                 same arguments. This appears to be a loop. Please try a \
-                                 different approach or provide a text response."
-                            );
-                            self.push_message(Message::user(msg)).await;
-                            // Force text response instead of continuing the loop
-                            let text = self
-                                .force_response(
-                                    "Please provide a text response instead of repeating the same tool call.",
-                                )
-                                .await?;
-                            self.save_episode(user_prompt, &text, true);
-                            return Ok(());
-                        }
-                        QualityViolation::EmptyResponse => {
-                            // Handled in the no-tool-calls branch below
-                        }
-                    }
-                }
-
-                return Ok(()); // Next iteration for tool results
-            }
-        }
-
-        // No tool calls — extract text response
-        let text = response.message.content.unwrap_or_default();
-
-        // Push the assistant's response (even if empty) so the model sees it
-        // in the conversation history and corrects on the next iteration.
-        self.push_message(Message {
-            role: "assistant".to_string(),
-            content: Some(text.clone()),
-            thinking: None,
-            tool_calls: None,
-        })
-        .await;
-
-        // Fail-fast on consecutive empty responses (handoff §6):
-        // push already done above so history stays consistent, no orphaned
-        // LLM round-trips. Streak resets on any non-empty content or tool call.
-        if text.trim().is_empty() {
-            self.empty_response_streak = self.empty_response_streak.saturating_add(1);
-            warn!(
-                streak = self.empty_response_streak,
-                "Empty response detected, streak={}", self.empty_response_streak
-            );
-            if should_fail_fast(self.empty_response_streak) {
-                warn!(
-                    streak = self.empty_response_streak,
-                    "Empty response streak cap reached (2), failing fast"
-                );
-                self.save_episode(user_prompt, "no response (empty after 2 retries)", false);
-                return Ok(());
-            }
-            warn!(
-                streak = self.empty_response_streak,
-                "Empty response detected, continuing loop for retry"
-            );
-            return Ok(());
-        }
-        // Non-empty text resets the streak
-        self.empty_response_streak = 0;
-
-        // Check if the text contains XML tool calls that weren't in tool_calls (with diagnostics)
-        let (parsed, diagnostics) = self.parser.parse_with_diagnostics(&text);
-        if !diagnostics.is_empty() && parsed.is_empty() {
-            for diag in diagnostics {
-                warn!(diagnostic = %diag, "Malformed tool call in text response");
-                self.push_message(Message::user(diag)).await;
-            }
-            return Ok(());
-        }
-        if !parsed.is_empty() {
-            // There are tool calls in the text, process them
-            for tc in &parsed {
-                self.execute_and_push_tool_result(tc).await?;
-            }
-            return Ok(()); // Process tool results next iteration
-        }
-
-        // Pure text response — we're done
-        // (Assistant message already pushed above before the empty check)
-        if let Some(nudge) = self.check_done_guard(&text) {
-            self.push_message(Message::user(nudge)).await;
-            return Ok(());
-        }
-        // Save successful episode to memory
-        self.save_episode(user_prompt, &text, true);
-
-        Ok(())
-    }
-
-    /// Execute one tool call and push its result message (shared by the
-    /// native tool_calls path and the XML-in-text path).
-    ///
-    /// Applies the E3 deterministic guards around every execution:
-    /// - doom-loop detection (3× identical → system nudge, 6× → fail-fast),
-    /// - truncation-to-disk for oversized outputs.
-    ///
-    /// F2.2: tool errors become failed result messages, never aborts (except
-    /// the doom-loop fail-fast, which is an explicit loop-level abort).
-    /// Returns `true` when the caller should break and re-read (retry).
-    async fn execute_and_push_tool_result(&mut self, tc: &ParsedToolCall) -> Result<bool> {
-        // F2.2: Tool errors become failed results, never abort.
-        // F4.3: Track invalid streak for schema breaker.
-        let result = match self.registry.execute(tc).await {
-            Ok(r) => {
-                self.invalid_streak = 0;
-                r
-            }
-            Err(e) => {
-                // F4.3: increment invalid streak on NotFound/InvalidArgs.
-                if matches!(
-                    e,
-                    crate::tools::ToolError::NotFound(_) | crate::tools::ToolError::InvalidArgs { .. }
-                ) {
-                    self.invalid_streak += 1;
-                }
-                warn!(error = %e, name = tc.name, streak = self.invalid_streak, "Tool execution failed");
-                crate::tools::ToolResult {
-                    success: false,
-                    output: format!("Tool '{}' failed: {e}", tc.name),
-                    retry: false,
-                }
-            }
-        };
-        debug!(name = tc.name, success = result.success, "Tool executed");
-
-        // E3 doom-loop guard — deterministic repetition detector. The result
-        // message is pushed FIRST so history stays consistent even on the
-        // fail-fast verdict (F2.5 ordering: results before corrective msgs).
-        let doom = self.doom_loop.record(&tc.name, &tc.arguments);
-
-        // E3 truncation-to-disk: oversized outputs are persisted in full and
-        // replaced by a head+tail excerpt with a pointer to the file.
-        // Tier 3 read-guard: cap at min(fixed 50KB, remaining-budget-derived
-        // cap) so a big tool result cannot overflow the window between
-        // compaction checks.
-        let budget_cap = effective_output_cap(self.budget.remaining());
-        let output = truncate_tool_output(result.output, TRUNCATION_MAX_BYTES.min(budget_cap));
-
-        self.push_message(Message {
-            role: "tool".to_string(),
-            content: Some(output),
-            thinking: None,
-            tool_calls: None,
-        })
-        .await;
-
-        match doom {
-            DoomLoopVerdict::Fail => {
-                anyhow::bail!(
-                    "Doom loop: tool '{}' executed {}× consecutively with identical arguments",
-                    tc.name,
-                    DOOM_LOOP_FAIL_AT
-                );
-            }
-            DoomLoopVerdict::Nudge => {
-                warn!(
-                    name = tc.name,
-                    streak = self.doom_loop.streak,
-                    "Doom loop detected, injecting corrective nudge"
-                );
-                self.push_message(Message {
-                    role: "system".to_string(),
-                    content: Some(DOOM_LOOP_NUDGE_MSG.to_string()),
-                    thinking: None,
-                    tool_calls: None,
-                })
-                .await;
-            }
-            DoomLoopVerdict::Fresh => {}
-        }
-
-        Ok(result.retry)
-    }
-
-    /// Count tokens of `text` using the model's real tokenizer when the
-    /// Ollama server is reachable, falling back to the local heuristic.
     async fn count_tokens(&self, text: &str) -> usize {
         match self.client.count_tokens(&self.config.model, text).await {
             Ok(n) => n,
@@ -1202,444 +643,6 @@ impl Agent {
     }
 
     /// Run bootstrap detection (cached, runs once).
-    fn run_bootstrap(&mut self) {
-        if self.bootstrap_done {
-            return;
-        }
-        let result = self.bootstrap.detect();
-        if !result.hint.is_empty() {
-            info!(hint = %result.hint, "Bootstrap detection complete");
-        }
-        self.bootstrap_done = true;
-    }
-
-    /// Inject knowledge at the conversation tail if relevant cards are found.
-    async fn inject_knowledge(&mut self, user_prompt: &str) {
-        if !self.knowledge_base.is_enabled() {
-            return;
-        }
-
-        if let Some(injection) = self.knowledge_base.build_injection(user_prompt) {
-            debug!(
-                cards = self.knowledge_base.card_count(),
-                "Knowledge injection prepared"
-            );
-            // F2.3: Use push_message for token accounting (not manual consume).
-            self.messages.push(Message {
-                role: "user".to_string(),
-                content: Some(injection.clone()),
-                thinking: None,
-                tool_calls: None,
-            });
-            let tokens = self.count_tokens(&injection).await;
-            self.budget.consume(tokens);
-        }
-    }
-
-    /// Recall top-3 past episodes by goal similarity and inject at conversation tail.
-    async fn recall_episodes(&mut self, goal: &str) {
-        if let Some(ref store) = self.memory_store {
-            if let Ok(episodes) = store.recall_similar(goal, 3) {
-                if !episodes.is_empty() {
-                    let context = episodes
-                        .iter()
-                        .map(|ep| {
-                            format!(
-                                "- Goal: {}\n  Outcome: {}\n  Files: {:?}",
-                                ep.goal, ep.outcome, ep.files_touched
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let injection = format!("[Past Episodes]\n{}\n[End Past Episodes]\n", context);
-                    debug!(count = episodes.len(), "Episodic memory recall");
-                    // F2.3: Use push_message for token accounting.
-                    self.messages.push(Message {
-                        role: "user".to_string(),
-                        content: Some(injection.clone()),
-                        thinking: None,
-                        tool_calls: None,
-                    });
-                    let tokens = self.count_tokens(&injection).await;
-                    self.budget.consume(tokens);
-                }
-            }
-        }
-    }
-
-    /// Save an episode after task completion (best-effort).
-    fn save_episode(&self, goal: &str, outcome: &str, success: bool) {
-        if let Some(ref store) = self.memory_store {
-            let files_touched = self.list_workspace_files();
-            let ep = Episode::new(
-                goal.to_string(),
-                files_touched,
-                Some(if success { "pass" } else { "fail" }.into()),
-                outcome.to_string(),
-            );
-            store.save(&ep).ok(); // Best effort — don't fail the agent on memory errors
-        }
-    }
-
-    /// List top-level files in the workspace directory.
-    fn list_workspace_files(&self) -> Vec<String> {
-        let mut files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.config.workspace) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    files.push(name.to_string());
-                }
-            }
-        }
-        files
-    }
-
-    /// Preflight: inject workspace context + model stance overlay.
-    ///
-    /// The system message leads the conversation. When the model id contains
-    /// "qwen", the E3 [`QWEN_STANCE_OVERLAY`] is appended (or emitted alone)
-    /// so Qwen-family models act instead of hedging.
-    ///
-    /// f8 T4.1: profiles with [`PromptStyle::Minimal`] (nano tier) get a
-    /// compact imperative contract instead — terse identity, one-action-
-    /// per-turn, read-before-edit and smallest-unique-span guidance, plus at
-    /// most the project-type labels. Verbose bootstrap command hints and the
-    /// stance overlay are skipped (the Minimal text is already imperative).
-    fn preflight(&mut self, _user_prompt: &str) {
-        if self.config.profile.prompt_style == PromptStyle::Minimal {
-            let mut system_msg = String::from(MINIMAL_RUNTIME);
-            if let Some(result) = self.bootstrap.result() {
-                let labels = result
-                    .project_types
-                    .iter()
-                    .map(|p| p.label())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if !labels.is_empty() {
-                    system_msg.push_str(&format!("\nWorkspace type: {labels}."));
-                }
-            }
-            self.messages.push(Message {
-                role: "system".to_string(),
-                content: Some(system_msg),
-                thinking: None,
-                tool_calls: None,
-            });
-            return;
-        }
-
-        let mut system_msg = String::new();
-        if let Some(result) = self.bootstrap.result() {
-            if !result.hint.is_empty() {
-                system_msg = format!(
-                    "Workspace detected: {}. Available build commands: {}",
-                    result
-                        .project_types
-                        .iter()
-                        .map(|p| p.label())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    result
-                        .project_types
-                        .iter()
-                        .flat_map(|p| p.build_commands())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                );
-            }
-        }
-        if let Some(overlay) = model_stance_overlay(&self.config.model) {
-            if !system_msg.is_empty() {
-                system_msg.push_str("\n\n");
-            }
-            system_msg.push_str(overlay);
-        }
-        if !system_msg.is_empty() {
-            // Insert as first system context
-            self.messages.push(Message {
-                role: "system".to_string(),
-                content: Some(system_msg),
-                thinking: None,
-                tool_calls: None,
-            });
-        }
-    }
-
-    /// Retry the LLM call with thinking disabled (F2.6).
-    ///
-    /// Instead of returning raw text, this re-calls the LLM with thinking
-    /// disabled and returns the full `ChatResponse` so the caller can process
-    /// tool calls and quality checks normally.
-    async fn llm_call_no_thinking(&self) -> Result<ChatResponse> {
-        info!("Retrying LLM call with thinking disabled");
-        // B1-400: sanitize the cloned history before wiring (tail-only, idempotent).
-        let mut messages = sanitize_trailing_assistants(self.messages.clone());
-        messages.insert(
-            0,
-            Message {
-                role: "system".to_string(),
-                content: Some(
-                    "Do not use thinking/reasoning mode. Respond directly with text or tool calls."
-                        .to_string(),
-                ),
-                thinking: None,
-                tool_calls: None,
-            },
-        );
-
-        let mut options = self.request_options(&messages);
-        // F2.6 hard guarantee: the retry must not think again, regardless of
-        // model-id/env heuristics — force `"think": false` on this request.
-        options.think = Some(false);
-        let options = Some(options);
-        self.client
-            .chat_with_options(
-                &self.config.model,
-                messages,
-                Some(self.tools.clone()),
-                options,
-            )
-            .await
-            .context("Retry LLM call without thinking failed")
-    }
-
-    /// E3 dynamic max-output cap + F2 per-model sampling/thinking:
-    /// request only as much output as still fits the context window
-    /// (`context_limit − estimated_input − 1024`, floor 256), never more than
-    /// the profile's `num_predict`; sampling parameters and the thinking
-    /// override come from the resolved per-model tuning. Input estimated
-    /// conservatively at chars/4 via
-    /// [`kitty_runtime::client::estimate_input_tokens`]. The session-fixed
-    /// `num_ctx` is injected by [`kitty_runtime::OllamaClient`] itself.
-    fn request_options(&self, messages: &[Message]) -> kitty_runtime::client::RequestOptions {
-        let est = kitty_runtime::client::estimate_input_tokens(messages);
-        let dynamic = i64::from(kitty_runtime::client::dynamic_max_output(
-            self.config.context_window,
-            est,
-        ));
-        let num_predict = i32::try_from(dynamic.min(i64::from(self.config.tuning.num_predict)))
-            .unwrap_or(kitty_runtime::client::MIN_OUTPUT_TOKENS);
-        kitty_runtime::client::RequestOptions {
-            num_predict: Some(num_predict),
-            temperature: Some(self.config.tuning.temperature),
-            top_p: self.config.tuning.top_p,
-            top_k: self.config.tuning.top_k.map(|k| k as i32),
-            think: if self.config.tuning.thinking == ThinkingMode::Off {
-                Some(false)
-            } else {
-                None
-            },
-            ..Default::default()
-        }
-    }
-
-    /// Make an LLM call with bounded retry for transient errors (F3.3).
-    ///
-    /// Retries on transient failures (rate limits, 5xx, connection resets) with
-    /// exponential backoff. Non-transient errors (bad request, auth, etc.) fail
-    /// immediately. Maximum 3 retries with 500ms → 1s → 2s backoff.
-    async fn llm_call(&self) -> Result<ChatResponse> {
-        // B1-400: transport sanitizer — never wire a trailing [assistant, assistant] (Ollama 400).
-        let messages = sanitize_trailing_assistants(self.messages.clone());
-        let model = &self.config.model;
-        let tools = Some(self.tools.clone());
-        let options = Some(self.request_options(&messages));
-
-        const MAX_RETRIES: usize = 3;
-        let mut last_err: Option<anyhow::Error> = None;
-
-        for attempt in 0..=MAX_RETRIES {
-            match self
-                .client
-                .chat_with_options(model, messages.clone(), tools.clone(), options.clone())
-                .await
-            {
-                Ok(resp) => return Ok(resp),
-                Err(e) if e.is_retryable() && attempt < MAX_RETRIES => {
-                    let backoff = Duration::from_millis(500 * 2u64.pow(attempt as u32));
-                    warn!(
-                        attempt,
-                        backoff_ms = backoff.as_millis() as u64,
-                        error = %e,
-                        "Transient LLM error, retrying"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    last_err = Some(e.into());
-                }
-                Err(e) => return Err(e).context("LLM call failed"),
-            }
-        }
-        Err(last_err.unwrap())
-    }
-
-    /// Force the model to respond with text (no tools).
-    async fn force_response(&self, instruction: &str) -> Result<String> {
-        // B1-400: sanitize the base history tail BEFORE pushing the forcing user turn
-        // (keeps interior duplicates intact; wire ends with user so stays valid).
-        let mut messages = sanitize_trailing_assistants(self.messages.clone());
-        messages.push(Message {
-            role: "user".to_string(),
-            content: Some(instruction.to_string()),
-            thinking: None,
-            tool_calls: None,
-        });
-
-        // Call without tools to force text response
-        let options = Some(self.request_options(&messages));
-        let response = self
-            .client
-            .chat_with_options(
-                &self.config.model,
-                messages,
-                None, // No tools — forces text
-                options,
-            )
-            .await
-            .context("Force response LLM call failed")?;
-
-        Ok(response
-            .message
-            .content
-            .unwrap_or_else(|| "No response generated.".to_string()))
-    }
-
-    /// Trigger context compaction: summarize old messages and free tokens.
-    ///
-    /// Uses [`CompactionSummary`] for structured output — the LLM provides
-    /// prose, and file operations are extracted deterministically from tool
-    /// results to give small models a clear session-state snapshot.
-    async fn trigger_compaction(&mut self) -> Result<()> {
-        info!("Triggering context compaction");
-
-        // Split messages: keep recent ones, summarize old ones.
-        let len = self.messages.len();
-        let keep_count = 4.min(len);
-        let naive_split_at = len.saturating_sub(keep_count);
-
-        if naive_split_at == 0 {
-            // Nothing left to compact (e.g. context full from a single huge
-            // message). Register the no-op so the consecutive-compaction halt
-            // guard can engage instead of spinning until max_iterations.
-            let _ = self.budget.record_compaction(0, 1);
-            return Ok(());
-        }
-
-        // f8 AD6: move the boundary back to the nearest USER turn so tool
-        // results are never orphaned and kept turns stay complete.
-        let final_split = compaction_split_boundary(&self.messages, naive_split_at);
-
-        // m7 accounting consistency: freed_text AND summary_source BOTH
-        // derive from the SAME final boundary, computed BEFORE the drain.
-        let freed_text: String = self.messages[..final_split]
-            .iter()
-            .filter_map(|m| m.content.as_deref())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // E3 deterministic prune: everything drained gets its tool-output
-        // content erased BEFORE the summarizer LLM sees it — survives even a
-        // weak/dumb summarizer model, because the erasure is deterministic,
-        // not model-dependent.
-        let summary_source: String = self.messages[..final_split]
-            .iter()
-            .map(|m| {
-                if m.role == "tool" {
-                    "[tool output pruned]"
-                } else {
-                    m.content.as_deref().unwrap_or("")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // P2: extract file operations deterministically from tool results
-        let tool_outputs: Vec<String> = self.messages[..final_split]
-            .iter()
-            .filter_map(|m| {
-                if m.role == "tool" {
-                    m.content.clone()
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let (read_files, modified_files) =
-            crate::compaction::extract_file_operations(&tool_outputs);
-
-        let old_messages: Vec<Message> = self.messages.drain(..final_split).collect();
-        debug_assert_eq!(old_messages.len(), final_split);
-
-        let summary_prompt = format!(
-            "Summarize the key decisions, code changes, and context from this conversation \
-             segment in at most 280 words of plain prose. Be concise — only include \
-             information needed for ongoing work:\n\n{}",
-            summary_source
-        );
-
-        // Ask the model to summarize
-        let summary_messages = vec![Message {
-            role: "user".to_string(),
-            content: Some(summary_prompt),
-            thinking: None,
-            tool_calls: None,
-        }];
-        // f8 AD4: summarization is mechanical — override ONLY the sampling
-        // fields for a cheap, near-deterministic, bounded reply. num_ctx is
-        // intentionally NOT set here: the session window is client-frozen
-        // (G2-FIX4 guard traps caller injection in debug builds).
-        let mut options = self.request_options(&summary_messages);
-        options.temperature = Some(0.1);
-        options.num_predict = Some(400);
-        let summary = self
-            .client
-            .chat_with_options(&self.config.model, summary_messages, None, Some(options))
-            .await
-            .context("Compaction summary LLM call failed")?;
-
-        let summary_text = summary
-            .message
-            .content
-            .unwrap_or_else(|| "[compaction summary unavailable]".to_string());
-
-        // P2: build structured summary with file operations
-        let structured = crate::compaction::CompactionSummary {
-            goal: summary_text,
-            read_files,
-            modified_files,
-            ..crate::compaction::CompactionSummary::empty()
-        };
-        let formatted_summary = structured.format_markdown();
-
-        let freed = ContextBudget::estimate_tokens(&freed_text);
-        let needed = ContextBudget::estimate_tokens(&formatted_summary) + 100;
-
-        // Record compaction
-        if let Err(ContextError::InsufficientCompaction {
-            freed: f,
-            needed: n,
-        }) = self.budget.record_compaction(freed, needed)
-        {
-            warn!(
-                freed = f,
-                needed = n,
-                "Compaction freed insufficient tokens"
-            );
-        }
-
-        // Insert summary as system message at the start
-        self.messages.insert(
-            0,
-            Message {
-                role: "system".to_string(),
-                content: Some(format!("[Context Summary]\n{formatted_summary}")),
-                thinking: None,
-                tool_calls: None,
-            },
-        );
-
-        Ok(())
-    }
-
     /// Push a message and track token usage (F2.3 — sole accounting point).
     ///
     /// Uses real tokenization when the server is reachable; falls back to the
@@ -1729,7 +732,7 @@ const TRUNCATION_HEAD_CHARS: usize = 2000;
 /// Tail excerpt size (chars) returned for truncated outputs.
 const TRUNCATION_TAIL_CHARS: usize = 1000;
 /// Env override for the truncation spill directory.
-pub const ENV_TRUNCATION_DIR: &str = "KITTY_TRUNCATION_DIR";
+pub use crate::config::ENV_TRUNCATION_DIR;
 
 /// Directory where full oversized tool outputs are spilled.
 ///
@@ -1739,11 +742,7 @@ pub const ENV_TRUNCATION_DIR: &str = "KITTY_TRUNCATION_DIR";
 /// Retention: spill files are scratch data — safe to delete after 7 days.
 /// There is no automatic purge yet; cleanup is manual
 /// (`find .kitty/truncation -mtime +7 -delete`).
-fn truncation_dir() -> std::path::PathBuf {
-    std::env::var(ENV_TRUNCATION_DIR)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(".kitty/truncation"))
-}
+use crate::config::truncation_dir;
 
 /// Generate a ULID: 26-char Crockford base32, canonical layout — 48-bit ms
 /// timestamp in the high bits + 80 bits of entropy sourced from the
@@ -1842,118 +841,11 @@ fn effective_output_cap(remaining_tokens: usize) -> usize {
         .saturating_mul(4)
         .max(MIN_OUTPUT_BUDGET_BYTES)
 }
-
-// ---------------------------------------------------------------------------
-// Verification loop (P0): grade the agent's work with workspace tests and
-// feed failures back so the model can revise.
-// ---------------------------------------------------------------------------
-
-/// Env override that disables the verification loop (`KITTY_VERIFY_LOOP=off`).
-pub const ENV_VERIFY_LOOP: &str = "KITTY_VERIFY_LOOP";
-
-/// Maximum revision cycles after a failed verification (spec: up to 2).
-const VERIFY_MAX_REVISIONS: usize = 2;
-
-/// Hard timeout for one workspace test run. Independent of
-/// `bash_timeout_secs` (profile-driven, tuned for single commands) because a
-/// full test suite legitimately runs longer.
-const VERIFY_TEST_TIMEOUT_SECS: u64 = 300;
-
-/// Outcome of grading the workspace after the tool loop finishes.
-enum Verification {
-    /// Loop disabled / no test command detected / no files modified —
-    /// behave exactly as before the loop existed.
-    Skipped,
-    /// Test command ran successfully.
-    Passed,
-    /// Test command failed; payload is the combined stdout+stderr excerpt.
-    Failed(String),
-}
-
-/// Whether the verification loop is enabled (default on; `KITTY_VERIFY_LOOP=off`
-/// disables).
-fn verify_loop_enabled() -> bool {
-    std::env::var(ENV_VERIFY_LOOP).as_deref() != Ok("off")
-}
-
-/// `true` when a Makefile declares a `test:` target (column-0 target line).
-fn makefile_has_test_target(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|content| content.lines().any(|l| l.starts_with("test:")))
-        .unwrap_or(false)
-}
-
-/// Detect the workspace test command (priority order: Rust → Python → JS/TS →
-/// Go → generic Makefile). `None` when no recognizable project marker exists.
-fn detect_test_command(workspace: &Path) -> Option<String> {
-    if workspace.join("Cargo.toml").exists() {
-        return Some("cargo test --workspace -- -q".to_string());
-    }
-    if workspace.join("pyproject.toml").exists() || workspace.join("setup.py").exists() {
-        return Some("python3 -m pytest --tb=short -q".to_string());
-    }
-    if workspace.join("package.json").exists() {
-        return Some("npm test -- --brief".to_string());
-    }
-    if workspace.join("go.mod").exists() {
-        return Some("go test ./...".to_string());
-    }
-    for name in ["Makefile", "makefile"] {
-        let mk = workspace.join(name);
-        if mk.is_file() && makefile_has_test_target(&mk) {
-            return Some("make test".to_string());
-        }
-    }
-    None
-}
-
-impl Agent {
-    /// Run the workspace test command detected for [`AgentConfig::workspace`].
-    ///
-    /// The command executes through the same containment stack as the Bash
-    /// tool (Guard policy → Sandbox kernel containment → hard timeout), so
-    /// `KITTY_SANDBOX=off` applies here too. Output is truncated to the same
-    /// cap as tool results before being fed back to the model.
-    async fn verify_workspace(&self) -> Verification {
-        if !verify_loop_enabled() {
-            return Verification::Skipped;
-        }
-        let Some(command) = detect_test_command(&self.config.workspace) else {
-            debug!("verification skipped: no test command detected");
-            return Verification::Skipped;
-        };
-        info!(command = %command, "verification: running workspace tests");
-        let result = self
-            .registry
-            .run_bash_command_in(
-                &command,
-                std::time::Duration::from_secs(VERIFY_TEST_TIMEOUT_SECS),
-                Some(&self.config.workspace),
-            )
-            .await;
-        match result {
-            Ok(r) if r.success => {
-                info!(command = %command, "verification: tests passed");
-                Verification::Passed
-            }
-            Ok(r) => {
-                warn!(command = %command, "verification: tests failed");
-                Verification::Failed(truncate_tool_output(r.output, TRUNCATION_MAX_BYTES))
-            }
-            Err(e) => {
-                // Blocked / sandbox failure running the test command itself:
-                // do not punish the model for harness-level issues.
-                warn!(error = %e, "verification: test command could not run");
-                Verification::Skipped
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use kitty_runtime::{ChatResponse, Message, MockClient, OllamaClient};
+    use run::detect_test_command;
     use std::future::Future;
     use std::pin::Pin;
 
@@ -2153,8 +1045,8 @@ mod tests {
             MockClient::new(vec![dummy_response("ok"), dummy_response("final")]),
             AgentConfig::default(),
         );
-        agent.config_mut().max_iterations = 1;
-        agent.config_mut().tuning.thinking = ThinkingMode::Budget(512);
+        agent.config.max_iterations = 1;
+        agent.config.tuning.thinking = ThinkingMode::Budget(512);
         let out = agent.run("hi").await.unwrap();
         assert_eq!(out, "final");
         assert_eq!(agent.thinking_budget().per_turn_cap(), Some(512));
@@ -2165,8 +1057,8 @@ mod tests {
             MockClient::new(vec![dummy_response("ok"), dummy_response("final")]),
             AgentConfig::default(),
         );
-        agent.config_mut().max_iterations = 1;
-        agent.config_mut().tuning.thinking = ThinkingMode::On;
+        agent.config.max_iterations = 1;
+        agent.config.tuning.thinking = ThinkingMode::On;
         let _ = agent.run("hi").await.unwrap();
         assert_eq!(agent.thinking_budget().per_turn_cap(), None);
     }
@@ -2635,7 +1527,7 @@ mod tests {
         let mut agent = Agent::new(mock, cfg);
         // new_inner syncs caps from the profile; use the bench-override path
         // so this test controls the iteration cap directly.
-        agent.config_mut().max_iterations = 2;
+        agent.config.max_iterations = 2;
         let out = agent.run("do the thing").await.unwrap();
         assert_eq!(out, "final answer");
 
@@ -2744,7 +1636,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        agent.config_mut().max_iterations = 2;
+        agent.config.max_iterations = 2;
         let out = agent.run("break things").await.unwrap();
 
         // Two revision cycles → exactly two feedback messages.
@@ -2796,7 +1688,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        agent.config_mut().max_iterations = 2;
+        agent.config.max_iterations = 2;
         let out = agent.run("make it work").await.unwrap();
 
         assert_eq!(out, "done v1");
@@ -2847,7 +1739,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        agent.config_mut().max_iterations = 2;
+        agent.config.max_iterations = 2;
         let out = agent.run("break things").await.unwrap();
 
         assert_eq!(out, "done v1");
@@ -2894,7 +1786,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        agent.config_mut().max_iterations = 2;
+        agent.config.max_iterations = 2;
         let out = agent.run("talk only").await.unwrap();
 
         assert_eq!(out, "done");
@@ -2941,7 +1833,7 @@ mod tests {
         // to force_response — no continuation prompt anywhere in history.
         let responses = vec![dummy_response("cycle1"), dummy_response("forced final")];
         let mut agent = Agent::new(MockClient::new(responses), AgentConfig::default());
-        agent.config_mut().max_iterations = 1;
+        agent.config.max_iterations = 1;
         let out = agent.run("hi").await.unwrap();
         assert_eq!(out, "forced final");
         assert_eq!(
@@ -2974,7 +1866,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        agent.config_mut().max_iterations = 1;
+        agent.config.max_iterations = 1;
         let out = agent.run("keep going").await.unwrap();
         assert_eq!(out, "final answer");
 
@@ -3037,7 +1929,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        agent.config_mut().max_iterations = 2;
+        agent.config.max_iterations = 2;
         let out = agent.run("break things").await.unwrap();
 
         assert_eq!(out, "done v4");
@@ -3109,7 +2001,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        agent.config_mut().max_iterations = 1;
+        agent.config.max_iterations = 1;
         let out = agent.run("persist me").await.unwrap();
         assert_eq!(out, "terminal answer");
 
@@ -3274,7 +2166,7 @@ mod tests {
         };
         let mut agent = Agent::new(mock, cfg);
         let max = agent.budget().max();
-        agent.budget_mut().consume(max); // remaining → 0
+        agent.budget.consume(max); // remaining → 0
 
         agent
             .process_response(
@@ -3462,7 +2354,7 @@ mod tests {
             ..Default::default()
         };
         let mut agent = Agent::new(capturing, cfg);
-        agent.config_mut().max_iterations = 2;
+        agent.config.max_iterations = 2;
 
         let out = agent.run("goal").await.unwrap();
         assert_eq!(out, "forced final");

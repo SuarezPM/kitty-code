@@ -40,3 +40,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+criterion = "0.5"
+proptest = "1"
+
+[[bench]]
+name = "harness_bench"
+harness = false

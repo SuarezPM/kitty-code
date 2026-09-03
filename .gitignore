@@ -14,6 +14,11 @@ __pycache__/
 *.pyc
 /bench_*.json
 /week0_*.json
+# Agent-run scratch files at the repo root (audit 2026-09 Fase 4.3):
+# bench exercises write solution artifacts here; they are never tracked.
+/[a-z]*.py
+/[a-z]*.js
+/[a-z]*.sh
 results/
 /jobs/
 

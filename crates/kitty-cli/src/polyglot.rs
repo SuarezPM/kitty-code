@@ -6,8 +6,8 @@
 //! runs the agent, materializes tests AFTER agent finishes, then runs unit tests.
 //! Retries once on failure with test output fed back.
 
-use std::path::{Path, PathBuf};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 /// Parsed .meta/config.json for an Exercism exercise.
 #[derive(Debug, Clone, Deserialize)]
@@ -19,9 +19,6 @@ pub struct ExerciseConfig {
 pub struct ExerciseFiles {
     pub solution: Vec<String>,
     pub test: Vec<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub example: Vec<String>,
 }
 
 /// A Polyglot exercise loaded from official Exercism format.
@@ -172,11 +169,7 @@ fn copy_dir_excluding(src: &Path, dst: &Path, exclude: &str) -> std::io::Result<
 }
 
 /// Copy test files from original to tempdir (AFTER agent finishes).
-pub fn materialize_tests(
-    src: &Path,
-    dst: &Path,
-    config: &ExerciseConfig,
-) -> std::io::Result<()> {
+pub fn materialize_tests(src: &Path, dst: &Path, config: &ExerciseConfig) -> std::io::Result<()> {
     for file in &config.files.test {
         let src_path = src.join(file);
         let dst_path = dst.join(file);
@@ -284,11 +277,7 @@ pub fn load_polyglot_exercises(base_dir: &Path) -> Vec<PolyglotExercise> {
 
             if let Some(config) = load_exercise_config(&exercise_dir) {
                 exercises.push(PolyglotExercise {
-                    id: format!(
-                        "{}-{}",
-                        lang.chars().next().unwrap_or('x'),
-                        exercise_name
-                    ),
+                    id: format!("{}-{}", lang.chars().next().unwrap_or('x'), exercise_name),
                     lang: lang.to_string(),
                     exercise_dir,
                     config,
@@ -311,12 +300,12 @@ pub fn generate_polyglot_report(results: &[PolyglotResult]) -> serde_json::Value
     };
 
     let by_language: std::collections::HashMap<String, serde_json::Value> =
-        results.iter().fold(
-            std::collections::HashMap::new(),
-            |mut acc, r| {
-                let entry = acc.entry(r.lang.clone()).or_insert_with(|| {
-                    serde_json::json!({"attempted": 0, "passed": 0, "failed": 0})
-                });
+        results
+            .iter()
+            .fold(std::collections::HashMap::new(), |mut acc, r| {
+                let entry = acc.entry(r.lang.clone()).or_insert_with(
+                    || serde_json::json!({"attempted": 0, "passed": 0, "failed": 0}),
+                );
                 let obj = entry.as_object_mut().unwrap();
                 *obj.get_mut("attempted").unwrap() =
                     serde_json::json!(obj["attempted"].as_i64().unwrap_or(0) + 1);
@@ -328,8 +317,7 @@ pub fn generate_polyglot_report(results: &[PolyglotResult]) -> serde_json::Value
                         serde_json::json!(obj["failed"].as_i64().unwrap_or(0) + 1);
                 }
                 acc
-            },
-        );
+            });
 
     serde_json::json!({
         "suite": "polyglot",
@@ -372,7 +360,6 @@ mod tests {
             files: ExerciseFiles {
                 solution: vec!["lib.rs".into()],
                 test: vec!["tests/test.rs".into()],
-                example: vec![],
             },
         };
 
@@ -439,7 +426,6 @@ mod tests {
             files: ExerciseFiles {
                 solution: vec!["src/lib.rs".into()],
                 test: vec!["tests/test.rs".into()],
-                example: vec![],
             },
         };
 

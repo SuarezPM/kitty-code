@@ -37,6 +37,23 @@ context budget, knowledge injection, episodic memory) around a small local LLM.
    - empty streak 2 / iteration cap = size preset overridden only by a matched per-model turn-cap entry (static table or `KITTY_MODEL_TURN_CAPS`) / ToolLoop → optional `CloudClient` fallback (1 retry, `--cloud-fallback`) else fail-fast.
 3. Final text returned; episode saved (best-effort, with embedding BLOB if `embedding` feature).
 
+## Structure Remediations (2026-09-03, audit Fase 1-6)
+- `kitty-cli/src/main.rs` is a thin dispatch layer (<1K LOC); benchmark
+  suites + stats live in `crates/kitty-cli/src/bench/{common,run,gpqa,claweval,polyglot,tb2,ab}.rs`.
+- `kitty-harness/src/agent.rs` → `agent/{mod,run,response}.rs`; `guard.rs` →
+  `guard/{mod,patterns,shell_parse,interpreters}.rs`.
+- All harness `KITTY_*` env names + typed accessors: `kitty-harness/src/config.rs`
+  (runtime-owned vars stay in `kitty-runtime`; sandbox child vars stay in `sandbox.rs`).
+- Per-run overrides via `Agent::run_with(prompt, RunOverrides)`;
+  `config_mut()`/`budget_mut()` removed from the public API.
+- `EpisodeStore` ops run via `spawn_blocking` from the agent; BM25 index
+  cached with write-side invalidation. Parser micro-benches:
+  `cargo bench -p kitty-harness`.
+- CI gates: strict clippy (`--all-targets --all-features -D warnings`),
+  `--all-features` tests, CycloneDX SBOM job, weekly `cargo audit`,
+  llvm-cov gate (kitty-harness ≥70%, measured 89.7% at remediation time).
+- Zero `#[allow(dead_code)]` in production code; root orphan scripts removed.
+
 ## Honesty Notes (verified 2026-08-30 — f8 + F2 B1-l225 autonomous)
 - **560 tests pass** (`cargo test --workspace --all-features`: 46 cli +425 harness +25 memory +64 runtime) 0 failed, `cargo clippy --all-targets --all-features -- -D warnings` **FAIL 2× await_holding_lock in tools.rs:3189 pre-existente (no introducido por benches, cargo test OK)**, `cargo fmt --all --check` clean. Release build ~30s LTO strip. `cargo deny check` clean.
 - **F6 W5 Consumer vs Vendor published**: Harbor 0.21.0 + Docker 29.7.2 — Oracle 15/15 100% (polyglot) 5m06s + 5/5 100% (TB2 adaptive-rejection-sampler x5) 3m19s prove infra healthy (extrapolated 225/225 + 89/89 valid as gate, not vendor claim). Consumer ornith:9b proxies: 13/15 86.7% polyglot + 8/8 100% TB2 builtin + 2/15 13.3% file_ops (gate 9.2% PASSED barely). Grading `harbor-verifier-unit-tests` vs `string-match-homemade NOT comparable` — do NOT compare. See `AUDIT.md` §2, `docs/FLOOR-BENCHMARK.md` W5, `CNAS.md`.

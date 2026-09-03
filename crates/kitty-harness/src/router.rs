@@ -346,12 +346,12 @@ pub fn active_tool_guidelines(active_tools: &[&str]) -> String {
     for tool in active_tools {
         match *tool {
             "Read" => {
-                guidelines
-                    .push_str("Read files before editing them. Use offset/limit for large files.\n");
+                guidelines.push_str(
+                    "Read files before editing them. Use offset/limit for large files.\n",
+                );
             }
             "Write" => {
-                guidelines
-                    .push_str("Write creates new files only. Use Edit for existing files.\n");
+                guidelines.push_str("Write creates new files only. Use Edit for existing files.\n");
             }
             "Edit" => {
                 guidelines.push_str("Edit requires exact text matching. Read the file first.\n");

@@ -144,9 +144,7 @@ impl CompactionSummary {
 
     /// Total number of items across all progress categories.
     pub fn progress_count(&self) -> usize {
-        self.progress_done.len()
-            + self.progress_in_progress.len()
-            + self.progress_blocked.len()
+        self.progress_done.len() + self.progress_in_progress.len() + self.progress_blocked.len()
     }
 }
 
