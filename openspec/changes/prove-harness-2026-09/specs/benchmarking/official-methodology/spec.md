@@ -98,12 +98,15 @@ exemption.
 
 - **GIVEN** a TB2.1 pre-registration
 - **WHEN** its pins are inspected
-- **THEN** it records dataset `terminal-bench-2-1` version 2.1.0
-  (source commit `7131e43`), Harbor `v0.22.0`, agent `terminus-2`,
-  temp 1.0 / top_p 1.0 passed explicitly (Harbor ≥0.6.5 sends no
-  default), the served model id, and `-k 5`. A Fase 5.2
-  pre-registration on Harbor 0.21.0 is void — the Fase 4 upgrade is a
-  prerequisite gate (local 0.21.0 on 2026-09-09, non-normative).
+- **THEN** it records registry id
+  `terminal-bench/terminal-bench-2-1` + Hub rev 6 + tag `latest`
+  (published 2026-04-30) + ref `sha256:7d7bdc1c…` (full hash from
+  the run's Harbor config), Harbor `v0.22.0`, agent `terminus-2`,
+  temp 1.0 / top_p 1.0 passed explicitly, the served model id, and
+  `-k 5`. The Fase 0 git-commit pin (`7131e43`) is RETIRED as
+  unresolvable (no such GitHub repo, 2026-09-09) — any 5.2
+  pre-registration citing it is void. A Fase 5.2 pre-registration
+  on Harbor 0.21.0 is likewise void.
 
 #### Scenario: SWE-bench pins
 
