@@ -8,7 +8,7 @@ is the **harness** (tool loop, safety guards, hashline edits, quality monitor,
 context budget, knowledge injection, episodic memory) around a small local LLM.
 
 ## System Entry Points
-- `crates/kitty-cli/src/main.rs` — CLI binary (`run`, `bench`, `bench-ab`, `info`, `mcp`, `tui`).
+- `crates/kitty-cli/src/main.rs` (~633L thin dispatch: `Cli`/`Commands` + `resolve_project_root` + `resolve_session_num_ctx`, bench delegated to `bench/`) — CLI binary (`run`, `bench`, `bench-ab`, `info`, `mcp`, `tui`); bench suite in `crates/kitty-cli/src/bench/{common,run,ab,polyglot,tb2,gpqa,claweval}.rs` + suite support libs.
 - `Cargo.toml` — virtual workspace, 4 member crates, release profile (LTO, strip, `panic="abort"`).
 - `AUDIT.md` / `CNAS.md` — honesty-first benchmark documentation (homemade quizzes,
   explicitly **not** Aider Polyglot / Terminal-Bench 2.0; Harbor oracle verifier 15/15 + 5/5 100%).
@@ -18,10 +18,10 @@ context budget, knowledge injection, episodic memory) around a small local LLM.
 ## Directory Map (Aggregated)
 | Directory | Responsibility Summary | Detailed Map |
 |-----------|------------------------|--------------|
-| `crates/kitty-runtime/` | Ollama HTTP client + ChatClient trait + tool wire-types + Grammar spike + Cloud/Llama clients. | [View Map](crates/kitty-runtime/codemap.md) |
-| `crates/kitty-harness/` | Agent loop, tools + fuzzy edit ladder, hashline edits, parser, guard, sandbox, plugin, quality monitor, budgets, per-model tuning profiles, knowledge, bootstrap. | [View Map](crates/kitty-harness/codemap.md) |
-| `crates/kitty-memory/` | Episodic memory (blake3 + SQLite) + BM25 + embedding (fastembed opt-in) + RRF hybrid recall. | [View Map](crates/kitty-memory/codemap.md) |
-| `crates/kitty-cli/` | CLI + embedded benchmark suites + bench-ab + MCP + TUI. | [View Map](crates/kitty-cli/codemap.md) |
+| `crates/kitty-runtime/` | `ChatClient` trait + Ollama (`num_ctx`/`truncate`/think + LRU) / Cloud (`SecretString`) / llama.cpp (vocab-probe + `grammar_lazy`) clients + post-hoc `GrammarClient` filter + tool wire-types + `gbnf-probe` binary. | [View Map](crates/kitty-runtime/codemap.md) |
+| `crates/kitty-harness/` | Agent loop (`agent/{mod,run,response}`, autorun hops, `RunOverrides`), tool registry, layered guard (`guard/{mod,patterns,shell_parse,interpreters}`), Landlock/seccomp sandbox, fuzzy edit ladder, parser + JSON repair, quality monitor, router, contract done-guard, `config.rs` typed `KITTY_*`, compaction, telemetry, skills, knowledge, bootstrap. | [View Map](crates/kitty-harness/codemap.md) |
+| `crates/kitty-memory/` | Episodic memory (`Episode`/`EpisodeStore`, blake3 + SQLite WAL) + `Bm25Index` (k1 1.2/b 0.75) + opt-in dense embeddings (MiniLM-L6-v2, dim 384) fused via RRF K=60. | [View Map](crates/kitty-memory/codemap.md) |
+| `crates/kitty-cli/` | Thin-dispatch CLI + `bench/` suite (`common`/`run`/`ab` + polyglot/tb2/gpqa/claweval runners, wilson CI, seed-42 interleave) + suite support libs + MCP stdio server + ratatui TUI. | [View Map](crates/kitty-cli/codemap.md) |
 | `bench/official/` | Vendored official benchmarks (aider-harbor 225, terminal-bench-2 89, polyglot-benchmark 225) — Harbor oracle verifier. | — |
 | `benches/` | Homemade benches + exercises JSON (228) + baseline + A/B benches (recall, GBNF) + bench scripts. | — |
 | `docs/` | STRATEGY (F6.4 ADR final), FLOOR-BENCHMARK, PLUGIN, TUI, ADR-GBNF-GO, AUDIT mirror. | — |
@@ -68,3 +68,7 @@ context budget, knowledge injection, episodic memory) around a small local LLM.
 - **F0-F5 hardened**: guard (command substitution, eval block, timeout 30s bench), hashline prefix matching, tool error handling, budget single-point accounting (`push_message` sole), cross-turn tool-loop detection (args-aware blake3), message ordering, thinking retry (cap 2), Read truncation (300 lines), Grep via ignore crate, dead code removal, CLI flags (`--profile tiny|medium|large`, `--no-memory` auto, `--semantic-memory`, `--cloud-fallback`), JSON exercise loading, `bench-ab` interleaved + wilson CI.
 - **Empty response fix**: assistant msg pushed to history, no orphaned LLM round-trips, `MAX_EMPTY_STREAK=2` + fail-fast → latency 87s→4s smollm2, 39s→24s qwen3.
 - **Bench/Knowledge (F6 W5):** `bench/official/` exists (aider-harness, polyglot-benchmark 225, terminal-bench-2 89, aider-harbor 225), `benches/exercises_polyglot.json` 228 (225 +3 Python: list-comp/decorators/async), floor 225 smollm2 45.3% (<50% → demo re-frame, `docs/FLOOR-BENCHMARK.md`), knowledge 5 cards (`knowledge/*.md` rust-traits/go-generics/python-list-comp/python-decorators/python-async) scoring word1.0/bigram2.0, `benches/baseline.json` 96.44, `kitty mcp` stdio 6 tools via Guard, `cargo deny` + `deny.toml` allowlist, `CODEOWNERS`, workflows pinned SHA.
+
+## Codemap Freshness (2026-09-08)
+- Submaps re-read from source after `codemap.mjs changes` reported 42 added / 2 removed / 18 modified: `kitty-cli` 94L, `kitty-harness` 86L, `kitty-memory` 46L, `kitty-runtime` 78L — all verified by re-read, disjoint ownership, no other files touched.
+- State saved via `codemap.mjs update`. `AGENTS.md` already references this atlas — Step 5 skipped as idempotent.

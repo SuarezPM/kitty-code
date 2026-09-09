@@ -1,31 +1,78 @@
 # crates/kitty-runtime/
 
 ## Responsibility
-Inference runtime layer. Typed HTTP clients for the Ollama chat API plus the
-serializable tool wire-types (`ToolDefinition`/`ToolFunction`) shared with the harness.
-Pluggable via `ChatClient` trait (Ollama / Cloud / llama.cpp + Grammar spike).
+LLM client crate: typed backends behind one trait plus shared tool wire-types.
+Owns `ChatClient` abstraction, Ollama / Cloud / llama.cpp clients, GBNF grammar
+spike, `RuntimeError` taxonomy, and the `gbnf-probe` measurement binary.
 
 ## Design
-- `ChatClient` (client.rs: ~555L trait): `trait ChatClient: Send+Sync { chat, count_tokens, health_check }` via `Pin<Box<dyn Future>>` object-safe. Sole abstraction for Agent loop.
-- `OllamaClient` (client.rs: ~555L): thin `reqwest` (rustls only) wrapper. One typed `chat()` (non-streaming POST `/api/chat`), plus `health_check`, `list_models`, `show_model`, and `count_tokens` (calls Ollama's `/api/tokenize` to return the model's real token count, heuristic fallback). 5min timeout. `MockClient` (`Arc<Mutex<VecDeque<ChatResponse>>>`, clone shares queue) for tests.
-- `CloudClient` (cloud.rs: 578L, F6 W2): generic OpenAI-compatible `/v1/chat/completions` (no vendor hardcoded, `KITTY_CLOUD_API_KEY` + `KITTY_CLOUD_BASE_URL` env), timeout 120s rustls, cost metering `tracing::info!(prompt_tokens, completion_tokens, total_tokens, cost_usd)` ($2/1M in + $6/1M out placeholder), `auth_header Bearer` never logged, `Debug` redacted `<redacted>`, `MockCloud` clone shares queue. 9 tests (MockCloud, timeout, env, ChatClient bound, no hardcoded domain).
-- `GrammarClient` (grammar.rs: 398L): **spike defer** (F6.4 ADR-005). `GrammarConfig::to_gbnf()` generates GBNF string for `{"name": enum, "arguments": object}` with JSON value rules; `validate()` = `serde_json` + `required`-field check. No decode-time enforcement — `ChatClient` has no grammar field; `OllamaClient::chat` does not send GBNF. `GrammarClient<C: ChatClient>` strict filtering drops invalid `tool_calls`.
-- `LlamaCppClient` (llama.rs: 392L, F6 W4): in-process `llama.cpp` adapter (F6.4 GO path). `model_path: PathBuf` GGUF + `fallback: OllamaClient` + `state: Arc<Mutex<Option<Inner>>>` (backend/model `Send` via `unsafe impl`) + `load_error`. Vocab-only probe `LlamaModelParams::vocab_only(true)`, `tool_schemas_to_gbnf` per-tool `json_schema_to_grammar` + combined, `LlamaSampler::grammar_lazy` (triggers `["{\"name\""]`, avoids `grammar+tools` HTTP 400 `server-common.cpp:1289`). `try_load` non-blocking: if GGUF absent, immediately delegates to fallback (MUST NOT block). 4 tests: Send/Sync + fallback paths + no grammar+tools together. Feature `llama` optional (no dep on defer).
-- Wire types (client.rs / tools.rs: ~101L): plain `serde` structs mirroring Ollama's `/api/chat` schema (`Message`, `ToolCall`, `ToolCallFunction`, `ChatRequest`, `ChatResponse`). `Message` carries optional `thinking` and `tool_calls`; `skip_serializing_if` minimal. `ToolDefinition` is the only exported artifact used by the harness.
-- `error.rs` (34L): `RuntimeError` (`Http` / `Api` / `InvalidArgument` / `ConnectionRefused` / `UnexpectedResponse`).
+- `ChatClient` (client.rs): `chat` + `chat_with_options` + `count_tokens` +
+  `health_check` via `Pin<Box<dyn Future>>` object-safe. `Box<T: ChatClient>`
+  blanket impl forwards `chat_with_options` (f8 AD4 rider). Sole seam for harness.
+- `OllamaClient` (client.rs): typed `reqwest` POST `/api/chat`, `/api/tokenize`,
+  `/api/tags`, `/api/show`. `build_chat_request` merges session-fixed `num_ctx`
+  into `options` (never top-level) + `truncate: false` + `think: false` heuristic
+  (`should_disable_thinking`, `KITTY_NO_THINK`). `TokenCache` LRU-256 over
+  (model, hashed prompt); `parse_num_ctx` / `parse_native_context_length` /
+  `classify_api_error` / `dynamic_max_output` / `estimate_input_tokens` pure helpers.
+  `MockClient` (`Arc<Mutex<VecDeque<ChatResponse>>>`, clone shares queue) for tests.
+- `CloudClient` (cloud.rs): vendor-agnostic OpenAI-compat POST `{base}/chat/completions`
+  (`KITTY_CLOUD_API_KEY` + `KITTY_CLOUD_BASE_URL`, 120s default via shared
+  `KITTY_OLLAMA_TIMEOUT_SECS`). Key held in `SecretString` (zeroize-on-drop,
+  `Debug` redacted, `auth_header` Bearer at transport only). Cost metering
+  `tracing::info!`; `CloudMessage::reasoning_content` normalized into
+  `Message::thinking`. `is_secret_env_name` / `sanitize_env` strip secrets from
+  child env. `MockCloud` mirrors `MockClient` semantics.
+- `LlamaCppClient` (llama.rs): in-process GGUF adapter (`model_path: PathBuf` +
+  `fallback: OllamaClient` + `state: Arc<Mutex<Option<Inner>>>>` + `load_error`,
+  `unsafe impl Send/Sync`). `try_load` vocab-only probe, missing GGUF delegates
+  immediately to fallback (never blocks). `tool_schemas_to_gbnf` (`oneOf` per-tool
+  `json_schema_to_grammar` + fallbacks), `build_grammar_lazy_sampler` /
+  `build_lazy_sampler_with` (`grammar_lazy` + word trigger `{"name"` +
+  tokenizer-derived `trigger_tokens_from_lookup` over `TRIGGER_PHRASES`).
+  Behind optional `llama` feature (`llama-cpp-2`, `llama-vulkan` for GPU offload).
+- `GrammarClient` spike (grammar.rs): `GrammarConfig::to_gbnf()` (GBNF for
+  `{"name": enum, "arguments": object}` + JSON value rules) + `validate()` /
+  `validate_value()` (`serde_json`, flat or nested `function` shape, `required`
+  check). `GrammarClient<C: ChatClient>::apply_strict_filter` drops invalid
+  `tool_calls` on BOTH `chat` and `chat_with_options` paths. No decode-time
+  enforcement — post-hoc filter only.
+- Tool wire-types (tools.rs + client.rs): `ToolDefinition` / `ToolFunction`
+  (`type: function`, `parameters` JSON Schema), `Message` (`role/content/thinking/
+  tool_calls`, `user/assistant/tool_result/tool_calls` ctors), `ToolCall` /
+  `ToolCallFunction`, `ChatRequest` (`stream: false`, `options: RequestOptions`,
+  `think`, `truncate`), `ChatResponse` (`prompt_eval_count` truncation tell,
+  `eval_count/eval_duration`), `RequestOptions` (`temperature/top_p/top_k/
+  num_predict`, harness-owned `num_ctx`, caller `think` override). Helpers
+  `required_string` / `optional_string` / `optional_u64` / `json_params`.
+- `error.rs`: `RuntimeError` (`Http/Json/Io/Api/ContextOverflow/ModelNotFound/
+  ConnectionRefused/ToolExecution/InvalidArgument/UnexpectedResponse`) +
+  `ErrorClass` (`Transient/RateLimit/Permanent/Overflow/Quota`) +
+  `is_transient/error_class/is_retryable/is_overflow` for harness retry/compaction.
+- `bin/gbnf_probe.rs` (`llama`-gated): empirical A/B harness decoding each prompt
+  per arm (`Lazy` production `grammar_lazy_sampler_for` / `LazyTok` / `CanaryWord` /
+  `CanaryTok` / `Full` / `Off` baseline) via `generate()` + `run_diag_tokens()`
+  (`--diag-tokens`), `bench_tools()` Read/Write/Edit/Bash. No double-`accept`
+  (`sample` already accepts). `lib.rs` re-exports all clients + wire types.
 
 ## Flow
-CLI → `ChatClient::chat(model, messages, tools)` → (OllamaClient POST `/api/chat` | CloudClient POST `/v1/chat/completions` | LlamaCppClient vocab probe + `grammar_lazy` sampler then fallback) → status check → `ChatResponse` (+ `GrammarClient` filter) → `ChatResponse`. Tool definitions flow harness → client → Ollama.
+Harness → `ChatClient::chat_with_options(model, messages, tools, RequestOptions)`
+→ `OllamaClient::build_chat_request` (inject fixed `options.num_ctx` from
+`KITTY_NUM_CTX`/`DEFAULT_NUM_CTX=32768`, force `truncate: false`, apply
+`think: false`) → POST `/api/chat` (`CloudClient`: `/chat/completions` + Bearer;
+`LlamaCppClient`: vocab probe + `grammar_lazy` sampler exercise, then fallback
+generation) → status check (`classify_api_error`: 400 + `exceed_context_size_error`
+→ `ContextOverflow`; `prompt_near_capacity` 95% warn) → `ChatResponse`
+(`GrammarClient::apply_strict_filter` drops schema-invalid `tool_calls`) →
+harness parser normalizes downstream (`thinking` kept separate from `content`,
+never fed back as visible text; `dynamic_max_output` = `ctx − estimate − 1024`,
+floor 256).
 
 ## Integration
-- Consumed by: `kitty-harness` (agent loop, tool defs), `kitty-cli` (entry). `kitty-harness` owns `ChatClient` injection (`Agent::new` + `set_cloud_client` + Llama tiny path).
-- Depends on: `reqwest` (rustls), `serde_json`, `tokio`. No internal crate deps.
-- Note: `tree-sitter` is declared in the workspace but **unused** (dead dependency, noted in codemap).
-
-## Tests
-18 lib tests (ChatClient, MockClient, grammar validate, tool_definition, cloud/llama when wired) + cloud 9 + llama 4 = up to 31 when F6 modules `pub mod` wired. `cargo test -p kitty-runtime` green, clippy `-D warnings` clean.
-
-## Honest status (F6.4 ADR-005 final)
-- Grammar: spike `to_gbnf` + `validate` post-hoc only; real decode-time enforcement requires `llama-cpp-2 = "0.1.154"` `LlamaSampler::grammar` / `grammar_lazy` (GO when tiny validity <95% on `benches/ab_gbnf.py` — measured 60% spike vs 98% grammar_lazy, verdict GO). `llama.rs` implements the GO contract without blocking without GGUF. **AMEND 2026-08-21 (post-audit): veredicto GO REVERTIDO** — medición empírica real (probe `gbnf-probe`, GGUF qwen2.5-coder-7b-q4_k_m, 50 prompts): 94.0% baseline, delta 0.0pp; el trigger lazy `{"name"` nunca se activa bajo Qwen2.5 tokenization (no-op silencioso); decoding grammar-constrained sigue SIN MEDIR. Ver docs/ADR-GBNF-GO.md.
-- Cloud: vendor-agnostic, no hardcoded domain, key never logged, `Debug` redacted.
-- See `docs/STRATEGY.md` F6.4 for ADR, alternatives (llama-cpp-2 in-process preferred vs llama-server daemon fallback) and pitfall `custom grammar + tools` exclusive.
+- Consumed by: `kitty-harness` (agent loop injects `Box<dyn ChatClient>`,
+  owns tool defs + options + compaction on `Overflow`); `gbnf-probe` binary
+  exercises `llama::grammar_lazy_sampler_for/build_lazy_sampler_with/
+  derive_trigger_tokens_pub/tool_schemas_to_gbnf_pub` + `GrammarConfig::validate`.
+- Depends on: `reqwest` (rustls HTTP), `serde`/`serde_json`, `thiserror`,
+  `tokio`, `tracing`, `zeroize`; optional `llama-cpp-2` (`llama`/`llama-vulkan`
+  features). No internal workspace deps.

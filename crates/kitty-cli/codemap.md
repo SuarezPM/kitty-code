@@ -1,26 +1,94 @@
 # crates/kitty-cli/
 
 ## Responsibility
-Binary entry point: CLI parsing (`clap`), the `run`/`bench`/`bench-ab`/`info`/`mcp`/`tui` commands,
-and embedded benchmark suites (homemade + Harbor oracle proxies).
+Binary entry point: `clap` CLI parsing plus `Run/Bench/BenchAb/Info/Mcp/Tui`
+commands, embedded bench harness (homemade + official-suite wrappers), MCP
+stdio server, and optional ratatui TUI. No agent logic — only orchestration.
 
 ## Design
-- `main.rs` (~1080L): `clap` derive CLI. `Cli { url, model, thinking_budget, profile, knowledge, knowledge_dir, context_window, max_iterations, bash_timeout, semantic_memory, cloud_fallback }` + `Commands Run/Bench/BenchAb/Info/Mcp/Tui`. `Run` overlays profile then explicit flags (`cloud_fallback` + `semantic_memory` post-`with_profile`, tiny guard forces false with warn). `Bench`/`BenchAb` build `BenchConfig { semantic_memory, profile, ... }` + `is_small_model` tiny guard, `run_bench` loops limit, `run_one_bench` per exercise with `tempfile::tempdir` absolute path `Save to {tmpdir}/{check_file}` (prevents CWD contamination), `AgentConfig{semantic_memory: cfg.semantic_memory && profile!="tiny", cloud_fallback: ...}` + hybrid recall `if semantic_memory { recall_hybrid(None,3) } else recall_similar`. Helpers `bench_exit_code` (gate 50% + baseline delta 2%), `wilson_ci` z 1.96, `p50_ms` median, `parse_thinking_budgets`, `build_ab_plan` interleaved seed 42.
-- Bench items: `exercises()` 15 polyglot + `tb2_exercises()` 8 shell; `json_to_bench_item` + `load_json_exercises` for `--exercises` JSON (supports `check_type: file_exists/file_not_exists/file_executable/file_content_exact/always_pass` + `check_path`). `BenchConfig.semantic_memory` + CLI `--semantic-memory` (disabled for tiny) + `--cloud-fallback` (opt-in 1 retry, `KITTY_CLOUD_*` propagation).
-- `mcp.rs` (333L): `McpServer` stdio JSON-RPC line delimited; 6 tools via `ToolRegistry::execute` (Guard enforced + Sandbox env hints, plugin delegated when `PluginRegistry` present); `handle_request` for tests; 5 tests (`list_tools` 6, `call_tool_read`, `bash_blocked`, `bash_echo`, `persist read→edit`).
-- `tui.rs` (194L, feature `tui`): ratatui 0.29 + crossterm 0.28; `run_tui` `StatusInfo` ctx pct + duration + model; q/Esc quit. `#[cfg(feature = "tui")]` on variant + match arm.
+- `main.rs` (~633L, thin dispatch): `Cli { url, model, thinking_budget,
+  profile, knowledge, knowledge_dir, context_window, max_iterations,
+  bash_timeout, semantic_memory, cloud_fallback }` + `Commands
+  Run/Bench/BenchAb/Info/Mcp/Tui`. Helpers `default_db_path`,
+  `resolve_project_root` (marker walk `.git/Cargo.toml/...`, Gate-4 sandbox
+  allow-root), `resolve_session_num_ctx` → `NumCtxResolution { num_ctx,
+  source: env|native|fallback }` (env `KITTY_NUM_CTX` wins verbatim, else
+  one-shot `/api/show` probe clamped [4096,32768], else `DEFAULT_NUM_CTX`).
+  `Run` builds `AgentConfig` + `with_profile`, then applies `RunOverrides`
+  (context_window/max_iterations/thinking `Budget`/bash_timeout; `tiny/nano`
+  guard warns on `--semantic-memory`; `KITTY_AUTORUN_HOPS` only here+TUI,
+  never bench). `Bench/BenchAb` pack `BenchCliCtx` and delegate to
+  `bench::bench_command` / `bench::bench_ab_command`; `Info` uses
+  `health_check` + `standard_tool_definitions`; `Mcp` → `mcp::run`.
+- `bench/` suite (dispatch extracted from `main.rs`): `mod.rs` holds
+  `BenchCliCtx`, `BenchArgs`, `BenchAbArgs`, `bench_command`,
+  `bench_ab_command`. `common.rs`: `BenchConfig` (client/model/limit/
+  use_memory/thinking_budget/context_window/max_iterations/autorun_hops/
+  exercise_timeout_secs/bash_timeout/profile/knowledge), `BenchItem
+  { id,label,prompt,check,check_file }`, `BenchResult
+  { id,lang,passed,verdict,latency_ms }`, `JsonExercise` +
+  `json_to_bench_item`/`load_json_exercises`, `exercises()` 15 homemade
+  polyglot items, `bench_exit_code` (gate 50% + baseline delta 2%),
+  `is_small_model` (resolved `tiny|nano` → memory off), `language_of` +
+  `tally_by_language`, `resolve_timeout_from_flag` (flag > env
+  `KITTY_BENCH_TIMEOUT_SECS` > `DEFAULT_...=120`), `file_contains`,
+  `file_is_executable`. `run.rs`: `run_bench` loop over `limit`,
+  `run_one_bench` (`tempfile::tempdir` + absolute `Save to {tmp}/{file}`
+  prompt, `ENV_VERIFY_LOOP=off`, per-exercise `timeout`, verdict
+  pass/fail/error/timeout + `Episode` persist), `tb2_exercises()` 8 shell.
+  `ab.rs`: `parse_thinking_budgets`, `build_ab_plan` (seed-42 shuffle when
+  `interleave`), `budget_summary` (`errored` vs `timed_out` split),
+  `wilson_ci` (z 1.96), `p50_ms`. `polyglot.rs`: `run_polyglot_bench`
+  (`.meta/config.json` load, copy tree, agent 900s, `materialize_tests`,
+  unit tests 180s, 2 attempts with `retry_prompt`). `tb2.rs`:
+  `run_tb2_official` (harbor preflight → `run_tb2`, blocked JSON on fail).
+  `gpqa.rs`: `run_gpqa_suite` (gated: requires `--pre-registration` +
+  `--limit 198`, binding checks model/limits, `blocked` JSON never touches
+  model). `claweval.rs`: `run_claweval_suite` (`claw-eval batch` wrapper,
+  preflight on CLI + `OPENROUTER_API_KEY`).
+- Suite support (top level): `polyglot.rs` (`PolyglotExercise/Result`,
+  `load_polyglot_exercises`, `build_prompt`, `copy_exercise_tree`,
+  `materialize_tests`, `run_test_with_timeout`, `test_command`);
+  `tb2.rs` (`Tb2Config`, `Tb2Result`, `preflight`/`is_ready`/
+  `blocked_reasons`, `build_command`, `run_tb2`); `gpqa.rs`
+  (`GPQA_NUM_QUESTIONS=198`, `GpqaPreRegistration`, `preflight_gpqa_with_prereg`,
+  `permute_four`, `extract_answer_strict`, `grade_answer`, `GpqaResult`);
+  `claweval.rs` (`ClawEvalRunConfig/Result/Status/Error`,
+  `preflight_claweval`, `run_claweval_batch`, `parse_batch_output`).
+- `mcp.rs`: `McpServer { tools, registry }` stdio JSON-RPC line-delimited;
+  `list_tools` (6 via `standard_tool_definitions`), `call_tool` /
+  `handle_request` (`tools/list|call`, `initialize`) all through
+  `ToolRegistry::execute` (Guard + workspace `resolve_project_root`);
+  `run_stdio` loop; `run()` entrypoint.
+- `tui.rs` (feature `tui`, ratatui 0.29 + crossterm 0.28): `StatusInfo
+  { context_used/context_window, context_pct, session_duration }`,
+  `Message { role, content }`, `App` (input/history/draft/messages/
+  scroll/is_running; `take_input`, `history_up/down`, `handle_event`
+  over `AgentEvent`, `apply_q_policy` q-quits-only-when-empty-idle),
+  `run_tui` → `run_app` (mpsc 100 + `spawn_local` `Agent::run`,
+  `KITTY_AUTORUN_HOPS` allowed here).
 
 ## Flow
-`Cli::parse` → `OllamaClient` / `ChatClient` → match command → `Agent::new`+`run` (or bench loop with `BenchConfig`) → print result / write JSON (`--out`). `McpServer::run` stdio loop → `ToolRegistry::execute`.
+`Cli::parse` → `resolve_session_num_ctx` (Run/Bench/BenchAb only,
+`with_num_ctx` frozen client) → match: `Run` = `Agent::new` +
+`run_with(prompt, overrides)`; `Bench/BenchAb` = `BenchCliCtx` +
+`BenchArgs/BenchAbArgs` → `bench_command`/`bench_ab_command` (CWD-stale
+guard, `is_small_model` memory-off, suite switch gpqa→`run_gpqa_suite`,
+claweval→`run_claweval_suite`, tb2-official→`run_tb2_official`,
+polyglot→`run_polyglot_bench`, else `run_bench`/`run_one_bench`) →
+print + JSON `--out` (+ `bench_exit_code` vs `benches/baseline.json`).
+`Mcp` → `McpServer::run` stdio loop → `handle_request` →
+`ToolRegistry::execute`. `Tui` → `run_tui(model, url, ctx)`.
 
 ## Integration
-- Consumes: `kitty-runtime` (OllamaClient, CloudClient, LlamaCppClient, ChatClient), `kitty-harness` (Agent, ToolRegistry, PluginRegistry, Sandbox, Guard), `kitty-memory` (EpisodeStore, RRF/embedding).
+- Consumed by: binary users (`kitty run/bench/bench-ab/info/mcp/tui`);
+  bench JSON consumed by runbooks (`--out`, blocked-vs-executed envelopes).
+- Depends on: `kitty-harness` (`Agent`, `AgentConfig`, `RunOverrides`,
+  `ModelProfile`, `ThinkingMode`, `ToolRegistry`, `standard_tool_definitions`,
+  `KnowledgeConfig`, `ENV_VERIFY_LOOP`/`ENV_BENCH_MODE`), `kitty-runtime`
+  (`OllamaClient`, `DEFAULT_NUM_CTX`, `ENV_NUM_CTX`, cloud/KV preflight),
+  `kitty-memory` (`EpisodeStore`, `Episode`).
 - Bench harness lives here, not in `kitty-harness` — keeps harness lib pure.
-
-## Honest status
-- `info` lists **actual** registered tools via `standard_tool_definitions` (6 core), not hardcoded — advert removed.
-- Bench grades by substring `file_contains` / `file_exists` etc., so "pass" ≠ correctness (documented honestly in `AUDIT.md` as homemade, not Aider Polyglot / TB2). `run_polyglot_bench` / `run_tb2_bench` are thin wrappers over single `run_bench` driver (duplication removed).
-- Harbor verifier (official) not run via CLI bench — CLI bench is homemade proxy. Oracle via `harbor run -p bench/official/... -a oracle` proves infra; CLI bench `13/15 86.7%` + `8/8 100%` + `2/15 13.3%` are proxies NOT comparable (see `AUDIT.md` §2).
-
-## Tests
-17 tests (bench_exit 6, bench_ab 2, mcp 7, profile heuristic, etc.) `cargo test -p kitty-cli` green, clippy `-D warnings` clean. `Commands::Tui` gated same as `tui` feature (no default).
+  Grading is substring/file-check or local approximation (`polyglot` unit
+  tests real; homemade `exercises`/`tb2_exercises` proxies; gpqa/claweval/
+  tb2-official labelled non-official) — pass ≠ upstream leaderboard.
