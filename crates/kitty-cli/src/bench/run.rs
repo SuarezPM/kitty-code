@@ -16,15 +16,22 @@ use std::time::Instant;
 pub(crate) async fn run_bench(items: &[BenchItem], cfg: &BenchConfig) -> Result<Vec<BenchResult>> {
     let mut results = Vec::new();
 
-    let store = if cfg.use_memory {
-        Some(EpisodeStore::open(&default_db_path())?)
+    let mut store = if cfg.use_memory {
+        // Blocking rusqlite open runs on the blocking pool so the async
+        // executor never parks on SQLite.
+        let path = default_db_path();
+        Some(
+            tokio::task::spawn_blocking(move || EpisodeStore::open(&path))
+                .await
+                .context("episode store open task failed")??,
+        )
     } else {
         None
     };
 
     for (i, ex) in items.iter().take(cfg.limit).enumerate() {
         print!("[{:2}/{:2}] ", i + 1, cfg.limit.min(items.len()));
-        results.push(run_one_bench(ex, cfg, store.as_ref()).await?);
+        results.push(run_one_bench(ex, cfg, &mut store).await?);
     }
 
     Ok(results)
@@ -33,13 +40,24 @@ pub(crate) async fn run_bench(items: &[BenchItem], cfg: &BenchConfig) -> Result<
 pub(crate) async fn run_one_bench(
     ex: &BenchItem,
     cfg: &BenchConfig,
-    store: Option<&EpisodeStore>,
+    store: &mut Option<EpisodeStore>,
 ) -> Result<BenchResult> {
     print!("{:20}...", ex.id);
 
-    // Recall similar past episodes
-    if let Some(store) = store {
-        let past = store.recall_similar(ex.prompt, 3)?;
+    // Recall on the blocking pool (take/restore, best-effort).
+    // Pool failure ⇒ no-memory-for-this-exercise.
+    if let Some(mem) = store.take() {
+        let goal = ex.prompt;
+        let (back, recalled) = tokio::task::spawn_blocking(move || {
+            let result = mem.recall_similar(goal, 3);
+            (Some(mem), result)
+        })
+        .await
+        .unwrap_or((None, Ok(Vec::new())));
+        if let Some(mem) = back {
+            *store = Some(mem);
+        }
+        let past = recalled.unwrap_or_default();
         if !past.is_empty() {
             print!(" ({} past)", past.len());
         }
@@ -133,7 +151,8 @@ pub(crate) async fn run_one_bench(
     let status = if passed { "PASS" } else { "FAIL" };
     println!("{} ({:.0}ms)", status, latency_ms);
 
-    if let Some(store) = store {
+    // Persist the episode on the blocking pool (take/restore, best-effort).
+    if let Some(mem) = store.take() {
         let files_touched = if verdict == "pass" || verdict == "fail" {
             list_files(&tmpdir_str)
         } else {
@@ -145,7 +164,16 @@ pub(crate) async fn run_one_bench(
             Some(verdict.into()),
             format!("{verdict} (latency {latency_ms:.0}ms)"),
         );
-        store.save(&ep).ok();
+        let (back, saved) = tokio::task::spawn_blocking(move || {
+            let result = mem.save(&ep);
+            (Some(mem), result)
+        })
+        .await
+        .unwrap_or((None, Ok(())));
+        if let Some(mem) = back {
+            *store = Some(mem);
+        }
+        let _ = saved;
     }
 
     Ok(BenchResult {

@@ -4,7 +4,7 @@
 
 use crate::bench::common::{BenchConfig, BenchResult};
 use crate::default_db_path;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kitty_harness::agent::{Agent, AgentConfig, RunOverrides};
 use kitty_harness::knowledge::KnowledgeConfig;
 use kitty_harness::ThinkingMode;
@@ -236,8 +236,15 @@ pub(crate) async fn run_gpqa_suite(
     let mut results: Vec<BenchResult> = Vec::with_capacity(take);
     let mut correct = 0usize;
 
-    let store = if cfg.use_memory {
-        Some(EpisodeStore::open(&default_db_path())?)
+    // Blocking rusqlite open runs on the blocking pool so the async
+    // executor never parks on SQLite.
+    let mut store = if cfg.use_memory {
+        let path = default_db_path();
+        Some(
+            tokio::task::spawn_blocking(move || EpisodeStore::open(&path))
+                .await
+                .context("episode store open task failed")??,
+        )
     } else {
         None
     };
@@ -326,15 +333,26 @@ pub(crate) async fn run_gpqa_suite(
             None => println!("{} ({:.0}ms) -> ?", status, latency_ms),
         }
 
-        // Episode sin prompt (no registrar prompts GPQA)
-        if let Some(store) = &store {
+        // Episode sin prompt (no registrar prompts GPQA), persistido en el
+        // blocking pool (take/restore: bucle secuencial, propiedad única,
+        // best effort con fallback si falla el pool).
+        if let Some(s) = store.take() {
             let ep = Episode::new(
                 format!("gpqa:{}", q.id),
                 vec![],
                 Some(verdict.to_string()),
                 format!("gpqa {} {} (latency {:.0}ms)", q.id, verdict, latency_ms),
             );
-            store.save(&ep).ok();
+            let (back, saved) = tokio::task::spawn_blocking(move || {
+                let result = s.save(&ep);
+                (Some(s), result)
+            })
+            .await
+            .unwrap_or((None, Ok(())));
+            if let Some(s) = back {
+                store = Some(s);
+            }
+            let _ = saved;
         }
 
         results.push(BenchResult {

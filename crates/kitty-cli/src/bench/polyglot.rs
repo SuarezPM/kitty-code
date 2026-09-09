@@ -4,7 +4,7 @@
 
 use crate::bench::common::BenchConfig;
 use crate::default_db_path;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kitty_harness::agent::{Agent, AgentConfig, RunOverrides};
 use kitty_harness::knowledge::KnowledgeConfig;
 use kitty_harness::ThinkingMode;
@@ -50,8 +50,15 @@ pub(crate) async fn run_polyglot_bench(
         take
     );
 
-    let store = if cfg.use_memory {
-        Some(EpisodeStore::open(&default_db_path())?)
+    // Blocking rusqlite open runs on the blocking pool so the async
+    // executor never parks on SQLite.
+    let mut store = if cfg.use_memory {
+        let path = default_db_path();
+        Some(
+            tokio::task::spawn_blocking(move || EpisodeStore::open(&path))
+                .await
+                .context("episode store open task failed")??,
+        )
     } else {
         None
     };
@@ -232,8 +239,10 @@ pub(crate) async fn run_polyglot_bench(
             error: error_msg,
         };
 
-        // Persist episode for memory
-        if let Some(store) = &store {
+        // Persist episode for memory on the blocking pool (take/restore
+        // shape from `agent/response.rs`: sequential loop, single ownership,
+        // best effort with fallback on pool failure).
+        if let Some(s) = store.take() {
             let ep = Episode::new(
                 last_prompt,
                 vec![],
@@ -243,7 +252,16 @@ pub(crate) async fn run_polyglot_bench(
                     ex.id, result.verdict, result.latency_ms
                 ),
             );
-            store.save(&ep).ok();
+            let (back, saved) = tokio::task::spawn_blocking(move || {
+                let result = s.save(&ep);
+                (Some(s), result)
+            })
+            .await
+            .unwrap_or((None, Ok(())));
+            if let Some(s) = back {
+                store = Some(s);
+            }
+            let _ = saved;
         }
 
         results.push(result);

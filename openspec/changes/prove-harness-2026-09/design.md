@@ -81,9 +81,10 @@ scoped-out until B2/B3 land.
 - Bench `EpisodeStore` calls move to the agent's take/`spawn_blocking`/
   restore shape (`agent/response.rs:314-383`); sequential loop, no
   concurrency change.
-- Release job: tag trigger, `id-token: write`, `cargo build --release
-  -p kitty-cli`, SBOM attach, keyless `cosign sign` + Rekor bundle +
-  `attest-build-provenance`.
+- Release job: tag trigger, `id-token: write` + `contents: write`
+  (+ `attestations: write`, required by `attest-build-provenance`),
+  `cargo build --release -p kitty-cli`, SBOM attach, keyless
+  `cosign sign` + Rekor bundle + `attest-build-provenance`.
 
 ## 5. Risks
 

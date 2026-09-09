@@ -20,7 +20,7 @@ pub(crate) use gpqa::run_gpqa_suite;
 pub(crate) use run::run_bench;
 
 use crate::default_db_path;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kitty_harness::agent::clamp_autorun_hops;
 use kitty_harness::ModelProfile;
 use kitty_runtime::OllamaClient;
@@ -341,8 +341,15 @@ pub async fn bench_ab_command(
         _ => exercises(),
     };
 
-    let store = if base_cfg.use_memory {
-        Some(kitty_memory::EpisodeStore::open(&default_db_path())?)
+    let mut store = if base_cfg.use_memory {
+        // Blocking rusqlite open runs on the blocking pool so the async
+        // executor never parks on SQLite.
+        let path = default_db_path();
+        Some(
+            tokio::task::spawn_blocking(move || kitty_memory::EpisodeStore::open(&path))
+                .await
+                .context("episode store open task failed")??,
+        )
     } else {
         None
     };
@@ -368,7 +375,7 @@ pub async fn bench_ab_command(
             budget,
             task_idx
         );
-        let r = run::run_one_bench(ex, &cfg, store.as_ref()).await?;
+        let r = run::run_one_bench(ex, &cfg, &mut store).await?;
         per_budget.entry(*budget).or_default().push(r);
     }
 

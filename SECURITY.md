@@ -49,6 +49,41 @@ We follow coordinated disclosure to protect users. Once a vulnerability is confi
 - We ask reporters to avoid public disclosure before we have published a fix and to allow at least **14 days** for remediation, or a mutually agreed disclosure timeline.
 - After the fix is released, we publish an advisory describing the vulnerability, its impact, and the patched versions.
 
+## Release verification
+
+Every release is built by automation — never on a maintainer laptop. Pushing
+a version tag runs `.github/workflows/release.yml`, which compiles
+`kitty-cli` in release mode, attaches the CycloneDX SBOM, and publishes both
+as release assets. Each asset ships with:
+
+- A **keyless cosign signature** (`.sig`) plus its **Rekor bundle**
+  (`.bundle`), produced with ambient OIDC identity — there are no long-lived
+  signing keys or secrets to manage.
+- A **build-provenance attestation** recording which workflow built the
+  asset from which source.
+
+To verify a downloaded asset (example: the `kitty-cli` binary with its
+`kitty-cli.bundle` sidecar in the same directory):
+
+1. Verify the keyless signature and its Rekor inclusion proof:
+
+   ```bash
+   cosign verify-blob \
+     --bundle kitty-cli.bundle \
+     --certificate-identity-regexp '^https://github.com/SuarezPM/kitty-code/.github/workflows/release.yml@refs/tags/' \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+     kitty-cli
+   ```
+
+2. Verify the build provenance attestation:
+
+   ```bash
+   gh attestation verify kitty-cli --repo SuarezPM/kitty-code
+   ```
+
+Both commands must succeed. If either fails, do not run the binary — please
+report it through the private channels above.
+
 ## Credit
 
 We believe in giving credit to security researchers. With your permission, we will publicly acknowledge your contribution in the advisory, release notes, and in this repository. If you prefer to remain anonymous, we will respect that choice.

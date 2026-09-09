@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  id-token: write
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # rust-toolchain.toml pins the toolchain; rustup resolves it per-invocation.
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - name: Install Rust toolchain (rustup, no archived actions)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: cargo build (release)
+        run: cargo build --locked --release -p kitty-cli
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked --version 0.5.9 cargo-cyclonedx
+      # SBOM covers --all-features while the binary is default-features (deliberate, mirrors ci.yml).
+      - name: Generate SBOM
+        run: cargo cyclonedx --all-features --format json
+      - name: Stage release assets
+        run: |
+          mkdir -p dist
+          cp target/release/kitty-cli dist/kitty-cli
+          shopt -s globstar nullglob
+          cp target/**/*.cdx.json dist/
+          compgen -G "dist/*.cdx.json" > /dev/null || { echo "SBOM missing"; exit 1; }
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: "dist/*"
+      - name: Install cosign (keyless, no secrets)
+        uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+      - name: Sign release assets (keyless, Rekor bundle)
+        run: |
+          shopt -s nullglob
+          test -f dist/kitty-cli || { echo "binary missing"; exit 1; }
+          for asset in dist/*; do
+            cosign sign-blob --yes \
+              --bundle "${asset}.bundle" \
+              --output-signature "${asset}.sig" \
+              "${asset}"
+          done
+      - name: Publish GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" --generate-notes dist/*
