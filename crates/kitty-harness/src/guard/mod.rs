@@ -712,4 +712,24 @@ mod tests {
             "grep foo <<< \"bar\""
         );
     }
+
+    #[test]
+    fn strip_heredoc_bodies_multiline_kills_arithmetic_mutant() {
+        // Two body lines force `consumed += line.len() + 1` to run twice;
+        // a `+=` -> `*=` mutant leaves `consumed` at 0 and leaks the body.
+        assert_eq!(
+            strip_heredoc_bodies("cat > f << EOF\na\nb\nEOF\necho hi"),
+            "cat > f echo hi"
+        );
+    }
+
+    #[test]
+    fn strip_heredoc_bodies_double_heredoc_rescans() {
+        // Two heredocs in one command exercise the re-scan path
+        // (`search_from = at` after the first strip).
+        assert_eq!(
+            strip_heredoc_bodies("cat > a << EOF\nx\nEOF\ncat > b << END\ny\nEND\necho done"),
+            "cat > a cat > b echo done"
+        );
+    }
 }
