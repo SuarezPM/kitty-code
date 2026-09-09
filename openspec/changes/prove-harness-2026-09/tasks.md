@@ -6,12 +6,12 @@
 - [ ] 0.2 Extender el esquema de manifiesto `benches/ab/` a los 4 suites (campos por ejercicio para polyglot: outcome/attempt/tests_touched; `-k` y trajectorias para TB2.1; run-id para SWE-bench).
 - [ ] 0.3 Gate Fase 0: revisión del diseño contra las honesty rules (un revisor confirma que ningún task permite tocar el entorno de bench).
 
-## 1. Fase 1 — Mutación del guard (CPU local)
+## 1. Fase 1 — Mutación del guard (DESCOPED 2026-09-09: full run inviable en este box — dos OOM kills; se conserva evidencia parcial)
 
-- [ ] 1.1 Relanzar `cargo mutants --package kitty-harness --file crates/kitty-harness/src/guard/patterns.rs --file crates/kitty-harness/src/guard/shell_parse.rs --no-shuffle --jobs 4 --baseline=skip --iterate`; guardar el log fuera de `/tmp` (p. ej. `results/mutants-guard-<fecha>.log`).
-- [ ] 1.2 Añadir el test asesino de `strip_heredoc_bodies`: `cat > f << EOF\na\nb\nEOF\necho hi` debe dar el strip exacto (mata el `+=`→`*=`); segundo caso con dos heredocs en un comando.
-- [ ] 1.3 Matar el resto de MISSED que salgan o documentar cada superviviente como aceptado con motivo; ratchetear el ratio >70% de CONTRIBUTING.
-- [ ] 1.4 Gate Fase 1: `cargo test -p kitty-harness --all-features` verde + informe de mutación archivado.
+- [x] 1.2 Añadir el test asesino de `strip_heredoc_bodies`: `cat > f << EOF\na\nb\nEOF\necho hi` debe dar el strip exacto (mata el `+=`→`*=`); segundo caso con dos heredocs en un comando. (Hecho, commit `aa424fc`.)
+- [ ] 1.1 Full mutant run — DESCOPED: dos lanzamientos muertos por OOM del sistema (logs `results/mutants-guard-20260909T142104Z.log` y `...150009Z.log`); no relanzar en este box.
+- [ ] 1.3 Ratchet >70% — DESCOPED con 1.1; evidencia parcial archivada (~70/337 puntuados + cluster MISSED en aritmética de `split_command_chain` como trabajo futuro documentado).
+- [ ] 1.4 Gate Fase 1 → Gate B′ ligero (killer test + evidencia parcial + descope), sin informe de mutación completo.
 
 ## 2. Fase 2 — Release con firma + higiene de recall (código, sin benches)
 

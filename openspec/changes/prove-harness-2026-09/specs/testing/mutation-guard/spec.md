@@ -40,6 +40,13 @@ The documented CONTRIBUTING target (>70% caught for guard modules)
 SHALL hold on every re-run; new MISSED mutants are either killed with a
 test or recorded as accepted with a reason.
 
+Status 2026-09-09 (non-normative): full ratchet descoped with tasks
+1.1/1.3 — two full runs OOM-killed on this box (logs in `results/`).
+Partial evidence stands: the killer test for the known `+=`→`*=`
+MISSED (committed `aa424fc`) plus ~70 scored mutants showing a MISSED
+cluster in `split_command_chain` arithmetic, recorded as future test
+work.
+
 #### Scenario: regression in mutation score fails the gate
 
 - **GIVEN** a fresh guard mutation report below the archived ratio
