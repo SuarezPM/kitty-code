@@ -36,9 +36,10 @@ accumulation executes at least twice and any `+=`→`*=` mutant diverges.
 
 ### Requirement: Mutation ratio above 70 percent is ratcheted
 
-The documented CONTRIBUTING target (>70% caught for guard modules)
-SHALL hold on every re-run; new MISSED mutants are either killed with a
-test or recorded as accepted with a reason.
+Deferred until a runner with headroom (see tasks 1.1/1.3); until
+then the documented CONTRIBUTING target (>70% caught for guard
+modules) SHOULD hold on every re-run; new MISSED mutants are either
+killed with a test or recorded as accepted with a reason.
 
 Status 2026-09-09 (non-normative): full ratchet descoped with tasks
 1.1/1.3 — two full runs OOM-killed on this box (logs in `results/`).

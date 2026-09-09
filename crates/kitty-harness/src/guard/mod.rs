@@ -715,8 +715,7 @@ mod tests {
 
     #[test]
     fn strip_heredoc_bodies_multiline_kills_arithmetic_mutant() {
-        // Two body lines force `consumed += line.len() + 1` to run twice;
-        // a `+=` -> `*=` mutant leaves `consumed` at 0 and leaks the body.
+        // Two body lines + trailing chain pin body_end precisely (overshoot is masked by the clamp without trailing content).
         assert_eq!(
             strip_heredoc_bodies("cat > f << EOF\na\nb\nEOF\necho hi"),
             "cat > f echo hi"
@@ -730,6 +729,29 @@ mod tests {
         assert_eq!(
             strip_heredoc_bodies("cat > a << EOF\nx\nEOF\ncat > b << END\ny\nEND\necho done"),
             "cat > a cat > b echo done"
+        );
+    }
+
+    #[test]
+    fn split_command_chain_or_longest_match() {
+        assert_eq!(split_command_chain("a || b"), vec!["a", "b"]);
+        assert_eq!(split_command_chain("a || b || c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn split_command_chain_mixed_operators_and_edges() {
+        assert_eq!(
+            split_command_chain("ls; rm -rf / || echo done"),
+            vec!["ls", "rm -rf /", "echo done"]
+        );
+        assert_eq!(split_command_chain("&& ls &&"), vec!["ls"]);
+    }
+
+    #[test]
+    fn split_command_chain_heredoc_body_never_command() {
+        assert_eq!(
+            split_command_chain("cat > f << EOF\nrm -rf /\nEOF\n&& echo hi"),
+            vec!["cat > f", "echo hi"]
         );
     }
 }
