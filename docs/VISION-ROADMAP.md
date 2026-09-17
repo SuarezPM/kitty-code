@@ -52,6 +52,15 @@ empaquetado en un binario estático. Cada feature nueva que no cierre un P0 dilu
    tareas del orden del dataset (cero cherry-pick post-hoc), con nombres honestos `_l50`/`_l15`,
    gate de trials erróneos ≤10%, y fallback `_partialN` con nota `not empirically closed`.
    Pre-registro completo: `docs/AUDIT.md` §6 "Approved night strategy".
+4. **Prove-harness Fases 0–4 cerradas, HOLD antes de la batería pesada (2026-09-09).**
+   7 commits, Gates A–E (2 re-reviews); primer par A/B citable N=15 casero:
+   empate 14/14 (`ornith:9b` vs `ornith-1.5:9b`), string-match-homemade,
+   nunca tasa oficial; oracle smoke TB2.1 25/25 (infra validada, no señal
+   de modelo); mutación full descoped por OOM del box (quedan killer test
+   + evidencia parcial); ClawEval descoped (mismatch de upstream);
+   GPQA bloqueado (approval+token HF). Estimaciones calibradas y HOLD con
+   GO pendiente en `handoff.md`; estado vivo en
+   `.slim/deepwork/prove-harness-2026-09.md`.
 
 ## 4. Estado de métricas — honestidad ante todo
 

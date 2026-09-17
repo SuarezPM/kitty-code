@@ -35,6 +35,8 @@
 
 ## 5. Fase 5 — Benches pesados, en orden (cada uno pre-registrado y con gate)
 
+**HOLD 2026-09-09: NADA arranca sin GO del usuario — ver `handoff.md` (estimaciones calibradas + 3 decisiones pendientes). Reanudar: verificar binario fresco + Ollama + árbol limpio, lanzar 5.1 detached + watcher, exigir esquema de manifiesto extendido (fingerprints daemon/modelo).**
+
 - [ ] 5.1 Polyglot-225 ×2 runs con ornith 1.5 9B (órdenes distintos, temp 0.3, ctx 32768, thinking 2048): reportar media±SD, split por intento, auditoría de tests tocados. (~20h/run).
 - [ ] 5.2 TB2.1 89×5 (`terminus-2`, temp 1.0/top_p 1.0, trajectorias publicadas) + oracle `-k5` previo.
 - [ ] 5.3 GPQA Diamond 198 con pre-registro válido.
