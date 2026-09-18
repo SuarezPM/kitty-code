@@ -1,0 +1,35 @@
+{
+  "timestamp_utc": "20260909T150252Z",
+  "git_head_sha": "68dcd8fb1a56f05f5e5673ba581ce185236edb56",
+  "tree": "clean",
+  "suite": "polyglot",
+  "n_per_arm": 15,
+  "exercises": {
+    "path": "benches/exercises_polyglot.json",
+    "sha256": "0d38e3cc18c3acbeeb3b6ef605de6f8afe5d74aeb0eeafc1ed840ec77a6fa3b3",
+    "loaded": 228
+  },
+  "selection_rule": "first-N exercises in dataset order (-l N); chosen before launch, no post-hoc re-selection",
+  "thinking_budget": 2048,
+  "timeout_secs": 900,
+  "profile": "medium",
+  "interleave": true,
+  "valid_run_gate": "errored trials <= 10% of N per arm; no early cuts",
+  "harness_config": {
+    "max_iterations": 5,
+    "note": "kitty bench polyglot uses bench override (5), not the 16 default"
+  },
+  "env_baseline": "both arms launched from one normalized prefix; stripped: KITTY_NUM_CTX, KITTY_KV_QUANT_ACK, KITTY_MODEL_TURN_CAPS, KITTY_NO_THINK, KITTY_LINT_GATE, KITTY_EDIT_CHECK, KITTY_AUTORUN_HOPS, KITTY_BENCH_TIMEOUT_SECS",
+  "arm_a": {
+    "model": "ornith:9b",
+    "levers": "none — normalized baseline only"
+  },
+  "arm_b": {
+    "model": "ornith-1.5:9b",
+    "levers": {
+      "KITTY_NUM_CTX": "32768",
+      "KITTY_KV_QUANT_ACK": "q8_0",
+      "note": "same normalized baseline + these declared levers layered on top"
+    }
+  }
+}
