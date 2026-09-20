@@ -74,7 +74,12 @@ static SMALL: ModelProfile = ModelProfile {
     context_window: 8192,
     max_iterations: 12,
     tool_subset: &["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-    use_native_tools: true,
+    // Text tool calls + harness repair pipeline (parser 1c, JSON repair,
+    // alias normalization) INSTEAD of native: weak 2-4B tool-callers emit
+    // malformed native args that make Ollama itself 500
+    // ("llama-server returned invalid tool call arguments") before the
+    // harness ever sees the text. Measured 2026-09-20 on MiniCPM5-2B.
+    use_native_tools: false,
     read_cap: 150,
     bash_timeout_secs: 45,
     bash_output_cap: 4_000,
@@ -856,7 +861,9 @@ mod tests {
             p.tool_subset,
             &["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
         );
-        assert!(p.use_native_tools);
+        // Deliberately NO native tools: weak 2-4B callers 500 Ollama with
+        // malformed native args; text + harness repair dominates.
+        assert!(!p.use_native_tools);
         assert_eq!(p.read_cap, 150);
         assert_eq!(p.bash_timeout_secs, 45);
         assert_eq!(p.bash_output_cap, 4_000);

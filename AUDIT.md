@@ -162,6 +162,8 @@ Per CNAS methodology:
 5. No frontier reasoning, no long context, no production hardening beyond sandbox + guard + audit.
 6. Benchmarks are single-file / dockerized task proxies, not repo-scale agent work.
 7. Known harness limitations (Guard Write-to-existing-file stall, thinking-budget mismatch, context-length dependency) qualify every consumer number until fixed — see `docs/AUDIT.md` §6 for the three limitations and the approved pre-registered night strategy.
+8. MiniCPM5-2B (2026-09-20, manifests `manifest-20260920T163000Z-minicpm5-l15.json` + `manifest-20260920T172000Z-minicpm5-microexp.json`): **0/15** on official-polyglot-first-15 (unit-test grading) + 0/5 micro-runs. Lane functional (smoke Write OK) but not competitive on Exercism-hard. Native tools OFF for the small tier (Ollama 500s on weak-model native args before harness repair sees them). Vendor 46.4% SWE-bench NOT reproduced, NOT claimed.
+9. K2-Horizon-3.7B: client implemented + mock-tested, serving frozen (no SGLang on box, GGUF fork-only) — `docs/SERVING-K2-SGLANG.md`. Zero bench numbers, none claimed.
 
 ---
 
@@ -169,6 +171,7 @@ Per CNAS methodology:
 
 * [x] Harbor + Docker stack verified (oracle 15/15 and 5/5)
 * [x] Homemade proxies for ornith:9b 13/15 86.7% and TB2 8/8 100% + 2/15 13.3%
+* [x] Small-model lane (2026-09-20): `small` preset + minicpm/k2 tuning + kwarg parser + compat client; MiniCPM5-2B baseline 0/15 official-first-15 (valid zero, not a claim)
 * [ ] Custom Harbor adapter for kitty agent to run official verifier with ornith:9b (next step for true Consumer official rate)
 * [ ] Full 225 and 89 official runs when adapter exists (0.7h + 0.49h at n=2)
 * [ ] RAG + long context + multi-file benchmark when warranted

@@ -23,6 +23,15 @@ spike, `RuntimeError` taxonomy, and the `gbnf-probe` measurement binary.
   `tracing::info!`; `CloudMessage::reasoning_content` normalized into
   `Message::thinking`. `is_secret_env_name` / `sanitize_env` strip secrets from
   child env. `MockCloud` mirrors `MockClient` semantics.
+- `OpenAiCompatClient` (openai_compat.rs): keyless OpenAI-compat POST
+  `{base}/v1/chat/completions` for models Ollama can't serve (K2-Horizon-3.7B
+  via SGLang; `KITTY_OPENAI_BASE_URL`, default `:30000`). `reasoning_content`
+  ↔ `thinking` both directions, `tool_call_id` positional pairing
+  (`kitty_{n}` fallback), server tool names validated identifier-shaped
+  (anti prompt-injection), malformed args salvaged as `_raw`, options
+  always forwarded, `extra_body.reasoning_effort` (K2 `high`;
+  `think:false` drops it), chars/4 `count_tokens`, `/v1/models` health.
+  11 wiremock tests. K2 serving frozen (no SGLang on box): `docs/SERVING-K2-SGLANG.md`.
 - `LlamaCppClient` (llama.rs): in-process GGUF adapter (`model_path: PathBuf` +
   `fallback: OllamaClient` + `state: Arc<Mutex<Option<Inner>>>>` + `load_error`,
   `unsafe impl Send/Sync`). `try_load` vocab-only probe, missing GGUF delegates
