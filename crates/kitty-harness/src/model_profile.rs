@@ -1,6 +1,7 @@
 //! Model profiles — parametrize harness behaviour per model size.
 //!
-//! Four presets: nano (<2B small-family models, minimal prompt), tiny (≤2B),
+//! Five presets: nano (<2B small-family models, minimal prompt), tiny (≤2B),
+//! small (2-4B with declared tool-calling: native tools on, full prompt),
 //! medium (8-13B, default), large (27-35B). Each preset determines context
 //! window, iteration cap, tool subset, native-tool flag, read cap, bash
 //! timeout, compaction threshold and prompt style.
@@ -68,6 +69,19 @@ static TINY: ModelProfile = ModelProfile {
     prompt_style: PromptStyle::Full,
 };
 
+static SMALL: ModelProfile = ModelProfile {
+    name: "small",
+    context_window: 8192,
+    max_iterations: 12,
+    tool_subset: &["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+    use_native_tools: true,
+    read_cap: 150,
+    bash_timeout_secs: 45,
+    bash_output_cap: 4_000,
+    compact_threshold: 0.75,
+    prompt_style: PromptStyle::Full,
+};
+
 static MEDIUM: ModelProfile = ModelProfile {
     name: "medium",
     context_window: 16384,
@@ -104,6 +118,11 @@ impl ModelProfile {
     pub fn tiny() -> &'static Self {
         &TINY
     }
+    /// Preset for 2-4B models with declared tool-calling (8K, 12 iter,
+    /// 6 tools, native on, full prompt): e.g. MiniCPM5-2B, K2-Horizon-3.7B.
+    pub fn small() -> &'static Self {
+        &SMALL
+    }
     /// Preset for 8-13B models (16K, 1024 thinking — bench ab 50 knee 1024>2048 96% vs 90% p0.44, 20 iter, 6 tools, native).
     pub fn medium() -> &'static Self {
         &MEDIUM
@@ -113,19 +132,20 @@ impl ModelProfile {
         &LARGE
     }
 
-    /// Resolve the session profile from the CLI `--profile` value and the
-    /// model id (f8 T4.1).
-    ///
     /// An explicitly recognized profile name always wins (`--profile medium`
     /// on a 3B model stays medium). Otherwise ("auto" or any unrecognized
-    /// value) the MODEL NAME decides via [`is_nano_sized_model`]: conservative
-    /// sub-3B family ids select `nano`, everything else stays `medium`.
+    /// value) the MODEL NAME decides via [`is_small_sized_model`] /
+    /// [`is_nano_sized_model`]: 2-4B tool-callers select `small`,
+    /// conservative sub-3B family ids select `nano`, everything else stays
+    /// `medium`.
     pub fn from_cli(profile: &str, model_id: &str) -> &'static Self {
         match profile.trim().to_ascii_lowercase().as_str() {
             "nano" => Self::nano(),
             "tiny" => Self::tiny(),
+            "small" => Self::small(),
             "large" => Self::large(),
             "medium" => Self::medium(),
+            _ if is_small_sized_model(model_id) => Self::small(),
             _ if is_nano_sized_model(model_id) => Self::nano(),
             _ => Self::medium(),
         }
@@ -151,6 +171,25 @@ pub fn is_nano_sized_model(model_id: &str) -> bool {
         .is_match(model_id)
 }
 
+/// Auto-detection of the small tier: 2-4B models with vendor-declared
+/// tool-calling (MiniCPM5-2B, K2-Horizon-3.7B). Checked BEFORE
+/// [`is_nano_sized_model`] in [`ModelProfile::from_cli`] because e.g.
+/// `minicpm5:2b` also matches the nano `2b` token.
+///
+/// Two shapes: (a) `minicpm` + a `2b` size token (the 3B MiniCPMs stay out
+/// until a tool-calling recipe is confirmed for them); (b) the K2-Horizon
+/// dense small id (`k2-horizon-3.7b` / `k2_horizon` spellings, incl. the
+/// `IFM/K2-Horizon-3.7B` HF id). Case-insensitive. Everything else falls
+/// through to nano/medium.
+#[must_use]
+pub fn is_small_sized_model(model_id: &str) -> bool {
+    let lower = model_id.to_ascii_lowercase();
+    if lower.contains("k2-horizon") || lower.contains("k2_horizon") {
+        return true;
+    }
+    lower.contains("minicpm") && is_nano_sized_model(model_id)
+}
+
 // ── Per-model turn caps (Tier 4) ───────────────────────────────────
 
 /// Per-model-id iteration caps, matched by plain `starts_with` prefix
@@ -168,7 +207,16 @@ pub fn is_nano_sized_model(model_id: &str) -> bool {
 /// SINGLE SOURCE OF TRUTH (F2): these caps are consumed exclusively through
 /// [`ModelTuning::resolve`] / [`turn_cap_for_model`] — never read directly
 /// elsewhere.
-static MODEL_TURN_CAPS: &[(&str, usize)] = &[("ornith:9b", 24), ("ornith-1.5", 16)];
+static MODEL_TURN_CAPS: &[(&str, usize)] = &[
+    ("ornith:9b", 24),
+    ("ornith-1.5", 16),
+    ("minicpm5:2b", 12),
+    ("minicpm5-2b", 12),
+    ("openbmb/minicpm5", 12),
+    ("k2-horizon", 12),
+    ("k2_horizon", 12),
+    ("ifm/k2-horizon", 12),
+];
 
 // ── Per-model inference settings (F2) ──────────────────────────────
 
@@ -228,7 +276,10 @@ impl Default for ModelTuning {
 
 /// Static per-family defaults (F2). Resolution order in
 /// [`ModelTuning::resolve`]: exact model-id match → family match (id contains
-/// "ornith" / "qwen") → default.
+/// "ornith" / "qwen" / "minicpm" / "k2-horizon") → default.
+///
+/// Rule (multi-model lane): only families with a vendor-documented sampling
+/// recipe get an entry here; everything else uses the default.
 impl ModelTuning {
     /// Fallback for unknown models: conservative sampling, capped thinking.
     #[must_use]
@@ -265,10 +316,43 @@ impl ModelTuning {
         }
     }
 
+    /// MiniCPM5 family (reasoning-trained, vendor recipe: temperature 1.0,
+    /// top_p 0.95, thinking on). Thinking stays ON uncapped like ornith:
+    /// capping a reasoning model retries without thinking, which destroys
+    /// the capability the vendor post-trained for.
+    #[must_use]
+    pub fn minicpm_family() -> Self {
+        Self {
+            max_iterations: 20,
+            temperature: 1.0,
+            top_p: Some(0.95),
+            top_k: None,
+            num_predict: 8192,
+            thinking: ThinkingMode::On,
+        }
+    }
+
+    /// K2-Horizon family (reasoning-trained, vendor recipe: temperature 1.0,
+    /// top_p 0.95, reasoning_effort high, ≥32768 output tokens). `num_predict`
+    /// 32768 is the vendor's stated minimum so reasoning is never truncated
+    /// (truncated reasoning is a failed response, not a shorter one).
+    #[must_use]
+    pub fn k2_family() -> Self {
+        Self {
+            max_iterations: 20,
+            temperature: 1.0,
+            top_p: Some(0.95),
+            top_k: None,
+            num_predict: 32768,
+            thinking: ThinkingMode::On,
+        }
+    }
+
     /// Resolve inference settings for `model_id`.
     ///
     /// Order: exact model-id table hit → family substring match ("ornith",
-    /// "qwen", case-insensitive) → default. Overrides applied last:
+    /// "qwen", "minicpm", "k2-horizon"/"k2_horizon", case-insensitive) →
+    /// default. Overrides applied last:
     ///
     /// 1. `KITTY_MODEL_TURN_CAPS` env entries (`turn_caps_env`) override
     ///    `max_iterations` when their prefix matches.
@@ -315,6 +399,10 @@ impl ModelTuning {
             Self::ornith_family()
         } else if lower.contains("qwen") {
             Self::qwen_family()
+        } else if lower.contains("minicpm") {
+            Self::minicpm_family()
+        } else if lower.contains("k2-horizon") || lower.contains("k2_horizon") {
+            Self::k2_family()
         } else {
             Self::default_profile()
         };
@@ -404,12 +492,16 @@ pub fn turn_cap_from_env_spec(spec: Option<&str>, model_id: &str) -> Option<usiz
 }
 
 /// Static-table half of [`turn_cap_for_model`]: first [`MODEL_TURN_CAPS`]
-/// prefix match, or `None`.
+/// prefix match, or `None`. Comparison is case-insensitive (all static
+/// prefixes are lowercase) so HF-style ids (`IFM/K2-Horizon-3.7B`,
+/// `openbmb/MiniCPM5-2B`) match their entries; env-spec matching stays
+/// case-sensitive (user-controlled prefixes, documented prefix semantics).
 #[must_use]
 fn turn_cap_static_for(model_id: &str) -> Option<usize> {
+    let lower = model_id.to_ascii_lowercase();
     MODEL_TURN_CAPS
         .iter()
-        .find(|(prefix, _)| model_id.starts_with(prefix))
+        .find(|(prefix, _)| lower.starts_with(*prefix))
         .map(|(_, cap)| *cap)
 }
 
@@ -735,7 +827,14 @@ mod tests {
         // (VERIFY_MAX_REVISIONS = 2 revision cycles re-enter the full loop).
         // Every resolvable default must stay ≤ 24 so the worst case stays
         // bounded (~72 calls).
-        for model in ["ornith:9b", "ornith-1.5", "qwen3:8b", "mystery-model"] {
+        for model in [
+            "ornith:9b",
+            "ornith-1.5",
+            "qwen3:8b",
+            "mystery-model",
+            "minicpm5:2b",
+            "IFM/K2-Horizon-3.7B",
+        ] {
             let t = ModelTuning::resolve(model, None, None);
             assert!(
                 t.max_iterations <= 24,
@@ -743,5 +842,105 @@ mod tests {
                 t.max_iterations
             );
         }
+    }
+
+    // ── Multi-model lane: small preset + minicpm/k2 families ──────────
+
+    #[test]
+    fn small_preset_values() {
+        let p = ModelProfile::small();
+        assert_eq!(p.name, "small");
+        assert_eq!(p.context_window, 8192);
+        assert_eq!(p.max_iterations, 12);
+        assert_eq!(
+            p.tool_subset,
+            &["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+        );
+        assert!(p.use_native_tools);
+        assert_eq!(p.read_cap, 150);
+        assert_eq!(p.bash_timeout_secs, 45);
+        assert_eq!(p.bash_output_cap, 4_000);
+        assert!((p.compact_threshold - 0.75).abs() < f32::EPSILON);
+        assert_eq!(p.prompt_style, PromptStyle::Full);
+    }
+
+    #[test]
+    fn from_cli_small_explicit_and_auto() {
+        // Explicit name always wins, even on a non-small model.
+        assert_eq!(ModelProfile::from_cli("small", "qwen3:8b").name, "small");
+        assert_eq!(ModelProfile::from_cli("SMALL", "ornith:9b").name, "small");
+        // Auto-detection: minicpm 2B ids and K2-Horizon select small…
+        for model in [
+            "minicpm5:2b",
+            "minicpm5-2b",
+            "openbmb/MiniCPM5-2B",
+            "IFM/K2-Horizon-3.7B",
+            "k2_horizon-3.7b-q4",
+        ] {
+            assert_eq!(
+                ModelProfile::from_cli("auto", model).name,
+                "small",
+                "{model} should auto-resolve to small"
+            );
+        }
+        // …while other sub-3B ids stay nano and the rest stay medium.
+        assert_eq!(ModelProfile::from_cli("auto", "qwen2.5:3b").name, "nano");
+        assert_eq!(ModelProfile::from_cli("auto", "llama3.2:1b").name, "nano");
+        assert_eq!(ModelProfile::from_cli("auto", "qwen3:8b").name, "medium");
+        assert_eq!(ModelProfile::from_cli("auto", "ornith:9b").name, "medium");
+    }
+
+    #[test]
+    fn small_detection_boundaries() {
+        assert!(is_small_sized_model("minicpm5:2b"));
+        assert!(is_small_sized_model("minicpm5-2b-instruct"));
+        assert!(is_small_sized_model("IFM/K2-Horizon-3.7B"));
+        assert!(is_small_sized_model("k2_horizon-3.7b"));
+        // No false positives: other vendors' 2B/3B ids stay nano-track…
+        assert!(!is_small_sized_model("qwen2.5:3b"));
+        assert!(!is_small_sized_model("gemma-2b"));
+        // …minicpm without a 2b size token is not small (3B MiniCPMs stay
+        // out until a tool-calling recipe is confirmed for them)…
+        assert!(!is_small_sized_model("minicpm3-4b"));
+        // …and bare "k2" without the horizon marker does not match.
+        assert!(!is_small_sized_model("k2-think"));
+    }
+
+    #[test]
+    fn tuning_minicpm_and_k2_families() {
+        // MiniCPM: vendor recipe temp 1.0 / top_p 0.95, thinking ON uncapped,
+        // plus the static 12-cap.
+        let mini = ModelTuning::resolve("minicpm5:2b", None, None);
+        assert!((mini.temperature - 1.0).abs() < f32::EPSILON);
+        assert_eq!(mini.top_p, Some(0.95));
+        assert_eq!(mini.thinking, ThinkingMode::On);
+        assert_eq!(mini.num_predict, 8192);
+        assert_eq!(mini.max_iterations, 12);
+
+        // K2: vendor minimum num_predict 32768 so reasoning is never cut.
+        let k2 = ModelTuning::resolve("IFM/K2-Horizon-3.7B", None, None);
+        assert!((k2.temperature - 1.0).abs() < f32::EPSILON);
+        assert_eq!(k2.top_p, Some(0.95));
+        assert_eq!(k2.thinking, ThinkingMode::On);
+        assert_eq!(k2.num_predict, 32768);
+        assert_eq!(k2.max_iterations, 12);
+
+        // KITTY_NO_THINK still wins over both reasoning families.
+        for model in ["minicpm5:2b", "IFM/K2-Horizon-3.7B"] {
+            let t = ModelTuning::resolve(model, Some("1"), None);
+            assert_eq!(t.thinking, ThinkingMode::Off, "{model} must honor NO_THINK");
+        }
+    }
+
+    #[test]
+    fn turn_cap_static_table_small_models() {
+        with_env_turn_caps(None, || {
+            assert_eq!(turn_cap_for_model("minicpm5:2b"), Some(12));
+            assert_eq!(turn_cap_for_model("minicpm5-2b-instruct"), Some(12));
+            assert_eq!(turn_cap_for_model("k2-horizon-3.7b"), Some(12));
+            // HF-style ids (case-insensitive static match).
+            assert_eq!(turn_cap_for_model("IFM/K2-Horizon-3.7B"), Some(12));
+            assert_eq!(turn_cap_for_model("openbmb/MiniCPM5-2B"), Some(12));
+        });
     }
 }

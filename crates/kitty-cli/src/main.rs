@@ -197,9 +197,10 @@ pub struct Cli {
     #[arg(long, default_value = "60")]
     pub bash_timeout: u64,
 
-    /// Model profile preset: nano|tiny|medium|large (default: auto —
-    /// auto-detects nano-tier sub-3B models by id shape)
-    #[arg(long, global = true, default_value = "auto", value_parser = clap::builder::PossibleValuesParser::new(["nano", "tiny", "medium", "large", "auto"]))]
+    /// Model profile preset: nano|tiny|small|medium|large (default: auto —
+    /// auto-detects small-tier 2-4B tool-callers and nano-tier sub-3B models
+    /// by id shape)
+    #[arg(long, global = true, default_value = "auto", value_parser = clap::builder::PossibleValuesParser::new(["nano", "tiny", "small", "medium", "large", "auto"]))]
     pub profile: String,
 
     /// Enable semantic memory (hybrid BM25+embedding RRF, medium/large only)
@@ -409,7 +410,7 @@ async fn main() -> Result<()> {
                 // G4-1: gate on the RESOLVED profile, not the raw flag string
                 // (the "auto" default never equals "tiny" verbatim).
                 let resolved = ModelProfile::from_cli(&cli.profile, &cli.model);
-                if resolved.name == "tiny" || resolved.name == "nano" {
+                if matches!(resolved.name, "tiny" | "nano" | "small") {
                     warn!(
                         "--semantic-memory requires medium/large profile, ignoring for {}",
                         resolved.name

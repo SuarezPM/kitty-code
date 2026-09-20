@@ -363,10 +363,13 @@ pub(crate) fn bench_exit_code(rate: f64, gate: f64, baseline: Option<f64>) -> i3
     }
 }
 pub(crate) fn is_small_model(profile: &str, model: &str) -> bool {
-    // G4-1: gate on the RESOLVED profile name — nano sessions (auto-detected
-    // or explicit) must get the same small-model bench guard as tiny, or
-    // SQLite recall stalls a 4096-token session.
-    matches!(ModelProfile::from_cli(profile, model).name, "tiny" | "nano")
+    // G4-1: gate on the RESOLVED profile name — nano/small sessions
+    // (auto-detected or explicit) must get the same small-model bench guard
+    // as tiny, or SQLite recall stalls a ≤8K-token session.
+    matches!(
+        ModelProfile::from_cli(profile, model).name,
+        "tiny" | "nano" | "small"
+    )
 }
 #[cfg(test)]
 mod bench_exit_tests {
@@ -561,5 +564,26 @@ mod small_model_gate_tests {
         );
         assert!(!is_small_model("auto", "qwen3:8b"));
         assert!(!is_small_model("medium", "qwen2.5-3b"));
+    }
+
+    #[test]
+    fn small_sessions_count_as_small_models_for_bench_gating() {
+        // Multi-model lane: small-tier ids trip the same memory-off guard.
+        assert!(
+            is_small_model("auto", "minicpm5:2b"),
+            "auto-profile + small-detected id ⇒ small"
+        );
+        assert!(
+            is_small_model("small", "some-model-id"),
+            "explicit --profile small ⇒ small"
+        );
+        assert!(
+            is_small_model("auto", "IFM/K2-Horizon-3.7B"),
+            "K2 HF id ⇒ small"
+        );
+        assert!(
+            !is_small_model("medium", "minicpm5:2b"),
+            "explicit medium beats auto-detection"
+        );
     }
 }

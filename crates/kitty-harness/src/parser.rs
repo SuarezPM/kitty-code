@@ -5,6 +5,8 @@
 //! - `<|tool_call|>` special tags (Qwen-style chat templates)
 //! - `[TOOL_CALLS]` markers (Mistral-style arrays)
 //! - `<tool_call>` XML blocks in text content
+//! - Python-kwarg calls `[name(k='v', ...)]` in `<|tool_call_start|>`
+//!   (MiniCPM5 / Liquid-style templates)
 //! - JSON objects embedded in ```json / ```tool fences
 //! - `<json>` blocks
 //! - Bare JSON objects embedded in prose
@@ -65,6 +67,14 @@ const MESSAGE_TAG_LOOKAHEAD_BYTES: usize = 200;
 
 /// Marker introducing the loose Gemma `call:NAME{json}` fragment form.
 const LOOSE_CALL_MARKER: &str = "call:";
+
+/// Opener for MiniCPM5/Liquid-style Python-kwarg tool calls:
+/// `<|tool_call_start|>[write_file(path='a.py')]<|tool_call_end|>`.
+const KWARG_CALL_OPENER: &str = "<|tool_call_start|>";
+/// Closers accepted for the kwarg form (the `_start` opener pairs with any).
+const KWARG_CALL_CLOSERS: &[&str] = &["<|tool_call_end|>", "<|end_tool_call|>", "</tool_call>"];
+/// Maximum nesting depth for Python-literal kwarg values (lists/dicts).
+const KWARG_MAX_DEPTH: u32 = 8;
 
 /// Parser for tool calls from model output.
 pub struct ToolCallParser {
@@ -139,6 +149,7 @@ impl ToolCallParser {
     fn has_tool_call_intent(&self, content: &str) -> bool {
         content.contains("<tool_call>")
             || content.contains("<|tool_call|>")
+            || content.contains("<|tool_call_start|>")
             || content.contains("[TOOL_CALLS]")
             || content.contains("```json")
             || content.contains("<json>")
@@ -156,6 +167,7 @@ impl ToolCallParser {
     /// XML + fenced-block union semantics are preserved):
     /// 1. `<|tool_call|>` special tags
     ///    1b. asymmetric `<|tool_call>` opener (Gemma 4 wild variant)
+    ///    1c. `<|tool_call_start|>` + Python-kwarg calls (MiniCPM5/Liquid)
     /// 2. `[TOOL_CALLS]` marker
     /// 3. `<tool_call>` XML blocks
     /// 4. ```json / ```tool fenced blocks
@@ -189,6 +201,15 @@ impl ToolCallParser {
         //     `<|tool_call>` is a prefix of `<|tool_call|>`.
         if results.is_empty() {
             results.extend(self.parse_asymmetric_tool_calls(content));
+        }
+
+        // 1c. `<|tool_call_start|>[name(k='v', ...)]` (MiniCPM5/Liquid-style
+        //     Python kwargs). Runs after the JSON-tag layers so JSON
+        //     envelopes keep priority; disjoint openers (no JSON layer
+        //     matches `<|tool_call_start|>`) keep every call owned by one
+        //     layer. Names are canonicalized by the fuzzy layer afterwards.
+        if results.is_empty() {
+            results.extend(self.parse_python_kwarg_calls(content));
         }
 
         // 2. `[TOOL_CALLS]` marker (Mistral-style array or single object).
@@ -366,6 +387,53 @@ impl ToolCallParser {
         }
 
         Vec::new()
+    }
+
+    /// Parse `<|tool_call_start|>...` regions with a Python-kwarg payload
+    /// parser (see [`Self::parse_python_kwarg_call`]).
+    fn parse_python_kwarg_calls(&self, content: &str) -> Vec<ParsedToolCall> {
+        self.parse_delimited_calls_with(
+            content,
+            KWARG_CALL_OPENER,
+            KWARG_CALL_CLOSERS,
+            |payload| self.parse_python_kwarg_call(payload),
+        )
+    }
+
+    /// Parse one `[name(k='v', n=3)]` (or bare `name(k='v')`) payload into a
+    /// call. Returns `None` when the shape is not a kwarg call — the layer
+    /// then yields nothing, later layers still run, and the intent heuristic
+    /// reports the attempt as malformed rather than dropping it silently.
+    fn parse_python_kwarg_call(&self, payload: &str) -> Option<ParsedToolCall> {
+        let mut body = payload.trim();
+        if let Some(stripped) = body.strip_prefix('[') {
+            body = stripped.strip_suffix(']')?.trim();
+        }
+        let paren = body.find('(')?;
+        let name = body[..paren].trim();
+        if !is_word_like(name) || name.len() > MAX_INLINE_NAME_LEN {
+            return None;
+        }
+        let after = body[paren + 1..].trim_start();
+        let close = find_matching_paren(after)?;
+        let args_str = after[..close].trim();
+        if !after[close + 1..].trim().is_empty() {
+            return None; // trailing garbage after `)` — not a clean call
+        }
+        let mut args = serde_json::Map::new();
+        if !args_str.is_empty() {
+            for item in split_top_level(args_str, ',') {
+                let (key, value) = parse_kwarg_item(item.trim(), 0)?;
+                if !is_word_like(key) {
+                    return None;
+                }
+                args.insert(key.to_string(), value);
+            }
+        }
+        Some(ParsedToolCall {
+            name: name.to_string(),
+            arguments: Value::Object(args),
+        })
     }
 
     /// Parse JSON code blocks: ```json ... ``` and ```tool ... ```
@@ -1097,6 +1165,198 @@ fn parse_loose_call_payload(rest: &str) -> Option<(&str, Value)> {
         .iter()
         .find(|&&(s, _)| s == 0)?;
     Some((name, parse_lenient_value(&rest[s..=e])?))
+}
+
+/// Byte index of the `)` closing the paren opened just before `s` (depth
+/// starts at 1). Skips quoted regions (both quote styles, backslash
+/// escapes); nested `(`/`)` adjust depth, other brackets are inert. All
+/// returned indices land on ASCII bytes, so slicing at them is safe.
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 1u32;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for (i, b) in s.bytes().enumerate() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => quote = Some(b),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split `s` on `delim` (must be ASCII: `,`, `=`, `:`) at bracket depth 0,
+/// quote-aware (both styles, backslash escapes). Depth counts `(`, `[`,
+/// `{` uniformly, so commas inside nested literals never split.
+fn split_top_level(s: &str, delim: char) -> Vec<&str> {
+    debug_assert!(delim.is_ascii());
+    let mut parts = Vec::new();
+    let mut depth = 0u32;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut start = 0;
+    let delim_b = delim as u8;
+    for (i, b) in s.bytes().enumerate() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => quote = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b if b == delim_b && depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Parse one `key=literal` item into its key slice and JSON value.
+/// Returns `None` unless the item is exactly one top-level `=` pair.
+fn parse_kwarg_item(item: &str, depth: u32) -> Option<(&str, Value)> {
+    let kv = split_top_level(item, '=');
+    if kv.len() != 2 {
+        return None;
+    }
+    let key = kv[0].trim();
+    let raw = kv[1].trim();
+    if key.is_empty() || raw.is_empty() {
+        return None;
+    }
+    Some((key, parse_python_literal(raw, depth)?))
+}
+
+/// Parse one Python literal into JSON: quoted strings (both styles, with
+/// escapes), `True`/`False`/`None`, ints, finite floats, `[...]` lists and
+/// `{...}` dicts (string or identifier keys). Returns `None` for anything
+/// else so the caller degrades to `_raw`/malformed instead of guessing.
+fn parse_python_literal(s: &str, depth: u32) -> Option<Value> {
+    if depth > KWARG_MAX_DEPTH {
+        return None;
+    }
+    let s = s.trim();
+    if s.len() >= 2 && (s.starts_with('\'') || s.starts_with('"')) {
+        return parse_python_string(s).map(Value::String);
+    }
+    match s {
+        "True" => return Some(Value::Bool(true)),
+        "False" => return Some(Value::Bool(false)),
+        "None" => return Some(Value::Null),
+        _ => {}
+    }
+    if s.starts_with('[') {
+        let inner = s.strip_prefix('[')?.strip_suffix(']')?;
+        if inner.trim().is_empty() {
+            return Some(Value::Array(Vec::new()));
+        }
+        let items: Option<Vec<Value>> = split_top_level(inner, ',')
+            .into_iter()
+            .map(|it| parse_python_literal(it.trim(), depth + 1))
+            .collect();
+        return items.map(Value::Array);
+    }
+    if s.starts_with('{') {
+        let inner = s.strip_prefix('{')?.strip_suffix('}')?;
+        let mut map = serde_json::Map::new();
+        if !inner.trim().is_empty() {
+            for entry in split_top_level(inner, ',') {
+                let kv = split_top_level(entry, ':');
+                if kv.len() != 2 {
+                    return None;
+                }
+                let raw_key = kv[0].trim();
+                let key = if raw_key.len() >= 2
+                    && (raw_key.starts_with('\'') || raw_key.starts_with('"'))
+                {
+                    parse_python_string(raw_key)?
+                } else if is_word_like(raw_key) {
+                    raw_key.to_string()
+                } else {
+                    return None;
+                };
+                let value = parse_python_literal(kv[1].trim(), depth + 1)?;
+                map.insert(key, value);
+            }
+        }
+        return Some(Value::Object(map));
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(Value::from(n));
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return if f.is_finite() {
+            Some(Value::from(f))
+        } else {
+            None // "nan"/"inf" parse but are not JSON
+        };
+    }
+    None
+}
+
+/// Parse one Python string literal (single or double quoted) with backslash
+/// escapes (`\n \t \r \\ \' \" \0`; unknown escapes kept verbatim). An
+/// unescaped interior quote terminates nothing — the literal is malformed
+/// and yields `None`.
+fn parse_python_string(s: &str) -> Option<String> {
+    let quote = *s.as_bytes().first()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    if s.len() < 2 || !s.ends_with(quote as char) {
+        return None;
+    }
+    let inner = &s[1..s.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                '0' => out.push('\0'),
+                '\\' => out.push('\\'),
+                '\'' => out.push('\''),
+                '"' => out.push('"'),
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+        } else if c == quote as char {
+            return None; // unescaped interior quote: not one literal
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
 }
 
 /// Classic two-row Levenshtein edit distance.
@@ -1958,5 +2218,167 @@ mid
             calls.is_empty(),
             "mention beyond the 32K tail must not drive recovery"
         );
+    }
+
+    // ── Layer 1c: MiniCPM5/Liquid-style Python-kwarg calls ──────────
+
+    #[test]
+    fn parse_kwarg_basic_single_string() {
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call_start|>[Read(path='foo.rs')]<|tool_call_end|>";
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["path"], "foo.rs");
+    }
+
+    #[test]
+    fn parse_kwarg_multiple_mixed_types() {
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call_start|>[Write(path=\"a.py\", count=3, ratio=1.5, \
+            verbose=True, other=False, missing=None, neg=-7)]<|tool_call_end|>";
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        let a = &calls[0].arguments;
+        assert_eq!(a["path"], "a.py");
+        assert_eq!(a["count"], 3);
+        assert_eq!(a["ratio"], 1.5);
+        assert_eq!(a["verbose"], true);
+        assert_eq!(a["other"], false);
+        assert!(a["missing"].is_null());
+        assert_eq!(a["neg"], -7);
+    }
+
+    #[test]
+    fn parse_kwarg_escapes() {
+        let parser = ToolCallParser::new();
+        let input = r#"<|tool_call_start|>[Write(path='a.py', content='line1\nline2\'q\\')]<|tool_call_end|>"#;
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["content"], "line1\nline2'q\\");
+    }
+
+    #[test]
+    fn parse_kwarg_unordered_keys() {
+        // Kwarg order must not matter: content-first still parses.
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call_start|>[Edit(content='new', path='a.rs')]<|tool_call_end|>";
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Edit");
+        assert_eq!(calls[0].arguments["path"], "a.rs");
+        assert_eq!(calls[0].arguments["content"], "new");
+    }
+
+    #[test]
+    fn parse_kwarg_list_and_dict() {
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call_start|>[Bash(command='ls', tags=['a', 'b'], \
+            opts={'k': 1, v: True})]<|tool_call_end|>";
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["tags"], serde_json::json!(["a", "b"]));
+        assert_eq!(calls[0].arguments["opts"], serde_json::json!({"k": 1, "v": true}));
+    }
+
+    #[test]
+    fn parse_kwarg_bare_form_without_brackets() {
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call_start|>Bash(command='ls')<|tool_call_end|>";
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].arguments["command"], "ls");
+    }
+
+    #[test]
+    fn parse_kwarg_empty_args() {
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call_start|>[Read()]<|tool_call_end|>";
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert!(calls[0].arguments.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_kwarg_name_case_canonicalized() {
+        // Layer 9 fuzzy layer folds `read` onto `Read` afterwards.
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call_start|>[read(path='a.rs')]<|tool_call_end|>";
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+    }
+
+    #[test]
+    fn parse_kwarg_unclosed_opener_consumes_rest() {
+        let parser = ToolCallParser::new();
+        let input = "thinking out loud <|tool_call_start|>[Bash(command='ls')]";
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+    }
+
+    #[test]
+    fn parse_kwarg_multiple_regions() {
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call_start|>[Read(path='a.rs')]<|tool_call_end|> \
+            then <|tool_call_start|>[Bash(command='ls')]<|tool_call_end|>";
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[1].name, "Bash");
+    }
+
+    #[test]
+    fn parse_kwarg_json_layers_keep_priority() {
+        // First-match-wins: a JSON envelope in layer 1 beats a kwarg call.
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call|>{\"name\":\"Read\",\"arguments\":{\"path\":\"j.rs\"}}<|end|> \
+            <|tool_call_start|>[Bash(command='ls')]<|tool_call_end|>";
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments["path"], "j.rs");
+    }
+
+    #[test]
+    fn parse_kwarg_trailing_garbage_rejected() {
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call_start|>[Read(path='a.rs')] junk<|tool_call_end|>";
+        assert!(parser.parse(input).is_empty());
+    }
+
+    #[test]
+    fn parse_kwarg_malformed_reports_intent() {
+        // Garbage inside the markers: nothing parses, but the intent
+        // heuristic fires so the caller gets a diagnostic, not silence.
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call_start|>garbage((<|tool_call_end|>";
+        assert!(parser.parse(input).is_empty());
+        let (_, diagnostics) = parser.parse_with_diagnostics(input);
+        assert!(!diagnostics.is_empty());
+    }
+
+    #[test]
+    fn parse_kwarg_nan_inf_rejected() {
+        // "nan"/"inf" parse as f64 but are not JSON — must not leak in.
+        let parser = ToolCallParser::new();
+        assert!(parser
+            .parse("<|tool_call_start|>[Bash(x=nan)]<|tool_call_end|>")
+            .is_empty());
+        assert!(parser
+            .parse("<|tool_call_start|>[Bash(x=inf)]<|tool_call_end|>")
+            .is_empty());
+    }
+
+    #[test]
+    fn parse_kwarg_alternate_closer() {
+        let parser = ToolCallParser::new();
+        let input = "<|tool_call_start|>[Grep(pattern='foo')]</tool_call>";
+        let calls = parser.parse(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Grep");
     }
 }

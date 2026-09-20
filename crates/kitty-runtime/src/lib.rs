@@ -10,6 +10,7 @@ pub mod grammar;
 pub mod llama;
 #[cfg(not(feature = "llama"))]
 pub mod llama;
+pub mod openai_compat;
 pub mod tools;
 
 pub use client::{
@@ -23,4 +24,5 @@ pub use grammar::{GrammarClient, GrammarConfig};
 pub use llama::LlamaCppClient;
 #[cfg(not(feature = "llama"))]
 pub use llama::LlamaCppClient;
+pub use openai_compat::OpenAiCompatClient;
 pub use tools::ToolDefinition;
