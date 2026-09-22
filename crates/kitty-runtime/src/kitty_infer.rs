@@ -50,6 +50,10 @@ pub const ENV_TOKENIZER_DIR: &str = "KITTY_INFER_TOKENIZER_DIR";
 pub const ENV_CTX: &str = "KITTY_INFER_CTX";
 /// Extra comma-separated F32 filename prefixes.
 pub const ENV_F32_PREFIXES: &str = "KITTY_INFER_F32_PREFIXES";
+/// GPU layer count override (e.g. `12` keeps 12 layers on cuda[0], spilling
+/// the rest to CPU). Unset = automatic mapping. Needed for >8GB models
+/// (K2 9.5GB) where auto packs too tight to survive prefill transients.
+pub const ENV_GPU_LAYERS: &str = "KITTY_INFER_GPU_LAYERS";
 
 const DEFAULT_CTX: usize = 4096;
 
@@ -57,6 +61,22 @@ const DEFAULT_CTX: usize = 4096;
 /// unit-testable (env read stays at the call site).
 pub fn backend_selected(raw: Option<&str>) -> bool {
     raw.map(|v| v.trim() == BACKEND_KITTY_INFER).unwrap_or(false)
+}
+
+/// Parse the GPU-layer spill override. `None` = unset/invalid = automatic
+/// mapping. Pure and unit-testable.
+fn parse_gpu_layers(raw: Option<&str>) -> Option<usize> {
+    raw?.trim().parse::<usize>().ok().filter(|v| *v > 0)
+}
+
+/// Thinking toggle for reasoning templates (K2 opens `<ifm|think>` at high
+/// effort by default — fine on full GPU, far too slow on CPU-spilled
+/// residents). `KITTY_INFER_NO_THINK=1` renders the empty think block.
+/// Pure and unit-testable; anything else (unset/invalid) keeps thinking on.
+pub const ENV_NO_THINK: &str = "KITTY_INFER_NO_THINK";
+
+fn thinking_enabled(raw: Option<&str>) -> bool {
+    !matches!(raw.map(|v| v.trim()), Some("1") | Some("true") | Some("yes"))
 }
 
 /// Resolved configuration for one embedded resident.
@@ -148,6 +168,27 @@ fn map_role(role: &str) -> (&'static str, bool) {
 #[cfg(test)]
 mod mapping_tests {
     use super::map_role;
+
+    #[test]
+    fn gpu_layers_parse() {
+        use super::parse_gpu_layers;
+        assert_eq!(parse_gpu_layers(None), None);
+        assert_eq!(parse_gpu_layers(Some("12")), Some(12));
+        assert_eq!(parse_gpu_layers(Some(" 12 ")), Some(12));
+        assert_eq!(parse_gpu_layers(Some("0")), None);
+        assert_eq!(parse_gpu_layers(Some("nope")), None);
+    }
+
+    #[test]
+    fn thinking_toggle() {
+        use super::thinking_enabled;
+        assert!(thinking_enabled(None));
+        assert!(thinking_enabled(Some("0")));
+        assert!(thinking_enabled(Some("nope")));
+        assert!(!thinking_enabled(Some("1")));
+        assert!(!thinking_enabled(Some(" true ")));
+        assert!(!thinking_enabled(Some("yes")));
+    }
 
     #[test]
     fn roles_map_lossy_documented() {
@@ -326,6 +367,19 @@ impl KittyInferClient {
                         .with_max_model_len(ctx)
                         .with_dtype(dtype.clone())
                         .with_paged_attn(PagedAttentionMetaBuilder::default().build()?);
+                    if let Some(n) = parse_gpu_layers(std::env::var(ENV_GPU_LAYERS).ok().as_deref())
+                    {
+                        builder = builder.with_device_mapping(
+                            mistralrs::DeviceMapSetting::Map(
+                                mistralrs::DeviceMapMetadata::from_num_device_layers(vec![
+                                    mistralrs::DeviceLayerMapMetadata {
+                                        ordinal: 0,
+                                        layers: n,
+                                    },
+                                ]),
+                            ),
+                        );
+                    }
                     if let Some(tj) = tok_json {
                         builder = builder.with_tokenizer_json(tj.to_string_lossy().into_owned());
                     }
@@ -364,7 +418,8 @@ impl KittyInferClient {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> RequestBuilder {
-        let mut req = RequestBuilder::new();
+        let mut req =
+            RequestBuilder::new().enable_thinking(thinking_enabled(std::env::var(ENV_NO_THINK).ok().as_deref()));
         for m in messages {
             let (kind, _) = map_role(&m.role);
             let text = m.content.clone().unwrap_or_default();
