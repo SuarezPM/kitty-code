@@ -76,13 +76,24 @@ impl KittyInferConfig {
                  (e.g. {ENV_MODEL}=~/.cache/kitty/models/Qwen3-4B-Q4_K_M.gguf)"
             ))
         })?;
+        let ctx_len = match std::env::var(ENV_CTX) {
+            Err(_) => DEFAULT_CTX,
+            Ok(raw) => raw
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|v| *v > 0)
+                .ok_or_else(|| {
+                    RuntimeError::InvalidArgument(format!(
+                        "{ENV_CTX}={raw:?} is not a positive integer — unset it or \
+                         set a value like {ENV_CTX}=4096"
+                    ))
+                })?,
+        };
         Self::from_path(
             PathBuf::from(raw),
             std::env::var(ENV_TOKENIZER_DIR).ok().map(PathBuf::from),
-            std::env::var(ENV_CTX)
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(DEFAULT_CTX),
+            ctx_len,
         )
     }
 
@@ -139,7 +150,7 @@ mod mapping_tests {
     use super::map_role;
 
     #[test]
-    fn roles_map_without_loss() {
+    fn roles_map_lossy_documented() {
         assert_eq!(map_role("system"), ("system", false));
         assert_eq!(map_role("assistant"), ("assistant", false));
         assert_eq!(map_role("user"), ("user", false));
@@ -196,25 +207,41 @@ mod mapping_tests {
 // Loaded client (feature-gated; mirrors LlamaCppClient structure)
 // ---------------------------------------------------------------------------
 
+/// Process-wide loaded models, keyed by [`ModelSpec`](mistralrs::serving::ModelSpec)
+/// id. The single-flight lock lives in `global_registry`; this map only
+/// makes a registry-shared load visible to every client (a per-client slot
+/// would diverge: client B would miss a model client A just built).
+/// Pruned to the winner on every successful load, so the map honors the
+/// single-resident contract instead of pinning evicted models in VRAM.
+/// Plain std mutex, never held across await.
+#[cfg(feature = "kitty-infer")]
+static LOADED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<Model>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "kitty-infer")]
+fn loaded_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<Model>>> {
+    LOADED.get_or_init(Default::default)
+}
+
 /// Embedded kitty-infer backend: single-resident GGUF behind [`ChatClient`].
 ///
-/// State is `Arc<tokio::Mutex<Option<Arc<Model>>>>`; the mutex serializes the
-/// check-then-load so concurrent turns cannot double-load 5GB. The global
-/// `global_registry` additionally guarantees evict-before-load across
-/// clients in one process.
+/// Concurrency contract (D1): serialization lives in `global_registry`,
+/// which holds its guard across evict → load → store and reuses the
+/// resident for same-spec waiters — two concurrent `ensure_loaded` (same
+/// or different clients, same spec) compile the model exactly once, and
+/// both read it from [`loaded_map`]. Cross-spec races serialize with
+/// last-writer-wins residency, same as the registry metadata.
 #[cfg(feature = "kitty-infer")]
 pub struct KittyInferClient {
     config: KittyInferConfig,
-    loaded: Arc<tokio::sync::Mutex<Option<Arc<Model>>>>,
 }
 
 #[cfg(feature = "kitty-infer")]
 impl KittyInferClient {
     pub fn new(config: KittyInferConfig) -> Self {
-        Self {
-            config,
-            loaded: Arc::new(tokio::sync::Mutex::new(None)),
-        }
+        Self { config }
     }
 
     pub fn from_env() -> Result<Self> {
@@ -225,9 +252,17 @@ impl KittyInferClient {
         &self.config
     }
 
+    fn spec_id(&self) -> Option<String> {
+        ki::ModelSpec::auto(&format!("local:{}", self.config.model_path.display()))
+            .ok()
+            .map(|spec| spec.id)
+    }
+
     pub fn is_ready(&self) -> bool {
         // Non-blocking probe only; never loads here.
-        self.loaded.try_lock().map(|g| g.is_some()).unwrap_or(true)
+        self.spec_id()
+            .and_then(|id| loaded_map().lock().ok().map(|m| m.contains_key(&id)))
+            .unwrap_or(false)
     }
 
     fn friendly(err: impl std::fmt::Display) -> RuntimeError {
@@ -241,16 +276,6 @@ impl KittyInferClient {
     /// context (the KV lever this client controls), and `vram_precheck`
     /// fails fast with byte counts before touching the engine.
     async fn ensure_loaded(&self) -> Result<Arc<Model>> {
-        // Fast path under a short lock; the guard is DROPPED before the
-        // ~20s load below. (The load closure writes through `slot`, which
-        // aliases this same mutex — holding the guard across it would
-        // deadlock the non-reentrant async mutex.)
-        {
-            let guard = self.loaded.lock().await;
-            if let Some(model) = guard.as_ref() {
-                return Ok(model.clone());
-            }
-        }
         let cfg = self.config.clone();
         let file_name = cfg
             .model_path
@@ -272,14 +297,19 @@ impl KittyInferClient {
             ki::file_bytes(&cfg.model_path).map_err(Self::friendly)?;
         let spec = ki::ModelSpec::auto(&format!("local:{}", cfg.model_path.display()))
             .map_err(Self::friendly)?;
+        let spec_id = spec.id.clone();
 
-        let slot = self.loaded.clone();
+        // Fast path: another client (or an earlier turn) already built it.
+        if let Some(model) = loaded_map().lock().ok().and_then(|m| m.get(&spec_id).cloned()) {
+            return Ok(model);
+        }
+
         let resident = ki::global_registry()
             .load_with_retry(spec, |fraction| {
                 let file_name = file_name.clone();
                 let parent = parent.clone();
                 let tok_json = tok_json.clone();
-                let slot = slot.clone();
+                let spec_id = spec_id.clone();
                 async move {
                     // Attempt ctx scales with the retry fraction (1.0 → ~0.66):
                     // KV cache is the OOM lever this client owns.
@@ -300,7 +330,10 @@ impl KittyInferClient {
                         builder = builder.with_tokenizer_json(tj.to_string_lossy().into_owned());
                     }
                     let model = builder.build().await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
-                    *slot.lock().await = Some(Arc::new(model));
+                    loaded_map()
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("loaded-model map is poisoned"))?
+                        .insert(spec_id, Arc::new(model));
                     Ok(())
                 }
             })
@@ -311,12 +344,20 @@ impl KittyInferClient {
             gpu_fraction = resident.gpu_fraction,
             "kitty-infer resident ready"
         );
-        self.loaded
+        // Prune evicted models so the map honors single-residence.
+        let mut map = loaded_map()
             .lock()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| RuntimeError::KittyInfer("load reported success but no model is resident — retry once; if it repeats, capture RUST_LOG=info output".to_string()))
+            .map_err(|_| {
+                RuntimeError::KittyInfer("loaded-model map is poisoned".to_string())
+            })?;
+        map.retain(|id, _| id == &resident.spec.id);
+        map.get(&resident.spec.id).cloned().ok_or_else(|| {
+            RuntimeError::KittyInfer(
+                "load reported success but no model is resident — retry once; \
+                 if it repeats, capture RUST_LOG=info output"
+                    .to_string(),
+            )
+        })
     }
 
     fn to_request(
