@@ -218,13 +218,35 @@ impl OpenAiCompatClient {
         for m in messages {
             match m.role.as_str() {
                 "tool" => {
-                    let id = pending_ids.first().cloned().unwrap_or_else(|| {
-                        generated += 1;
-                        format!("kitty_{generated}")
-                    });
-                    if !pending_ids.is_empty() {
-                        pending_ids.remove(0);
-                    }
+                    // Explicit id wins (harness-threaded via
+                    // `Message::tool_call_id`); positional pairing stays as
+                    // the fallback for results that predate the field.
+                    let id = match m.tool_call_id.clone() {
+                        Some(explicit) => {
+                            if let Some(pos) =
+                                pending_ids.iter().position(|p| p == &explicit)
+                            {
+                                pending_ids.remove(pos);
+                            }
+                            explicit
+                        }
+                        None => {
+                            let id = pending_ids.first().cloned().unwrap_or_else(|| {
+                                generated += 1;
+                                // Unknown id: positional fallback, loud —
+                                // never a silent verbatim correlation.
+                                tracing::warn!(
+                                    "tool result without id and empty pending queue; \
+                                     generated fallback id (multi-tool turns need ids)"
+                                );
+                                format!("kitty_{generated}")
+                            });
+                            if !pending_ids.is_empty() {
+                                pending_ids.remove(0);
+                            }
+                            id
+                        }
+                    };
                     out.push(CompatMessage {
                         role: "tool".to_string(),
                         content: m.content.clone(),
@@ -350,6 +372,7 @@ impl OpenAiCompatClient {
                 } else {
                     Some(tool_calls)
                 },
+                tool_call_id: None,
             },
             done: true,
             eval_count: None,
@@ -675,20 +698,25 @@ mod tests {
                     },
                 },
             ]),
+            tool_call_id: None,
         };
         let msgs = vec![
             assistant,
             Message::tool_result("file"),
             Message::tool_result("out"),
+            // Explicit id beats positional pairing (and doesn't consume it).
+            Message::tool_result_with_id("explicit", Some("srv_9".into())),
         ];
         let wire = OpenAiCompatClient::to_compat_messages(&msgs);
-        assert_eq!(wire.len(), 3);
+        assert_eq!(wire.len(), 4);
         let calls = wire[0].tool_calls.as_ref().unwrap();
         assert_eq!(calls.len(), 2);
         // Server ids preserved or generated — and stable across the pair.
         assert_eq!(calls[1].id, "srv_9");
         assert_eq!(wire[1].tool_call_id.as_deref(), Some(calls[0].id.as_str()));
         assert_eq!(wire[2].tool_call_id.as_deref(), Some("srv_9"));
+        // Explicit id on the result wins over positional pairing.
+        assert_eq!(wire[3].tool_call_id.as_deref(), Some("srv_9"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -69,11 +69,186 @@ fn parse_gpu_layers(raw: Option<&str>) -> Option<usize> {
     raw?.trim().parse::<usize>().ok().filter(|v| *v > 0)
 }
 
+/// Validate a spill count against the model's own layer total. `n > total`
+/// is always nonsense (asking for more GPU layers than exist) and bails.
+/// Unknown total allows through: the absolute refuses it replaced couldn't
+/// see per-model size either, and the byte pre-check stays fail-closed
+/// below. Pure and unit-testable.
+fn validate_gpu_layers(n: usize, total: Option<usize>) -> Result<()> {
+    if let Some(t) = total {
+        if n > t {
+            return Err(RuntimeError::InvalidArgument(format!(
+                "KITTY_INFER_GPU_LAYERS={n} exceeds the model's {t} layers — \
+                 check the value (internal knob documented ≤12)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Layered GPU-byte estimate mirroring `vram_precheck` shape with spill:
+/// `file × (n/total) × fraction + kv(ctx)`. Unknown total (or no spill)
+/// falls back to the legacy full-file shape. Pure and unit-testable.
+fn spill_estimate_bytes(
+    file_len: u64,
+    layers: Option<usize>,
+    total: Option<usize>,
+    fraction: f32,
+    ctx_len: usize,
+) -> u64 {
+    let share = match (layers, total) {
+        (Some(n), Some(t)) if t > 0 => n.min(t) as f64 / t as f64,
+        _ => 1.0,
+    };
+    let model = file_len as f64 * share * fraction.clamp(0.0, 1.0) as f64;
+    let kv = ctx_len as u64 * 256 * 1024;
+    model as u64 + kv
+}
+
+/// Headroom under which a spill estimate warns. Measured: spill-20's
+/// estimate sat ~1% under free yet OOMed on prefill transients/graphs, so
+/// "under free" alone is not safe on 8GB — warn above 90%.
+const SPILL_WARN_HEADROOM: f64 = 0.90;
+
+/// Read the GGUF's own `block_count` for its declared architecture from the
+/// file header (no model load). Returns `None` on any parse miss — callers
+/// treat unknown as unvalidated, never as zero. Pure file IO, no new deps.
+fn gguf_read_u32(f: &mut std::fs::File) -> Option<u32> {
+    use std::io::Read;
+    let mut b = [0u8; 4];
+    f.read_exact(&mut b).ok()?;
+    Some(u32::from_le_bytes(b))
+}
+
+fn gguf_read_u64(f: &mut std::fs::File) -> Option<u64> {
+    use std::io::Read;
+    let mut b = [0u8; 8];
+    f.read_exact(&mut b).ok()?;
+    Some(u64::from_le_bytes(b))
+}
+
+fn gguf_read_str(f: &mut std::fs::File) -> Option<String> {
+    use std::io::Read;
+    let len = gguf_read_u64(f)? as usize;
+    if len > 100_000_000 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
+}
+
+fn gguf_block_count(path: &std::path::Path) -> Option<usize> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let read_u32 = gguf_read_u32;
+    let read_u64 = gguf_read_u64;
+    let read_str = gguf_read_str;
+    if &{
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic).ok()?;
+        magic
+    } != b"GGUF"
+    {
+        return None;
+    }
+    read_u32(&mut f)?; // version
+    let tensor_count = read_u64(&mut f)?;
+    let kv_count = read_u64(&mut f)?;
+    if tensor_count > 1_000_000 || kv_count > 1_000_000 {
+        return None;
+    }
+    // Order-independent: remember any `.block_count` candidate and resolve
+    // against the architecture once known (writers usually put general.*
+    // first, but nothing guarantees it).
+    let mut arch: Option<String> = None;
+    let mut candidate: Option<(String, u64)> = None;
+    for _ in 0..kv_count {
+        let key = read_str(&mut f)?;
+        let ty = read_u32(&mut f)?;
+        if key == "general.architecture" && ty == 8 {
+            arch = Some(read_str(&mut f)?);
+        } else if ty == 4 {
+            let v = read_u32(&mut f)?;
+            if candidate.is_none() && key.ends_with(".block_count") {
+                candidate = Some((key, v as u64));
+            }
+        } else if ty == 10 {
+            let mut b8 = [0u8; 8];
+            f.read_exact(&mut b8).ok()?;
+            let v = u64::from_le_bytes(b8);
+            if candidate.is_none() && key.ends_with(".block_count") {
+                candidate = Some((key, v));
+            }
+        } else {
+            skip_gguf_value(&mut f, ty)?;
+        }
+    }
+    let (key, count) = candidate?;
+    let arch = arch?;
+    if key != format!("{arch}.block_count") {
+        return None;
+    }
+    usize::try_from(count).ok().filter(|v| *v > 0)
+}
+
+/// Skip one GGUF metadata value of the given type tag.
+fn skip_gguf_value(f: &mut std::fs::File, ty: u32) -> Option<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    match ty {
+        0 | 1 => {
+            f.seek(SeekFrom::Current(1)).ok()?;
+        }
+        2 | 3 => {
+            f.seek(SeekFrom::Current(2)).ok()?;
+        }
+        4 | 5 | 6 => {
+            f.seek(SeekFrom::Current(4)).ok()?;
+        }
+        7 => {
+            f.seek(SeekFrom::Current(1)).ok()?;
+        }
+        8 => {
+            let mut len = [0u8; 8];
+            f.read_exact(&mut len).ok()?;
+            f.seek(SeekFrom::Current(u64::from_le_bytes(len) as i64)).ok()?;
+        }
+        9 => {
+            // array: element type + count, then elements (assume no nesting)
+            let mut b4 = [0u8; 4];
+            f.read_exact(&mut b4).ok()?;
+            let elem = u32::from_le_bytes(b4);
+            let mut b8 = [0u8; 8];
+            f.read_exact(&mut b8).ok()?;
+            let n = u64::from_le_bytes(b8);
+            if n > 10_000_000 {
+                return None;
+            }
+            for _ in 0..n {
+                skip_gguf_value(f, elem)?;
+            }
+        }
+        10 | 11 | 12 => {
+            f.seek(SeekFrom::Current(8)).ok()?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
 /// Thinking toggle for reasoning templates (K2 opens `<ifm|think>` at high
 /// effort by default — fine on full GPU, far too slow on CPU-spilled
 /// residents). `KITTY_INFER_NO_THINK=1` renders the empty think block.
 /// Pure and unit-testable; anything else (unset/invalid) keeps thinking on.
 pub const ENV_NO_THINK: &str = "KITTY_INFER_NO_THINK";
+
+/// Fallback id for an id-less tool result: positional `tool-{idx}` among
+/// the tool messages of the request (idx 0 keeps the historical `"tool-0"`).
+/// Pure and unit-testable.
+fn tool_fallback_id(id: Option<&str>, idx: usize) -> String {
+    id.map(str::to_string)
+        .unwrap_or_else(|| format!("tool-{idx}"))
+}
 
 fn thinking_enabled(raw: Option<&str>) -> bool {
     !matches!(raw.map(|v| v.trim()), Some("1") | Some("true") | Some("yes"))
@@ -151,16 +326,15 @@ impl KittyInferConfig {
 // Pure mapping helpers (feature-independent, unit-tested without a model)
 // ---------------------------------------------------------------------------
 
-/// Map a kitty role string to a mistralrs role. Tool results have no
-/// `tool_call_id` field on [`Message`], so they travel as `User` content —
-/// threading the id through is follow-up work, not silent data loss (the
-/// content itself is preserved verbatim).
+/// Map a kitty role string to a mistralrs role. Tool results never reach
+/// this classifier: `to_request` intercepts `role == "tool"` first and
+/// threads [`Message::tool_call_id`] through `add_tool_message` (fallback
+/// `"tool-0"` documented on the constructor).
 #[cfg(any(feature = "kitty-infer", test))]
 fn map_role(role: &str) -> (&'static str, bool) {
     match role {
         "system" => ("system", false),
         "assistant" => ("assistant", false),
-        "tool" => ("user(tool-result)", true),
         _ => ("user", false),
     }
 }
@@ -180,6 +354,102 @@ mod mapping_tests {
     }
 
     #[test]
+    fn spill_validation_is_relative() {
+        use super::validate_gpu_layers;
+        assert!(validate_gpu_layers(24, Some(28)).is_ok());
+        assert!(validate_gpu_layers(28, Some(28)).is_ok());
+        assert!(validate_gpu_layers(37, Some(36)).is_err());
+        // Unknown total: allowed (documented), byte pre-check stays fail-closed.
+        assert!(validate_gpu_layers(99, None).is_ok());
+    }
+
+    #[test]
+    fn spill_estimate_scales_and_fails_fast() {
+        use super::spill_estimate_bytes;
+        // f32 fraction widens exactly like the implementation does.
+        let frac = 0.9f32.clamp(0.0, 1.0) as f64;
+        let kv = 7372u64 * 256 * 1024;
+        // K2 spill-20 shape: 10GB file, 20/36 layers.
+        let est = spill_estimate_bytes(10_000_000_000, Some(20), Some(36), 0.9, 7372);
+        assert_eq!(est, (10_000_000_000f64 * (20.0 / 36.0) * frac) as u64 + kv);
+        assert!(est < 10_000_000_000);
+        // No spill info: legacy full-file shape.
+        let full = spill_estimate_bytes(10_000_000_000, None, None, 0.9, 7372);
+        assert_eq!(full, (10_000_000_000f64 * frac) as u64 + kv);
+        assert!(est < full);
+    }
+
+    #[test]
+    fn gguf_block_count_reads_header() {
+        use super::gguf_block_count;
+        fn u32le(v: u32, out: &mut Vec<u8>) {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        fn u64le(v: u64, out: &mut Vec<u8>) {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        fn kv_str(out: &mut Vec<u8>, key: &str, val: &str) {
+            u64le(key.len() as u64, out);
+            out.extend_from_slice(key.as_bytes());
+            u32le(8, out);
+            u64le(val.len() as u64, out);
+            out.extend_from_slice(val.as_bytes());
+        }
+        fn kv_u32(out: &mut Vec<u8>, key: &str, val: u32) {
+            u64le(key.len() as u64, out);
+            out.extend_from_slice(key.as_bytes());
+            u32le(4, out);
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        let mut blob = vec![];
+        blob.extend_from_slice(b"GGUF");
+        u32le(3, &mut blob);
+        u64le(0, &mut blob); // tensor_count
+        u64le(2, &mut blob); // kv_count
+        kv_str(&mut blob, "general.architecture", "k2-horizon");
+        kv_u32(&mut blob, "k2-horizon.block_count", 36);
+        let dir = std::env::temp_dir();
+        let path = dir.join("kitty-infer-test-header.gguf");
+        std::fs::write(&path, &blob).unwrap();
+        assert_eq!(gguf_block_count(&path), Some(36));
+        // Truncated / wrong magic / wrong arch: None, never zero/panic.
+        std::fs::write(&path, &blob[..10]).unwrap();
+        assert_eq!(gguf_block_count(&path), None);
+        std::fs::write(&path, b"NOPE").unwrap();
+        assert_eq!(gguf_block_count(&path), None);
+        let mut blob2 = vec![];
+        blob2.extend_from_slice(b"GGUF");
+        u32le(3, &mut blob2);
+        u64le(0, &mut blob2);
+        u64le(2, &mut blob2);
+        kv_str(&mut blob2, "general.architecture", "llama");
+        kv_u32(&mut blob2, "k2-horizon.block_count", 36);
+        std::fs::write(&path, &blob2).unwrap();
+        assert_eq!(gguf_block_count(&path), None);
+        // Order-independent: block_count before the architecture key.
+        let mut blob3 = vec![];
+        blob3.extend_from_slice(b"GGUF");
+        u32le(3, &mut blob3);
+        u64le(0, &mut blob3);
+        u64le(2, &mut blob3);
+        kv_u32(&mut blob3, "qwen3.block_count", 36);
+        kv_str(&mut blob3, "general.architecture", "qwen3");
+        std::fs::write(&path, &blob3).unwrap();
+        assert_eq!(gguf_block_count(&path), Some(36));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn tool_fallback_ids_are_positional() {
+        use super::tool_fallback_id;
+        assert_eq!(tool_fallback_id(Some("call_9"), 0), "call_9");
+        assert_eq!(tool_fallback_id(Some("call_9"), 3), "call_9");
+        assert_eq!(tool_fallback_id(None, 0), "tool-0");
+        assert_eq!(tool_fallback_id(None, 1), "tool-1");
+        assert_eq!(tool_fallback_id(None, 7), "tool-7");
+    }
+
+    #[test]
     fn thinking_toggle() {
         use super::thinking_enabled;
         assert!(thinking_enabled(None));
@@ -191,12 +461,22 @@ mod mapping_tests {
     }
 
     #[test]
-    fn roles_map_lossy_documented() {
+    fn roles_map_with_tool_id_threaded() {
+        // Non-tool roles map plainly; `tool` is intercepted before the
+        // classifier (see `to_request`), so it falls through to `user` here
+        // and must never be relied upon for id correlation.
         assert_eq!(map_role("system"), ("system", false));
         assert_eq!(map_role("assistant"), ("assistant", false));
         assert_eq!(map_role("user"), ("user", false));
-        assert_eq!(map_role("tool"), ("user(tool-result)", true));
+        assert_eq!(map_role("tool"), ("user", false));
         assert_eq!(map_role("weird"), ("user", false));
+        // The id itself travels on the message, with a documented fallback.
+        use crate::client::Message;
+        assert_eq!(
+            Message::tool_result_with_id("out", Some("call_7".into())).tool_call_id,
+            Some("call_7".to_string())
+        );
+        assert_eq!(Message::tool_result("out").tool_call_id, None);
     }
 
     #[test]
@@ -336,6 +616,19 @@ impl KittyInferClient {
                 .map_err(Self::friendly)?;
         let file_len =
             ki::file_bytes(&cfg.model_path).map_err(Self::friendly)?;
+        // Spill validation is relative to the model's own layer total
+        // (read from the GGUF header, no load): n > total always bails.
+        // Unknown total allows through (documented: legacy had no per-model
+        // view either) with the byte pre-check below staying fail-closed.
+        // Internal knob documented ≤12 (measured 8GB envelope).
+        let gpu_layers = parse_gpu_layers(std::env::var(ENV_GPU_LAYERS).ok().as_deref());
+        let total_layers = gpu_layers
+            .is_some()
+            .then(|| gguf_block_count(&cfg.model_path))
+            .flatten();
+        if let Some(n) = gpu_layers {
+            validate_gpu_layers(n, total_layers)?;
+        }
         let spec = ki::ModelSpec::auto(&format!("local:{}", cfg.model_path.display()))
             .map_err(Self::friendly)?;
         let spec_id = spec.id.clone();
@@ -351,6 +644,8 @@ impl KittyInferClient {
                 let parent = parent.clone();
                 let tok_json = tok_json.clone();
                 let spec_id = spec_id.clone();
+                let gpu_layers = gpu_layers;
+                let total_layers = total_layers;
                 async move {
                     // Attempt ctx scales with the retry fraction (1.0 → ~0.66):
                     // KV cache is the OOM lever this client owns.
@@ -359,7 +654,34 @@ impl KittyInferClient {
                         .devices
                         .first()
                         .map(|d| d.total_bytes.saturating_sub(d.used_bytes));
-                    ki::vram_precheck(file_len, free, fraction, ctx).map_err(|e| {
+                    // Layered estimate: with spill only n/total of the file
+                    // sits on GPU. Warn above headroom (not fail — the
+                    // scaled pre-check below stays fail-closed with bytes).
+                    if let (Some(n), Some(t)) = (gpu_layers, total_layers) {
+                        let est = spill_estimate_bytes(file_len, Some(n), Some(t), fraction, ctx);
+                        if let Some(free_bytes) = free {
+                            if est as f64 > free_bytes as f64 * SPILL_WARN_HEADROOM {
+                                tracing::warn!(
+                                    estimate_bytes = est,
+                                    free_bytes,
+                                    gpu_layers = n,
+                                    total_layers = t,
+                                    "spill estimate within headroom of free VRAM; \
+                                     prefill transients may still OOM — failure will be loud"
+                                );
+                            }
+                        }
+                    }
+                    // Scale the precheck input so a spill passes on its real
+                    // GPU share instead of the full file (spill-20 passed the
+                    // legacy check and OOMed late — the HOLD this fixes).
+                    let eff_file = match (gpu_layers, total_layers) {
+                        (Some(n), Some(t)) if t > 0 => {
+                            ((file_len as f64 * n.min(t) as f64 / t as f64) as u64).max(1)
+                        }
+                        _ => file_len,
+                    };
+                    ki::vram_precheck(eff_file, free, fraction, ctx).map_err(|e| {
                         anyhow::anyhow!("{e:#}")
                     })?;
                     let mut builder = GgufModelBuilder::new(parent, vec![file_name])
@@ -367,8 +689,9 @@ impl KittyInferClient {
                         .with_max_model_len(ctx)
                         .with_dtype(dtype.clone())
                         .with_paged_attn(PagedAttentionMetaBuilder::default().build()?);
-                    if let Some(n) = parse_gpu_layers(std::env::var(ENV_GPU_LAYERS).ok().as_deref())
-                    {
+                    // Pre-validated above (relative clamp); the spill itself is
+                    // honored verbatim here so load matches what passed checks.
+                    if let Some(n) = gpu_layers {
                         builder = builder.with_device_mapping(
                             mistralrs::DeviceMapSetting::Map(
                                 mistralrs::DeviceMapMetadata::from_num_device_layers(vec![
@@ -396,6 +719,9 @@ impl KittyInferClient {
         tracing::info!(
             model = %resident.spec.id,
             gpu_fraction = resident.gpu_fraction,
+            ctx = cfg.ctx_len,
+            gpu_layers = ?gpu_layers,
+            thinking = thinking_enabled(std::env::var(ENV_NO_THINK).ok().as_deref()),
             "kitty-infer resident ready"
         );
         // Prune evicted models so the map honors single-residence.
@@ -420,9 +746,34 @@ impl KittyInferClient {
     ) -> RequestBuilder {
         let mut req =
             RequestBuilder::new().enable_thinking(thinking_enabled(std::env::var(ENV_NO_THINK).ok().as_deref()));
+        let mut tool_idx = 0usize;
         for m in messages {
-            let (kind, _) = map_role(&m.role);
             let text = m.content.clone().unwrap_or_default();
+            if m.role == "tool" {
+                // Threaded tool_call_id (harness-filled); id-less results
+                // get a positional `tool-{idx}` fallback (idx 0 keeps the
+                // legacy `"tool-0"`). First id-less result is debug-level
+                // (legacy single-tool path); idx ≥ 1 is genuinely ambiguous
+                // and stays warn-level — bounded by tool count, never a loop.
+                let id = tool_fallback_id(m.tool_call_id.as_deref(), tool_idx);
+                if m.tool_call_id.is_none() {
+                    if tool_idx == 0 {
+                        tracing::debug!(
+                            "tool result without tool_call_id; positional fallback \"tool-0\""
+                        );
+                    } else {
+                        tracing::warn!(
+                            tool_idx,
+                            "id-less tool result past the first cannot pair reliably; \
+                             positional fallback used (multi-tool turns need ids)"
+                        );
+                    }
+                }
+                tool_idx += 1;
+                req = req.add_tool_message(text, id);
+                continue;
+            }
+            let (kind, _) = map_role(&m.role);
             match kind {
                 "system" => {
                     req = req.add_message(TextMessageRole::System, text);
@@ -524,6 +875,7 @@ impl ChatClient for KittyInferClient {
                     content: choice.message.content.clone(),
                     thinking: None,
                     tool_calls,
+                    tool_call_id: None,
                 },
                 done: true,
                 eval_count: Some(resp.usage.completion_tokens as i64),

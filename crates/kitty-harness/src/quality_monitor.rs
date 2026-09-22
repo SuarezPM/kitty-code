@@ -249,6 +249,7 @@ mod tests {
         let tc = ParsedToolCall {
             name: "Read".to_string(),
             arguments: serde_json::json!({"path": "foo.rs"}),
+            id: None,
         };
         let violations = monitor.check_response(None, &[tc]);
         assert!(violations.is_empty());
@@ -267,6 +268,7 @@ mod tests {
         let tc = ParsedToolCall {
             name: "NonexistentTool".to_string(),
             arguments: serde_json::json!({}),
+            id: None,
         };
         let violations = monitor.check_response(None, &[tc]);
         assert!(violations.iter().any(|v| matches!(
@@ -283,6 +285,7 @@ mod tests {
         let tc = ParsedToolCall {
             name: "Read".to_string(),
             arguments: serde_json::json!({"path": "foo.rs"}),
+            id: None,
         };
 
         // First two calls — no loop yet
@@ -305,6 +308,7 @@ mod tests {
             &[ParsedToolCall {
                 name: "Read".to_string(),
                 arguments: serde_json::json!({}),
+                id: None,
             }],
         );
         monitor.check_response(
@@ -312,6 +316,7 @@ mod tests {
             &[ParsedToolCall {
                 name: "Edit".to_string(),
                 arguments: serde_json::json!({}),
+                id: None,
             }],
         );
         let violations = monitor.check_response(
@@ -319,6 +324,7 @@ mod tests {
             &[ParsedToolCall {
                 name: "Read".to_string(),
                 arguments: serde_json::json!({}),
+                id: None,
             }],
         );
         assert!(violations
@@ -335,6 +341,7 @@ mod tests {
         let tc = ParsedToolCall {
             name: "Read".to_string(),
             arguments: serde_json::json!({}),
+            id: None,
         };
         monitor.check_response(None, std::slice::from_ref(&tc));
         monitor.check_response(None, std::slice::from_ref(&tc));
@@ -356,10 +363,12 @@ mod tests {
         let read_tc = ParsedToolCall {
             name: "Read".to_string(),
             arguments: serde_json::json!({}),
+            id: None,
         };
         let edit_tc = ParsedToolCall {
             name: "Edit".to_string(),
             arguments: serde_json::json!({}),
+            id: None,
         };
         monitor.check_response(None, std::slice::from_ref(&read_tc));
         monitor.check_response(None, std::slice::from_ref(&read_tc));
@@ -416,6 +425,7 @@ mod tests {
         let tc = ParsedToolCall {
             name: "Read".to_string(),
             arguments: serde_json::json!({"path": "foo.rs"}),
+            id: None,
         };
         monitor.check_response(None, std::slice::from_ref(&tc));
         monitor.check_response(None, std::slice::from_ref(&tc));
@@ -440,14 +450,17 @@ mod tests {
         let tc_a = ParsedToolCall {
             name: "Read".to_string(),
             arguments: serde_json::json!({"path": "a.rs"}),
+            id: None,
         };
         let tc_b = ParsedToolCall {
             name: "Read".to_string(),
             arguments: serde_json::json!({"path": "b.rs"}),
+            id: None,
         };
         let tc_c = ParsedToolCall {
             name: "Read".to_string(),
             arguments: serde_json::json!({"path": "c.rs"}),
+            id: None,
         };
         monitor.check_response(None, std::slice::from_ref(&tc_a));
         monitor.check_response(None, std::slice::from_ref(&tc_b));

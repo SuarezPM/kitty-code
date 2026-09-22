@@ -45,6 +45,8 @@ impl McpServer {
         let tc = ParsedToolCall {
             name: name.to_string(),
             arguments: args,
+            // MCP calls originate locally: no server-issued id exists.
+            id: None,
         };
         let mut registry = self.registry.lock().await;
         match registry.execute(&tc).await {

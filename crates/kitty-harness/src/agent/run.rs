@@ -50,6 +50,7 @@ impl Agent {
             content: Some(user_prompt.to_string()),
             thinking: None,
             tool_calls: None,
+            tool_call_id: None,
         })
         .await;
 

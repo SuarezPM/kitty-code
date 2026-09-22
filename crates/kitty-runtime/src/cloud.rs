@@ -446,6 +446,7 @@ impl CloudClient {
                 // and never fed back as assistant content.
                 thinking: cm.reasoning_content,
                 tool_calls,
+                tool_call_id: None,
             },
             done: true,
             eval_count: usage.and_then(|u| u.total_tokens),
@@ -616,6 +617,7 @@ mod tests {
                         arguments: serde_json::json!({"path": "/tmp/x"}),
                     },
                 }]),
+                tool_call_id: None,
             },
             done: true,
             eval_count: Some(42),
@@ -897,6 +899,7 @@ mod tests {
             content: cm.content,
             thinking: cm.reasoning_content,
             tool_calls: None,
+            tool_call_id: None,
         };
         assert_eq!(msg.thinking.as_deref(), Some("chain of thought here"));
         assert_eq!(msg.content.as_deref(), Some("final visible answer"));

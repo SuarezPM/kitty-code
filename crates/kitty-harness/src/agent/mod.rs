@@ -280,6 +280,7 @@ pub fn sanitize_trailing_assistants(mut history: Vec<Message>) -> Vec<Message> {
             content: last.content.clone(),
             thinking: last.thinking.clone(),
             tool_calls: Some(merged),
+            tool_call_id: None,
         }
     };
     history.push(collapsed);
@@ -884,6 +885,7 @@ mod tests {
                         arguments: args,
                     },
                 }]),
+                tool_call_id: None,
             },
             done: true,
             eval_count: None,
@@ -2396,6 +2398,7 @@ mod tests {
             content: Some(content.to_string()),
             thinking: None,
             tool_calls: None,
+            tool_call_id: None,
         };
         let a_tc = |name: &str| Message {
             role: "assistant".to_string(),
@@ -2408,6 +2411,7 @@ mod tests {
                     arguments: serde_json::json!({}),
                 },
             }]),
+            tool_call_id: None,
         };
 
         // MERGE case: [user, assistant(tool), assistant(text)] → tool_calls
@@ -2459,6 +2463,7 @@ mod tests {
             content: Some(role.to_string()),
             thinking: None,
             tool_calls: None,
+            tool_call_id: None,
         };
         // Nearest user within the window wins.
         let history = vec![

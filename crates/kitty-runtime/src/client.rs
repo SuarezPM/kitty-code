@@ -311,6 +311,13 @@ pub struct Message {
     pub thinking: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Correlates a `role == "tool"` result with the assistant `tool_calls`
+    /// entry that requested it. Skipped on the wire when `None`; Ollama
+    /// accepts the field on tool messages (live probe: HTTP 200 + coherent
+    /// continuation). The embedded backend threads it into
+    /// `add_tool_message`, falling back to `"tool-0"` only when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
@@ -321,6 +328,7 @@ impl Message {
             content: Some(content.into()),
             thinking: None,
             tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -331,16 +339,25 @@ impl Message {
             content: Some(content.into()),
             thinking: None,
             tool_calls: None,
+            tool_call_id: None,
         }
     }
 
     /// Convenience constructor for a tool-result message.
     pub fn tool_result(content: impl Into<String>) -> Self {
+        Self::tool_result_with_id(content, None)
+    }
+
+    /// Tool-result message correlated with the requesting tool call.
+    /// `None` id keeps the old behavior (embedded backend falls back to
+    /// `"tool-0"` and documents it; single-tool turns are unaffected).
+    pub fn tool_result_with_id(content: impl Into<String>, id: Option<String>) -> Self {
         Self {
             role: "tool".into(),
             content: Some(content.into()),
             thinking: None,
             tool_calls: None,
+            tool_call_id: id,
         }
     }
 
@@ -351,6 +368,7 @@ impl Message {
             content: None,
             thinking: None,
             tool_calls: Some(calls),
+            tool_call_id: None,
         }
     }
 }
@@ -1353,6 +1371,7 @@ mod tests {
                     arguments: serde_json::json!({"path": "abcd"}),
                 },
             }]),
+            tool_call_id: None,
         };
         // args JSON is {"path":"abcd"} = 15 chars + name 4 = 19 → ceil(19/4)=5
         assert_eq!(estimate_input_tokens(&[m]), 5);

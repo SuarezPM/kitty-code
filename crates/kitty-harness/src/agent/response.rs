@@ -31,6 +31,9 @@ impl Agent {
                     all_tool_calls.push(ParsedToolCall {
                         name: tc.function.name.clone(),
                         arguments: tc.function.arguments.clone(),
+                        // Thread the server-issued id so tool results
+                        // correlate back (Fase 3); text-parsed calls keep None.
+                        id: tc.id.clone(),
                     });
                 }
 
@@ -129,6 +132,7 @@ impl Agent {
             content: Some(text.clone()),
             thinking: None,
             tool_calls: None,
+            tool_call_id: None,
         })
         .await;
 
@@ -243,6 +247,9 @@ impl Agent {
             content: Some(output),
             thinking: None,
             tool_calls: None,
+            // Thread the server-issued id so backends correlate the result;
+            // text-parsed calls carry None (fallback documented per backend).
+            tool_call_id: tc.id.clone(),
         })
         .await;
 
@@ -265,6 +272,7 @@ impl Agent {
                     content: Some(DOOM_LOOP_NUDGE_MSG.to_string()),
                     thinking: None,
                     tool_calls: None,
+                    tool_call_id: None,
                 })
                 .await;
             }
@@ -304,6 +312,7 @@ impl Agent {
                 content: Some(injection.clone()),
                 thinking: None,
                 tool_calls: None,
+                tool_call_id: None,
             });
             let tokens = self.count_tokens(&injection).await;
             self.budget.consume(tokens);
@@ -350,6 +359,7 @@ impl Agent {
                     content: Some(injection.clone()),
                     thinking: None,
                     tool_calls: None,
+                    tool_call_id: None,
                 });
                 let tokens = self.count_tokens(&injection).await;
                 self.budget.consume(tokens);
@@ -425,6 +435,7 @@ impl Agent {
                 content: Some(system_msg),
                 thinking: None,
                 tool_calls: None,
+                tool_call_id: None,
             });
             return;
         }
@@ -462,6 +473,7 @@ impl Agent {
                 content: Some(system_msg),
                 thinking: None,
                 tool_calls: None,
+                tool_call_id: None,
             });
         }
     }
@@ -485,6 +497,7 @@ impl Agent {
                 ),
                 thinking: None,
                 tool_calls: None,
+                tool_call_id: None,
             },
         );
 
@@ -586,6 +599,7 @@ impl Agent {
             content: Some(instruction.to_string()),
             thinking: None,
             tool_calls: None,
+            tool_call_id: None,
         });
 
         // Call without tools to force text response
@@ -686,6 +700,7 @@ impl Agent {
             content: Some(summary_prompt),
             thinking: None,
             tool_calls: None,
+            tool_call_id: None,
         }];
         // f8 AD4: summarization is mechanical — override ONLY the sampling
         // fields for a cheap, near-deterministic, bounded reply. num_ctx is
@@ -738,6 +753,7 @@ impl Agent {
                 content: Some(format!("[Context Summary]\n{formatted_summary}")),
                 thinking: None,
                 tool_calls: None,
+                tool_call_id: None,
             },
         );
 

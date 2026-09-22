@@ -38,6 +38,9 @@ use serde_json::Value;
 pub struct ParsedToolCall {
     pub name: String,
     pub arguments: Value,
+    /// Server-issued call id when parsed from a typed `ToolCall` (None for
+    /// calls parsed out of free text, which carry no id).
+    pub id: Option<String>,
 }
 
 /// Canonical tool names used for fuzzy-name matching when no explicit set is provided.
@@ -433,6 +436,7 @@ impl ToolCallParser {
         Some(ParsedToolCall {
             name: name.to_string(),
             arguments: Value::Object(args),
+            id: None,
         })
     }
 
@@ -539,6 +543,7 @@ impl ToolCallParser {
         Some(ParsedToolCall {
             name: name.to_string(),
             arguments,
+            id: None,
         })
     }
 
@@ -586,6 +591,7 @@ impl ToolCallParser {
                 results.push(ParsedToolCall {
                     name: name.to_string(),
                     arguments,
+                    id: None,
                 });
             }
         }
@@ -628,6 +634,7 @@ impl ToolCallParser {
         Some(ParsedToolCall {
             name,
             arguments: serde_json::json!({ "_raw": json_str.trim() }),
+            id: None,
         })
     }
 
@@ -694,9 +701,11 @@ impl ToolCallParser {
             // A complete embedded tool call with real arguments wins outright.
             if let Some(tc) = self.tool_call_from_value(&val) {
                 if !is_empty_arguments(&tc.arguments) {
+                    let id = val.get("id").and_then(Value::as_str).map(str::to_string);
                     return Some(ParsedToolCall {
                         name: self.canonical_tool_name(&tc.name),
                         arguments: tc.arguments,
+                        id,
                     });
                 }
                 continue; // name-shell with empty args — keep scanning
@@ -712,6 +721,7 @@ impl ToolCallParser {
                     return Some(ParsedToolCall {
                         name: tool.clone(),
                         arguments: val,
+                        id: None,
                     });
                 }
             }
@@ -1037,14 +1047,17 @@ fn finish_call(name: &str, args: Option<&Value>) -> ParsedToolCall {
         None => ParsedToolCall {
             name: name.to_string(),
             arguments: empty_object(),
+            id: None,
         },
         Some(v) if v.is_object() => ParsedToolCall {
             name: name.to_string(),
             arguments: v.clone(),
+            id: None,
         },
         Some(v) => ParsedToolCall {
             name: name.to_string(),
             arguments: serde_json::json!({ "_raw": v.to_string() }),
+            id: None,
         },
     }
 }
@@ -1144,6 +1157,7 @@ fn channel_payload_after_target(tail: &str, pos: usize, tool: &str) -> Option<Pa
     Some(ParsedToolCall {
         name: tool.to_string(),
         arguments: Value::Object(map),
+        id: None,
     })
 }
 

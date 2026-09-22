@@ -172,6 +172,7 @@ impl ToolRegistry {
                 normalize_tool_call(&ParsedToolCall {
                     name: call.name,
                     arguments: repaired,
+                    id: call.id.clone(),
                 })
             } else {
                 return Ok(ToolResult {
@@ -1153,6 +1154,7 @@ pub(crate) fn normalize_tool_call(tc: &ParsedToolCall) -> ParsedToolCall {
     ParsedToolCall {
         name: normalize_tool_name(&tc.name),
         arguments: rekey_arg_aliases(tc.arguments.clone()),
+        id: tc.id.clone(),
     }
 }
 
@@ -2042,6 +2044,7 @@ mod tests {
         let tc = ParsedToolCall {
             name: "Nonexistent".to_string(),
             arguments: serde_json::json!({}),
+            id: None,
         };
         let err = registry.execute(&tc).await.unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
@@ -2483,6 +2486,7 @@ mod tests {
                 "old_string": "beta",
                 "new_string": "BETA"
             }),
+            id: None,
         };
         let result = registry.execute(&tc).await.unwrap();
         assert!(result.success, "got: {}", result.output);
@@ -2497,6 +2501,7 @@ mod tests {
         let tc = ParsedToolCall {
             name: "Read".to_string(),
             arguments: serde_json::json!({"file_path": f.path().to_str().unwrap()}),
+            id: None,
         };
         let result = registry.execute(&tc).await.unwrap();
         assert!(result.success, "file_path alias must satisfy Read's `path`");
@@ -2504,6 +2509,7 @@ mod tests {
         let normalized = normalize_tool_call(&ParsedToolCall {
             name: "Bash".to_string(),
             arguments: serde_json::json!({"cmd": "echo hi", "extra": 1}),
+            id: None,
         });
         assert_eq!(normalized.arguments["command"], "echo hi");
         assert!(normalized.arguments.get("cmd").is_none());
@@ -2517,6 +2523,7 @@ mod tests {
         let normalized = normalize_tool_call(&ParsedToolCall {
             name: "Read".to_string(),
             arguments: serde_json::json!({"path": "real.txt", "file_path": "fake.txt"}),
+            id: None,
         });
         assert_eq!(normalized.arguments["path"], "real.txt");
         assert!(normalized.arguments.get("file_path").is_none());
@@ -2538,6 +2545,7 @@ mod tests {
         let tc = ParsedToolCall {
             name: "TotallyMadeUp".to_string(),
             arguments: serde_json::json!({}),
+            id: None,
         };
         let err = registry.execute(&tc).await.unwrap_err();
         match err {
@@ -2559,6 +2567,7 @@ mod tests {
                 "old_str": "x",
                 "new_str": "y"
             }),
+            id: None,
         });
         let twice = normalize_tool_call(&once);
         assert_eq!(once, twice);
@@ -2578,6 +2587,7 @@ mod tests {
             arguments: serde_json::json!({
                 "_raw": "{\"name\": \"Read\", \"path\": no_close"
             }),
+            id: None,
         };
         let result = registry.execute(&tc).await.unwrap();
         assert!(!result.success);
