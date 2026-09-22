@@ -54,6 +54,12 @@ pub enum RuntimeError {
 
     #[error("Ollama server returned unexpected response: {0}")]
     UnexpectedResponse(String),
+
+    /// Embedded kitty-infer backend failure. The message always carries the
+    /// recovery hint (OOM / tokenizer sidecar / load cause) — never a bare
+    /// engine dump.
+    #[error("kitty-infer backend error: {0}")]
+    KittyInfer(String),
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;

@@ -17,7 +17,7 @@ use kitty_harness::agent::{Agent, AgentConfig, RunOverrides};
 use kitty_harness::knowledge::KnowledgeConfig;
 use kitty_harness::tools::standard_tool_definitions;
 use kitty_harness::{ModelProfile, ThinkingMode};
-use kitty_runtime::OllamaClient;
+use kitty_runtime::{ChatClient, OllamaClient};
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -314,29 +314,71 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let client = OllamaClient::new(&cli.url);
+
+    // F2 embedded backend: KITTY_BACKEND=kitty-infer selects the in-process
+    // kitty-infer GGUF client (KITTY_INFER_MODEL=<path.gguf>). Default (unset
+    // or any other value) keeps the Ollama path byte-for-byte as before.
+    let use_infer = kitty_runtime::backend_selected(
+        std::env::var(kitty_runtime::ENV_BACKEND).ok().as_deref(),
+    );
+    if use_infer {
+        info!("backend=kitty-infer (embedded GGUF)");
+    }
+    let ollama_client: Option<OllamaClient> =
+        if use_infer { None } else { Some(OllamaClient::new(&cli.url)) };
 
     // f8 T2.2: resolve the session context window ONCE per process, BEFORE
     // any Agent/client construction, shared by Run/Bench/BenchAb. The value
     // is applied via with_num_ctx() before the first request; the client
     // stays frozen afterward (num_ctx is never injected per-request).
+    // Embedded backend skips the Ollama probe: ctx is owned by InferPolicy
+    // (KITTY_INFER_CTX, default 4096).
     let ctx_resolution = if matches!(
         cli.command,
         Commands::Run { .. } | Commands::Bench { .. } | Commands::BenchAb { .. }
     ) {
-        let res = resolve_session_num_ctx(&client, &cli.model).await;
-        info!(
-            num_ctx = res.num_ctx,
-            source = res.source,
-            "context window resolved"
-        );
-        Some(res)
+        match ollama_client.as_ref() {
+            Some(oc) => {
+                let res = resolve_session_num_ctx(oc, &cli.model).await;
+                info!(
+                    num_ctx = res.num_ctx,
+                    source = res.source,
+                    "context window resolved"
+                );
+                Some(res)
+            }
+            None => {
+                info!("context window owned by kitty-infer InferPolicy (KITTY_INFER_CTX)");
+                None
+            }
+        }
     } else {
         None
     };
-    let client = match &ctx_resolution {
-        Some(res) => client.with_num_ctx(res.num_ctx),
-        None => client,
+    // Boxed trait object: Ollama and embedded clients both implement
+    // ChatClient, so Run/Info stay backend-agnostic from here on.
+    let client: Box<dyn ChatClient> = match (&ollama_client, &ctx_resolution) {
+        _ if use_infer => {
+            #[cfg(feature = "kitty-infer")]
+            {
+                Box::new(kitty_runtime::KittyInferClient::from_env()?)
+            }
+            #[cfg(not(feature = "kitty-infer"))]
+            {
+                return Err(anyhow::anyhow!(kitty_runtime::unavailable_error()));
+            }
+        }
+        (Some(oc), Some(res)) => Box::new(oc.clone().with_num_ctx(res.num_ctx)),
+        (Some(oc), None) => Box::new(oc.clone()),
+        (None, _) => unreachable!("ollama backend always builds its client"),
+    };
+    // Bench suites drive OllamaClient concretely; the embedded backend is
+    // Run/Info-only until bench-over-ChatClient lands (honest bail, not a
+    // silent backend swap mid-bench).
+    let ollama_or_bail = || {
+        ollama_client.clone().ok_or_else(|| {
+            anyhow::anyhow!("bench suites require the ollama backend (KITTY_BACKEND must be unset)")
+        })
     };
 
     match cli.command {
@@ -466,7 +508,7 @@ async fn main() -> Result<()> {
             };
             bench::bench_command(
                 cli_ctx,
-                client.clone(),
+                ollama_or_bail()?,
                 bench::BenchArgs {
                     suite,
                     limit,
@@ -487,12 +529,20 @@ async fn main() -> Result<()> {
             println!("Kitty Code v{}", env!("CARGO_PKG_VERSION"));
             println!("Local coding agent for ornith:9B on consumer GPUs");
             println!();
-            println!("Model: {}", cli.model);
-            println!("URL:   {}", cli.url);
+            if use_infer {
+                println!("Backend: kitty-infer (embedded GGUF)");
+                println!(
+                    "Model: {}",
+                    std::env::var(kitty_runtime::ENV_MODEL)
+                        .unwrap_or_else(|_| "(KITTY_INFER_MODEL unset)".into())
+                );
+            } else {
+                println!("Model: {}", cli.model);
+                println!("URL:   {}", cli.url);
+            }
 
             match client.health_check().await {
-                Ok(true) => println!("Status: Connected"),
-                Ok(false) => println!("Status: Not connected"),
+                Ok(()) => println!("Status: Connected"),
                 Err(e) => println!("Status: Error: {}", e),
             }
 
@@ -531,7 +581,7 @@ async fn main() -> Result<()> {
             };
             bench::bench_ab_command(
                 cli_ctx,
-                client.clone(),
+                ollama_or_bail()?,
                 bench::BenchAbArgs {
                     thinking,
                     limit,
