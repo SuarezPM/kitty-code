@@ -7,8 +7,14 @@
 use anyhow::{Context, Result};
 use kitty_harness::config::ENV_BENCH_TIMEOUT_SECS;
 use kitty_harness::ModelProfile;
-use kitty_runtime::OllamaClient;
+use kitty_runtime::{
+    client::RequestOptions, ChatClient, ChatResponse, Message, OllamaClient, ToolDefinition,
+};
+#[cfg(feature = "kitty-infer")]
+use kitty_runtime::KittyInferClient;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use tracing::warn;
 
 // ── Benchmark ────────────────────────────────────────────────────────
@@ -249,10 +255,72 @@ pub(crate) fn file_contains(dir: &str, filename: &str, pattern: &str) -> bool {
     }
 }
 
+/// Backend-selected bench client (EMBEDDED-BENCH-SPEC §diseño mínimo-1):
+/// Ollama default; infer opt-in por env, nunca default silencioso.
+/// La sonda `num_ctx` solo corre en el brazo Ollama (infer usa
+/// `KITTY_INFER_CTX`); el resto de métricas es idéntico.
+#[derive(Clone)]
+pub(crate) enum BenchClient {
+    Ollama(OllamaClient),
+    #[cfg(feature = "kitty-infer")]
+    Infer(KittyInferClient),
+}
+
+impl ChatClient for BenchClient {
+    fn chat<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Pin<Box<dyn Future<Output = kitty_runtime::Result<ChatResponse>> + Send + 'a>> {
+        match self {
+            Self::Ollama(c) => ChatClient::chat(c, model, messages, tools),
+            #[cfg(feature = "kitty-infer")]
+            Self::Infer(c) => ChatClient::chat(c, model, messages, tools),
+        }
+    }
+
+    fn chat_with_options<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: Option<RequestOptions>,
+    ) -> Pin<Box<dyn Future<Output = kitty_runtime::Result<ChatResponse>> + Send + 'a>> {
+        match self {
+            Self::Ollama(c) => ChatClient::chat_with_options(c, model, messages, tools, options),
+            #[cfg(feature = "kitty-infer")]
+            Self::Infer(c) => ChatClient::chat_with_options(c, model, messages, tools, options),
+        }
+    }
+
+    fn count_tokens<'a>(
+        &'a self,
+        model: &'a str,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = kitty_runtime::Result<usize>> + Send + 'a>> {
+        match self {
+            Self::Ollama(c) => ChatClient::count_tokens(c, model, text),
+            #[cfg(feature = "kitty-infer")]
+            Self::Infer(c) => ChatClient::count_tokens(c, model, text),
+        }
+    }
+
+    fn health_check<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = kitty_runtime::Result<()>> + Send + 'a>> {
+        match self {
+            Self::Ollama(c) => ChatClient::health_check(c),
+            #[cfg(feature = "kitty-infer")]
+            Self::Infer(c) => ChatClient::health_check(c),
+        }
+    }
+}
+
 /// Shared benchmark configuration.
 #[derive(Clone)]
 pub(crate) struct BenchConfig {
-    pub(crate) client: OllamaClient,
+    pub(crate) client: BenchClient,
     pub(crate) model: String,
     pub(crate) limit: usize,
     pub(crate) use_memory: bool,

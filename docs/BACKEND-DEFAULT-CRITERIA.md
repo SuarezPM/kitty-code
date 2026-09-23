@@ -24,6 +24,11 @@ carril.
 4. **Bench comparativo**: misma suite polyglot/tb2 en ambos backends con el
    diseño de `EMBEDDED-BENCH-SPEC.md`; el embebido no debe perder >5pp de
    pass-rate ni romper los gates existentes.
+   Nota Gate C (2026-09-23): el 2/15-vs-3/15 qwen3 (infer-vs-ollama) queda
+   NO-MEDIDO como paridad — runs únicos n=15, Δ±1 dentro del ruido; no citar
+   como wash. Pata minicpm5-infer re-medida aislada en GPU sana: 0/15
+   (14 timeout + 1 fail; turno ~138s >> cap 30s; evidencias
+   `/tmp/kitty-bench/rerun/`).
 5. **Errores accionables**: todo fallo de `KittyInferClient` clasifica con
    hint (OOM/KV/tokenizer/modelo ausente); cero pánicos escapando al CLI en
    los paths probados (hoy: `expect` del scheduler paged en prompt largo
@@ -32,6 +37,11 @@ carril.
 6. **Docs al día**: tabla CTX-mínimo (apéndice serving en F0-RECON.md de
    kitty-infer) y este archivo actualizados con los números del humo que
    propone el cambio.
+7. **Robustez en runs encadenados**: entre runs GPU consecutivos se verifica
+   contexto sano (`nvidia-smi` + cola del log previo sin `CUDA_ERROR_*`); un
+   crash CUDA envenena al siguiente run en silencio (Gate C).
+8. **Paridad de envelope VRAM**: comparar backends bajo la misma envolvente
+   (pico + deriva VRAM); un Δ medido con distinta ocupación no es paridad.
 
 ## Recomendación explícita
 

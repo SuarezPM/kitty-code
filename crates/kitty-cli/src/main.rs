@@ -372,14 +372,31 @@ async fn main() -> Result<()> {
         (Some(oc), None) => Box::new(oc.clone()),
         (None, _) => unreachable!("ollama backend always builds its client"),
     };
-    // Bench suites drive OllamaClient concretely; the embedded backend is
-    // Run/Info-only until bench-over-ChatClient lands (honest bail, not a
-    // silent backend swap mid-bench).
-    let ollama_or_bail = || {
-        ollama_client.clone().ok_or_else(|| {
-            anyhow::anyhow!("bench suites require the ollama backend (KITTY_BACKEND must be unset)")
-        })
+    // Bench suites run over the backend-selected BenchClient (EMBEDDED-BENCH-SPEC
+    // §diseño mínimo-1): Ollama default; infer opt-in por env, nunca default
+    // silencioso. La sonda num_ctx solo corre en el brazo Ollama (resuelta
+    // arriba); infer usa KITTY_INFER_CTX.
+    let bench_client = || -> anyhow::Result<bench::BenchClient> {
+        if use_infer {
+            #[cfg(feature = "kitty-infer")]
+            {
+                Ok(bench::BenchClient::Infer(
+                    kitty_runtime::KittyInferClient::from_env()?,
+                ))
+            }
+            #[cfg(not(feature = "kitty-infer"))]
+            {
+                Err(anyhow::anyhow!(kitty_runtime::unavailable_error()))
+            }
+        } else {
+            Ok(bench::BenchClient::Ollama(
+                ollama_client
+                    .clone()
+                    .expect("ollama backend always builds its client"),
+            ))
+        }
     };
+    let bench_backend: &'static str = if use_infer { "kitty-infer" } else { "ollama" };
 
     match cli.command {
         Commands::Run { prompt, no_memory } => {
@@ -498,6 +515,7 @@ async fn main() -> Result<()> {
             let cli_ctx = bench::BenchCliCtx {
                 url: cli.url.clone(),
                 model: cli.model.clone(),
+                backend: bench_backend,
                 thinking_budget: cli.thinking_budget,
                 knowledge: cli.knowledge,
                 knowledge_dir: cli.knowledge_dir.clone(),
@@ -508,7 +526,7 @@ async fn main() -> Result<()> {
             };
             bench::bench_command(
                 cli_ctx,
-                ollama_or_bail()?,
+                bench_client()?,
                 bench::BenchArgs {
                     suite,
                     limit,
@@ -571,6 +589,7 @@ async fn main() -> Result<()> {
             let cli_ctx = bench::BenchCliCtx {
                 url: cli.url.clone(),
                 model: cli.model.clone(),
+                backend: bench_backend,
                 thinking_budget: cli.thinking_budget,
                 knowledge: cli.knowledge,
                 knowledge_dir: cli.knowledge_dir.clone(),
@@ -581,7 +600,7 @@ async fn main() -> Result<()> {
             };
             bench::bench_ab_command(
                 cli_ctx,
-                ollama_or_bail()?,
+                bench_client()?,
                 bench::BenchAbArgs {
                     thinking,
                     limit,

@@ -24,6 +24,9 @@ toml = "0.8"
 [features]
 default = []
 embedding = ["kitty-memory/embedding"]
+# Embedded kitty-infer backend for the infer_spike example (CPU-only here;
+# CUDA comes from the kitty-infer lane, same as kitty-cli/kitty-runtime).
+kitty-infer = ["kitty-runtime/kitty-infer"]
 
 # Process group kill on timeout (F3.1): nix signal + pid for all Unix targets.
 [target.'cfg(unix)'.dependencies]

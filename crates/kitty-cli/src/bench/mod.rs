@@ -13,7 +13,7 @@ pub mod tb2;
 pub(crate) use ab::{budget_summary, build_ab_plan, parse_thinking_budgets};
 pub(crate) use common::{
     bench_exit_code, exercises, is_small_model, json_to_bench_item, load_json_exercises,
-    resolve_timeout_from_flag, tally_by_language, BenchConfig, BenchItem, BenchResult,
+    resolve_timeout_from_flag, tally_by_language, BenchClient, BenchConfig, BenchItem, BenchResult,
     DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS,
 };
 pub(crate) use gpqa::run_gpqa_suite;
@@ -23,7 +23,6 @@ use crate::default_db_path;
 use anyhow::{Context, Result};
 use kitty_harness::agent::clamp_autorun_hops;
 use kitty_harness::ModelProfile;
-use kitty_runtime::OllamaClient;
 use std::path::PathBuf;
 use tracing::warn;
 
@@ -33,6 +32,9 @@ use tracing::warn;
 pub struct BenchCliCtx {
     pub url: String,
     pub model: String,
+    /// Backend bajo medición (`ollama` default; `kitty-infer` opt-in por env,
+    /// nunca default silencioso — EMBEDDED-BENCH-SPEC §diseño mínimo-2).
+    pub backend: &'static str,
     pub thinking_budget: usize,
     pub knowledge: bool,
     pub knowledge_dir: String,
@@ -70,7 +72,7 @@ pub struct BenchAbArgs {
 }
 
 /// `Commands::Bench` implementation (moved verbatim from `main.rs`).
-pub async fn bench_command(cli: BenchCliCtx, client: OllamaClient, args: BenchArgs) -> Result<()> {
+pub async fn bench_command(cli: BenchCliCtx, client: BenchClient, args: BenchArgs) -> Result<()> {
     let BenchArgs {
         suite,
         limit,
@@ -166,6 +168,7 @@ pub async fn bench_command(cli: BenchCliCtx, client: OllamaClient, args: BenchAr
 
     println!("Kitty Code Benchmark");
     println!("  Model: {}", cli.model);
+    println!("  Backend: {}", cli.backend);
     println!("  Suite: {} (limit: {})", suite, limit);
     println!(
         "  Memory: {}",
@@ -251,6 +254,7 @@ pub async fn bench_command(cli: BenchCliCtx, client: OllamaClient, args: BenchAr
 
     let output = serde_json::json!({
         "model": cli.model,
+        "backend": cli.backend,
         "suite": suite,
         "total": total,
         "passed": passed,
@@ -286,7 +290,7 @@ pub async fn bench_command(cli: BenchCliCtx, client: OllamaClient, args: BenchAr
 /// `Commands::BenchAb` implementation (moved verbatim from `main.rs`).
 pub async fn bench_ab_command(
     cli: BenchCliCtx,
-    client: OllamaClient,
+    client: BenchClient,
     args: BenchAbArgs,
 ) -> Result<()> {
     let BenchAbArgs {
@@ -356,6 +360,7 @@ pub async fn bench_ab_command(
 
     println!("Kitty Code A/B Benchmark");
     println!("  Model: {}", cli.model);
+    println!("  Backend: {}", cli.backend);
     println!("  Suite: {} (limit: {}, reps: {})", suite, limit, reps);
     println!("  Budgets: {:?}", budgets);
     println!("  Interleave: {}", interleave);
@@ -427,6 +432,7 @@ pub async fn bench_ab_command(
 
     let output = serde_json::json!({
         "model": cli.model,
+        "backend": cli.backend,
         "suite": suite,
         "limit": limit,
         "reps": reps,

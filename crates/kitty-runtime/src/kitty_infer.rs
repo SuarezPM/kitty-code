@@ -17,6 +17,11 @@
 //! honestly, it NEVER silently falls back to Ollama (that would hide the
 //! operator's choice). No auth in-process (nothing to authenticate).
 
+// Build sin feature `kitty-infer`: los helpers puros quedan sin uso porque el
+// cliente real vive tras el feature (Gate C) — silenciar ese ruido sin tocar
+// el build con feature, donde siguen advirtiendo si mueren de verdad.
+#![cfg_attr(not(feature = "kitty-infer"), allow(dead_code))]
+
 use std::path::PathBuf;
 
 use crate::error::{Result, RuntimeError};
@@ -708,6 +713,7 @@ fn loaded_map(
 /// both read it from [`loaded_map`]. Cross-spec races serialize with
 /// last-writer-wins residency, same as the registry metadata.
 #[cfg(feature = "kitty-infer")]
+#[derive(Clone)]
 pub struct KittyInferClient {
     config: KittyInferConfig,
 }
