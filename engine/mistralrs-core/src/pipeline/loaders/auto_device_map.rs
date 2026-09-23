@@ -191,6 +191,94 @@ macro_rules! b_to_mb {
     };
 }
 
+/// GPU preference for the auto decision (D1 forense: auto elegía CPU en
+/// silencio aun con GPU libre). `Offered` = el caller ya traía acelerador;
+/// `Probed` = no traía ninguno y el probe del sistema encontró uno (se
+/// antepone: GPU-first); `Absent` = no hay acelerador en ningún lado y el
+/// fallback a CPU se avisa a gritos (nunca por defecto silencioso).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuPreference {
+    Offered,
+    Probed,
+    Absent,
+}
+
+/// Truth table of the preference. Pure and unit-tested.
+fn gpu_preference(offered_has_accelerator: bool, probed_has_accelerator: bool) -> GpuPreference {
+    if offered_has_accelerator {
+        GpuPreference::Offered
+    } else if probed_has_accelerator {
+        GpuPreference::Probed
+    } else {
+        GpuPreference::Absent
+    }
+}
+
+/// System accelerator probe for the auto path. `cuda_if_available` compiles
+/// on every backend (CPU-only builds just report CPU); metal is probed only
+/// where it is compiled in.
+fn probe_system_accelerator() -> Option<Device> {
+    if let Ok(cuda) = Device::cuda_if_available(0) {
+        if !cuda.is_cpu() {
+            return Some(cuda);
+        }
+    }
+    #[cfg(feature = "metal")]
+    if let Ok(metal) = Device::new_metal(0) {
+        return Some(metal);
+    }
+    None
+}
+
+/// Loud notice for the CPU-only fallback. Pure and unit-tested: the text
+/// must name CPU explicitly (the bug was the silence, not the fallback).
+fn absent_accelerator_notice(offered: &str) -> String {
+    format!(
+        "[mistralrs-auto-map] WARNING: no GPU accelerator offered ({offered}) and none found on this system — mapping all layers to CPU. Explicit fallback, never a silent default: pass a CUDA device or check CUDA_VISIBLE_DEVICES/driver if a GPU exists."
+    )
+}
+
+/// Pure inner fill of the auto-map loop: how many next-first `(weight, kv)`
+/// pairs fit under `cap` with `used` bytes already spent. Overflow-safe;
+/// 0 when not even one layer fits. The productive loop below uses it (single
+/// implementation); the tests cover it directly.
+fn count_fitting_layers(sizes: &[usize], kv: &[usize], mut used: usize, cap: usize) -> usize {
+    let mut count = 0;
+    for (sz, kv) in sizes.iter().zip(kv.iter()) {
+        let Some(delta) = sz.checked_add(*kv) else {
+            break;
+        };
+        let Some(next_used) = used.checked_add(delta) else {
+            break;
+        };
+        if next_used > cap {
+            break;
+        }
+        used = next_used;
+        count += 1;
+    }
+    count
+}
+
+/// Audible reason for the final split. Pure and unit-tested.
+fn decision_reason(
+    gpu_layers: usize,
+    cpu_layers: usize,
+    preference: GpuPreference,
+) -> &'static str {
+    if cpu_layers == 0 {
+        "fits-on-gpu"
+    } else if gpu_layers == 0 {
+        if preference == GpuPreference::Absent {
+            "no-accelerator-cpu-only"
+        } else {
+            "gpu-fits-zero-spill-to-cpu"
+        }
+    } else {
+        "gpu-overflow-spill-to-cpu"
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::cast_possible_truncation,
@@ -212,6 +300,46 @@ pub fn get_device_layers(
     let mapped_max = loader.mapped_max_act_size_elems(config, params)? * dtype.size_in_bytes();
     let non_mapped_max =
         loader.non_mapped_max_act_size_elems(config, params)? * dtype.size_in_bytes();
+
+    // GPU preference: auto must never silently default to CPU (D1 forense).
+    // If the caller offered no accelerator, probe the system and prepend
+    // every similar device GPU-first, so every layer that fits the pre-check
+    // lands on GPU and CPU only takes real overflow. Every branch logs loudly
+    // (stderr + tracing), never tracing-only.
+    let offered_gpu = devices.iter().any(|d| !d.is_cpu());
+    let probed: Vec<Device> = if offered_gpu {
+        Vec::new()
+    } else {
+        match probe_system_accelerator() {
+            Some(gpu) => {
+                crate::device_map::get_all_similar_devices(&gpu).unwrap_or_else(|_| vec![gpu])
+            }
+            None => Vec::new(),
+        }
+    };
+    let preference = gpu_preference(offered_gpu, !probed.is_empty());
+    if preference == GpuPreference::Absent {
+        let notice = absent_accelerator_notice(&format!(
+            "[{}]",
+            devices.iter().map(|d| d.device_pretty_repr()).join(", ")
+        ));
+        eprintln!("{notice}");
+        warn!("{notice}");
+    } else if preference == GpuPreference::Probed {
+        let msg = format!(
+            "[mistralrs-auto-map] no accelerator in offered devices; system probe found {} — prepending GPU-first",
+            probed.iter().map(|d| d.device_pretty_repr()).join(", ")
+        );
+        eprintln!("{msg}");
+        info!("{msg}");
+    }
+    let owned_devices: Vec<Device>;
+    let devices: &[Device] = if probed.is_empty() {
+        devices
+    } else {
+        owned_devices = probed.into_iter().chain(devices.iter().cloned()).collect();
+        &owned_devices
+    };
 
     let mut layer_sizes_backup = if paged_attn_config.is_some() {
         Some(layer_sizes_in_bytes.clone())
@@ -435,7 +563,6 @@ pub fn get_device_layers(
         } else {
             let mut used = mapped_max;
             let mut used_weight_bytes = 0usize;
-            let mut count = 0;
             if ordinal == 0 {
                 used = checked_memory_sum([
                     used.max(non_mapped_max),
@@ -446,28 +573,32 @@ pub fn get_device_layers(
                 .unwrap_or(usize::MAX);
                 used_weight_bytes = used_weight_bytes.saturating_add(non_mapped_size_in_bytes);
             }
-            while let Some(&sz) = layer_sizes_in_bytes.last() {
-                let Some(delta) = sz.checked_add(kv_bytes_for_layer(layer + count)) else {
-                    break;
-                };
-                let Some(next_used) = used.checked_add(delta) else {
-                    break;
-                };
-                if next_used > cap {
-                    break;
-                }
-                layer_sizes_in_bytes.pop();
-                used = next_used;
-                used_weight_bytes = used_weight_bytes.saturating_add(sz);
-                count += 1;
-            }
+            // Next-first views over the unplaced tail (`layer_sizes_in_bytes`
+            // is stored reversed, so `.last()` is the next layer to place).
+            // Same arithmetic as the historical fill loop, via the single
+            // `count_fitting_layers` implementation (unit-tested below).
+            let tail = layer_sizes_in_bytes.len();
+            let next_sizes: Vec<usize> =
+                layer_sizes_in_bytes.iter().rev().copied().collect();
+            let next_kv: Vec<usize> =
+                (0..tail).map(|i| kv_bytes_for_layer(layer + i)).collect();
+            let count = count_fitting_layers(&next_sizes, &next_kv, used, cap);
             if count > 0 {
+                for _ in 0..count {
+                    let sz = layer_sizes_in_bytes
+                        .pop()
+                        .expect("counted from the live tail");
+                    used_weight_bytes = used_weight_bytes.saturating_add(sz);
+                }
                 remaining = remaining.saturating_sub(used_weight_bytes);
             } else {
-                warn!(
-                    "Device {} can fit 0 layers. Consider reducing auto map params from current: {params} (ex. reducing max seq len or max num images)",
+                let msg = format!(
+                    "[mistralrs-auto-map] device {} fits 0 layers (usable {} MB): consider reducing auto map params from current: {params} (ex. reducing max seq len or max num images)",
                     dev.device_pretty_repr(),
+                    b_to_mb!(cap),
                 );
+                eprintln!("{msg}");
+                warn!("{msg}");
                 ordinal += 1;
                 continue;
             }
@@ -511,6 +642,22 @@ pub fn get_device_layers(
             None,
         );
     }
+    // Always-visible decision log (stderr + tracing, never tracing-only):
+    // GPU/CPU layer totals, measured free VRAM per device, and the reason.
+    // Bench verification: grep `mistralrs-auto-map` on stderr.
+    let gpu_layers: usize = mappings.iter().map(|m| m.layers).sum();
+    let cpu_layers = num_layers.saturating_sub(gpu_layers);
+    let reason = decision_reason(gpu_layers, cpu_layers, preference);
+    let free_detail = avail_copy
+        .iter()
+        .rev()
+        .map(|(a, d)| format!("{}:free={}MiB", d.device_pretty_repr(), b_to_mb!(*a)))
+        .join(", ");
+    let summary = format!(
+        "[mistralrs-auto-map] decision: gpu_layers={gpu_layers} cpu_layers={cpu_layers} total={num_layers} reason={reason} preference={preference:?} [{free_detail}]"
+    );
+    eprintln!("{summary}");
+    info!("{summary}");
     Ok(DeviceMapMetadata::from_num_device_layers(mappings))
 }
 
@@ -585,8 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn post_load_utilization_is_not_frozen_to_the_inventory_estimate() {
-        let requested = MemoryGpuConfig::Utilization(0.85);
+    fn post_load_utilization_is_not_frozen_to_the_inventory_estimate() {        let requested = MemoryGpuConfig::Utilization(0.85);
         assert!(matches!(
             post_load_memory_config(requested, MemoryGpuConfig::MbAmount(45_000), true),
             MemoryGpuConfig::Utilization(value) if value == 0.85
@@ -620,5 +766,202 @@ mod tests {
                 min_mb: Some(40_000),
             }
         ));
+    }
+
+    // ---- GPU-preference auto-map (D1 forense) ----
+
+    #[test]
+    fn gpu_preference_truth_table() {
+        use super::{gpu_preference, GpuPreference};
+        assert_eq!(gpu_preference(true, false), GpuPreference::Offered);
+        assert_eq!(gpu_preference(true, true), GpuPreference::Offered);
+        assert_eq!(gpu_preference(false, true), GpuPreference::Probed);
+        assert_eq!(gpu_preference(false, false), GpuPreference::Absent);
+    }
+
+    #[test]
+    fn fitting_count_all_when_ample() {
+        use super::count_fitting_layers;
+        // Ample simulated GPU budget: the whole stack lands on cuda.
+        assert_eq!(
+            count_fitting_layers(&[100, 100, 100, 100], &[10, 10, 10, 10], 50, 10_000),
+            4
+        );
+    }
+
+    #[test]
+    fn fitting_count_partial_is_deterministic() {
+        use super::count_fitting_layers;
+        // 50 + 110 + 110 = 270 <= 280; the third would reach 380 > 280.
+        assert_eq!(
+            count_fitting_layers(&[100, 100, 100], &[10, 10, 10], 50, 280),
+            2
+        );
+        // Exact fit counts (the boundary is `> cap`, not `>=`).
+        assert_eq!(count_fitting_layers(&[100, 100], &[10, 10], 50, 270), 2);
+        // Scarce VRAM spill is prefix-deterministic: always the FIRST n.
+        assert_eq!(count_fitting_layers(&[60, 60, 60, 60], &[5, 5, 5, 5], 0, 130), 2);
+    }
+
+    #[test]
+    fn fitting_count_zero_and_overflow_safe() {
+        use super::count_fitting_layers;
+        assert_eq!(count_fitting_layers(&[100], &[10], 500, 100), 0);
+        assert_eq!(count_fitting_layers(&[], &[], 0, 100), 0);
+        // usize::MAX-scale sums must break, never wrap.
+        assert_eq!(
+            count_fitting_layers(&[usize::MAX, 1], &[1, 1], 0, usize::MAX),
+            0
+        );
+        assert_eq!(count_fitting_layers(&[8], &[8], usize::MAX, usize::MAX), 0);
+    }
+
+    #[test]
+    fn absent_notice_names_cpu_explicitly() {
+        use super::absent_accelerator_notice;
+        let msg = absent_accelerator_notice("[cpu]");
+        assert!(msg.contains("CPU"), "{msg}");
+        assert!(msg.contains("WARNING"), "{msg}");
+        assert!(msg.contains("silent"), "{msg}");
+    }
+
+    #[test]
+    fn decision_reasons_cover_split_cases() {
+        use super::{decision_reason, GpuPreference};
+        assert_eq!(
+            decision_reason(42, 0, GpuPreference::Offered),
+            "fits-on-gpu"
+        );
+        assert_eq!(
+            decision_reason(0, 42, GpuPreference::Absent),
+            "no-accelerator-cpu-only"
+        );
+        assert_eq!(
+            decision_reason(0, 42, GpuPreference::Offered),
+            "gpu-fits-zero-spill-to-cpu"
+        );
+        assert_eq!(
+            decision_reason(12, 30, GpuPreference::Offered),
+            "gpu-overflow-spill-to-cpu"
+        );
+        assert_eq!(
+            decision_reason(12, 30, GpuPreference::Probed),
+            "gpu-overflow-spill-to-cpu"
+        );
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn system_probe_finds_no_accelerator_without_cuda() {
+        use super::probe_system_accelerator;
+        assert!(probe_system_accelerator().is_none());
+    }
+
+    #[test]
+    fn auto_prefers_gpu_when_present_else_cpu_only() {
+        use super::super::{AutoDeviceMapQuantization, DeviceMappedModelLoader};
+        use crate::matformer::MatformerSliceConfig;
+
+        struct StubCfg;
+        impl ModelConfigLike for StubCfg {
+            fn max_seq_len(&self) -> usize {
+                64
+            }
+            fn num_layers(&self) -> usize {
+                4
+            }
+            fn hidden_size(&self) -> usize {
+                32
+            }
+            fn num_kv_heads(&self) -> usize {
+                2
+            }
+            fn num_attn_heads(&self) -> usize {
+                4
+            }
+            fn k_head_dim(&self) -> usize {
+                8
+            }
+            fn v_head_dim(&self) -> usize {
+                8
+            }
+        }
+
+        struct StubLoader;
+        impl DeviceMappedModelLoader for StubLoader {
+            fn non_mapped_max_act_size_elems(
+                &self,
+                _config: &str,
+                _params: &AutoDeviceMapParams,
+            ) -> Result<usize> {
+                Ok(1024)
+            }
+            fn mapped_max_act_size_elems(
+                &self,
+                _config: &str,
+                _params: &AutoDeviceMapParams,
+            ) -> Result<usize> {
+                Ok(1024)
+            }
+            fn non_mapped_size_in_bytes(
+                &self,
+                _config: &str,
+                _dtype: DType,
+                _weight_pack_factor: usize,
+                _quantization: Option<&AutoDeviceMapQuantization<'_>>,
+                _matformer_config: Option<&MatformerSliceConfig>,
+            ) -> Result<usize> {
+                Ok(1 << 20)
+            }
+            fn layer_sizes_in_bytes(
+                &self,
+                _config: &str,
+                _dtype: DType,
+                _weight_pack_factor: usize,
+                _matformer_config: Option<&MatformerSliceConfig>,
+            ) -> Result<Vec<usize>> {
+                Ok(vec![64 << 20; 4])
+            }
+            fn num_layers(&self, _config: &str) -> Result<usize> {
+                Ok(4)
+            }
+            fn model_config(&self, _config: &str) -> Result<Box<dyn ModelConfigLike>> {
+                Ok(Box::new(StubCfg))
+            }
+        }
+
+        // 4 x 64MiB layers + 1MiB non-mapped: fits any real device budget,
+        // so placement is decided purely by the preference rule.
+        let loader = StubLoader;
+        let params = AutoDeviceMapParams::Text {
+            max_seq_len: 64,
+            max_batch_size: 1,
+        };
+        let total = 4 * (64 << 20) + (1 << 20);
+        let meta = get_device_layers(
+            &loader,
+            "{}",
+            4,
+            vec![64 << 20; 4],
+            1 << 20,
+            total,
+            &[Device::Cpu],
+            DType::F16,
+            &params,
+            None,
+        )
+        .unwrap();
+        let gpu: usize = meta
+            .device_layers()
+            .map(|ds| ds.iter().map(|m| m.layers).sum())
+            .unwrap_or(0);
+        // No system accelerator: the whole stack is CPU (explicit fallback).
+        // With one (cuda build + GPU host): the ample budget puts it all on
+        // GPU. Either way the preference holds — never a silent mix.
+        if super::probe_system_accelerator().is_none() {
+            assert_eq!(gpu, 0);
+        } else {
+            assert_eq!(gpu, 4);
+        }
     }
 }
