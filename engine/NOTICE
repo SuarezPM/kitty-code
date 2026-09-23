@@ -1,0 +1,20 @@
+# NOTICE — kitty-infer attribution
+
+kitty-infer is a hard fork of **mistral.rs** by Eric Buehler
+(https://github.com/EricLBuehler/mistral.rs), baseline commit
+`d5ae0f18f2170f10d30880cb7d21fb0880410e7b` (v0.9.3, 2026).
+
+Upstream license: **MIT** (Copyright (c) 2024 Eric Buehler) — full text in
+`LICENSE` (unchanged from upstream). This fork inherits the MIT license and
+all of its obligations.
+
+What changed vs upstream (fork direction, not a merge-back fork):
+- Amputated to decoder-only dense + MoE text inference (GGUF 2–8 bit,
+  CPU + CUDA) for 1–35B agent models. Removed: multimodal, speech,
+  diffusion, embeddings, LoRA, server/UI, Python SDK, and other
+  non-`kitty run` subsystems (see F0-RECON.md amputation map).
+- Renamed crates/binaries to `kitty-infer`.
+
+Upstream gratitude: this project would not exist without the excellent work
+at mistral.rs (and its debt to HuggingFace candle). Cite upstream per its
+`CITATION.cff` when publishing benchmarks against it.

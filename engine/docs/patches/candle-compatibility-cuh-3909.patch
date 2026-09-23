@@ -1,0 +1,13 @@
+--- candle-kernels/src/compatibility.cuh.orig	2026-09-21 11:40:03.145825759 -0300
++++ candle-kernels/src/compatibility.cuh	2026-09-21 11:40:06.436911105 -0300
+@@ -7,7 +7,9 @@
+
+ // FIXME: the minimum compute capabilities are just guesses since the table is not specific enough
+
+-#if __CUDA_ARCH__ < 800
++// kitty-infer: backport candle#3909
++#define CANDLE_CUDA_VERSION (__CUDACC_VER_MAJOR__*1000+__CUDACC_VER_MINOR__*10)
++#if CANDLE_CUDA_VERSION < 12020 && __CUDA_ARCH__ < 800
+ __device__ __forceinline__ __half __hmax_nan(__half a, __half b) {
+     return __hisnan(a) ? a : (__hisnan(b) ? b : __hmax(a, b));
+ }
