@@ -1155,7 +1155,7 @@ impl ChatClient for KittyInferClient {
 pub fn unavailable_error() -> RuntimeError {
     RuntimeError::InvalidArgument(
         "KITTY_BACKEND=kitty-infer needs the `kitty-infer` cargo feature — \
-         rebuild with --features kitty-infer (sibling repo ../kitty-infer must be present)"
+         rebuild with --features kitty-infer (mono M3: engine/mistralrs interno)"
             .to_string(),
     )
 }
