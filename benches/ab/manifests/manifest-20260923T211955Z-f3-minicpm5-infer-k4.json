@@ -1,0 +1,181 @@
+{
+  "phase": "Fase 3 SDD post-merge mono (k>=3 + manifiestos persistidos)",
+  "cell": "minicpm5-infer",
+  "rep": 4,
+  "k_design": 3,
+  "timestamp_utc": "20260923T211955Z",
+  "git_head_sha": "55d949a",
+  "model": "minicpm5:2b",
+  "gguf_sha256": "ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd",
+  "backend": "kitty-infer",
+  "suite": "builtin",
+  "limit": 15,
+  "flags": "model=<m> --context-window 8192 bench builtin -l 15; thinking 2048, max_iter 5(bench), profile auto, memory off(auto-small), knowledge off",
+  "cap_secs_per_exercise": 150,
+  "cap_origin": "timeouts.json 150. D1-rerun GPU-limpia (ollama vacio, VRAM 1008 idle): auto-map IGUAL a CPU -> veredicto inalterado 0/15",
+  "seeds": "builtin orden fijo dataset, sin shuffle (interleave n/a en bench; seed 42 solo bench-ab); thresholds/semillas/interleave intactos (contrato EMBEDDED-BENCH-SPEC)",
+  "kv_config": "KITTY_INFER_CTX=8192, CLI ctx 8192",
+  "warmup": "Layers 0-41: cpu (47 GB) en propio log (RUST_LOG dirigido); preload Fase 2 no hilado en CLI",
+  "toks_per_s": null,
+  "toks_per_s_note": "n/d: el harness bench no expone conteo de tokens por ejercicio (BenchResult solo latencia); no se toca codigo en Fase 3",
+  "outcome": {
+    "passed": 0,
+    "total": 15,
+    "rate_pct": 0.0,
+    "by_language": {
+      "bash": {
+        "attempted": 2,
+        "passed": 0,
+        "failed": 0,
+        "errored": 2
+      },
+      "go": {
+        "attempted": 1,
+        "passed": 0,
+        "failed": 0,
+        "errored": 1
+      },
+      "javascript": {
+        "attempted": 3,
+        "passed": 0,
+        "failed": 0,
+        "errored": 3
+      },
+      "python": {
+        "attempted": 5,
+        "passed": 0,
+        "failed": 0,
+        "errored": 5
+      },
+      "rust": {
+        "attempted": 2,
+        "passed": 0,
+        "failed": 0,
+        "errored": 2
+      },
+      "typescript": {
+        "attempted": 2,
+        "passed": 0,
+        "failed": 0,
+        "errored": 2
+      }
+    },
+    "verdicts": {
+      "timeout": 15
+    },
+    "latency_ms": {
+      "avg": 30000.0,
+      "p50": 30000.0,
+      "max": 30000.0
+    },
+    "vram_peak_mib": 2138,
+    "results_mtime_epoch": 1790200645,
+    "details": [
+      {
+        "id": "py-fib",
+        "lang": "python",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "py-class",
+        "lang": "python",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "py-sort",
+        "lang": "python",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "py-decorator",
+        "lang": "python",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "py-context",
+        "lang": "python",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "js-promise",
+        "lang": "javascript",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "js-debounce",
+        "lang": "javascript",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "js-async",
+        "lang": "javascript",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "ts-interface",
+        "lang": "typescript",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "ts-generic",
+        "lang": "typescript",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "sh-backup",
+        "lang": "bash",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "sh-replace",
+        "lang": "bash",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "rust-struct",
+        "lang": "rust",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "rust-enum",
+        "lang": "rust",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      },
+      {
+        "id": "go-struct",
+        "lang": "go",
+        "passed": false,
+        "verdict": "timeout",
+        "latency_ms": 30000.0
+      }
+    ]
+  }
+}

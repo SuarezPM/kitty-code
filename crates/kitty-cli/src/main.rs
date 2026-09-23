@@ -241,8 +241,11 @@ pub enum Commands {
         #[arg(long, default_value = "0")]
         hops: usize,
         /// Per-exercise wall-clock cap in seconds. Overrides the
-        /// KITTY_BENCH_TIMEOUT_SECS env fallback; both absent ⇒ 30.
-        #[arg(long, default_value = "30")]
+        /// KITTY_BENCH_TIMEOUT_SECS env fallback; both absent ⇒ manifest
+        /// cell, else DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS (120). Fase 3:
+        /// el default clap DEBE igualar la constante o el flag contaria
+        /// siempre como explicito y el manifiesto nunca aplicaria.
+        #[arg(long, default_value = "120")]
         timeout_secs: u64,
         /// Output file for results
         #[arg(short, long, default_value = "bench_results.json")]
@@ -279,8 +282,11 @@ pub enum Commands {
         #[arg(long, default_value = "0")]
         hops: usize,
         /// Per-exercise wall-clock cap in seconds. Overrides the
-        /// KITTY_BENCH_TIMEOUT_SECS env fallback; both absent ⇒ 30.
-        #[arg(long, default_value = "30")]
+        /// KITTY_BENCH_TIMEOUT_SECS env fallback; both absent ⇒
+        /// DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS (120). Mismo patron
+        /// sentinela que bench (D1 gate k>=3): el default clap debe
+        /// igualar la constante.
+        #[arg(long, default_value = "120")]
         timeout_secs: u64,
         /// Repetitions per (task,budget) pair
         #[arg(long, default_value = "1")]

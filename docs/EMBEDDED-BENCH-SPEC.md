@@ -13,6 +13,11 @@ delta vs baseline), persistencia como `Episode`. Todo eso es agnóstico al
 backend **excepto**: construcción del cliente, `num_ctx` probe (`/api/show`),
 ventana de contexto y `is_small_model` por id.
 
+Nota D1 (gate k>=3): el `latency_ms` de un veredicto `timeout` es SENTINELA
+(`30000.0` hard-coded en `run.rs`, no elapsed real); el cap efectivo vive en
+el manifiesto Fase 1 (`crates/kitty-cli/src/bench/timeouts.json`, celda por
+modelo/backend). No promediar el sentinela como latencia.
+
 ## Diseño mínimo (cuando se apruebe)
 
 1. `BenchConfig.client: OllamaClient` → `Box<dyn ChatClient>`; la sonda

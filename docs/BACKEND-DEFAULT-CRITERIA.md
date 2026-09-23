@@ -26,9 +26,13 @@ carril.
    pass-rate ni romper los gates existentes.
    Nota Gate C (2026-09-23): el 2/15-vs-3/15 qwen3 (infer-vs-ollama) queda
    NO-MEDIDO como paridad — runs únicos n=15, Δ±1 dentro del ruido; no citar
-   como wash. Pata minicpm5-infer re-medida aislada en GPU sana: 0/15
-   (14 timeout + 1 fail; turno ~138s >> cap 30s; evidencias
-   `/tmp/kitty-bench/rerun/`).
+   como wash (absorbido por qwen3-ollama k>=3 @120s = {4,4,7} en Fase 3).
+   Nota D1 (gate bench-k>=3, 2026-09-23): minicpm5-infer k>=3 @150s = {0,0,0}
+   (+k4 0/15) es ROJO-solo-con-placement-GPU (k1: 4543MiB pico, util GPU 68%);
+   k2-k4 CPU-spill (`Layers 0-41: cpu` del auto-map pese a GPU libre y ollama
+   vacio) quedan NO-MEDIDOS como paridad GPU — 0/15 medido como conducta CPU.
+   qwen3-infer k>=3 @180s = {0,0,0}, todo CPU-spill. Manifiestos (13):
+   `benches/ab/manifests/manifest-20260923T*-f3-*.json`.
 5. **Errores accionables**: todo fallo de `KittyInferClient` clasifica con
    hint (OOM/KV/tokenizer/modelo ausente); cero pánicos escapando al CLI en
    los paths probados (hoy: `expect` del scheduler paged en prompt largo
