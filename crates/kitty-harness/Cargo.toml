@@ -30,7 +30,7 @@ kitty-infer = ["kitty-runtime/kitty-infer"]
 
 # Process group kill on timeout (F3.1): nix signal + pid for all Unix targets.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["signal"] }
+nix = { version = "0.31", features = ["signal"] }
 
 # Real Linux containment (audit P0): Landlock FS whitelist + seccomp-bpf
 # fail-closed allowlist + user/mount/PID namespaces. Versions matched to the
