@@ -1,4 +1,8 @@
 #![deny(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+// Mono M2: DUAL deps — el workspace renombra (reqwest013/rand09) para coexistir
+// con kitty (reqwest 0.12/rand 0.8); alias para no reescribir el codigo engine.
+extern crate rand09 as rand;
+extern crate reqwest013 as reqwest;
 use candle_core::Device;
 use engine::Engine;
 pub use engine::{

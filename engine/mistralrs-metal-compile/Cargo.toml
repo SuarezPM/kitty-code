@@ -2,11 +2,11 @@
 name = "mistralrs-metal-compile"
 readme = "../README.md"
 authors = ["Eric Buehler"]
-version.workspace = true
+version = "0.9.3"  # mono M2: identidad origen (workspace unificado es 0.1.0)
 edition.workspace = true
 rust-version.workspace = true
-description.workspace = true
-repository.workspace = true
+description = "kitty-infer: GGUF 1-35B text inference for `kitty run` (consumer GPU). Upstream MIT attribution in NOTICE."  # mono M2: idem version
+repository = "https://github.com/EricLBuehler/mistral.rs"  # mono M2: idem version
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true

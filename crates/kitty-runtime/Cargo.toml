@@ -21,11 +21,11 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 [features]
 default = []
 llama = ["dep:llama-cpp-2"]
-# Embedded kitty-infer GGUF backend (sibling repo ../kitty-infer, CPU-only
-# here; CUDA builds are the kitty-infer lane). Opt-in so default builds stay
-# light: `cargo check --features kitty-infer`.
+# Embedded kitty-infer GGUF backend (mono M2: engine/mistralrs interno,
+# CPU-only here; CUDA builds are the kitty-infer lane). Opt-in so default
+# builds stay light: `cargo check --features kitty-infer`.
 kitty-infer = ["dep:mistralrs", "dep:anyhow"]
-# GPU path: forwards CUDA into the sibling mistralrs build (sm_75 lane).
+# GPU path: forwards CUDA into the internal mistralrs build (sm_75 lane).
 # Default builds stay CPU-only; enable with --features kitty-infer-cuda.
 kitty-infer-cuda = ["kitty-infer", "mistralrs/cuda"]
 # GPU offload for the gbnf-probe measurement (needs Vulkan SDK headers +
@@ -37,7 +37,7 @@ version = "0.1.154"
 optional = true
 
 [dependencies.mistralrs]
-path = "../../../kitty-infer/mistralrs"
+path = "../../engine/mistralrs"
 optional = true
 
 [dependencies.anyhow]
