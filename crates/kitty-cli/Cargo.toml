@@ -28,7 +28,7 @@ kitty-infer = ["kitty-runtime/kitty-infer"]
 kitty-infer-cuda = ["kitty-infer", "kitty-runtime/kitty-infer-cuda"]
 
 [dependencies.ratatui]
-version = "0.29"
+version = "0.30"
 optional = true
 
 [dependencies.crossterm]
