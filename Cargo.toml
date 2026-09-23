@@ -80,7 +80,7 @@ regex = "1"
 # Temp files for tests
 tempfile = "3"
 
-rand = "0.8"
+rand = "0.10"
 llama-cpp-2 = "0.1.154"
 
 # F6.4 ADR-005 llama.cpp GBNF real adapter — wiring done; GO REVERTED 2026-08-21
