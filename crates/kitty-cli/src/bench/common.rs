@@ -332,7 +332,7 @@ pub(crate) struct BenchConfig {
     /// into benchmark runs. Default 0.
     pub(crate) autorun_hops: usize,
     /// Per-exercise wall-clock cap in seconds (f9 calibration: resolved via
-    /// flag > KITTY_BENCH_TIMEOUT_SECS > default 30).
+    /// flag > KITTY_BENCH_TIMEOUT_SECS > manifest cell > default).
     pub(crate) exercise_timeout_secs: u64,
     pub(crate) bash_timeout: u64,
     pub(crate) profile: &'static ModelProfile,
@@ -345,7 +345,7 @@ pub(crate) struct BenchConfig {
 pub const DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS: u64 = 120;
 
 /// Pure resolver for the per-exercise timeout — precedence: explicit CLI
-/// flag > `KITTY_BENCH_TIMEOUT_SECS` env > default 30.
+/// flag > `KITTY_BENCH_TIMEOUT_SECS` env > default constant.
 ///
 /// Returns `(resolved_secs, env_invalid)` so the caller can warn exactly
 /// once when the env var was present but unparsable (or non-positive): such
@@ -382,6 +382,124 @@ pub(crate) fn resolve_timeout_from_flag(flag_secs: u64) -> (u64, bool) {
         );
     }
     (resolved, invalid)
+}
+
+// ── Per-(model, backend) exercise timeouts (Fase 1 SDD) ─────────────
+// El cap único mataba a MiniCPM5-infer (~138s/turno, calidad OK): cada
+// celda (modelo, backend) resuelve su timeout desde `timeouts.json`
+// (embebido vía `include_str!`, sin IO en el bench). Precedencia en el
+// path `bench`: flag explícito > env > celda del manifiesto > default
+// seguro (= actual). Gate 50%, semillas e interleave: intocados.
+
+/// One manifest entry: seconds plus measured provenance. `origin` is
+/// returned to the caller so the run log records WHY the timeout
+/// applies (audit trail, Gate C).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct TimeoutEntry {
+    pub(crate) secs: u64,
+    #[serde(default)]
+    pub(crate) origin: String,
+}
+
+/// Embedded `timeouts.json`: `models[model][backend]` > `backends[backend]`
+/// > `default_secs`. Unknown keys fall through; a zero `secs` (or zero
+/// `default_secs`) normalizes to [`DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS`].
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct TimeoutManifest {
+    #[serde(default)]
+    pub(crate) default_secs: u64,
+    #[serde(default)]
+    pub(crate) backends: std::collections::HashMap<String, TimeoutEntry>,
+    #[serde(default)]
+    pub(crate) models: std::collections::HashMap<String, std::collections::HashMap<String, TimeoutEntry>>,
+}
+
+const EMBEDDED_TIMEOUT_MANIFEST: &str = include_str!("timeouts.json");
+
+/// Load the embedded manifest; on parse error warn once and fall back to
+/// the safe default (a manifest typo must never fail the bench).
+pub(crate) fn load_timeout_manifest() -> TimeoutManifest {
+    match serde_json::from_str::<TimeoutManifest>(EMBEDDED_TIMEOUT_MANIFEST) {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            warn!(error = %e, "timeouts.json invalid — using safe default timeout");
+            TimeoutManifest::default()
+        }
+    }
+}
+
+/// Resolve `(secs, origin)` for one cell: exact model+backend entry, else
+/// backend default, else manifest default, else
+/// [`DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS`]. Model match is trimmed +
+/// lowercased; backend verbatim (`ollama` | `kitty-infer`).
+pub(crate) fn timeout_for_manifest(
+    model: &str,
+    backend: &str,
+    manifest: &TimeoutManifest,
+) -> (u64, Option<String>) {
+    let key = model.trim().to_lowercase();
+    if let Some(per_backend) = manifest.models.get(&key) {
+        if let Some(entry) = per_backend.get(backend) {
+            if entry.secs > 0 {
+                return (entry.secs, Some(entry.origin.clone()));
+            }
+        }
+    }
+    if let Some(entry) = manifest.backends.get(backend) {
+        if entry.secs > 0 {
+            return (entry.secs, Some(entry.origin.clone()));
+        }
+    }
+    if manifest.default_secs > 0 {
+        return (manifest.default_secs, None);
+    }
+    (DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS, None)
+}
+
+/// Pure bench-path resolver — precedence: explicit CLI flag >
+/// `KITTY_BENCH_TIMEOUT_SECS` env > manifest cell. Same invalid-env
+/// contract as [`resolve_exercise_timeout_secs`], falling back to the
+/// manifest cell instead of the constant.
+#[must_use]
+pub(crate) fn resolve_bench_timeout_secs(
+    explicit_flag: Option<u64>,
+    env_raw: Option<&str>,
+    manifest_secs: u64,
+) -> (u64, bool) {
+    if let Some(secs) = explicit_flag {
+        return (secs, false);
+    }
+    match env_raw.map(str::trim) {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(secs) if secs > 0 => (secs, false),
+            _ => (manifest_secs, true),
+        },
+        None => (manifest_secs, false),
+    }
+}
+
+/// Full `bench`-command resolution: manifest cell for `(model, backend)`,
+/// overlaid by explicit flag/env. Returns `(secs, env_invalid, origin)`
+/// so the caller warns exactly once on bad env and logs the provenance.
+pub(crate) fn resolve_timeout_for_bench(
+    flag_secs: u64,
+    model: &str,
+    backend: &str,
+) -> (u64, bool, Option<String>) {
+    let manifest = load_timeout_manifest();
+    let (manifest_secs, origin) = timeout_for_manifest(model, backend, &manifest);
+    let explicit = (flag_secs != DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS).then_some(flag_secs);
+    let env_raw = std::env::var(ENV_BENCH_TIMEOUT_SECS).ok();
+    let (resolved, invalid) =
+        resolve_bench_timeout_secs(explicit, env_raw.as_deref(), manifest_secs);
+    if invalid {
+        warn!(
+            raw = ?env_raw,
+            manifest_secs,
+            "{ENV_BENCH_TIMEOUT_SECS} is not a positive integer — using manifest cell"
+        );
+    }
+    (resolved, invalid, origin)
 }
 pub(crate) fn file_is_executable(dir: &str, filename: &str) -> bool {
     let path = std::path::Path::new(dir).join(filename);
@@ -653,5 +771,101 @@ mod small_model_gate_tests {
             !is_small_model("medium", "minicpm5:2b"),
             "explicit medium beats auto-detection"
         );
+    }
+}
+
+#[cfg(test)]
+mod timeout_manifest_tests {
+    use super::{
+        load_timeout_manifest, resolve_bench_timeout_secs, timeout_for_manifest,
+        TimeoutManifest, DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS,
+    };
+
+    #[test]
+    fn embedded_manifest_parses_with_safe_default() {
+        let manifest = load_timeout_manifest();
+        assert_eq!(
+            manifest.default_secs, DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS,
+            "manifest default must equal the actual default (safe default)"
+        );
+        assert!(!manifest.models.is_empty(), "measured models present");
+    }
+
+    #[test]
+    fn each_cell_uses_its_own_timeout_not_the_uniform() {
+        let manifest = load_timeout_manifest();
+        // Measured 2026-09-23 (Gate C): minicpm5 trivial turn 138.4s on
+        // kitty-infer, 22-41s passes on ollama.
+        let (infer_secs, infer_origin) =
+            timeout_for_manifest("minicpm5:2b", "kitty-infer", &manifest);
+        assert_eq!(infer_secs, 150, "minicpm5-infer cell");
+        assert!(
+            infer_origin.is_some_and(|o| !o.is_empty()),
+            "cell carries its origin"
+        );
+        let (ollama_secs, _) = timeout_for_manifest("minicpm5:2b", "ollama", &manifest);
+        assert_eq!(ollama_secs, 60, "minicpm5-ollama cell");
+        // Non-uniform by construction: the infer cell differs from default.
+        assert_ne!(
+            infer_secs, DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS,
+            "a cell must not silently equal the uniform default here"
+        );
+        // Measured passes 95s/114s on kitty-infer.
+        let (qwen_secs, _) = timeout_for_manifest("qwen3:4b", "kitty-infer", &manifest);
+        assert_eq!(qwen_secs, 180, "qwen3-infer cell");
+    }
+
+    #[test]
+    fn unknown_cells_fall_back_to_safe_default() {
+        let manifest = load_timeout_manifest();
+        // Unknown model, known backend: backend default (with its origin).
+        let (secs, origin) = timeout_for_manifest("nope:99b", "ollama", &manifest);
+        assert_eq!(secs, DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS);
+        assert!(
+            origin.is_some_and(|o| !o.is_empty()),
+            "backend default carries its origin"
+        );
+        // Unknown model AND backend: manifest default, no cell origin.
+        let (secs, origin) = timeout_for_manifest("nope:99b", "nope", &manifest);
+        assert_eq!(secs, DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS);
+        assert!(origin.is_none(), "default carries no cell origin");
+        // Unknown backend for a known model: backend default, then default.
+        let (secs, _) = timeout_for_manifest("minicpm5:2b", "weird-backend", &manifest);
+        assert_eq!(secs, DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS);
+        // Zero entries normalize to the safe default, never to 0.
+        let zero = TimeoutManifest {
+            default_secs: 0,
+            ..Default::default()
+        };
+        let (secs, _) = timeout_for_manifest("nope:99b", "nope", &zero);
+        assert_eq!(secs, DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn model_key_match_is_case_insensitive() {
+        let manifest = load_timeout_manifest();
+        let (secs, _) = timeout_for_manifest("MiniCPM5:2B", "kitty-infer", &manifest);
+        assert_eq!(secs, 150);
+    }
+
+    #[test]
+    fn explicit_flag_and_env_beat_the_manifest_cell() {
+        // Explicit flag wins over everything.
+        assert_eq!(
+            resolve_bench_timeout_secs(Some(45), Some("60"), 150),
+            (45, false)
+        );
+        // Valid env wins over the manifest cell.
+        assert_eq!(
+            resolve_bench_timeout_secs(None, Some("60"), 150),
+            (60, false)
+        );
+        // Invalid env falls back to the manifest cell (flagged).
+        assert_eq!(
+            resolve_bench_timeout_secs(None, Some("garbage"), 150),
+            (150, true)
+        );
+        // Neither: the manifest cell applies silently.
+        assert_eq!(resolve_bench_timeout_secs(None, None, 150), (150, false));
     }
 }

@@ -13,8 +13,8 @@ pub mod tb2;
 pub(crate) use ab::{budget_summary, build_ab_plan, parse_thinking_budgets};
 pub(crate) use common::{
     bench_exit_code, exercises, is_small_model, json_to_bench_item, load_json_exercises,
-    resolve_timeout_from_flag, tally_by_language, BenchClient, BenchConfig, BenchItem, BenchResult,
-    DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS,
+    resolve_timeout_for_bench, resolve_timeout_from_flag, tally_by_language, BenchClient,
+    BenchConfig, BenchItem, BenchResult, DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS,
 };
 pub(crate) use gpqa::run_gpqa_suite;
 pub(crate) use run::run_bench;
@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use kitty_harness::agent::clamp_autorun_hops;
 use kitty_harness::ModelProfile;
 use std::path::PathBuf;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// CLI-level settings the bench commands need, cloned field-by-field from
 /// `Cli` before the subcommand payload is destructured (avoids borrowing the
@@ -117,10 +117,16 @@ pub async fn bench_command(cli: BenchCliCtx, client: BenchClient, args: BenchArg
     if small_model && !no_memory {
         warn!(model = %cli.model, "small model detected — auto-disabling episodic memory for bench (use explicit --no-memory to silence)");
     }
-    // f9 calibration: per-exercise timeout — flag > env > default.
-    let (exercise_timeout_secs, env_invalid) = resolve_timeout_from_flag(timeout_secs);
+    // Fase 1 SDD: per-exercise timeout — explicit flag > env > manifest
+    // (model, backend) cell > safe default (= actual). Gate 50%,
+    // semillas e interleave intocados.
+    let (exercise_timeout_secs, env_invalid, timeout_origin) =
+        resolve_timeout_for_bench(timeout_secs, &cli.model, cli.backend);
     if env_invalid {
-        warn!("per-exercise timeout falling back to {DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS}s");
+        warn!("per-exercise timeout falling back to manifest cell");
+    }
+    if let Some(origin) = timeout_origin {
+        info!(model = %cli.model, backend = %cli.backend, secs = exercise_timeout_secs, origin = %origin, "per-exercise timeout from manifest cell");
     }
 
     let cfg = BenchConfig {

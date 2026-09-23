@@ -1,0 +1,36 @@
+{
+  "_doc": "Fase 1 SDD: per-exercise bench timeout por (modelo, backend). El cap unico mataba a MiniCPM5-infer (~138s/turno con calidad OK). Precedencia en bench: --timeout-secs explicito > KITTY_BENCH_TIMEOUT_SECS > esta tabla > default_secs. Gate 50%, semillas e interleave: contrato intocable, no se tocan aqui. Claves de modelo en minusculas.",
+  "default_secs": 120,
+  "backends": {
+    "ollama": {
+      "secs": 120,
+      "origin": "default actual (DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS); backend sano mide 22-41s/ejercicio (ollama-minicpm5 14/15, 2026-09-23), cabe sin cambiar nada"
+    },
+    "kitty-infer": {
+      "secs": 150,
+      "origin": "embebido sistematicamente mas lento (prefill/throughput); piso 2B medido 138.4s/turno (probe-run GPU sana, 2026-09-23) -> 150 cubre modelos no listados sin matar el bench"
+    }
+  },
+  "models": {
+    "minicpm5:2b": {
+      "ollama": {
+        "secs": 60,
+        "origin": "14/15 medido con pases 22-41s (bench-ollama-minicpm5, 2026-09-23); 60 = max medido + margen, el bench sigue rapido en backend sano"
+      },
+      "kitty-infer": {
+        "secs": 150,
+        "origin": "turno trivial 138.4s medido (probe-run GPU sana, 2026-09-23) + margen; re-run aislado 0/15 con cap 120 (14 timeout + 1 fail); piso tarea 2B>=150s"
+      }
+    },
+    "qwen3:4b": {
+      "ollama": {
+        "secs": 120,
+        "origin": "3/15 con cap 30s (2026-09-23, sin latencias finas conservadas); se mantiene el default actual, sin claim"
+      },
+      "kitty-infer": {
+        "secs": 180,
+        "origin": "pases medidos 95s/114s (bench-infer-qwen3, 2026-09-23) + margen; piso tarea 4B>=180s"
+      }
+    }
+  }
+}
