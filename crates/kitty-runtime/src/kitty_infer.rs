@@ -34,8 +34,8 @@ use crate::tools::ToolDefinition;
 
 #[cfg(feature = "kitty-infer")]
 use mistralrs::{
-    serving as ki,
-    GgufModelBuilder, Model, PagedAttentionMetaBuilder, RequestBuilder, TextMessageRole,
+    serving as ki, GgufModelBuilder, Model, PagedAttentionMetaBuilder, ReasoningEffort,
+    RequestBuilder, TextMessageRole,
 };
 
 /// Env switch selecting this backend in `kitty-cli`.
@@ -241,6 +241,96 @@ fn skip_gguf_value(f: &mut std::fs::File, ty: u32) -> Option<()> {
 /// residents). `KITTY_INFER_NO_THINK=1` renders the empty think block.
 /// Pure and unit-testable; anything else (unset/invalid) keeps thinking on.
 pub const ENV_NO_THINK: &str = "KITTY_INFER_NO_THINK";
+/// Template tool-call format override (`json` | `xml` | `xml_typed`;
+/// unset/unknown = template default, `xml` for K2). Read by `to_request`.
+pub const ENV_TOOL_FORMAT: &str = "KITTY_INFER_TOOL_FORMAT";
+/// Reasoning-effort override (`low` | `medium`; unset/other = engine default).
+/// Read by `to_request` (K2 effort probe: `think_fast`/`think_faster` tags).
+pub const ENV_EFFORT: &str = "KITTY_INFER_REASONING_EFFORT";
+
+/// Validated tool-call format for the template context. Returns the
+/// lowercase `json`/`xml`/`xml_typed` value, else `None` (template default
+/// wins). Pure and unit-testable.
+fn tool_format(raw: Option<&str>) -> Option<String> {
+    match raw.map(str::trim) {
+        Some("json" | "xml" | "xml_typed") => raw.map(|v| v.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// Sampler overrides carried from `RequestOptions` into the builder.
+/// All-`None` = engine defaults (plain `chat` path).
+#[derive(Debug, Clone, Copy, Default)]
+struct SamplerOpts {
+    max_len: Option<usize>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<usize>,
+}
+
+/// Env overrides for sampler instrumentation (A/B recipe runs):
+/// `KITTY_INFER_TEMP`, `KITTY_INFER_TOP_P`, `KITTY_INFER_TOP_K`. Invalid or
+/// absent values leave the field untouched. Pure and unit-testable (env
+/// read stays at the call site).
+pub const ENV_TEMP: &str = "KITTY_INFER_TEMP";
+pub const ENV_TOP_P: &str = "KITTY_INFER_TOP_P";
+pub const ENV_TOP_K: &str = "KITTY_INFER_TOP_K";
+
+fn sampler_env_override(
+    samp: SamplerOpts,
+    temp: Option<&str>,
+    top_p: Option<&str>,
+    top_k: Option<&str>,
+) -> SamplerOpts {
+    let mut out = samp;
+    if let Some(t) = temp
+        .map(str::trim)
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|t| t.is_finite() && (0.0..=2.0).contains(t))
+    {
+        out.temperature = Some(t);
+    }
+    if let Some(p) = top_p
+        .map(str::trim)
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
+    {
+        out.top_p = Some(p);
+    }
+    if let Some(k) = top_k
+        .map(str::trim)
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|k| *k > 0)
+    {
+        out.top_k = Some(k.min(1000));
+    }
+    out
+}
+
+/// Map harness options onto sampler overrides. Pure and unit-testable:
+/// out-of-range values fall back to engine defaults rather than erroring
+/// mid-turn.
+fn sampler_opts_from(options: Option<crate::client::RequestOptions>) -> SamplerOpts {
+    let mut out = SamplerOpts::default();
+    if let Some(o) = options {
+        // Clamp to something sane: harness-derived caps can exceed the
+        // resident window when they were computed against another backend.
+        out.max_len = o.num_predict.filter(|n| *n > 0).map(|n| (n as usize).min(8192));
+        out.temperature = o
+            .temperature
+            .map(|t| t as f64)
+            .filter(|t| t.is_finite() && (0.0..=2.0).contains(t));
+        out.top_p = o
+            .top_p
+            .map(|p| p as f64)
+            .filter(|p| p.is_finite() && (0.0..=1.0).contains(p));
+        out.top_k = o
+            .top_k
+            .filter(|k| *k > 0)
+            .map(|k| (k as usize).min(1000));
+    }
+    out
+}
 
 /// Fallback id for an id-less tool result: positional `tool-{idx}` among
 /// the tool messages of the request (idx 0 keeps the historical `"tool-0"`).
@@ -447,6 +537,69 @@ mod mapping_tests {
         assert_eq!(tool_fallback_id(None, 0), "tool-0");
         assert_eq!(tool_fallback_id(None, 1), "tool-1");
         assert_eq!(tool_fallback_id(None, 7), "tool-7");
+    }
+
+    #[test]
+    fn sampler_opts_mapping() {
+        use super::sampler_opts_from;
+        use crate::client::RequestOptions;
+        let d = sampler_opts_from(None);
+        assert_eq!((d.max_len, d.temperature, d.top_p, d.top_k), (None, None, None, None));
+        let o = sampler_opts_from(Some(RequestOptions {
+            temperature: Some(1.0),
+            top_p: Some(0.95),
+            top_k: Some(40),
+            num_predict: Some(512),
+            ..Default::default()
+        }));
+        assert_eq!(o.max_len, Some(512));
+        assert_eq!(o.temperature, Some(1.0));
+        assert!((o.top_p.unwrap() - 0.95).abs() < 1e-6); // f32→f64 widening
+        assert_eq!(o.top_k, Some(40));
+        // Out-of-range falls back to defaults; huge caps clamp.
+        let o = sampler_opts_from(Some(RequestOptions {
+            temperature: Some(99.0),
+            top_p: Some(-1.0),
+            top_k: Some(0),
+            num_predict: Some(100_000),
+            ..Default::default()
+        }));
+        assert_eq!((o.temperature, o.top_p, o.top_k), (None, None, None));
+        assert_eq!(o.max_len, Some(8192));
+    }
+
+    #[test]
+    fn sampler_env_override_wins() {
+        use super::{sampler_env_override, SamplerOpts};
+        let base = SamplerOpts {
+            max_len: Some(512),
+            temperature: Some(0.3),
+            top_p: None,
+            top_k: None,
+        };
+        let o = sampler_env_override(base, Some("1.0"), Some("0.95"), None);
+        assert_eq!(o.max_len, Some(512));
+        assert_eq!(o.temperature, Some(1.0));
+        assert!((o.top_p.unwrap() - 0.95).abs() < 1e-9);
+        assert_eq!(o.top_k, None);
+        // Invalid values leave fields untouched.
+        let o = sampler_env_override(base, Some("nope"), Some("7"), Some("0"));
+        assert_eq!(
+            (o.temperature, o.top_p, o.top_k),
+            (Some(0.3), None, None)
+        );
+    }
+
+    #[test]
+    fn tool_format_validated() {
+        use super::tool_format;
+        assert_eq!(tool_format(None), None);
+        assert_eq!(tool_format(Some("json")), Some("json".to_string()));
+        assert_eq!(tool_format(Some(" xml ")), Some("xml".to_string()));
+        assert_eq!(tool_format(Some("xml_typed")), Some("xml_typed".to_string()));
+        assert_eq!(tool_format(Some("JSON")), None);
+        assert_eq!(tool_format(Some("yaml")), None);
+        assert_eq!(tool_format(Some("")), None);
     }
 
     #[test]
@@ -688,7 +841,14 @@ impl KittyInferClient {
                         .with_logging()
                         .with_max_model_len(ctx)
                         .with_dtype(dtype.clone())
-                        .with_paged_attn(PagedAttentionMetaBuilder::default().build()?);
+                        // Paged KV capacity must follow the attempt ctx: the
+                        // builder default pins ContextSize(4096) = 128 blocks,
+                        // which starves agent prompts (measured K2 panic).
+                        .with_paged_attn(
+                            PagedAttentionMetaBuilder::default()
+                                .with_gpu_memory(mistralrs::MemoryGpuConfig::ContextSize(ctx))
+                                .build()?,
+                        );
                     // Pre-validated above (relative clamp); the spill itself is
                     // honored verbatim here so load matches what passed checks.
                     if let Some(n) = gpu_layers {
@@ -746,6 +906,14 @@ impl KittyInferClient {
     ) -> RequestBuilder {
         let mut req =
             RequestBuilder::new().enable_thinking(thinking_enabled(std::env::var(ENV_NO_THINK).ok().as_deref()));
+        if let Some(fmt) = tool_format(std::env::var(ENV_TOOL_FORMAT).ok().as_deref()) {
+            req = req.with_tool_call_format(fmt);
+        }
+        match std::env::var(ENV_EFFORT).ok().as_deref() {
+            Some("low") => req = req.with_reasoning_effort(ReasoningEffort::Low),
+            Some("medium") => req = req.with_reasoning_effort(ReasoningEffort::Medium),
+            _ => {}
+        }
         let mut tool_idx = 0usize;
         for m in messages {
             let text = m.content.clone().unwrap_or_default();
@@ -823,32 +991,32 @@ impl KittyInferClient {
         }
         req
     }
-}
 
-#[cfg(feature = "kitty-infer")]
-impl std::fmt::Debug for KittyInferClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KittyInferClient")
-            .field("model_path", &self.config.model_path)
-            .field("ready", &self.is_ready())
-            .finish()
-    }
-}
-
-#[cfg(feature = "kitty-infer")]
-impl ChatClient for KittyInferClient {
-    fn chat<'a>(
-        &'a self,
-        model: &'a str,
+    async fn chat_inner(
+        &self,
+        model: &str,
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
-    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
-        Box::pin(async move {
-            let loaded = self.ensure_loaded().await?;
-            let resp = loaded
-                .send_chat_request(Self::to_request(messages, tools))
-                .await
-                .map_err(Self::friendly)?;
+        samp: SamplerOpts,
+    ) -> Result<ChatResponse> {
+        let loaded = self.ensure_loaded().await?;
+        let mut req = Self::to_request(messages, tools);
+        if let Some(n) = samp.max_len {
+            req = req.set_sampler_max_len(n);
+        }
+        if let Some(t) = samp.temperature {
+            req = req.set_sampler_temperature(t);
+        }
+        if let Some(p) = samp.top_p {
+            req = req.set_sampler_topp(p);
+        }
+        if let Some(k) = samp.top_k {
+            req = req.set_sampler_topk(k);
+        }
+        let resp = loaded
+            .send_chat_request(req)
+            .await
+            .map_err(Self::friendly)?;
             let choice = resp.choices.first().ok_or_else(|| {
                 RuntimeError::KittyInfer(
                     "engine returned zero choices — retry once; hint: check RUST_LOG=info for pipeline errors".to_string(),
@@ -882,8 +1050,56 @@ impl ChatClient for KittyInferClient {
                 eval_duration: None,
                 prompt_eval_count: Some(resp.usage.prompt_tokens as i64),
             })
+    }
+
+}
+
+#[cfg(feature = "kitty-infer")]
+impl std::fmt::Debug for KittyInferClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KittyInferClient")
+            .field("model_path", &self.config.model_path)
+            .field("ready", &self.is_ready())
+            .finish()
+    }
+}
+
+#[cfg(feature = "kitty-infer")]
+impl ChatClient for KittyInferClient {
+    fn chat<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            self.chat_inner(model, messages, tools, SamplerOpts::default())
+                .await
         })
     }
+
+    /// Honor `RequestOptions` (token cap + sampler). The trait default
+    /// IGNORES options, which left embedded generation unbounded (up to
+    /// `max_model_len`) and turned agent turns into 25-min timeouts.
+    /// `num_predict` clamps to 8192 (harness caps computed against another
+    /// backend can exceed the resident window); temperature/top_p/top_k
+    /// pass through when finite and in range, else engine defaults hold.
+    fn chat_with_options<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: Option<crate::client::RequestOptions>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
+        let samp = sampler_env_override(
+            sampler_opts_from(options),
+            std::env::var(ENV_TEMP).ok().as_deref(),
+            std::env::var(ENV_TOP_P).ok().as_deref(),
+            std::env::var(ENV_TOP_K).ok().as_deref(),
+        );
+        Box::pin(async move { self.chat_inner(model, messages, tools, samp).await })
+    }
+
 
     fn count_tokens<'a>(
         &'a self,
