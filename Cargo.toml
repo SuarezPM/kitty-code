@@ -59,7 +59,7 @@ clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 
 # SQLite
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Logging
 tracing = "0.1"
@@ -80,7 +80,6 @@ regex = "1"
 # Temp files for tests
 tempfile = "3"
 
-rand = "0.8"
 llama-cpp-2 = "0.1.154"
 
 # F6.4 ADR-005 llama.cpp GBNF real adapter — wiring done; GO REVERTED 2026-08-21
@@ -171,8 +170,9 @@ hf-hub = { version = "0.4.3", default-features = false, features = [
 ] }
 itertools = "0.14.0"
 rand09 = { package = "rand", version = "0.9.3" }
-# DUAL rand con motivo (M2): kitty usa 0.8 (harness shuffle); engine usa 0.9
-# (mistralrs + mistralrs-core, con rand_distr 0.5 / rand_isaac 0.4). Idem reqwest.
+# DUAL rand con motivo (M2): kitty-cli usa 0.10 (BenchAb shuffle, seed 42);
+# engine usa 0.9 (mistralrs + mistralrs-core, con rand_distr 0.5 / rand_isaac
+# 0.4). Idem reqwest.
 rand_distr = "0.5.1"
 dirs = "6.0.0"
 # M2: thiserror = "2.0.18" — ya cubierto por la entrada Kitty-Code (compatible), no duplicado

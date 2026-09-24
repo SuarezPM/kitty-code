@@ -308,6 +308,19 @@ mod bench_ab_tests {
         );
     }
 
+    /// Golden de rand 0.10; StdRng NO es estable entre majors — este test
+    /// detecta drift, no corrige historia (si cambia el major, actualizar el
+    /// golden tras revisión consciente, nunca a ciegas).
+    #[test]
+    fn seed_42_interleave_golden() {
+        let plan = build_ab_plan(2, &[1024, 2048], 1, true);
+        assert_eq!(
+            plan,
+            vec![(1, 1024), (0, 1024), (1, 2048), (0, 2048)],
+            "seed-42 interleave drift: revisar bump de rand antes de tocar el golden"
+        );
+    }
+
     /// G4-FIX1: mixed-verdict results must serialize `errored` and
     /// `timed_out` counts per budget (the runbook gate reads these), with
     /// all pre-existing fields preserved untouched.

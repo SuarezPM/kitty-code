@@ -19,7 +19,7 @@ hex.workspace = true
 glob.workspace = true
 ignore.workspace = true
 regex.workspace = true
-toml = "0.8"
+toml = "0.9"
 
 [features]
 default = []
@@ -30,20 +30,20 @@ kitty-infer = ["kitty-runtime/kitty-infer"]
 
 # Process group kill on timeout (F3.1): nix signal + pid for all Unix targets.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["signal"] }
+nix = { version = "0.31", features = ["signal"] }
 
 # Real Linux containment (audit P0): Landlock FS whitelist + seccomp-bpf
 # fail-closed allowlist + user/mount/PID namespaces. Versions matched to the
 # verified Apohara Catalyst reference implementation.
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.30", features = ["sched", "user", "process"] }
+nix = { version = "0.31", features = ["sched", "user", "process"] }
 seccompiler = { version = "0.5", features = ["json"] }
 landlock = "0.4"
 libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
-criterion = "0.5"
+criterion = "0.8"
 proptest = "1"
 
 [[bench]]

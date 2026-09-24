@@ -2,7 +2,9 @@
 //! HARNESS, not the model — they close the "no profiling" gap flagged by the
 //! 2026-09 audit before any further optimization is attempted.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion};
 use kitty_harness::parser::ToolCallParser;
 
 const CLEAN_NATIVE: &str = r#"I'll read the file.

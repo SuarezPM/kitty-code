@@ -8,7 +8,7 @@ use crate::episodic::{cosine_similarity, encode_embedding, Episode, EpisodeStore
 use crate::error::{MemoryError, Result};
 
 /// NOTE: rten bloqueado — int8 Gemma / ONNX runtime rten no disponible para AllMiniLML6V2
-/// en kitty-memory. fastembed 4 con ort (pure Rust ONNX) es el backend elegido:
+/// en kitty-memory. fastembed 7 con ort (pure Rust ONNX) es el backend elegido:
 /// descarga modelo ~80MB a ~/.kitty/models/ vía hf-hub, cosine en Rust, sin bundled
 /// modelo en repo (gitignore *.onnx). Tiny mantiene --no-memory, embedding es opt-in
 /// feature `embedding` y no bloquea tiny.
@@ -44,7 +44,7 @@ impl EmbeddingStore {
 
     pub fn try_new_with_cache(cache_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&cache_dir).map_err(|e| MemoryError::Embedding(e.to_string()))?;
-        let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
+        let opts = fastembed::TextInitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
             .with_cache_dir(cache_dir)
             .with_show_download_progress(true);
         let model = fastembed::TextEmbedding::try_new(opts)
@@ -59,20 +59,20 @@ impl EmbeddingStore {
         self.dim
     }
 
-    pub fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    pub fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         self.model
             .embed(texts, None)
             .map_err(|e| MemoryError::Embedding(e.to_string()))
     }
 
-    pub fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+    pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
         let v = self.embed(vec![text.to_string()])?;
         v.into_iter()
             .next()
             .ok_or_else(|| MemoryError::Embedding("empty embedding".into()))
     }
 
-    pub fn embed_goal_outcome(&self, goal: &str, outcome: &str) -> Result<Vec<f32>> {
+    pub fn embed_goal_outcome(&mut self, goal: &str, outcome: &str) -> Result<Vec<f32>> {
         let combined = format!("{goal} {outcome}");
         self.embed_one(&combined)
     }
@@ -82,7 +82,7 @@ impl EmbeddingStore {
     }
 
     pub fn save_episode_with_embedding(
-        &self,
+        &mut self,
         store: &EpisodeStore,
         episode: &Episode,
     ) -> Result<()> {
@@ -91,7 +91,7 @@ impl EmbeddingStore {
     }
 
     pub fn update_episode_embedding(
-        &self,
+        &mut self,
         store: &EpisodeStore,
         id: &str,
         goal: &str,
@@ -101,7 +101,12 @@ impl EmbeddingStore {
         store.update_embedding(id, &emb)
     }
 
-    pub fn recall(&self, store: &EpisodeStore, query: &str, limit: usize) -> Result<Vec<Episode>> {
+    pub fn recall(
+        &mut self,
+        store: &EpisodeStore,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Episode>> {
         let q = self.embed_one(query)?;
         store.recall_by_embedding(&q, limit)
     }
