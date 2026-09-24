@@ -64,26 +64,28 @@ Plan de especificación (sin código). Base: auditoría 6.2/10 (`docs/AUDIT-CODE
 
 ---
 
-## Cierre del programa (7.6/10)
+## Cierre del programa (7.9/10, Gate 3 PASS 2026-09-24)
 
 Score final por dimensión (pesos auditoría 25/20/15/10/20/10):
 
 | Dim | Score | Peso | Aporte |
 |-----|-------|------|--------|
 | D1 | 8 | 25 | 2.00 |
-| D2 | 7 | 20 | 1.40 |
+| D2 | 8 | 20 | 1.60 |
 | D3 | 7 | 15 | 1.05 |
 | D4 | 8 | 10 | 0.80 |
 | D5 | 8 | 20 | 1.60 |
-| D6 | 7 | 10 | 0.70 |
-| **Total** | | 100 | **7.55 → 7.6** |
+| D6 | 8 | 10 | 0.80 |
+| **Total** | | 100 | **7.85 → 7.9** |
 
-Razones de gap (corregidas):
-- D3 (7, no 8): T1.4 tokio-console + T1.5 p50/p99 ausentes — NO constructores-main (el offload `spawn_blocking` en CLI ya cierra ese frente, ctores siguen sync por diseño).
-- D5 (8, no 9): serving sin wire (policy + 6 tests verdes, listener axum pendiente) + HU-8 pending-on-release.
-- D2 (7, no 8): ReAct en paralelo (tipado Thought→Action→Observation no cerrado en este ciclo).
-- D6 (7, no 8): coverage % sin medir + mutants sin correr (infra lista: llvm-cov/nextest pinados, goldens y proptest W5 verdes).
+Razones de gap (corregidas, verificadas por oracle):
+- D3 (7, no 8): T1.4 tokio-console (poll>100ms) + T1.5 p50/p99 con modelo ausentes — NO constructores-main (`main.rs:449` y bench ya offloadean vía `spawn_blocking`).
+- D5 (8, no 9): wire sin compilar in-tree (manifest dormido) + HU-8 pending-on-release (sin tag no hay release que verificar).
+- D2 (8): ReAct cableado al guard real (test red-green, traza efímera, API aditiva).
+- D6 (8, sostén): coverage harness 89.9/84 ≥ diana 80 + baseline mutants persistido; sub-AC mutants ≥80% ABIERTO (57.8% parcial) — si no cierra, D6→7.
 
-HU-8 (`slsa-verifier` + `cosign verify`): pending-on-release explícito — el workflow firma y genera provenance/SBOM en cada release tag, pero la verificación verde contra un release publicado no se ha ejecutado en este ciclo.
+Debt log residual (todo declarado, nada escondido): mutants ≥80 (87/440, nightly advisory); HU-8 (`slsa-verifier`+`cosign verify` en primer tag); nextest swap documentado; BGE-M3/rerank HELD-offline; holdout-runner HELD; wire-compile (revivir manifest mistralrs-cli); pyo3 RUSTSEC-2026-0176/0177 (preexistentes); CI-SHAs muertos (codeql/scorecard/deny-action); test-cpu user-ns en hosted; carrera env coverage (PoisonError); cuda sin device en hosted.
 
-Serving: 6 tests (`serving_config.rs` unitarios + espejo de integración en `engine/mistralrs-core/tests/`), fail-closed + rutas + rate + CORS.
+Para 8.2 (+0.35): T1.4+T1.5 con modelo (+0.15) + wire compilable + HU-8 (+0.20) + mutants ≥80 (sostén). Para 10: lo anterior + T11.2 auditoría externa.
+
+Nota de actas: los mensajes de este ciclo citan "tools 3335→408" (real 3303→408), "agent 2896→1605" (real 2877→1575) y "762/0" (real 763) — imprecisiones no enmendadas (commits ya pusheados); valen los números de esta sección.
