@@ -5,7 +5,7 @@
 use crate::bench::common::BenchConfig;
 use crate::default_db_path;
 use anyhow::{Context, Result};
-use kitty_harness::agent::{Agent, AgentConfig, RunOverrides};
+use kitty_harness::agent::{AgentConfig, RunOverrides};
 use kitty_harness::knowledge::KnowledgeConfig;
 use kitty_harness::ThinkingMode;
 use kitty_memory::{Episode, EpisodeStore};
@@ -153,7 +153,8 @@ pub(crate) async fn run_polyglot_bench(
                 },
                 ..Default::default()
             };
-            let mut agent = Agent::new(cfg.client.clone(), base_config);
+            let mut agent =
+                crate::bench::common::build_bench_agent(cfg.client.clone(), base_config).await?;
             let mut overrides = RunOverrides {
                 max_iterations: Some(cfg.max_iterations.max(20)),
                 autorun_hops: Some(cfg.autorun_hops),

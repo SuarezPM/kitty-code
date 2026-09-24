@@ -6,8 +6,9 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 
 use mistralrs_core::{
-    initialize_logging, DiffusionLoaderType, McpClientConfig, ModelSelected, PagedCacheType,
-    SpeechLoaderType,
+    initialize_logging,
+    serving::{RateLimiter, ServingConfig, ENV_BIND},
+    DiffusionLoaderType, McpClientConfig, ModelSelected, PagedCacheType, SpeechLoaderType,
 };
 use mistralrs_server_core::{
     approvals::ApprovalBroker,
@@ -31,6 +32,72 @@ use crate::args::{
 use crate::ui::build_ui_router;
 
 const MEBIBYTE_BYTES: usize = 1024 * 1024;
+
+// ---------- serving-security wire (HU-4) ----------
+
+/// Shared guard state for the serving-security middleware: fail-closed
+/// bind/token policy + token-bucket rate limit. Built once per `run_server`.
+#[derive(Clone)]
+pub(crate) struct ServeGuard {
+    pub(crate) cfg: ServingConfig,
+    pub(crate) limiter: std::sync::Arc<RateLimiter>,
+}
+
+/// Build the guard from the CLI bind/port + `KITTY_*` env. Bails when the
+/// bind is off-loopback without `KITTY_API_TOKEN` — note `ServerOptions`
+/// defaults to `0.0.0.0`, so an unconfigured external serve refuses to start.
+pub(crate) fn serve_guard(host: &str, port: u16) -> Result<std::sync::Arc<ServeGuard>> {
+    let mut cfg = ServingConfig::from_env();
+    // Precedence: KITTY_BIND (env) > CLI host > built-in default. Never let
+    // the CLI default (0.0.0.0) silently override an explicit env bind.
+    let env_bind = std::env::var(ENV_BIND)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if let Some(bind) = env_bind {
+        cfg.bind = bind;
+    } else if !host.trim().is_empty() {
+        cfg.bind = host.trim().to_string();
+    }
+    cfg.port = port;
+    cfg.validate()
+        .map_err(|e| anyhow::anyhow!("serving policy refuses startup: {e}"))?;
+    Ok(std::sync::Arc::new(ServeGuard {
+        limiter: std::sync::Arc::new(RateLimiter::new(&cfg.rate_limit)),
+        cfg,
+    }))
+}
+
+/// Extract the bearer token (`Bearer <token>` scheme; raw value accepted).
+fn auth_bearer(req: &axum::http::Request<axum::body::Body>) -> Option<&str> {
+    req.headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.strip_prefix("Bearer ").unwrap_or(v))
+}
+
+/// Per-request gate: shed load over budget (429), then enforce the
+/// Admin/Logs/Metrics bearer rule (401). Open routes pass through.
+pub(crate) async fn serve_guard_middleware(
+    axum::extract::State(guard): axum::extract::State<std::sync::Arc<ServeGuard>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: middleware::Next,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    if !guard.limiter.try_acquire().await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded — retry later",
+        )
+            .into_response();
+    }
+    let path = req.uri().path().to_string();
+    if let Err(e) = guard.cfg.check_route(&path, auth_bearer(&req)) {
+        return (StatusCode::UNAUTHORIZED, e.to_string()).into_response();
+    }
+    next.run(req).await
+}
 
 /// Run the HTTP server with the specified model
 #[allow(clippy::too_many_arguments)]
@@ -211,9 +278,26 @@ pub async fn run_server(
         info!("UI available at http://{}:{}/ui", server.host, server.port);
     }
 
+    // HU-4 wire: fail-closed bind/token gate FIRST — if this bails, nothing
+    // below binds (main listener nor MCP). External bind without
+    // KITTY_API_TOKEN aborts here (note ServerOptions defaults to 0.0.0.0).
+    let guard = serve_guard(&server.host, server.port)?;
+    info!(
+        "serving policy: bind={} rate={}/s+{} cors_origins={}",
+        guard.cfg.addr(),
+        guard.cfg.rate_limit.rps,
+        guard.cfg.rate_limit.burst,
+        guard.cfg.cors.allow_origins.len()
+    );
+
     if let Some(mcp_port) = server.mcp_port {
         spawn_mcp_server(mistralrs_for_mcp, &server.host, mcp_port, server.port).await?;
     }
+
+    app = app.layer(middleware::from_fn_with_state(
+        guard,
+        serve_guard_middleware,
+    ));
 
     let listener =
         tokio::net::TcpListener::bind(format!("{}:{}", server.host, server.port)).await?;
@@ -237,11 +321,19 @@ pub(crate) async fn spawn_mcp_server(
     if mcp_port == http_port {
         anyhow::bail!("--mcp-port must differ from the HTTP --port ({http_port})");
     }
+    // HU-4 wire, same gate as the main router: validate before binding so a
+    // rejected policy binds nothing, and enforce auth/rate-limit per request.
+    // (Built here from the same constructor so the config.rs call site — same
+    // crate, untouched — inherits the gate with zero changes.)
+    let guard = serve_guard(host, mcp_port)?;
     let listener = tokio::net::TcpListener::bind(format!("{host}:{mcp_port}"))
         .await
         .with_context(|| format!("Failed to bind MCP server to {host}:{mcp_port}"))?;
     let listener = tcp_nodelay_listener(listener);
-    let router = create_mcp_router(mistralrs);
+    let router = create_mcp_router(mistralrs).layer(middleware::from_fn_with_state(
+        guard,
+        serve_guard_middleware,
+    ));
 
     info!("MCP server listening on http://{host}:{mcp_port}{MCP_ROUTE}");
     info!("MCP protocol version is {MCP_PROTOCOL_VERSION}");
@@ -2723,5 +2815,110 @@ mod tests {
 
         let policy = extract_sandbox_settings(sandbox, &runtime).unwrap();
         assert_eq!(policy.network, NetworkMode::Loopback);
+    }
+
+    // ---------- HU-4 wire tests (no model needed) ----------
+
+    /// Raw-socket HTTP/1.0 request over loopback; returns the status code.
+    /// (No reqwest in this crate — keeps the wire dependency-free.)
+    async fn raw_status(port: u16, method: &str, path: &str, bearer: Option<&str>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let auth = bearer
+            .map(|b| format!("Authorization: Bearer {b}\r\n"))
+            .unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 512];
+        let n = stream.read(&mut buf).await.unwrap();
+        let head = String::from_utf8_lossy(&buf[..n]);
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap()
+    }
+
+    fn guard_for_test(token: Option<&str>) -> std::sync::Arc<ServeGuard> {
+        let mut cfg = ServingConfig::default();
+        cfg.api_token = token.map(str::to_string);
+        std::sync::Arc::new(ServeGuard {
+            limiter: std::sync::Arc::new(RateLimiter::new(&cfg.rate_limit)),
+            cfg,
+        })
+    }
+
+    async fn spawn_guarded_app(guard: std::sync::Arc<ServeGuard>) -> u16 {
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "ok" }))
+            .route("/admin/load", axum::routing::post(|| async { "loaded" }))
+            .route("/metrics", axum::routing::get(|| async { "m" }))
+            .layer(middleware::from_fn_with_state(
+                guard,
+                super::serve_guard_middleware,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        port
+    }
+
+    #[test]
+    fn serve_guard_rejects_external_without_token() {
+        // NOTE: process-env scoped; no other test in this file reads KITTY_*.
+        std::env::remove_var("KITTY_API_TOKEN");
+        std::env::remove_var("KITTY_REQUIRE_TOKEN");
+        assert!(serve_guard("0.0.0.0", 1234).is_err());
+        assert!(serve_guard("127.0.0.1", 1234).is_ok());
+        std::env::set_var("KITTY_API_TOKEN", "secret");
+        assert!(serve_guard("0.0.0.0", 1234).is_ok());
+        std::env::remove_var("KITTY_API_TOKEN");
+    }
+
+    #[test]
+    fn serve_guard_bind_precedence_env_over_cli() {
+        // NOTE: same process-env caveat as above.
+        std::env::remove_var("KITTY_API_TOKEN");
+        std::env::remove_var("KITTY_BIND");
+        assert!(serve_guard("0.0.0.0", 1234).is_err());
+        std::env::set_var("KITTY_BIND", "127.0.0.1");
+        let g = serve_guard("0.0.0.0", 1234).unwrap();
+        assert_eq!(g.cfg.bind, "127.0.0.1");
+        std::env::remove_var("KITTY_BIND");
+    }
+
+    #[tokio::test]
+    async fn guard_middleware_gates_admin_over_loopback_http() {
+        let port = spawn_guarded_app(guard_for_test(Some("secret"))).await;
+        assert_eq!(raw_status(port, "GET", "/health", None).await, 200);
+        assert_eq!(raw_status(port, "POST", "/admin/load", None).await, 401);
+        assert_eq!(
+            raw_status(port, "POST", "/admin/load", Some("wrong")).await,
+            401
+        );
+        assert_eq!(
+            raw_status(port, "POST", "/admin/load", Some("secret")).await,
+            200
+        );
+        assert_eq!(raw_status(port, "GET", "/metrics", None).await, 401);
+    }
+
+    #[tokio::test]
+    async fn guard_middleware_sheds_load_over_budget() {
+        let mut cfg = ServingConfig::default();
+        cfg.rate_limit.rps = 1;
+        cfg.rate_limit.burst = 1;
+        let guard = std::sync::Arc::new(ServeGuard {
+            limiter: std::sync::Arc::new(RateLimiter::new(&cfg.rate_limit)),
+            cfg,
+        });
+        let port = spawn_guarded_app(guard).await;
+        assert_eq!(raw_status(port, "GET", "/health", None).await, 200);
+        assert_eq!(raw_status(port, "GET", "/health", None).await, 429);
     }
 }

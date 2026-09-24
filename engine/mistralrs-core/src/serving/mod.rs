@@ -3,13 +3,18 @@
 // No auth by default; see api::check_auth for the fail-closed rule when enabled.
 
 pub mod api;
+pub mod config;
 pub mod errors;
 pub mod health;
 pub mod infer_policy;
 pub mod model_manager;
 pub mod sse;
 
-pub use api::{AdminTasks, check_auth};
+pub use api::{check_auth, AdminTasks};
+pub use config::{
+    CorsConfig, RateLimitConfig, RateLimiter, ServingConfig, DEFAULT_BIND, DEFAULT_PORT, ENV_BIND,
+    ENV_BURST, ENV_CORS, ENV_PORT, ENV_REQUIRE_TOKEN, ENV_RPS, ENV_TOKEN,
+};
 pub use errors::{ErrorBody, KittyError, RequestLog};
 pub use health::{GpuDeviceStatus, GpuSnapshot};
 pub use infer_policy::{

@@ -224,8 +224,8 @@ pub enum Commands {
     },
     /// Run benchmarks
     Bench {
-        /// Benchmark suite: polyglot (225 Exercism exercises with unit test grading),
-        /// tb2 (terminal-bench), tb2-official (terminal-bench-2.1 via Harbor CLI),
+        /// Benchmark suite: polyglot (official dataset polyglot-benchmark, unit-test grading),
+        /// tb2 (HOMEMADE 8 ejercicios locales, no oficial), tb2-official (OFFICIAL terminal-bench-2.1 via Harbor CLI),
         /// gpqa, gpqa_diamond, claweval
         /// (gpqa requires --pre-registration <PATH>;
         ///  claweval requires OPENROUTER_API_KEY + claw-eval CLI;
@@ -443,7 +443,12 @@ async fn main() -> Result<()> {
                 ..Default::default()
             }
             .with_profile(&cli.profile);
-            let mut agent = Agent::new(client, base_config);
+            // W1: Agent::new es sync por diseño (mkdir + SQLite + knowledge load
+            // una vez por agente). Offload al blocking pool para no parkar el
+            // reactor; constructores públicos siguen sync.
+            let mut agent = tokio::task::spawn_blocking(move || Agent::new(client, base_config))
+                .await
+                .map_err(|e| anyhow::anyhow!("agent construction task failed: {e}"))?;
             // Per-run overrides (Fase 2.1): explicit CLI flags survive the
             // construction-time profile sync via one auditable override path.
             let mut overrides = RunOverrides::default();

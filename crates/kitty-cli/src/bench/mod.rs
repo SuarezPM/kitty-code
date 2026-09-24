@@ -12,7 +12,7 @@ pub mod tb2;
 
 pub(crate) use ab::{budget_summary, build_ab_plan, parse_thinking_budgets};
 pub(crate) use common::{
-    bench_exit_code, exercises, is_small_model, json_to_bench_item, load_json_exercises,
+    bench_exit_code, homemade_exercises, is_small_model, json_to_bench_item, load_json_exercises,
     resolve_timeout_for_bench, resolve_timeout_from_flag, tally_by_language, BenchClient,
     BenchConfig, BenchItem, BenchResult, DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS,
 };
@@ -217,8 +217,8 @@ pub async fn bench_command(cli: BenchCliCtx, client: BenchClient, args: BenchArg
         run_bench(&bench_items, &cfg).await?
     } else {
         match suite.as_str() {
-            "tb2" => run_bench(&run::tb2_exercises(), &cfg).await?,
-            _ => run_bench(&exercises(), &cfg).await?,
+            "tb2" => run_bench(&run::tb2_homemade_exercises(), &cfg).await?,
+            _ => run_bench(&homemade_exercises(), &cfg).await?,
         }
     };
 
@@ -347,8 +347,8 @@ pub async fn bench_ab_command(
     };
 
     let items: Vec<BenchItem> = match suite.as_str() {
-        "tb2" => run::tb2_exercises(),
-        _ => exercises(),
+        "tb2" => run::tb2_homemade_exercises(),
+        _ => homemade_exercises(),
     };
 
     let mut store = if base_cfg.use_memory {

@@ -5,6 +5,7 @@
 //! dispatch layer.
 
 use anyhow::{Context, Result};
+use kitty_harness::agent::{Agent, AgentConfig};
 use kitty_harness::config::ENV_BENCH_TIMEOUT_SECS;
 use kitty_harness::ModelProfile;
 #[cfg(feature = "kitty-infer")]
@@ -227,7 +228,10 @@ pub(crate) fn bench_file(
     }
 }
 
-pub(crate) fn exercises() -> Vec<BenchItem> {
+/// Homemade 15-ejercicio fallback (NO oficial): se usa solo cuando la suite
+/// no matchea polyglot/tb2/tb2-official/gpqa/claweval ni --exercises JSON.
+/// T8.1: nombre explícito homemade vs official (antes `exercises()`).
+pub(crate) fn homemade_exercises() -> Vec<BenchItem> {
     vec![
         bench("py-fib", "python", "Write a function fibonacci(n: int) -> list[int] that returns the first n Fibonacci numbers. Save to solution.py.", |d| file_contains(d, "solution.py", "def fibonacci")),
         bench("py-class", "python", "Create a BankAccount class with deposit() and withdraw() methods. Save to solution.py.", |d| file_contains(d, "solution.py", "class BankAccount")),
@@ -338,6 +342,15 @@ pub(crate) struct BenchConfig {
     pub(crate) profile: &'static ModelProfile,
     pub(crate) enable_knowledge: bool,
     pub(crate) knowledge_dir: PathBuf,
+}
+/// W1: `Agent::new` es sync por diseño (mkdir + SQLite open + knowledge
+/// load corren una vez por agente, no por tool-call). En paths async
+/// (bench/run/polyglot/gpqa) la construcción se offloadea al blocking pool
+/// para no parkar el reactor; los constructores públicos siguen sync.
+pub(crate) async fn build_bench_agent(client: BenchClient, config: AgentConfig) -> Result<Agent> {
+    tokio::task::spawn_blocking(move || Agent::new(client, config))
+        .await
+        .context("agent construction task failed")
 }
 /// Default per-exercise bench wall-clock cap (seconds). Calibration showed
 /// real 9B-model tasks on split-GPU hardware routinely exceed this; raise
@@ -557,6 +570,57 @@ pub(crate) fn is_small_model(profile: &str, model: &str) -> bool {
         ModelProfile::from_cli(profile, model).name,
         "tiny" | "nano" | "small"
     )
+}
+#[cfg(test)]
+mod homemade_golden_tests {
+    // T8.1 goldens patrón ab.rs:315 (seed golden): pin ids/orden homemade.
+    // Si cambia un ejercicio a conciencia, actualizar el golden tras revisión,
+    // nunca a ciegas. Suite strings (`tb2`, `polyglot`) intactos por compat.
+    #[test]
+    fn homemade_15_ids_golden() {
+        let ids: Vec<&str> = super::homemade_exercises().iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "py-fib",
+                "py-class",
+                "py-sort",
+                "py-decorator",
+                "py-context",
+                "js-promise",
+                "js-debounce",
+                "js-async",
+                "ts-interface",
+                "ts-generic",
+                "sh-backup",
+                "sh-replace",
+                "rust-struct",
+                "rust-enum",
+                "go-struct",
+            ]
+        );
+    }
+
+    #[test]
+    fn tb2_homemade_8_ids_golden() {
+        let ids: Vec<&str> = super::super::run::tb2_homemade_exercises()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "tb2-bash-count",
+                "tb2-py-csv",
+                "tb2-makefile",
+                "tb2-dockerfile",
+                "tb2-gh-actions",
+                "tb2-sh-find-modified",
+                "tb2-py-dirsize",
+                "tb2-sh-backup",
+            ]
+        );
+    }
 }
 #[cfg(test)]
 mod bench_exit_tests {

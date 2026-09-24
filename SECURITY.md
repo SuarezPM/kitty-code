@@ -86,9 +86,18 @@ report it through the private channels above.
 
 ## Embedded serving bind scope
 
-El serving embebido default-abierto es loopback-only por diseño
-(`engine/mistralrs-core/src/serving/api.rs:219`, `check_auth` sin token
-configurado): no exponer sin auth + rate-limit + bind 127.0.0.1.
+Política viva en `engine/mistralrs-core/src/serving/config.rs`
+(`ServingConfig`): bind por defecto `127.0.0.1:8080` (solo loopback, sin
+token); cualquier bind no-loopback (`0.0.0.0`, `::`, IP externa) exige
+`KITTY_API_TOKEN` — `validate()` falla el arranque sin él y `check_route()`
+deniega aunque el arranque se saltara el gate. Rutas Admin (`/admin/*`),
+Logs (`/logs`) y Metrics (`/metrics`) exigen bearer cuando hay token o el
+bind es externo; `/health` queda abierta. Rate-limit token-bucket sin
+dependencias (`KITTY_RATE_LIMIT_RPS`/`_BURST`); CORS es allow-list
+(`KITTY_CORS_ORIGINS`, fail-closed) con hook documentado para
+`tower_http::CorsLayer` (dep HELD: requiere entrada nueva en
+`mistralrs-core/Cargo.toml`). Nunca exponer sin token + rate-limit + bind
+loopback; sin `change-me` defaults en ningún lado.
 
 ## Credit
 

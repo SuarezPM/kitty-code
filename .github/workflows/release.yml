@@ -27,6 +27,8 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+      - name: Set SOURCE_DATE_EPOCH (reproducible builds)
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
       - name: cargo build (release)
         run: cargo build --locked --release -p kitty-cli
       - name: Install cargo-cyclonedx
@@ -47,6 +49,10 @@ jobs:
           subject-path: "dist/*"
       - name: Install cosign (keyless, no secrets)
         uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+        with:
+          # pin-everything: binario cosign 3.1.3 (versión con GHSA-fx35);
+          # el pin v3.8.2 de arriba es solo la ACTION installer, no el binario.
+          cosign-version: 3.1.3
       - name: Sign release assets (keyless, Rekor bundle)
         run: |
           shopt -s nullglob

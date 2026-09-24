@@ -6,7 +6,7 @@ use crate::bench::common::{
 };
 use crate::default_db_path;
 use anyhow::{Context, Result};
-use kitty_harness::agent::{Agent, AgentConfig, RunOverrides};
+use kitty_harness::agent::{AgentConfig, RunOverrides};
 use kitty_harness::knowledge::KnowledgeConfig;
 use kitty_harness::ThinkingMode;
 use kitty_memory::{Episode, EpisodeStore};
@@ -96,7 +96,8 @@ pub(crate) async fn run_one_bench(
         },
         ..Default::default()
     };
-    let mut agent = Agent::new(cfg.client.clone(), base_config);
+    let mut agent =
+        crate::bench::common::build_bench_agent(cfg.client.clone(), base_config).await?;
     // Per-run overrides (Fase 2.1): bench tuning flows through the single
     // auditable override path instead of post-construction mutations.
     // f8 T1.3: bench autorun is FLAG-ONLY — set explicitly (default 0) so an
@@ -184,9 +185,10 @@ pub(crate) async fn run_one_bench(
         latency_ms,
     })
 }
-// ── TB2: Terminal-Bench 2.0 ──────────────────────────────────────────
+// ── TB2 homemade: 8 ejercicios locales (NO oficial) ────────────────
+// T8.1: `tb2` suite = homemade; `tb2-official` = Harbor oficial (ver tb2.rs).
 
-pub(crate) fn tb2_exercises() -> Vec<BenchItem> {
+pub(crate) fn tb2_homemade_exercises() -> Vec<BenchItem> {
     vec![
         bench_file("tb2-bash-count", "bash", "Create a bash script called count_lines.sh that counts the number of lines in all .rs files in the current directory recursively. Save it to count_lines.sh and make it executable.", "count_lines.sh", |d| file_is_executable(d, "count_lines.sh") && file_contains(d, "count_lines.sh", "find")),
         bench_file("tb2-py-csv", "python", "Write a Python script called csv_to_json.py that reads a CSV file (input path as first argument) and outputs JSON to stdout. Save it to csv_to_json.py.", "csv_to_json.py", |d| file_contains(d, "csv_to_json.py", "csv") && file_contains(d, "csv_to_json.py", "json")),

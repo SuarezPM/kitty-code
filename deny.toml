@@ -7,6 +7,11 @@ targets = [{ triple = "x86_64-unknown-linux-gnu" }]
 yanked = "warn"
 unmaintained = "workspace"
 unsound = "workspace"
+# T10.3: paste RUSTSEC-2024-0436 (unmaintained, sin upgrade seguro) es
+# transitiva via engine/mistralrs (gemm/candle/tokenizers). Sin fix aguas
+# arriba; se ignora el advisory con comentario, el gate sigue en deny para
+# vulnerabilidades nuevas.
+ignore = ["RUSTSEC-2024-0436"]
 
 [bans]
 multiple-versions = "warn"
@@ -29,6 +34,13 @@ allow = [
     "CDLA-Permissive-2.0",
     "MIT-0",
     "Unlicense",
+    # T10.3 gap documentado (todas transitivas, OSI-approved, sin bajar el gate):
+    # - 0BSD: doctest-file via interprocess via engine/mistralrs-core
+    # - Zlib: foldhash via hashbrown (rusqlite/kitty-memory + engine)
+    # - MPL-2.0: option-ext via ureq?/dirs via engine/candle (ver cargo-deny)
+    "0BSD",
+    "Zlib",
+    "MPL-2.0",
 ]
 confidence-threshold = 0.8
 exceptions = []
