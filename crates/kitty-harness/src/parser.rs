@@ -2396,3 +2396,32 @@ mid
         assert_eq!(calls[0].name, "Grep");
     }
 }
+
+#[cfg(test)]
+mod proptest_unit {
+    // W5-code: proptest unitarios (migra 2 casos fijos a strategies).
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        #[test]
+        fn xml_envelope_roundtrip(
+            tool in prop::sample::select(vec!["Read", "Bash", "Grep", "Glob", "Edit", "Write"]),
+            path in "[a-z0-9_/]{1,24}\\.[a-z]{1,3}",
+        ) {
+            let parser = ToolCallParser::new();
+            let input = format!(r#"<tool_call>{{"name":"{tool}","arguments":{{"path":"{path}"}}}}</tool_call>"#);
+            let calls = parser.parse(&input);
+            prop_assert_eq!(calls.len(), 1);
+            prop_assert_eq!(&calls[0].name, tool);
+            prop_assert_eq!(&calls[0].arguments["path"], &serde_json::json!(path));
+        }
+        #[test]
+        fn arbitrary_text_never_panics(s in ".*{0,128}") {
+            let parser = ToolCallParser::new();
+            let _ = parser.parse(&s);
+            let _ = parser.try_parse_with_error(&s);
+        }
+    }
+}

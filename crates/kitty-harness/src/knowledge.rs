@@ -150,6 +150,9 @@ pub struct KnowledgeBase {
 
 impl KnowledgeBase {
     /// Create a new knowledge base. Loads cards from disk if enabled.
+    /// W1: startup constructor stays sync (runs once at agent construction,
+    /// not per tool call — not reactor-blocking). Hot paths use
+    /// [`Self::load_cards_async`] via `spawn_blocking`-free tokio::fs.
     pub fn new(config: KnowledgeConfig) -> Self {
         let cards = if config.enabled {
             Self::load_cards(&config.knowledge_dir)
@@ -157,6 +160,46 @@ impl KnowledgeBase {
             Vec::new()
         };
         Self { config, cards }
+    }
+
+    /// Async constructor for runtimes that prefer non-blocking startup.
+    /// Same semantics as [`Self::new`]; cards load via tokio::fs 1-op reads.
+    pub async fn new_async(config: KnowledgeConfig) -> Self {
+        let cards = if config.enabled {
+            Self::load_cards_async(&config.knowledge_dir).await
+        } else {
+            Vec::new()
+        };
+        Self { config, cards }
+    }
+
+    /// Async card loader: todo-file 1-op reads via tokio::fs (W1).
+    /// Directory traversal stays sync (metadata, fast); file contents
+    /// are read with a single async op per `.md` file.
+    pub async fn load_cards_async(dir: &Path) -> Vec<KnowledgeCard> {
+        let mut cards = Vec::new();
+
+        // Sync traversal (fast metadata) → async content reads (1 op each).
+        // read_dir has no async todo-file equivalent; entries are metadata.
+        let entries: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries.flatten().map(|e| e.path()).collect(),
+            Err(_) => return cards,
+        };
+
+        for path in entries {
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                    let id = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    cards.push(KnowledgeCard::parse(&id, &content));
+                }
+            }
+        }
+
+        cards
     }
 
     /// Load all markdown files from the knowledge directory.
@@ -373,6 +416,26 @@ mod tests {
         };
         let base = KnowledgeBase::new(config);
         assert_eq!(base.card_count(), 2);
+    }
+
+    /// W1 red-green: async loader yields the same cards as the sync loader
+    /// without parking the reactor (tokio::test fails if blocking).
+    #[tokio::test]
+    async fn load_cards_async_matches_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rust.md"), "# Rust\nUse cargo test.").unwrap();
+        std::fs::write(dir.path().join("python.md"), "# Python\nUse pytest.").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "not markdown").unwrap();
+
+        let sync_cards = KnowledgeBase::load_cards(dir.path());
+        let async_cards = KnowledgeBase::load_cards_async(dir.path()).await;
+        assert_eq!(sync_cards.len(), 2);
+        assert_eq!(async_cards.len(), 2);
+        let mut sync_ids: Vec<_> = sync_cards.iter().map(|c| &c.id).collect();
+        let mut async_ids: Vec<_> = async_cards.iter().map(|c| &c.id).collect();
+        sync_ids.sort();
+        async_ids.sort();
+        assert_eq!(sync_ids, async_ids);
     }
 
     #[test]

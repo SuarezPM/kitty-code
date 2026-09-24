@@ -563,3 +563,43 @@ pub fn detect_write_targets(cmd: &str) -> Vec<String> {
 pub fn is_write_via_redirect(cmd: &str) -> bool {
     !detect_write_targets(cmd).is_empty()
 }
+
+#[cfg(test)]
+mod proptest_unit {
+    // W5-code: proptest unitarios (migra casos fijos a strategies).
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn fixed_redirect_target_migrated() {
+        assert_eq!(detect_write_targets("echo hi > out.txt"), vec!["out.txt"]);
+        assert!(detect_write_targets("cat > /dev/null").is_empty());
+        assert!(detect_write_targets("echo a 2>&1").is_empty());
+    }
+
+    #[test]
+    fn fixed_chain_split_migrated() {
+        assert_eq!(split_command_chain("a && b").len(), 2);
+        assert_eq!(split_command_chain("echo 'a && b'").len(), 1);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        #[test]
+        fn chain_split_never_panics(s in ".*{0,128}") {
+            let _ = split_command_chain(&s);
+        }
+        #[test]
+        fn write_targets_never_panics(s in ".*{0,128}") {
+            let _ = detect_write_targets(&s);
+            let _ = is_write_via_redirect(&s);
+        }
+        #[test]
+        fn redirect_roundtrip_name(
+            name in "[a-z]{1,12}\\.[a-z]{1,4}",
+        ) {
+            let cmd = format!("echo hi > {name}");
+            prop_assert_eq!(detect_write_targets(&cmd), vec![name]);
+        }
+    }
+}

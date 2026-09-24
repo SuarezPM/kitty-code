@@ -186,11 +186,25 @@ impl Contract {
 
     /// Convenience: write markdown to `.smallcode/contracts/<id>/contract.md` under `base_dir`.
     /// Best-effort, returns the path written.
+    /// W1: sync startup path kept for compat; async variant below for runtimes.
     pub fn save_markdown(&self, base_dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
         let dir = base_dir.join(".smallcode").join("contracts").join(&self.id);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("contract.md");
         std::fs::write(&path, self.to_markdown())?;
+        Ok(path)
+    }
+
+    /// Async variant: todo-file 1-op via tokio::fs (W1). Same layout as
+    /// [`Self::save_markdown`].
+    pub async fn save_markdown_async(
+        &self,
+        base_dir: &std::path::Path,
+    ) -> std::io::Result<std::path::PathBuf> {
+        let dir = base_dir.join(".smallcode").join("contracts").join(&self.id);
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join("contract.md");
+        tokio::fs::write(&path, self.to_markdown()).await?;
         Ok(path)
     }
 }
@@ -426,6 +440,63 @@ mod tests {
         assert!(!c2.mark_failed("ghost", "x"));
     }
 
+    // ── Consumer tests (agent `check_done_guard` paths) ─────────────────────
+    //
+    // These mirror the decision table in `agent/mod.rs::check_done_guard`
+    // WITHOUT touching the process env (no `SMALLCODE_CONTRACT` mutation, so
+    // they stay race-free under parallel test threads; env handling is
+    // covered by the agent-side integration test with save/restore).
+
+    /// Pending contract + done-claim text = the blocking path: not done,
+    /// claim detected, and the markdown the agent embeds names the blocker.
+    #[test]
+    fn consumer_pending_claim_blocks_with_blocker_id() {
+        let mut c = Contract::new("consumer");
+        let a1 = c.add_assertion(AssertionCheck::FileExists("a.rs".into()));
+        assert!(!c.is_done(), "pending contract must not be done");
+        assert!(
+            looks_like_done_claim("All done"),
+            "consumer text must read as a done claim"
+        );
+        assert_eq!(c.blockers().len(), 1);
+        assert_eq!(c.blockers()[0].id, a1);
+        assert!(
+            c.to_markdown().contains(&a1),
+            "nudge markdown must name the blocker"
+        );
+    }
+
+    /// Done contract + done-claim text = allow path (completed DoD never blocks).
+    #[test]
+    fn consumer_done_contract_allows_claim() {
+        let mut c = Contract::new("consumer-done");
+        let a1 = c.add_assertion(AssertionCheck::FileExists("a.rs".into()));
+        c.mark_passed(&a1);
+        assert!(c.is_done());
+        assert!(looks_like_done_claim("All done"));
+        assert!(c.blockers().is_empty(), "done contract has no blockers");
+    }
+
+    /// Pending contract + ordinary progress text = allow path (no false positive).
+    #[test]
+    fn consumer_pending_non_claim_allows() {
+        let mut c = Contract::new("consumer-progress");
+        c.add_assertion(AssertionCheck::FileExists("b.rs".into()));
+        assert!(!c.is_done());
+        assert!(!looks_like_done_claim("I did some work"));
+        assert!(!looks_like_done_claim("done?"), "question never blocks");
+    }
+
+    /// Ready-to-ship phrasing on a pending contract = blocking path variant.
+    #[test]
+    fn consumer_ready_phrase_blocks_pending() {
+        let mut c = Contract::new("consumer-ready");
+        c.add_assertion(AssertionCheck::CommandSucceeds("cargo test".into()));
+        assert!(!c.is_done());
+        assert!(looks_like_done_claim("ready for review"));
+        assert_eq!(c.blockers().len(), 1);
+    }
+
     #[test]
     fn add_assertion_generates_description_and_ids() {
         let mut c = Contract::new("desc");
@@ -441,5 +512,18 @@ mod tests {
         let id3 = c.add_assertion(AssertionCheck::CommandSucceeds("make".into()));
         assert_eq!(id3, "a03");
         assert!(c.assertions[2].description.contains("make"));
+    }
+
+    /// W1 red-green: async save writes the same markdown as the sync path.
+    #[tokio::test]
+    async fn save_markdown_async_matches_sync() {
+        let c = Contract::new("w1-async");
+        let dir = tempfile::tempdir().unwrap();
+        let sync_path = c.save_markdown(dir.path()).unwrap();
+        let sync_content = std::fs::read_to_string(&sync_path).unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let async_path = c.save_markdown_async(dir2.path()).await.unwrap();
+        let async_content = std::fs::read_to_string(&async_path).unwrap();
+        assert_eq!(sync_content, async_content);
     }
 }

@@ -41,8 +41,11 @@ proptest! {
         let path = dir.path().join("f.txt");
         std::fs::write(&path, &content).unwrap();
         let mut editor = HashlineEditor::new();
-        let _ = editor.read_file(&path);
-        match editor.edit_by_hash(&path, &hash, &new_content) {
+        // W1 async: drive the async leaves via a current-thread runtime;
+        // proptest cases stay sync so shrinking still works.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _ = rt.block_on(editor.read_file(&path));
+        match rt.block_on(editor.edit_by_hash(&path, &hash, &new_content)) {
             Ok(_) | Err(HashlineError::FileChanged { .. }) => {}
             other => {
                 // Any other error is acceptable as long as it is an error,
@@ -61,11 +64,12 @@ proptest! {
         let path = dir.path().join("f.txt");
         std::fs::write(&path, &line).unwrap();
         let mut editor = HashlineEditor::new();
-        let _ = editor.read_file(&path);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _ = rt.block_on(editor.read_file(&path));
         // Change the file on disk after the snapshot: any edit against the
         // old snapshot MUST return FileChanged, never silently apply.
         std::fs::write(&path, format!("{line}\nCHANGED")).unwrap();
-        match editor.edit_by_hash(&path, &hash, "x") {
+        match rt.block_on(editor.edit_by_hash(&path, &hash, "x")) {
             Err(HashlineError::FileChanged { .. }) => {}
             Ok(_) => prop_assert!(false, "stale edit silently applied"),
             Err(_) => {}

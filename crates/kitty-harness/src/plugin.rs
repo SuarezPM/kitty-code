@@ -215,6 +215,16 @@ fn load_manifest(path: &Path) -> Result<PluginManifest, PluginError> {
     parse_manifest(&content)
 }
 
+/// Async manifest loader: todo-file 1-op via tokio::fs (W1). Same parse as
+/// [`load_manifest`]; startup callers keep the sync path for compat.
+#[allow(dead_code)] // W1 async variant for runtimes; exercised in tests
+async fn load_manifest_async(path: &Path) -> Result<PluginManifest, PluginError> {
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| PluginError::Manifest(format!("read {}: {e}", path.display())))?;
+    parse_manifest(&content)
+}
+
 fn parse_manifest(content: &str) -> Result<PluginManifest, PluginError> {
     // Prefer `toml` crate if content looks like TOML; fallback to JSON for tests.
     // We try TOML first, then JSON, so tests can use either.
@@ -542,5 +552,18 @@ enabled = true
         for n in ["HelloTool", "ToolA", "ToolB"] {
             assert!(!core_after.iter().any(|d| d.function.name == n));
         }
+    }
+
+    /// W1 red-green: async manifest loader parses the same registry as sync.
+    #[tokio::test]
+    async fn plugin_load_manifest_async_matches_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plugins.toml");
+        std::fs::write(&path, "[[plugin]]\nname = \"hello\"\nenabled = true\n").unwrap();
+        let sync_r = PluginRegistry::load_from_manifest(&path).unwrap();
+        let manifest = load_manifest_async(&path).await.unwrap();
+        assert_eq!(manifest.plugins().len(), 1);
+        assert_eq!(sync_r.len(), 1);
+        assert!(sync_r.contains_tool("HelloTool"));
     }
 }

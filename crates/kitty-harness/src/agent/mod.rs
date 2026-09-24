@@ -4,895 +4,152 @@
 //! Handles multi-turn tool call chains, context budget management,
 //! thinking budget caps, quality monitoring, knowledge injection, and bootstrap detection.
 
+// W2 splits (por símbolo): config = tipos persistentes, policy = reglas del loop,
+// setup = construcción del Agent, output = truncado a disco. `agent/mod.rs`
+// queda como fachada fina: declaraciones + re-exports (API idéntica) +
+// helpers de test centralizados (definición única para `agent/*`).
+//
+// El bloque `use` se conserva aunque el código productivo se movió:
+// `response.rs`/`run.rs` (fuera del alcance de este split) resuelven sus
+// macros e imports vía `use super::*`.
 use anyhow::{Context, Result};
-use kitty_memory::{Episode, EpisodeStore};
-use kitty_runtime::{
-    ChatClient, ChatResponse, GrammarClient, GrammarConfig, Message, ToolDefinition,
-};
+use kitty_memory::Episode;
+use kitty_runtime::{ChatClient, ChatResponse, Message};
 use std::path::Path;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::bootstrap::Bootstrap;
 use crate::context::{ContextBudget, ContextError};
-use crate::contract::{contract_guard_enabled, looks_like_done_claim, Contract};
-use crate::knowledge::{KnowledgeBase, KnowledgeConfig};
-use crate::model_profile::{ModelProfile, ModelTuning, PromptStyle, ThinkingMode};
-use crate::overflow;
-use crate::parser::{ParsedToolCall, ToolCallParser};
-use crate::quality_monitor::{QualityConfig, QualityMonitor, QualityViolation};
-use crate::router::{tools_for_category, ToolRouter};
-use crate::thinking_budget::ThinkingBudget;
-use crate::tools::ToolRegistry;
+#[cfg(test)]
+use crate::model_profile::ModelProfile;
+use crate::model_profile::{PromptStyle, ThinkingMode};
+use crate::parser::ParsedToolCall;
+use crate::quality_monitor::QualityViolation;
 
+mod config;
+mod output;
+mod policy;
+mod react;
 mod response;
 mod run;
+mod setup;
 
-pub use run::ENV_VERIFY_LOOP;
-
-/// Streaming events emitted during `run_with_events`.
-#[derive(Debug, Clone)]
-pub enum AgentEvent {
-    Thinking(String),
-    ToolCall {
-        name: String,
-        args: serde_json::Value,
-    },
-    ToolResult {
-        name: String,
-        output: String,
-        success: bool,
-    },
-    AssistantMessage(String),
-    Error(String),
-    Done(String),
-}
-
-/// Configuration for the agent.
-#[derive(Debug, Clone)]
-pub struct AgentConfig {
-    /// Model name to use.
-    pub model: String,
-    /// Maximum number of tool-call iterations before forcing a text response.
-    pub max_iterations: usize,
-    /// Autorun continuation hops (f8 AD1): extra FULL tool-loop cycles granted
-    /// ONLY on iteration exhaustion — force_response is skipped, an
-    /// [`AUTORUN_CONTINUE_PROMPT`] is pushed and the inner loop restarts.
-    /// Default 0 keeps behavior byte-identical to the legacy single-cycle run;
-    /// clamped to 0..=[`MAX_AUTORUN_HOPS`] wherever set. Independent of
-    /// `VERIFY_MAX_REVISIONS` (which counts verification-driven re-entries).
-    pub autorun_hops: usize,
-    /// Context window size in tokens.
-    pub context_window: usize,
-    /// Compaction threshold (0.0-1.0). Default: 0.8.
-    pub compact_threshold: f32,
-    /// Whether knowledge injection is enabled.
-    pub enable_knowledge: bool,
-    /// Knowledge configuration.
-    pub knowledge_config: KnowledgeConfig,
-    /// Quality monitor configuration.
-    pub quality_config: QualityConfig,
-    /// Workspace directory for bootstrap detection.
-    pub workspace: std::path::PathBuf,
-    /// Path to episodic memory database. None = memory disabled.
-    pub memory_db_path: Option<String>,
-    /// Bash command timeout in seconds (F1.3). Default: 60.
-    pub bash_timeout_secs: u64,
-    /// Model profile preset (tiny|medium|large). Determines defaults for context, thinking, caps, etc.
-    pub profile: &'static ModelProfile,
-    /// Per-model inference settings (F2): sampling, thinking mode, and the
-    /// unified per-model iteration cap. Resolved from the model id in
-    /// [`Agent::new`] (exact → family → default); post-construction
-    /// per-run overrides (Fase 2.1) still win.
-    pub tuning: ModelTuning,
-    /// Whether to use 2-stage tool routing (router ready but gated behind this flag).
-    pub use_routing: bool,
-    /// Whether grammar-constrained decoding is enabled (tiny profile / spike).
-    /// Default false; enabled via `--profile tiny` or future CLI flag.
-    pub enable_grammar: bool,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            model: "qwen3:8b".to_string(),
-            max_iterations: 20,
-            autorun_hops: 0,
-            context_window: 16384,
-            compact_threshold: 0.8,
-            enable_knowledge: false,
-            knowledge_config: KnowledgeConfig::default(),
-            quality_config: QualityConfig::default(),
-            workspace: std::path::PathBuf::from("."),
-            memory_db_path: None,
-            bash_timeout_secs: 60,
-            profile: ModelProfile::medium(),
-            tuning: ModelTuning::default(),
-            use_routing: false,
-            enable_grammar: false,
-        }
-    }
-}
-
-impl AgentConfig {
-    /// Build a config from a CLI profile string, syncing derived fields from
-    /// the profile. The MODEL ID participates when the profile value does not
-    /// name a preset ("auto" or unknown): f8 T4.1 auto-detects nano-tier
-    /// models by id shape.
-    pub fn with_profile(mut self, profile_name: &str) -> Self {
-        let p = ModelProfile::from_cli(profile_name, &self.model);
-        self.profile = p;
-        self.context_window = p.context_window;
-        self.max_iterations = p.max_iterations;
-        self.bash_timeout_secs = p.bash_timeout_secs;
-        self.compact_threshold = p.compact_threshold;
-        // dedup: with_profile and new_inner both enforce tiny/nano→grammar for CLI vs direct Agent::new callers
-        if matches!(p.name, "tiny" | "nano") {
-            self.enable_grammar = true;
-        }
-        self
-    }
-}
-
-/// Maximum consecutive empty LLM responses before failing fast.
-///
-/// After this many empty responses the agent terminates the turn quickly
-/// instead of looping until `max_iterations`/timeout (handoff §6).
-/// Gate 2 tuning: 3→2 for faster fail-fast on small models.
-const MAX_EMPTY_STREAK: u8 = 2;
-
-/// Returns `true` when the empty-response streak has reached the fail-fast cap.
-///
-/// Exposed for unit testing the streak logic without a live LLM.
-pub fn should_fail_fast(streak: u8) -> bool {
-    streak >= MAX_EMPTY_STREAK
-}
-
-// ---------------------------------------------------------------------------
-// E3 deterministic guards (zero model intelligence required)
-// ---------------------------------------------------------------------------
-
-/// Doom-loop guard: identical tool+args executions before a corrective nudge.
-const DOOM_LOOP_NUDGE_AT: usize = 3;
-/// Doom-loop guard: identical tool+args executions before fail-fast abort.
-const DOOM_LOOP_FAIL_AT: usize = 6;
-/// System nudge injected when the doom-loop streak reaches [`DOOM_LOOP_NUDGE_AT`].
-const DOOM_LOOP_NUDGE_MSG: &str =
-    "Loop detected: same tool+args 3×. Change approach or provide a different strategy.";
-/// E3 step cap: injected as a trailing user message on the final iteration so
-/// the model wraps up instead of being cut mid-action (opencode
-/// MAX_STEPS_PROMPT pattern).
-const MAX_STEPS_PROMPT: &str =
-    "FINAL ITERATION: summarize progress and deliver your best result now.";
-
-/// Autorun continuation prompt (f8 AD1): pushed when an iteration budget is
-/// exhausted while [`AgentConfig::autorun_hops`] remain. Style-matches
-/// [`MAX_STEPS_PROMPT`] but signals the opposite — keep working the SAME task
-/// with tools; stop calling tools only when done. The two are never injected
-/// in the same cycle: MAX_STEPS is suppressed while hops remain.
-const AUTORUN_CONTINUE_PROMPT: &str =
-    "CONTINUE: you have more budget — keep working on the same task using tools. \
-     When the task is complete, stop calling tools and give your final answer.";
-
-/// Hard upper bound for [`AgentConfig::autorun_hops`] (clamp helper below).
-/// Each hop multiplies worst-case LLM calls by another full tool-loop cycle,
-/// so runaway values are rejected at every set site.
-pub const MAX_AUTORUN_HOPS: usize = 12;
-
-/// Clamp `autorun_hops` into 0..=[`MAX_AUTORUN_HOPS`] (usize cannot be
-/// negative). Applied wherever the value is set: config default stays 0
-/// (byte-identical legacy behavior), CLI/env/bench values are bounded here.
-#[must_use]
-pub fn clamp_autorun_hops(hops: usize) -> usize {
-    hops.min(MAX_AUTORUN_HOPS)
-}
-
-/// Fixed-machine rule (f8 AD1): after verification FAILS and the revision
-/// budget is exhausted, one autorun hop may buy one more full cycle.
-///
-/// Reachability (G1 rider): UNREACHABLE on every current live path. The
-/// `'autorun` loop provably exits ONLY through its `break`, and that break is
-/// guarded by `hops_remaining == 0` (any positive balance is spent one hop
-/// earlier to restart the inner loop instead of falling through). The
-/// verification section runs strictly after that break, so it always observes
-/// `hops_remaining == 0` and this predicate is constant-false in practice.
-/// The arm is retained deliberately: it encodes the AD1 machine rule for any
-/// future path where hops may legitimately survive into verification, and it
-/// stays unit-tested so the invariant is pinned.
-/// Maximum revision cycles after a failed verification (spec: up to 2).
-const VERIFY_MAX_REVISIONS: usize = 2;
-
-#[must_use]
-fn autorun_hop_retries_after_revisions_exhausted(
-    hops_remaining: usize,
-    revision_cycles: usize,
-) -> bool {
-    hops_remaining > 0 && revision_cycles >= VERIFY_MAX_REVISIONS
-}
-
-/// f8 AD6/m7: walk-back window (in messages) when searching for a safe
-/// user-turn boundary before the naive compaction split point. Bounded so a
-/// pathologically long assistant→tool run cannot scan the whole history.
-const COMPACTION_WALKBACK_MAX: usize = 12;
-
-/// Pure boundary selection for compaction (f8 AD6 + G3-FIX2): if the naive
-/// split ALREADY lands on a user turn, keep it exactly (no under-freeing).
-/// Otherwise walk BACK up to [`COMPACTION_WALKBACK_MAX`] messages to the
-/// nearest index `i > 0` where `messages[i]` begins a USER turn. Cutting at
-/// a user boundary can never orphan tool results or split an
-/// assistant→tool run (rule 3): every kept message from there on belongs to
-/// a complete turn. If no user boundary exists within the window, fall back
-/// to the naive split (degenerate histories stay graceful).
-#[must_use]
-fn compaction_split_boundary(messages: &[Message], naive_split_at: usize) -> usize {
-    if naive_split_at == 0 {
-        return 0;
-    }
-    // G3-FIX2: the naive point is tested FIRST — when it already sits on a
-    // user boundary it is used as-is instead of being skipped for an older,
-    // strictly-less-freeing cut.
-    if messages[naive_split_at].role == "user" {
-        return naive_split_at;
-    }
-    // Remaining candidates are naive-1 down to max(naive-K, 1) — index 0 is
-    // excluded (a zero split would compact nothing).
-    let lower = naive_split_at
-        .saturating_sub(COMPACTION_WALKBACK_MAX)
-        .max(1);
-    let mut idx = naive_split_at;
-    while idx > lower {
-        idx -= 1;
-        if messages[idx].role == "user" {
-            return idx;
-        }
-    }
-    naive_split_at
-}
-
-/// Collapse consecutive trailing `assistant` messages to at most one (B1-400
-/// wire sanitizer). Idempotent, tail-only — interior duplicates untouched.
-/// MERGE: if any tail assistant has tool_calls, concat all onto the LAST;
-/// DROP: else keep only the LAST. Cheap O(tail) scan, no allocation when tail≤1.
-pub fn sanitize_trailing_assistants(mut history: Vec<Message>) -> Vec<Message> {
-    let trailing = history
-        .iter()
-        .rev()
-        .take_while(|m| m.role == "assistant")
-        .count();
-    if trailing <= 1 {
-        return history;
-    }
-    let len = history.len();
-    let start = len - trailing;
-    let mut merged: Vec<kitty_runtime::ToolCall> = Vec::new();
-    for msg in &history[start..] {
-        if let Some(tcs) = &msg.tool_calls {
-            merged.extend(tcs.clone());
-        }
-    }
-    let last = history[start + trailing - 1].clone();
-    history.truncate(start);
-    let collapsed = if merged.is_empty() {
-        last
-    } else {
-        Message {
-            role: "assistant".to_string(),
-            content: last.content.clone(),
-            thinking: last.thinking.clone(),
-            tool_calls: Some(merged),
-            tool_call_id: None,
-        }
-    };
-    history.push(collapsed);
-    history
-}
-
-/// Verdict returned by [`DoomLoopGuard::record`] after one tool execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DoomLoopVerdict {
-    /// No repetition pattern (or streak below the nudge threshold).
-    Fresh,
-    /// Streak reached [`DOOM_LOOP_NUDGE_AT`] — inject the corrective nudge.
-    Nudge,
-    /// Streak reached [`DOOM_LOOP_FAIL_AT`] — fail fast.
-    Fail,
-}
-
-/// Deterministic doom-loop detector over executed tools.
-///
-/// Tracks the last tool execution as a `(tool name, serialized args)` key and
-/// counts consecutive identical executions. A different key resets the streak.
-#[derive(Debug, Default)]
-struct DoomLoopGuard {
-    last_key: Option<String>,
-    streak: usize,
-}
-
-impl DoomLoopGuard {
-    /// Record one tool execution and return the resulting verdict.
-    fn record(&mut self, name: &str, args: &serde_json::Value) -> DoomLoopVerdict {
-        let serialized = serde_json::to_string(args).unwrap_or_default();
-        let key = format!("{name}\u{0}{serialized}");
-        if self.last_key.as_deref() == Some(key.as_str()) {
-            self.streak += 1;
-        } else {
-            self.last_key = Some(key);
-            self.streak = 1;
-        }
-        if self.streak >= DOOM_LOOP_FAIL_AT {
-            DoomLoopVerdict::Fail
-        } else if self.streak >= DOOM_LOOP_NUDGE_AT {
-            DoomLoopVerdict::Nudge
-        } else {
-            DoomLoopVerdict::Fresh
-        }
-    }
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
-/// E3: proven stance overlay for Qwen-family models, which tend to hedge and
-/// ask permission instead of acting (cheetahclaws-proven). Appended to the
-/// system prompt when the model id contains "qwen".
-pub const QWEN_STANCE_OVERLAY: &str = "Communicate by executing: treat user requests as direct tool instructions. Do not ask permission. Do not narrate plans without acting.";
-
-/// f8 T4.1: minimal runtime contract for the nano tier (`PromptStyle::
-/// Minimal`). Terse identity plus the four non-negotiables; the workspace
-/// line is appended in `preflight`. Budget: ≤1600 chars INCLUDING that line.
-const MINIMAL_RUNTIME: &str = "\
-You are a coding agent working inside this repository. Complete the user's task using tools.
-
-Rules:
-- One action per turn: either ONE tool call OR your final text answer, never both.
-- Read a file before editing it; only edit files you have read this session.
-- Edits must be the smallest unique span: old_string has to match exactly once, \
-with just enough surrounding lines to disambiguate. Use Write only for NEW files.
-- Before finishing, check your work and state what you changed in one short \
-paragraph.";
-
-/// Returns the stance overlay for `model`, if any (currently qwen-family only).
-fn model_stance_overlay(model: &str) -> Option<&'static str> {
-    if model.to_ascii_lowercase().contains("qwen") {
-        Some(QWEN_STANCE_OVERLAY)
-    } else {
-        None
-    }
-}
-
-/// Check whether an anyhow error represents a context overflow.
-///
-/// Matches both the typed [`kitty_runtime::RuntimeError::ContextOverflow`] variant
-/// and string-based overflow patterns from other providers (via
-/// [`crate::overflow::detect_overflow`]).
-fn is_context_overflow_error(e: &anyhow::Error) -> bool {
-    // Check for the typed ContextOverflow variant first
-    if let Some(runtime_err) = e.downcast_ref::<kitty_runtime::RuntimeError>() {
-        if matches!(
-            runtime_err,
-            kitty_runtime::RuntimeError::ContextOverflow { .. }
-        ) {
-            return true;
-        }
-    }
-    // Fall back to string-based pattern matching for non-runtime errors
-    overflow::detect_overflow(&e.to_string())
-}
-
-/// Effective per-turn thinking-token cap for a [`ThinkingMode`].
-///
-/// Budget(n) caps at n (exceeding retries once without thinking — FASE D);
-/// On stays UNCAPPED (a reasoning-trained model must never be forced off
-/// mid-session by a budget trip); Off is enforced on the wire via
-/// `"think": false` in request_options (no cap needed).
-fn per_turn_thinking_cap(mode: ThinkingMode) -> Option<usize> {
-    match mode {
-        ThinkingMode::Budget(n) => Some(n as usize),
-        ThinkingMode::On | ThinkingMode::Off => None,
-    }
-}
-
-/// Per-run overrides applied at a single point at the start of
-/// [`Agent::run_with`] (audit 2026-09 Fase 2.1). Absent fields mean "use the
-/// configured defaults"; there are no sentinel values, so an invalid state is
-/// unrepresentable.
-///
-/// This replaces the former `config_mut()`/`budget_mut()` escape hatches
-/// whose post-construction mutations were the root cause of the G2-FIX3
-/// dead-store bug class: overrides now flow through one auditable path and
-/// the thinking-budget re-seed reads the post-override tuning.
-#[derive(Debug, Clone, Default)]
-pub struct RunOverrides {
-    /// Full tuning replacement (sampling, thinking mode, turn caps).
-    pub tuning: Option<ModelTuning>,
-    /// Compaction threshold; combined with `context_window` it re-derives the
-    /// effective threshold via `ContextBudget::derive_compaction_threshold`.
-    pub compact_threshold: Option<f32>,
-    /// Autorun continuation hops (clamped into 0..=MAX_AUTORUN_HOPS).
-    pub autorun_hops: Option<usize>,
-    /// Context window; resizes the budget to match.
-    pub context_window: Option<usize>,
-    /// Iteration cap for the tool loop.
-    pub max_iterations: Option<usize>,
-    /// Bash command timeout in seconds.
-    pub bash_timeout: Option<u64>,
-}
-
-/// The core agent loop.
-pub struct Agent {
-    client: Box<dyn ChatClient>,
-    config: AgentConfig,
-    messages: Vec<Message>,
-    tools: Vec<ToolDefinition>,
-    budget: ContextBudget,
-    registry: ToolRegistry,
-    parser: ToolCallParser,
-    thinking_budget: ThinkingBudget,
-    quality_monitor: QualityMonitor,
-    knowledge_base: KnowledgeBase,
-    bootstrap: Bootstrap,
-    /// Whether bootstrap has run for the current session.
-    bootstrap_done: bool,
-    /// Episodic memory store. None when memory is disabled.
-    memory_store: Option<EpisodeStore>,
-    /// Consecutive empty responses in the current turn (fail-fast §6).
-    empty_response_streak: u8,
-    /// E3 deterministic doom-loop detector over executed tools.
-    doom_loop: DoomLoopGuard,
-    /// 2-stage tool router (affirmation guard, stateful).
-    router: ToolRouter,
-    contract: Option<Contract>,
-    /// Consecutive invalid tool calls (NotFound, InvalidArgs) — breaker mechanism (F4.3).
-    invalid_streak: usize,
-}
-
-impl Agent {
-    /// Create a new agent with the given config (accepts any ChatClient impl, boxes it).
-    pub fn new(client: impl ChatClient + 'static, config: AgentConfig) -> Self {
-        let tools = crate::tools::standard_tool_definitions();
-        Self::new_inner(Box::new(client), config, tools)
-    }
-
-    /// Create with custom tool definitions (accepts any ChatClient impl, boxes it).
-    pub fn with_tools(
-        client: impl ChatClient + 'static,
-        config: AgentConfig,
-        tools: Vec<ToolDefinition>,
-    ) -> Self {
-        Self::new_inner(Box::new(client), config, tools)
-    }
-
-    /// Replace the inner client (useful for tests with MockClient).
-    pub fn with_client(mut self, client: Box<dyn ChatClient>) -> Self {
-        self.client = client;
-        self
-    }
-
-    /// Shared constructor: wires budget, monitors, knowledge, bootstrap and
-    /// memory from `config` (F4.1 — single implementation, no duplication).
-    fn new_inner(
-        client: Box<dyn ChatClient>,
-        mut config: AgentConfig,
-        tools: Vec<ToolDefinition>,
-    ) -> Self {
-        // Clamp the autorun surface at construction (covers CLI/env/bench
-        // plumbing, which all set the field before Agent::new).
-        config.autorun_hops = clamp_autorun_hops(config.autorun_hops);
-        // Sync derived fields from profile (single source of truth).
-        // Keeps AgentConfig::default() (medium) unchanged for existing tests,
-        // while --profile tiny correctly drives caps.
-        {
-            let p = config.profile;
-            config.context_window = p.context_window;
-            config.max_iterations = p.max_iterations;
-            config.bash_timeout_secs = p.bash_timeout_secs;
-            config.compact_threshold = p.compact_threshold;
-        }
-        // F2: per-model inference settings — sampling, thinking mode, and the
-        // UNIFIED iteration cap (absorbs the former standalone Tier-4
-        // turn-cap override; env KITTY_MODEL_TURN_CAPS + KITTY_NO_THINK apply
-        // inside the resolver). Per-run overrides (Fase 2.1) still win:
-        // they apply later through the single auditable path.
-        //
-        // G2-FIX2: only overwrite max_iterations when a per-model turn-cap
-        // entry ACTUALLY matched (exact table hit or env spec hit). Family/
-        // default resolution carries no cap authority and must not stomp
-        // deliberate profile presets (tiny's invariant 4K/5iter/4tools).
-        let (tuning, cap_matched) = ModelTuning::resolve_from_env_with_cap_hit(&config.model);
-        config.tuning = tuning;
-        if cap_matched {
-            config.max_iterations = config.tuning.max_iterations;
-        }
-        // Filter tools by profile subset (tiny → 4 tools, medium/large → 6)
-        let tools: Vec<ToolDefinition> = {
-            let subset = config.profile.tool_subset;
-            // If tool set equals standard, filter; custom tools are left as-is.
-            // Heuristic: if len == standard len, apply subset filter.
-            let standard_len = crate::tools::standard_tool_definitions().len();
-            if tools.len() == standard_len {
-                tools
-                    .into_iter()
-                    .filter(|t| subset.contains(&t.function.name.as_str()))
-                    .collect()
-            } else {
-                tools
-            }
-        };
-        // Grammar enforcement: auto-enable for tiny/nano profiles (spike).
-        // dedup: with_profile and new_inner both enforce tiny/nano→grammar for CLI vs direct Agent::new callers
-        if matches!(config.profile.name, "tiny" | "nano") {
-            config.enable_grammar = true;
-        }
-        // Grammar enforcement: wrap client if enabled (spike, default false).
-        let client: Box<dyn ChatClient> = if config.enable_grammar {
-            let grammar = GrammarConfig::from_tools(tools.clone());
-            Box::new(GrammarClient::new(client, grammar))
-        } else {
-            client
-        };
-        let mut budget = ContextBudget::new(config.context_window);
-        // f8 AD5: derive the EFFECTIVE compaction threshold for the actual
-        // window (never raises above the profile value; equals it on ≥16k
-        // windows against 0.8 profiles). `config.compact_threshold` keeps the
-        // PROFILE value as the explicit-override surface.
-        budget.set_threshold(ContextBudget::derive_compaction_threshold(
-            config.compact_threshold,
-            config.context_window,
-        ));
-        let tool_names: Vec<String> = tools.iter().map(|t| t.function.name.clone()).collect();
-        // F2/G2-FIX3: per-turn thinking policy comes from the resolved model
-        // profile. This is only the INITIAL seed — `run()` re-seeds from the
-        // CURRENT `config.tuning.thinking` on every call, so post-construction
-        // mutations (CLI/bench A/B thinking axis) take effect.
-        let thinking_budget = ThinkingBudget::new(
-            per_turn_thinking_cap(config.tuning.thinking),
-            None, // No session cap by default
-        );
-        let quality_monitor = QualityMonitor::new(config.quality_config.clone(), tool_names);
-        let knowledge_base = KnowledgeBase::new(config.knowledge_config.clone());
-        let bootstrap = Bootstrap::new(&config.workspace);
-        let memory_store = config.memory_db_path.as_ref().and_then(|path| {
-            if let Some(dir) = std::path::Path::new(path).parent() {
-                std::fs::create_dir_all(dir).ok();
-            }
-            EpisodeStore::open(path).ok()
-        });
-        // Read before moving `config` into the struct (no Copy).
-        let bash_timeout_secs = config.bash_timeout_secs;
-        // f8 T2.3: the active profile governs the default Read window.
-        let read_cap = config.profile.read_cap;
-        // F4.1: the active profile governs the Bash output cap.
-        let bash_output_cap = config.profile.bash_output_cap;
-        // Gate-4: the Bash-sandbox FS allow-root must follow the configured
-        // workspace explicitly — never silently inherit the process cwd
-        // (launching from `$HOME` would otherwise make all of HOME writable).
-        let workspace = config.workspace.clone();
-
-        Self {
-            client,
-            config,
-            messages: Vec::new(),
-            tools,
-            budget,
-            registry: ToolRegistry::with_timeout(bash_timeout_secs)
-                .with_workspace(workspace)
-                .with_read_cap(read_cap)
-                .with_bash_output_cap(bash_output_cap),
-            parser: ToolCallParser::new(),
-            thinking_budget,
-            quality_monitor,
-            knowledge_base,
-            bootstrap,
-            bootstrap_done: false,
-            memory_store,
-            empty_response_streak: 0,
-            doom_loop: DoomLoopGuard::default(),
-            router: ToolRouter::new(),
-            contract: None,
-            invalid_streak: 0,
-        }
-    }
-
-    /// Get filtered tool definitions for a prompt via the 2-stage router.
-    ///
-    /// When `use_routing` is false (default), returns the full profile-filtered
-    /// tool set. When true, classifies `prompt` and returns only the
-    /// category subset (empty for Plan → saves ~800 tokens). Statefully
-    /// preserves affirmation guard via internal `ToolRouter`.
-    pub fn get_tools_for_prompt(&mut self, prompt: &str) -> Vec<ToolDefinition> {
-        if !self.config.use_routing {
-            return self.tools.clone();
-        }
-        let cat = self.router.classify(prompt);
-        let filtered = tools_for_category(cat);
-        // Intersect router category with profile subset + agent tools for safety
-        let allowed: std::collections::HashSet<&str> = self
-            .tools
-            .iter()
-            .map(|t| t.function.name.as_str())
-            .collect();
-        filtered
-            .into_iter()
-            .filter(|t| allowed.contains(t.function.name.as_str()))
-            .collect()
-    }
-
-    /// Stateless helper: classify and return tools for `prompt` without mutating router.
-    pub fn tools_for_prompt(prompt: &str) -> Vec<ToolDefinition> {
-        crate::router::get_tools_for_prompt(prompt)
-    }
-
-    /// Expose current router last category (for testing).
-    pub fn router_last(&self) -> Option<crate::router::ToolCategory> {
-        self.router.last_category()
-    }
-
-    /// Immutable access to config.
-    pub fn config(&self) -> &AgentConfig {
-        &self.config
-    }
-
-    async fn count_tokens(&self, text: &str) -> usize {
-        match self.client.count_tokens(&self.config.model, text).await {
-            Ok(n) => n,
-            Err(e) => {
-                debug!(error = %e, "tokenize failed; using heuristic estimate");
-                ContextBudget::estimate_tokens(text)
-            }
-        }
-    }
-
-    /// Run bootstrap detection (cached, runs once).
-    /// Push a message and track token usage (F2.3 — sole accounting point).
-    ///
-    /// Uses real tokenization when the server is reachable; falls back to the
-    /// heuristic (chars/4). Every token consumed by the conversation flows
-    /// through this one call — no separate `budget.consume()` elsewhere.
-    // B1-400 decision: keep push_message as-is — wire sanitizer (idempotent tail-only) is sufficient and avoids touching episode/tool ordering invariants.
-    async fn push_message(&mut self, msg: Message) {
-        if let Some(content) = msg.content.as_deref() {
-            let tokens = self.count_tokens(content).await;
-            self.budget.consume(tokens);
-        }
-        self.messages.push(msg);
-    }
-
-    /// Get the current message history.
-    pub fn messages(&self) -> &[Message] {
-        &self.messages
-    }
-
-    /// Get the context budget status.
-    pub fn budget(&self) -> &ContextBudget {
-        &self.budget
-    }
-
-    /// Get the thinking budget tracker.
-    pub fn thinking_budget(&self) -> &ThinkingBudget {
-        &self.thinking_budget
-    }
-
-    /// Get the quality monitor.
-    pub fn quality_monitor(&self) -> &QualityMonitor {
-        &self.quality_monitor
-    }
-
-    /// Get the bootstrap result.
-    pub fn bootstrap_result(&self) -> Option<&crate::bootstrap::BootstrapResult> {
-        self.bootstrap.result()
-    }
-
-    /// Current consecutive empty-response count (for testing / introspection).
-    pub fn empty_streak(&self) -> u8 {
-        self.empty_response_streak
-    }
-
-    /// Associated helper mirroring the free `should_fail_fast` (for `Agent::` call sites).
-    pub fn should_fail_fast(streak: u8) -> bool {
-        should_fail_fast(streak)
-    }
-
-    pub fn set_contract(&mut self, c: Contract) {
-        self.contract = Some(c);
-    }
-    pub fn clear_contract(&mut self) {
-        self.contract = None;
-    }
-    pub fn contract(&self) -> Option<&Contract> {
-        self.contract.as_ref()
-    }
-    fn check_done_guard(&self, text: &str) -> Option<String> {
-        if !contract_guard_enabled() {
-            return None;
-        }
-        let c = self.contract.as_ref()?;
-        if c.is_done() {
-            return None;
-        }
-        if !looks_like_done_claim(text) {
-            return None;
-        }
-        Some(format!("[CONTRACT-GUARD] Blockers:\n{}", c.to_markdown()))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// E3 truncation-to-disk
-// ---------------------------------------------------------------------------
-
-/// Tool outputs larger than this many BYTES are persisted to disk (E3).
-const TRUNCATION_MAX_BYTES: usize = 50 * 1024;
-/// Tool outputs with more than this many LINES are persisted to disk (E3).
-const TRUNCATION_MAX_LINES: usize = 2000;
-/// Floor (bytes) for the ctx-aware output cap, so a nearly-exhausted context
-/// budget still returns a useful excerpt instead of an always-truncated stub.
-const MIN_OUTPUT_BUDGET_BYTES: usize = 2048;
-/// Head excerpt size (chars) returned for truncated outputs.
-const TRUNCATION_HEAD_CHARS: usize = 2000;
-/// Tail excerpt size (chars) returned for truncated outputs.
-const TRUNCATION_TAIL_CHARS: usize = 1000;
-/// Env override for the truncation spill directory.
 pub use crate::config::ENV_TRUNCATION_DIR;
+pub use config::{AgentConfig, AgentEvent, RunOverrides};
+pub(crate) use output::{effective_output_cap, truncate_tool_output, TRUNCATION_MAX_BYTES};
+pub use policy::clamp_autorun_hops;
+#[cfg(test)]
+pub(crate) use policy::QWEN_STANCE_OVERLAY;
+pub(crate) use policy::{
+    autorun_hop_retries_after_revisions_exhausted, compaction_split_boundary,
+    is_context_overflow_error, model_stance_overlay, per_turn_thinking_cap,
+    sanitize_trailing_assistants, should_fail_fast, DoomLoopGuard, DoomLoopVerdict,
+    AUTORUN_CONTINUE_PROMPT, DOOM_LOOP_FAIL_AT, DOOM_LOOP_NUDGE_MSG, MAX_STEPS_PROMPT,
+    MINIMAL_RUNTIME, VERIFY_MAX_REVISIONS,
+};
+pub use react::{Action, Observation, ReActStep, Thought};
+pub use run::ENV_VERIFY_LOOP;
+pub use setup::Agent;
 
-/// Directory where full oversized tool outputs are spilled.
-///
-/// Defaults to `.kitty/truncation` under the process cwd; override with
-/// `KITTY_TRUNCATION_DIR`. Created lazily on first spill.
-///
-/// Retention: spill files are scratch data — safe to delete after 7 days.
-/// There is no automatic purge yet; cleanup is manual
-/// (`find .kitty/truncation -mtime +7 -delete`).
-use crate::config::truncation_dir;
+#[cfg(test)]
+use kitty_runtime::OllamaClient;
 
-/// Generate a ULID: 26-char Crockford base32, canonical layout — 48-bit ms
-/// timestamp in the high bits + 80 bits of entropy sourced from the
-/// nanosecond clock mixed with a process-local counter (no external crate).
-fn generate_ulid() -> String {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let ms = now.as_millis();
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
-    // 80-bit entropy space: subsec nanos (30 bits) << 32 | monotonic counter,
-    // masked to exactly 80 bits so the ULID layout stays canonical.
-    let random: u128 = ((now.subsec_nanos() as u128) << 50)
-        | ((counter & 0xFFFF) << 34)
-        | ((ms & 0x3FF) << 24)
-        | (counter & 0xFFFFFF);
-    let value: u128 = (ms << 80) | (random & ((1u128 << 80) - 1));
-
-    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    let mut out = [b'0'; 26];
-    let mut v = value;
-    for i in (0..26).rev() {
-        out[i] = ALPHABET[(v & 31) as usize];
-        v >>= 5;
-    }
-    String::from_utf8(out.to_vec()).unwrap_or_else(|_| "0".repeat(26))
+#[cfg(test)]
+pub(crate) fn dummy_agent() -> Agent {
+    let client = OllamaClient::new("http://localhost:11434");
+    let cfg = AgentConfig {
+        workspace: std::path::PathBuf::from("/tmp"),
+        ..Default::default()
+    };
+    Agent::new(client, cfg)
 }
 
-/// First `n` chars of `s`, char-boundary safe.
-fn head_chars(s: &str, n: usize) -> &str {
-    match s.char_indices().nth(n) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
+#[cfg(test)]
+pub(crate) fn dummy_response(content: &str) -> ChatResponse {
+    ChatResponse {
+        model: "test-model".into(),
+        message: Message::assistant(content),
+        done: true,
+        eval_count: None,
+        eval_duration: None,
+        prompt_eval_count: None,
     }
 }
 
-/// Last `n` chars of `s`, char-boundary safe.
-fn tail_chars(s: &str, n: usize) -> &str {
-    let total = s.chars().count();
-    if total <= n {
-        return s;
-    }
-    let skip = total - n;
-    match s.char_indices().nth(skip) {
-        Some((idx, _)) => &s[idx..],
-        None => s,
+/// A ChatResponse carrying one native tool call.
+#[cfg(test)]
+pub(crate) fn tool_call_response(name: &str, args: serde_json::Value) -> ChatResponse {
+    ChatResponse {
+        model: "test-model".into(),
+        message: Message {
+            role: "assistant".into(),
+            content: None,
+            thinking: None,
+            tool_calls: Some(vec![kitty_runtime::ToolCall {
+                id: None,
+                function: kitty_runtime::ToolCallFunction {
+                    name: name.to_string(),
+                    arguments: args,
+                },
+            }]),
+            tool_call_id: None,
+        },
+        done: true,
+        eval_count: None,
+        eval_duration: None,
+        prompt_eval_count: None,
     }
 }
 
-/// E3 truncation-to-disk: when a tool output exceeds `max_bytes` bytes or
-/// 2000 lines, write the FULL output to `<truncation_dir>/<ulid>.txt` and
-/// return a head+tail excerpt (first 2000 + last 1000 chars) plus a pointer
-/// hint so the model can re-read the file if needed.
-///
-/// Tier 3: callers derive `max_bytes` from the remaining context budget
-/// (see [`effective_output_cap`] and the call site in
-/// `execute_and_push_tool_result`) so a large-but-under-50KB Read cannot
-/// overflow a small window between compaction checks.
-///
-/// Best-effort: if the directory cannot be created or the file written, the
-/// excerpt is still returned with an explicit "unavailable" marker instead
-/// of failing the tool call.
-fn truncate_tool_output(output: String, max_bytes: usize) -> String {
-    let over_bytes = output.len() > max_bytes;
-    let over_lines = output.lines().count() > TRUNCATION_MAX_LINES;
-    if !over_bytes && !over_lines {
-        return output;
-    }
+/// Serialize env-mutating tests (cargo runs them on parallel threads).
+/// Delegates to the crate-wide lock in `model_profile` so env tests in
+/// both modules exclude each other (they share one test binary).
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::model_profile::test_env_lock()
+}
 
-    let dir = truncation_dir();
-    let head = head_chars(&output, TRUNCATION_HEAD_CHARS);
-    let tail = tail_chars(&output, TRUNCATION_TAIL_CHARS);
-
-    let persisted = std::fs::create_dir_all(&dir)
-        .ok()
-        .map(|_| dir.join(format!("{}.txt", generate_ulid())))
-        .filter(|path| std::fs::write(path, &output).is_ok());
-
-    match persisted {
-        Some(path) => format!(
-            "{head}\n...\n{tail}\n[truncated: full output at {}]",
-            path.display()
+/// Run `f` with the tuning-relevant env vars cleared (restored
+/// afterwards) so profile-resolution tests are hermetic.
+#[cfg(test)]
+pub(crate) fn with_clean_tuning_env(f: impl FnOnce()) {
+    let _g = env_lock();
+    let vars = [
+        (
+            crate::model_profile::ENV_MODEL_TURN_CAPS,
+            std::env::var(crate::model_profile::ENV_MODEL_TURN_CAPS).ok(),
         ),
-        None => format!("{head}\n...\n{tail}\n[truncated: full output unavailable]"),
+        (
+            kitty_runtime::client::ENV_NO_THINK,
+            std::env::var(kitty_runtime::client::ENV_NO_THINK).ok(),
+        ),
+    ];
+    for (key, _) in &vars {
+        std::env::remove_var(key);
+    }
+    f();
+    for (key, prev) in &vars {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }
 
-/// Tier 3 read-guard: effective byte cap for a single tool output given the
-/// remaining context budget in tokens. Uses the project-wide chars≈bytes/4
-/// heuristic (consistent with `ContextBudget::estimate_tokens`) and floors
-/// at [`MIN_OUTPUT_BUDGET_BYTES`].
-fn effective_output_cap(remaining_tokens: usize) -> usize {
-    remaining_tokens
-        .saturating_mul(4)
-        .max(MIN_OUTPUT_BUDGET_BYTES)
+/// Write a Makefile whose `test` target exits with `code`.
+#[cfg(test)]
+pub(crate) fn makefile_workspace(dir: &Path, code: u8) -> std::path::PathBuf {
+    std::fs::write(dir.join("Makefile"), format!("test:\n\t@exit {code}\n")).unwrap();
+    dir.to_path_buf()
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kitty_runtime::{ChatResponse, Message, MockClient, OllamaClient};
+    use kitty_runtime::{ChatResponse, Message, MockClient, OllamaClient, ToolDefinition};
     use run::detect_test_command;
     use std::future::Future;
     use std::pin::Pin;
-
-    fn dummy_agent() -> Agent {
-        let client = OllamaClient::new("http://localhost:11434");
-        let cfg = AgentConfig {
-            workspace: std::path::PathBuf::from("/tmp"),
-            ..Default::default()
-        };
-        Agent::new(client, cfg)
-    }
-
-    fn dummy_response(content: &str) -> ChatResponse {
-        ChatResponse {
-            model: "test-model".into(),
-            message: Message::assistant(content),
-            done: true,
-            eval_count: None,
-            eval_duration: None,
-            prompt_eval_count: None,
-        }
-    }
-
-    /// A ChatResponse carrying one native tool call.
-    fn tool_call_response(name: &str, args: serde_json::Value) -> ChatResponse {
-        ChatResponse {
-            model: "test-model".into(),
-            message: Message {
-                role: "assistant".into(),
-                content: None,
-                thinking: None,
-                tool_calls: Some(vec![kitty_runtime::ToolCall {
-                    id: None,
-                    function: kitty_runtime::ToolCallFunction {
-                        name: name.to_string(),
-                        arguments: args,
-                    },
-                }]),
-                tool_call_id: None,
-            },
-            done: true,
-            eval_count: None,
-            eval_duration: None,
-            prompt_eval_count: None,
-        }
-    }
 
     /// Test double that captures the most recent chat request (for asserting
     /// what the summarizer LLM actually receives during compaction).
@@ -966,76 +223,6 @@ mod tests {
         }
     }
 
-    /// Serialize env-mutating tests (cargo runs them on parallel threads).
-    /// Delegates to the crate-wide lock in `model_profile` so env tests in
-    /// both modules exclude each other (they share one test binary).
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::model_profile::test_env_lock()
-    }
-
-    /// Run `f` with the tuning-relevant env vars cleared (restored
-    /// afterwards) so profile-resolution tests are hermetic.
-    fn with_clean_tuning_env(f: impl FnOnce()) {
-        let _g = env_lock();
-        let vars = [
-            (
-                crate::model_profile::ENV_MODEL_TURN_CAPS,
-                std::env::var(crate::model_profile::ENV_MODEL_TURN_CAPS).ok(),
-            ),
-            (
-                kitty_runtime::client::ENV_NO_THINK,
-                std::env::var(kitty_runtime::client::ENV_NO_THINK).ok(),
-            ),
-        ];
-        for (key, _) in &vars {
-            std::env::remove_var(key);
-        }
-        f();
-        for (key, prev) in &vars {
-            match prev {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-
-    #[test]
-    fn profile_preset_iterations_survive_family_default() {
-        with_clean_tuning_env(|| {
-            // G2-FIX2 good case: unknown model → family/default resolution has
-            // NO cap authority → tiny's deliberate 5-iteration invariant must
-            // survive (the old code stomped it to 20).
-            let cfg = AgentConfig {
-                model: "unknown-model:7b".into(),
-                profile: ModelProfile::tiny(),
-                ..Default::default()
-            };
-            let agent = Agent::new(MockClient::new(vec![]), cfg);
-            assert_eq!(agent.config().max_iterations, 5);
-            // Tuning still carries its family default internally…
-            assert_eq!(agent.config().tuning.max_iterations, 20);
-            // …and sampling/thinking fields apply regardless.
-            assert_eq!(agent.config().tuning.thinking, ThinkingMode::Budget(2048));
-        });
-    }
-
-    #[test]
-    fn exact_turn_cap_still_overrides_profile_preset() {
-        with_clean_tuning_env(|| {
-            // Good case: exact Tier-4 table hit RAISES tiny's 5 → 24 for
-            // ornith:9b (the original unified behavior must keep working).
-            let cfg = AgentConfig {
-                model: "ornith:9b".into(),
-                profile: ModelProfile::tiny(),
-                ..Default::default()
-            };
-            let agent = Agent::new(MockClient::new(vec![]), cfg);
-            assert_eq!(agent.config().max_iterations, 24);
-            assert_eq!(agent.config().tuning.max_iterations, 24);
-            assert_eq!(agent.config().tuning.thinking, ThinkingMode::On);
-        });
-    }
-
     #[tokio::test]
     async fn thinking_budget_reseeded_from_tuning_at_run_start() {
         // G2-FIX3 good case: post-construction mutation of tuning.thinking —
@@ -1063,45 +250,6 @@ mod tests {
         agent.config.tuning.thinking = ThinkingMode::On;
         let _ = agent.run("hi").await.unwrap();
         assert_eq!(agent.thinking_budget().per_turn_cap(), None);
-    }
-
-    #[test]
-    fn no_think_env_forces_thinking_off_and_request_flag() {
-        let _g = env_lock();
-        let key = kitty_runtime::client::ENV_NO_THINK;
-        let prev = std::env::var(key).ok();
-        std::env::set_var(key, "1");
-        let agent = Agent::new(
-            MockClient::new(vec![]),
-            AgentConfig {
-                model: "ornith:9b".into(),
-                ..Default::default()
-            },
-        );
-        match prev {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        // KITTY_NO_THINK wins over the ornith profile's ThinkingMode::On…
-        assert_eq!(agent.config().tuning.thinking, ThinkingMode::Off);
-        // …and reaches the wire as think:false on every request.
-        assert_eq!(agent.request_options(&[]).think, Some(false));
-    }
-
-    #[test]
-    fn should_fail_fast_false_before_cap() {
-        assert!(!should_fail_fast(0));
-        assert!(!should_fail_fast(1));
-        assert!(!Agent::should_fail_fast(1));
-    }
-
-    #[test]
-    fn should_fail_fast_true_at_and_beyond_cap() {
-        assert!(should_fail_fast(2));
-        assert!(should_fail_fast(3));
-        assert!(should_fail_fast(255));
-        assert!(Agent::should_fail_fast(2));
-        assert_eq!(MAX_EMPTY_STREAK, 2);
     }
 
     #[test]
@@ -1374,87 +522,6 @@ mod tests {
     // E3: doom-loop guard (deterministic, zero model intelligence)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn doom_loop_guard_nudges_at_three_and_fails_at_six() {
-        let mut guard = DoomLoopGuard::default();
-        let args = serde_json::json!({"path": "a.rs"});
-        // 1st and 2nd identical executions — no verdict
-        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Fresh);
-        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Fresh);
-        // 3rd consecutive identical → nudge
-        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Nudge);
-        // 4th / 5th → still nudge territory (nudge fires at exactly 3)
-        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Nudge);
-        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Nudge);
-        // 6th consecutive identical → fail fast
-        assert_eq!(guard.record("Read", &args), DoomLoopVerdict::Fail);
-    }
-
-    #[test]
-    fn doom_loop_guard_resets_on_different_tool_or_args() {
-        let mut guard = DoomLoopGuard::default();
-        let a = serde_json::json!({"path": "a.rs"});
-        let b = serde_json::json!({"path": "b.rs"});
-        assert_eq!(guard.record("Read", &a), DoomLoopVerdict::Fresh);
-        assert_eq!(guard.record("Read", &a), DoomLoopVerdict::Fresh);
-        // Different args reset the streak
-        assert_eq!(guard.record("Read", &b), DoomLoopVerdict::Fresh);
-        assert_eq!(guard.record("Read", &b), DoomLoopVerdict::Fresh);
-        // Two more with `b` → 3rd consecutive of `b` nudges
-        assert_eq!(guard.record("Read", &b), DoomLoopVerdict::Nudge);
-        // Different tool resets too
-        assert_eq!(guard.record("Grep", &b), DoomLoopVerdict::Fresh);
-    }
-
-    #[tokio::test]
-    async fn process_response_doom_loop_nudges_then_fails_fast() {
-        let tmp = tempfile::tempdir().unwrap();
-        let file_path = tmp.path().join("doom.txt");
-        std::fs::write(&file_path, "content").unwrap();
-
-        let mock = MockClient::new(vec![]);
-        let cfg = AgentConfig {
-            workspace: tmp.path().to_path_buf(),
-            quality_config: QualityConfig {
-                loop_threshold: 100, // disable quality ToolLoop so only the doom guard fires
-            },
-            ..Default::default()
-        };
-        let mut agent = Agent::new(mock, cfg);
-
-        let response = tool_call_response(
-            "Read",
-            serde_json::json!({"path": file_path.to_string_lossy()}),
-        );
-
-        // Executions 1-2: no nudge
-        for _ in 0..2 {
-            agent.process_response("p", response.clone()).await.unwrap();
-        }
-        assert!(!agent
-            .messages
-            .iter()
-            .any(|m| m.content.as_deref() == Some(DOOM_LOOP_NUDGE_MSG)));
-
-        // Execution 3: system nudge injected after the tool result
-        agent.process_response("p", response.clone()).await.unwrap();
-        let last = agent.messages.last().unwrap();
-        assert_eq!(last.role, "system");
-        assert_eq!(last.content.as_deref(), Some(DOOM_LOOP_NUDGE_MSG));
-
-        // Executions 4-5: still nudge-only
-        for _ in 0..2 {
-            agent.process_response("p", response.clone()).await.unwrap();
-        }
-
-        // Execution 6: fail-fast error aborts the loop
-        let err = agent.process_response("p", response).await.unwrap_err();
-        assert!(
-            err.to_string().contains("Doom loop"),
-            "expected doom-loop fail-fast, got: {err}"
-        );
-    }
-
     #[tokio::test]
     async fn synonym_named_call_passes_quality_gate_and_executes() {
         // G3-1: normalization runs BEFORE the quality monitor, so a
@@ -1546,36 +613,33 @@ mod tests {
     // Verification loop (P0): test feedback to agent
     // -----------------------------------------------------------------------
 
-    /// Write a Makefile whose `test` target exits with `code`.
-    fn makefile_workspace(dir: &Path, code: u8) -> std::path::PathBuf {
-        std::fs::write(dir.join("Makefile"), format!("test:\n\t@exit {code}\n")).unwrap();
-        dir.to_path_buf()
-    }
-
-    #[test]
-    fn detect_test_command_priority_order() {
+    #[tokio::test]
+    async fn detect_test_command_priority_order() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path();
 
         // No markers → None
-        assert_eq!(detect_test_command(ws), None);
+        assert_eq!(detect_test_command(ws).await, None);
 
         // Generic: Makefile WITH a test target → make test
         makefile_workspace(ws, 0);
         assert_eq!(
-            detect_test_command(ws).as_deref(),
+            detect_test_command(ws).await.as_deref(),
             Some("make test"),
             "Makefile with test target should map to `make test`"
         );
 
         // Go beats generic Makefile
         std::fs::write(ws.join("go.mod"), "module x\n").unwrap();
-        assert_eq!(detect_test_command(ws).as_deref(), Some("go test ./..."));
+        assert_eq!(
+            detect_test_command(ws).await.as_deref(),
+            Some("go test ./...")
+        );
 
         // JS/TS beats Go
         std::fs::write(ws.join("package.json"), "{}").unwrap();
         assert_eq!(
-            detect_test_command(ws).as_deref(),
+            detect_test_command(ws).await.as_deref(),
             Some("npm test -- --brief")
         );
 
@@ -1584,7 +648,7 @@ mod tests {
         std::fs::remove_file(ws.join("package.json")).unwrap();
         std::fs::write(ws.join("setup.py"), "").unwrap();
         assert_eq!(
-            detect_test_command(ws).as_deref(),
+            detect_test_command(ws).await.as_deref(),
             Some("python3 -m pytest --tb=short -q")
         );
 
@@ -1592,16 +656,16 @@ mod tests {
         std::fs::remove_file(ws.join("setup.py")).unwrap();
         std::fs::write(ws.join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
         assert_eq!(
-            detect_test_command(ws).as_deref(),
+            detect_test_command(ws).await.as_deref(),
             Some("cargo test --workspace -- -q")
         );
     }
 
-    #[test]
-    fn makefile_without_test_target_is_ignored() {
+    #[tokio::test]
+    async fn makefile_without_test_target_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Makefile"), "build:\n\t@true\n").unwrap();
-        assert_eq!(detect_test_command(dir.path()), None);
+        assert_eq!(detect_test_command(dir.path()).await, None);
     }
 
     #[tokio::test]
@@ -1817,18 +881,6 @@ mod tests {
     // f8 T1.1/T1.2: autorun continuation hops (fixed state machine)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn clamp_autorun_hops_bounds_surface() {
-        // Good inputs pass through.
-        assert_eq!(clamp_autorun_hops(0), 0);
-        assert_eq!(clamp_autorun_hops(1), 1);
-        assert_eq!(clamp_autorun_hops(12), 12);
-        // Bad inputs clamp to the cap (usize cannot go negative).
-        assert_eq!(clamp_autorun_hops(13), 12);
-        assert_eq!(clamp_autorun_hops(usize::MAX), 12);
-        assert_eq!(MAX_AUTORUN_HOPS, 12);
-    }
-
     #[tokio::test]
     async fn autorun_hops_zero_keeps_legacy_single_cycle() {
         // hops=0 must be byte-identical legacy: first exhaustion goes straight
@@ -1962,25 +1014,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn autorun_hop_retry_rule_after_revisions_exhausted() {
-        // Good: hop available AND revisions exhausted -> retry via hop.
-        assert!(autorun_hop_retries_after_revisions_exhausted(
-            1,
-            VERIFY_MAX_REVISIONS
-        ));
-        // Bad: no hop left -> terminal return even with revisions exhausted.
-        assert!(!autorun_hop_retries_after_revisions_exhausted(
-            0,
-            VERIFY_MAX_REVISIONS
-        ));
-        // Bad: revisions NOT exhausted yet -> revision branch handles it.
-        assert!(!autorun_hop_retries_after_revisions_exhausted(
-            1,
-            VERIFY_MAX_REVISIONS - 1
-        ));
-    }
-
     #[tokio::test]
     async fn episodes_saved_only_at_terminal_branches() {
         // Intermediate cycles end in TOOL-call responses (which never reach a
@@ -2019,134 +1052,9 @@ mod tests {
     // E3: truncation-to-disk
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn truncate_small_output_passthrough() {
-        let out = truncate_tool_output("small output".to_string(), TRUNCATION_MAX_BYTES);
-        assert_eq!(out, "small output");
-    }
-
-    #[test]
-    fn head_tail_chars_are_char_boundary_safe() {
-        let s = "héllo wörld 日本語のテキスト";
-        let head = head_chars(s, 5);
-        assert!(s.starts_with(head));
-        let tail = tail_chars(s, 4);
-        assert!(s.ends_with(tail));
-        // No panics on multibyte boundaries; full round trip covers the string
-        let total = s.chars().count();
-        assert_eq!(
-            format!("{}{}", head_chars(s, total - 2), tail_chars(s, 2)),
-            s
-        );
-    }
-
-    #[test]
-    fn generate_ulid_is_canonical_shape_and_unique() {
-        let a = generate_ulid();
-        let b = generate_ulid();
-        assert_eq!(a.len(), 26);
-        assert!(
-            a.chars()
-                .all(|c| "0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(c)),
-            "ULID must be Crockford base32, got {a}"
-        );
-        assert_ne!(a, b, "consecutive ULIDs must differ (counter entropy)");
-    }
-
-    #[test]
-    fn truncate_large_output_spills_to_disk_with_pointer() {
-        let _g = env_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var(ENV_TRUNCATION_DIR).ok();
-        std::env::set_var(ENV_TRUNCATION_DIR, tmp.path());
-
-        // >50KB triggers spill
-        let big = "x".repeat(60 * 1024);
-        let out = truncate_tool_output(big.clone(), TRUNCATION_MAX_BYTES);
-        assert!(
-            out.contains("[truncated: full output at "),
-            "expected truncation pointer, got tail: {}",
-            &out[out.len().saturating_sub(200)..]
-        );
-        assert!(out.starts_with(&"x".repeat(TRUNCATION_HEAD_CHARS)));
-        assert!(out.contains(&"x".repeat(TRUNCATION_TAIL_CHARS)));
-        // Full output persisted on disk
-        let path = out
-            .lines()
-            .last()
-            .unwrap()
-            .trim_start_matches("[truncated: full output at ")
-            .trim_end_matches(']');
-        let persisted = std::fs::read_to_string(path).unwrap();
-        assert_eq!(persisted.len(), big.len());
-
-        // >2000 lines also triggers spill
-        let many_lines = "line\n".repeat(2500);
-        let out2 = truncate_tool_output(many_lines, TRUNCATION_MAX_BYTES);
-        assert!(out2.contains("[truncated: full output at "));
-
-        if let Some(v) = prev {
-            std::env::set_var(ENV_TRUNCATION_DIR, v);
-        } else {
-            std::env::remove_var(ENV_TRUNCATION_DIR);
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Tier 3: ctx-aware output cap (read-guard trimming)
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn effective_output_cap_scales_and_floors() {
-        // Healthy budget: chars ≈ bytes/4 heuristic scales linearly.
-        assert_eq!(effective_output_cap(16384), 16384 * 4);
-        // Tiny / exhausted budgets floor at MIN_OUTPUT_BUDGET_BYTES.
-        assert_eq!(effective_output_cap(0), MIN_OUTPUT_BUDGET_BYTES);
-        assert_eq!(effective_output_cap(100), MIN_OUTPUT_BUDGET_BYTES); // 400 < 2048
-                                                                        // Saturating: huge remaining tokens cannot overflow usize.
-        assert_eq!(effective_output_cap(usize::MAX), usize::MAX);
-    }
-
-    #[test]
-    fn truncate_under_both_caps_passthrough() {
-        // Under the injected byte cap AND the fixed line cap → untouched.
-        let out = truncate_tool_output("hello world".to_string(), TRUNCATION_MAX_BYTES);
-        assert_eq!(out, "hello world");
-        let lines = "l\n".repeat(TRUNCATION_MAX_LINES); // exactly at the line cap
-        let out2 = truncate_tool_output(lines.clone(), TRUNCATION_MAX_BYTES);
-        assert_eq!(out2, lines);
-    }
-
-    #[test]
-    fn truncate_exceeding_small_injected_budget_spills() {
-        let _g = env_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var(ENV_TRUNCATION_DIR).ok();
-        std::env::set_var(ENV_TRUNCATION_DIR, tmp.path());
-
-        // 10KB exceeds a SMALL injected cap even though the fixed 50KB
-        // threshold would not fire — exactly the Tier 3 overflow class.
-        let medium = "y".repeat(10 * 1024);
-        let out = truncate_tool_output(medium.clone(), 4096);
-        assert!(
-            out.contains("[truncated: full output at "),
-            "expected spill pointer under small budget cap"
-        );
-        assert!(out.starts_with(&"y".repeat(TRUNCATION_HEAD_CHARS)));
-        let path = out
-            .lines()
-            .last()
-            .unwrap()
-            .trim_start_matches("[truncated: full output at ")
-            .trim_end_matches(']');
-        assert_eq!(std::fs::read_to_string(path).unwrap().len(), medium.len());
-
-        if let Some(v) = prev {
-            std::env::set_var(ENV_TRUNCATION_DIR, v);
-        } else {
-            std::env::remove_var(ENV_TRUNCATION_DIR);
-        }
-    }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
@@ -2200,52 +1108,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Tier 4: per-model turn cap applied in new_inner
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn turn_cap_applied_per_model_in_new_inner() {
-        let _g = env_lock();
-        let prev = std::env::var(crate::model_profile::ENV_MODEL_TURN_CAPS).ok();
-        std::env::remove_var(crate::model_profile::ENV_MODEL_TURN_CAPS);
-
-        // Matching model id → static-table cap overrides the profile default.
-        let client = OllamaClient::new("http://localhost:11434");
-        let cfg = AgentConfig {
-            model: "ornith:9b".to_string(),
-            workspace: std::path::PathBuf::from("/tmp"),
-            ..Default::default()
-        };
-        let agent = Agent::new(client, cfg);
-        assert_eq!(agent.config().max_iterations, 24);
-
-        // Prefix semantics hold through Agent construction too.
-        let client = OllamaClient::new("http://localhost:11434");
-        let cfg = AgentConfig {
-            model: "ornith-1.5-instruct".to_string(),
-            workspace: std::path::PathBuf::from("/tmp"),
-            ..Default::default()
-        };
-        let agent = Agent::new(client, cfg);
-        assert_eq!(agent.config().max_iterations, 16);
-
-        // Non-matching model keeps the profile default (medium → 20).
-        let client = OllamaClient::new("http://localhost:11434");
-        let cfg = AgentConfig {
-            model: "qwen3:8b".to_string(),
-            workspace: std::path::PathBuf::from("/tmp"),
-            ..Default::default()
-        };
-        let agent = Agent::new(client, cfg);
-        assert_eq!(
-            agent.config().max_iterations,
-            ModelProfile::medium().max_iterations
-        );
-
-        if let Some(v) = prev {
-            std::env::set_var(crate::model_profile::ENV_MODEL_TURN_CAPS, v);
-        } else {
-            std::env::remove_var(crate::model_profile::ENV_MODEL_TURN_CAPS);
-        }
-    }
 
     // -----------------------------------------------------------------------
     // E3: deterministic prune before compaction summarization
@@ -2391,147 +1253,10 @@ mod tests {
 
     /// G5 sanitizer, direct table: merge case (tool_calls concatenated),
     /// drop case (plain duplicates), normal case unchanged.
-    #[test]
-    fn sanitize_trailing_assistants_merge_drop_and_noop() {
-        let m = |role: &str, content: &str| Message {
-            role: role.to_string(),
-            content: Some(content.to_string()),
-            thinking: None,
-            tool_calls: None,
-            tool_call_id: None,
-        };
-        let a_tc = |name: &str| Message {
-            role: "assistant".to_string(),
-            content: None,
-            thinking: None,
-            tool_calls: Some(vec![kitty_runtime::ToolCall {
-                id: None,
-                function: kitty_runtime::ToolCallFunction {
-                    name: name.to_string(),
-                    arguments: serde_json::json!({}),
-                },
-            }]),
-            tool_call_id: None,
-        };
-
-        // MERGE case: [user, assistant(tool), assistant(text)] → tool_calls
-        // carried onto the kept LAST assistant.
-        let history = vec![
-            m("user", "goal"),
-            a_tc("Read"),
-            m("assistant", "later text"),
-        ];
-        let out = sanitize_trailing_assistants(history);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[1].content.as_deref(), Some("later text"));
-        let tcs = out[1].tool_calls.as_ref().expect("tool_calls carried over");
-        assert_eq!(tcs.len(), 1);
-        assert_eq!(tcs[0].function.name, "Read");
-
-        // DROP case: plain consecutive assistants keep only the LAST content.
-        let history = vec![
-            m("user", "goal"),
-            m("assistant", "first"),
-            m("assistant", "second"),
-        ];
-        let out = sanitize_trailing_assistants(history);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[1].content.as_deref(), Some("second"));
-        assert!(out[1].tool_calls.is_none());
-
-        // NORMAL cases untouched.
-        let history = vec![m("user", "q"), m("assistant", "a"), m("user", "q2")];
-        let out = sanitize_trailing_assistants(history.clone());
-        assert_eq!(out, history);
-        let single = vec![m("assistant", "only")];
-        assert_eq!(sanitize_trailing_assistants(single.clone()), single);
-        assert!(sanitize_trailing_assistants(Vec::new()).is_empty());
-        // Interior duplicates are NOT touched (wire constraint is about the tail).
-        let history = vec![m("assistant", "x"), m("assistant", "y"), m("user", "z")];
-        let out = sanitize_trailing_assistants(history);
-        assert_eq!(out.len(), 3);
-    }
 
     // -----------------------------------------------------------------------
     // f8 T3.3: safe prune boundary with bounded walk-back (AD6/m7)
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn compaction_split_boundary_pure_table() {
-        let m = |role: &str| Message {
-            role: role.to_string(),
-            content: Some(role.to_string()),
-            thinking: None,
-            tool_calls: None,
-            tool_call_id: None,
-        };
-        // Nearest user within the window wins.
-        let history = vec![
-            m("user"),
-            m("assistant"),
-            m("tool"),
-            m("user"),
-            m("assistant"),
-        ];
-        assert_eq!(compaction_split_boundary(&history, 4), 3);
-
-        // Tool at naive split → walk back to its turn-start user.
-        let history = vec![
-            m("user"),
-            m("assistant"),
-            m("user"),
-            m("assistant"),
-            m("tool"),
-            m("user"),
-        ];
-        assert_eq!(compaction_split_boundary(&history, 4), 2);
-
-        // No user in reach within K=12 → naive fallback.
-        let mut history = vec![m("system"), m("assistant"), m("tool")];
-        for _ in 0..12 {
-            history.push(m("assistant"));
-            history.push(m("tool"));
-        }
-        history.push(m("user"));
-        history.push(m("assistant"));
-        // naive_split_at points deep into the long assistant→tool run; the
-        // only user sits >12 back ⇒ naive fallback.
-        let naive = history.len() - 2;
-        assert_eq!(compaction_split_boundary(&history, naive), naive);
-
-        // Degenerate: no user at all → naive fallback.
-        let history = vec![m("system"), m("assistant"), m("tool"), m("assistant")];
-        assert_eq!(compaction_split_boundary(&history, 2), 2);
-        // Zero split stays zero.
-        assert_eq!(compaction_split_boundary(&history, 0), 0);
-
-        // G3-FIX2: naive lands EXACTLY on a user ⇒ returned unchanged (the
-        // old decrement-first scan skipped it for an older turn).
-        let history = vec![
-            m("user"),
-            m("assistant"),
-            m("user"),
-            m("assistant"),
-            m("user"),
-            m("assistant"),
-        ];
-        assert_eq!(
-            compaction_split_boundary(&history, 4),
-            4,
-            "exact user-boundary landing must not under-free"
-        );
-        // Mixed: exact landing beats walking back even when older users exist.
-        let history = vec![
-            m("user"),
-            m("assistant"),
-            m("tool"),
-            m("user"),
-            m("assistant"),
-            m("user"),
-            m("assistant"),
-        ];
-        assert_eq!(compaction_split_boundary(&history, 5), 5);
-    }
 
     #[tokio::test]
     async fn compaction_never_orphans_tool_results() {
@@ -2759,17 +1484,6 @@ mod tests {
     // E3: qwen stance overlay
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn qwen_stance_overlay_pure_predicate() {
-        assert_eq!(model_stance_overlay("qwen3:8b"), Some(QWEN_STANCE_OVERLAY));
-        assert_eq!(
-            model_stance_overlay("Qwen2.5-Coder-7B"),
-            Some(QWEN_STANCE_OVERLAY)
-        );
-        assert_eq!(model_stance_overlay("ornith:9b"), None);
-        assert_eq!(model_stance_overlay("llama3"), None);
-    }
-
     #[tokio::test]
     async fn preflight_appends_qwen_stance_to_system_prompt() {
         // Default model is qwen3:8b → overlay present even without bootstrap hint.
@@ -2857,21 +1571,5 @@ mod tests {
             .find(|m| m.role == "system")
             .expect("qwen medium profile gets the stance overlay");
         assert_eq!(system.content.as_deref(), Some(QWEN_STANCE_OVERLAY));
-    }
-
-    #[test]
-    fn explicit_profile_beats_nano_autodetection() {
-        // f8 T4.1 AC: --profile medium on a 3B id stays medium.
-        let cfg = AgentConfig {
-            model: "qwen2.5-3b".to_string(),
-            ..Default::default()
-        }
-        .with_profile("medium");
-        assert_eq!(cfg.profile.name, "medium");
-        assert_eq!(cfg.profile.prompt_style, PromptStyle::Full);
-        // And nano is reachable explicitly.
-        let cfg = AgentConfig::default().with_profile("nano");
-        assert_eq!(cfg.profile.name, "nano");
-        assert_eq!(cfg.profile.prompt_style, PromptStyle::Minimal);
     }
 }

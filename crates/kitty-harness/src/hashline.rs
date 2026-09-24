@@ -82,9 +82,13 @@ impl HashlineEditor {
     }
 
     /// Read a file and tag each line with a BLAKE3 hash.
-    pub fn read_file(&mut self, path: impl AsRef<Path>) -> Result<FileSnapshot, HashlineError> {
+    /// W1 async: todo-file 1-op via tokio::fs so Read never parks the reactor.
+    pub async fn read_file(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<FileSnapshot, HashlineError> {
         let path = path.as_ref().to_path_buf();
-        let content = std::fs::read_to_string(&path)?;
+        let content = tokio::fs::read_to_string(&path).await?;
         let lines = Self::tag_lines(&content);
         let file_hash = FileSnapshot::compute_file_hash(&lines);
         let snapshot = FileSnapshot {
@@ -118,7 +122,8 @@ impl HashlineEditor {
     ///
     /// Returns the new file content. Does NOT write to disk — caller decides.
     /// If the file changed since last read, returns `FileChanged` error.
-    pub fn edit_by_hash(
+    /// W1 async: revalidates via async hash so Edit never blocks the reactor.
+    pub async fn edit_by_hash(
         &self,
         path: impl AsRef<Path>,
         old_hash: &str,
@@ -131,7 +136,7 @@ impl HashlineEditor {
             .ok_or_else(|| HashlineError::NotLoaded(path.display().to_string()))?;
 
         // Verify file hasn't changed
-        let current_hash = Self::compute_current_file_hash(path)?;
+        let current_hash = Self::compute_current_file_hash(path).await?;
         if current_hash != snapshot.file_hash {
             return Err(HashlineError::FileChanged {
                 expected: snapshot.file_hash.clone(),
@@ -184,7 +189,8 @@ impl HashlineEditor {
     ///
     /// Verifies the hash prefix matches the line at `line_num`, then replaces.
     /// Returns `HashNotFound` if the prefix doesn't match the specified line.
-    pub fn edit_by_hash_and_line(
+    /// W1 async: revalidates via async hash so Edit never blocks the reactor.
+    pub async fn edit_by_hash_and_line(
         &self,
         path: impl AsRef<Path>,
         old_hash: &str,
@@ -198,7 +204,7 @@ impl HashlineEditor {
             .ok_or_else(|| HashlineError::NotLoaded(path.display().to_string()))?;
 
         // Verify file hasn't changed
-        let current_hash = Self::compute_current_file_hash(path)?;
+        let current_hash = Self::compute_current_file_hash(path).await?;
         if current_hash != snapshot.file_hash {
             return Err(HashlineError::FileChanged {
                 expected: snapshot.file_hash.clone(),
@@ -241,8 +247,9 @@ impl HashlineEditor {
     }
 
     /// Compute the current file hash on disk (without loading into snapshot).
-    fn compute_current_file_hash(path: &Path) -> Result<String, HashlineError> {
-        let content = std::fs::read_to_string(path)?;
+    /// W1 async: todo-file 1-op via tokio::fs.
+    async fn compute_current_file_hash(path: &Path) -> Result<String, HashlineError> {
+        let content = tokio::fs::read_to_string(path).await?;
         let lines = Self::tag_lines(&content);
         Ok(FileSnapshot::compute_file_hash(&lines))
     }
@@ -280,25 +287,25 @@ mod tests {
         f
     }
 
-    #[test]
-    fn hash_line_deterministic() {
+    #[tokio::test]
+    async fn hash_line_deterministic() {
         let h1 = LineHash::hash_line("hello");
         let h2 = LineHash::hash_line("hello");
         assert_eq!(h1, h2);
     }
 
-    #[test]
-    fn hash_line_different_for_different_content() {
+    #[tokio::test]
+    async fn hash_line_different_for_different_content() {
         let h1 = LineHash::hash_line("hello");
         let h2 = LineHash::hash_line("world");
         assert_ne!(h1, h2);
     }
 
-    #[test]
-    fn read_file_tags_lines() {
+    #[tokio::test]
+    async fn read_file_tags_lines() {
         let f = temp_file("line1\nline2\nline3");
         let mut editor = HashlineEditor::new();
-        let snapshot = editor.read_file(f.path()).unwrap();
+        let snapshot = editor.read_file(f.path()).await.unwrap();
         assert_eq!(snapshot.lines.len(), 3);
         assert_eq!(snapshot.lines[0].content, "line1");
         assert_eq!(snapshot.lines[1].content, "line2");
@@ -306,21 +313,21 @@ mod tests {
         assert_eq!(snapshot.lines[0].line_num, 1);
     }
 
-    #[test]
-    fn edit_by_hash_works() {
+    #[tokio::test]
+    async fn edit_by_hash_works() {
         let f = temp_file("aaa\nbbb\nccc");
         let mut editor = HashlineEditor::new();
-        let snapshot = editor.read_file(f.path()).unwrap();
+        let snapshot = editor.read_file(f.path()).await.unwrap();
         let hash_b = snapshot.lines[1].hash.clone();
-        let result = editor.edit_by_hash(f.path(), &hash_b, "BBB").unwrap();
+        let result = editor.edit_by_hash(f.path(), &hash_b, "BBB").await.unwrap();
         assert_eq!(result, "aaa\nBBB\nccc");
     }
 
-    #[test]
-    fn edit_by_hash_rejects_changed_file() {
+    #[tokio::test]
+    async fn edit_by_hash_rejects_changed_file() {
         let f = temp_file("aaa\nbbb\nccc");
         let mut editor = HashlineEditor::new();
-        let _snapshot = editor.read_file(f.path()).unwrap();
+        let _snapshot = editor.read_file(f.path()).await.unwrap();
 
         // Modify the file externally
         let mut f2 = std::fs::OpenOptions::new()
@@ -331,23 +338,27 @@ mod tests {
         write!(f2, "aaa\nXXX\nccc").unwrap();
         drop(f2);
 
-        let err = editor.edit_by_hash(f.path(), "dummy", "new").unwrap_err();
+        let err = editor
+            .edit_by_hash(f.path(), "dummy", "new")
+            .await
+            .unwrap_err();
         assert!(matches!(err, HashlineError::FileChanged { .. }));
     }
 
-    #[test]
-    fn edit_by_hash_rejects_unknown_hash() {
+    #[tokio::test]
+    async fn edit_by_hash_rejects_unknown_hash() {
         let f = temp_file("aaa\nbbb\nccc");
         let mut editor = HashlineEditor::new();
-        let _snapshot = editor.read_file(f.path()).unwrap();
+        let _snapshot = editor.read_file(f.path()).await.unwrap();
         let err = editor
             .edit_by_hash(f.path(), "deadbeef", "new")
+            .await
             .unwrap_err();
         assert!(matches!(err, HashlineError::HashNotFound(_)));
     }
 
-    #[test]
-    fn format_tagged_works() {
+    #[tokio::test]
+    async fn format_tagged_works() {
         let lines = vec![
             LineHash {
                 line_num: 1,
@@ -369,34 +380,37 @@ mod tests {
         assert_eq!(tagged, "1:abc123|hello\n2:def456|world");
     }
 
-    #[test]
-    fn edit_by_hash_prefix_matches_full_hash() {
+    #[tokio::test]
+    async fn edit_by_hash_prefix_matches_full_hash() {
         let f = temp_file("aaa\nbbb\nccc");
         let mut editor = HashlineEditor::new();
-        let snapshot = editor.read_file(f.path()).unwrap();
+        let snapshot = editor.read_file(f.path()).await.unwrap();
         let full_hash = &snapshot.lines[1].hash;
         let prefix = &full_hash[..8.min(full_hash.len())];
-        let result = editor.edit_by_hash(f.path(), prefix, "BBB").unwrap();
+        let result = editor.edit_by_hash(f.path(), prefix, "BBB").await.unwrap();
         assert_eq!(result, "aaa\nBBB\nccc");
     }
 
-    #[test]
-    fn edit_by_hash_full_64_char_hash_still_works() {
+    #[tokio::test]
+    async fn edit_by_hash_full_64_char_hash_still_works() {
         let f = temp_file("aaa\nbbb\nccc");
         let mut editor = HashlineEditor::new();
-        let snapshot = editor.read_file(f.path()).unwrap();
+        let snapshot = editor.read_file(f.path()).await.unwrap();
         let full_hash = snapshot.lines[1].hash.clone();
         assert_eq!(full_hash.len(), 64); // BLAKE3 produces 64 hex chars
-        let result = editor.edit_by_hash(f.path(), &full_hash, "BBB").unwrap();
+        let result = editor
+            .edit_by_hash(f.path(), &full_hash, "BBB")
+            .await
+            .unwrap();
         assert_eq!(result, "aaa\nBBB\nccc");
     }
 
-    #[test]
-    fn edit_by_hash_ambiguous_prefix_returns_error() {
+    #[tokio::test]
+    async fn edit_by_hash_ambiguous_prefix_returns_error() {
         // Create file with two identical lines
         let f = temp_file("same\nsame\ndifferent");
         let mut editor = HashlineEditor::new();
-        let snapshot = editor.read_file(f.path()).unwrap();
+        let snapshot = editor.read_file(f.path()).await.unwrap();
         let hash_line0 = &snapshot.lines[0].hash;
         let hash_line1 = &snapshot.lines[1].hash;
         // Identical lines → identical hashes
@@ -404,48 +418,52 @@ mod tests {
         let prefix = &hash_line0[..8.min(hash_line0.len())];
         let err = editor
             .edit_by_hash(f.path(), prefix, "REPLACED")
+            .await
             .unwrap_err();
         assert!(matches!(err, HashlineError::AmbiguousPrefix(_)));
     }
 
-    #[test]
-    fn edit_by_hash_and_line_disambiguates() {
+    #[tokio::test]
+    async fn edit_by_hash_and_line_disambiguates() {
         // Create file with two identical lines
         let f = temp_file("same\nsame\ndifferent");
         let mut editor = HashlineEditor::new();
-        let snapshot = editor.read_file(f.path()).unwrap();
+        let snapshot = editor.read_file(f.path()).await.unwrap();
         let hash_line0 = &snapshot.lines[0].hash;
         let prefix = &hash_line0[..8.min(hash_line0.len())];
         let result = editor
             .edit_by_hash_and_line(f.path(), prefix, 1, "FIRST")
+            .await
             .unwrap();
         assert_eq!(result, "FIRST\nsame\ndifferent");
     }
 
-    #[test]
-    fn edit_by_hash_short_prefix_falls_to_exact_match() {
+    #[tokio::test]
+    async fn edit_by_hash_short_prefix_falls_to_exact_match() {
         let f = temp_file("aaa\nbbb\nccc");
         let mut editor = HashlineEditor::new();
-        let snapshot = editor.read_file(f.path()).unwrap();
+        let snapshot = editor.read_file(f.path()).await.unwrap();
         // 5-char prefix should NOT match (too short for prefix mode)
         let short_prefix = &snapshot.lines[1].hash[..5];
         let err = editor
             .edit_by_hash(f.path(), short_prefix, "BBB")
+            .await
             .unwrap_err();
         // Falls through to exact match, which won't find a 5-char hash
         assert!(matches!(err, HashlineError::HashNotFound(_)));
     }
 
-    #[test]
-    fn edit_by_hash_and_line_rejects_mismatched_hash() {
+    #[tokio::test]
+    async fn edit_by_hash_and_line_rejects_mismatched_hash() {
         let f = temp_file("aaa\nbbb\nccc");
         let mut editor = HashlineEditor::new();
-        let snapshot = editor.read_file(f.path()).unwrap();
+        let snapshot = editor.read_file(f.path()).await.unwrap();
         let hash_a = &snapshot.lines[0].hash;
         let prefix_a = &hash_a[..8.min(hash_a.len())];
         // Try to edit line 2 using line 0's hash prefix → should fail
         let err = editor
             .edit_by_hash_and_line(f.path(), prefix_a, 2, "BBB")
+            .await
             .unwrap_err();
         assert!(matches!(err, HashlineError::HashNotFound(_)));
     }
@@ -455,16 +473,54 @@ mod tests {
     /// reject, because a sub-6-char hash can never equal a 64-char line
     /// hash. Flipping `==` to `!=` there would silently accept any short
     /// hash — this test pins the rejection.
-    #[test]
-    fn edit_by_hash_and_line_rejects_short_hash() {
+    #[tokio::test]
+    async fn edit_by_hash_and_line_rejects_short_hash() {
         let f = temp_file("aaa\nbbb\nccc");
         let mut editor = HashlineEditor::new();
-        editor.read_file(f.path()).unwrap();
+        editor.read_file(f.path()).await.unwrap();
         for short in ["a", "abc", "abcde"] {
             let err = editor
                 .edit_by_hash_and_line(f.path(), short, 1, "XXX")
+                .await
                 .unwrap_err();
             assert!(matches!(err, HashlineError::HashNotFound(_)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod proptest_unit {
+    // W5-code: proptest unitarios puros (sin runtime; migran casos fijos).
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn fixed_tagged_format_migrated() {
+        let l = LineHash {
+            line_num: 1,
+            hash: "abc123".into(),
+            content: "hello".into(),
+        };
+        assert_eq!(l.to_tagged(), "1:abc123|hello");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        #[test]
+        fn hash_deterministic(s in ".*{0,128}") {
+            prop_assert_eq!(LineHash::hash_line(&s), LineHash::hash_line(&s));
+        }
+        #[test]
+        fn tagged_contains_separator(
+            n in 1usize..9999,
+            content in "[a-zA-Z0-9 ]{0,64}",
+        ) {
+            let l = LineHash { line_num: n, hash: LineHash::hash_line(&content), content: content.clone() };
+            let t = l.to_tagged();
+            let want_prefix = format!("{}:", n);
+            prop_assert!(t.starts_with(&want_prefix));
+            prop_assert!(t.contains('|'));
+            prop_assert!(t.ends_with(&content));
         }
     }
 }

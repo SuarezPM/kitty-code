@@ -65,7 +65,7 @@ budget sub-systems. This is "the product" (the harness, not the model).
   `telemetry_enabled`, `verify_loop_enabled`; `redact.rs`: `redact_secrets`;
   `overflow.rs`: `detect_overflow`, `detect_silent_overflow`; `telemetry.rs`:
   `TelemetryWriter`, `TurnEvent` JSONL rotating 10MB; `skills.rs`: `Skill`,
-  `discover_skills` progressive disclosure; `comparison.rs`: `compare_harnesses`,
+  `format_skills_xml` progressive disclosure; `comparison.rs`:
   `HarnessComparison`, `ExerciseResult`; `plugin.rs`: `Plugin`, `PluginRegistry`,
   `HelloPlugin`, `TwoToolPlugin`, `load_from_manifest`).
 

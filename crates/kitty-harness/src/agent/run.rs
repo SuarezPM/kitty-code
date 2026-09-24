@@ -27,6 +27,8 @@ impl Agent {
         self.empty_response_streak = 0;
         // E3: reset the deterministic doom-loop detector per run as well.
         self.doom_loop.reset();
+        // W7: the ReAct trace is per-run ephemeral, like the doom streak.
+        self.react_steps.clear();
         // Bootstrap: detect workspace on first turn
         self.run_bootstrap();
 
@@ -201,22 +203,24 @@ impl Agent {
                     }
 
                     // F3.4: write telemetry for this turn (after process_response)
-                    telemetry.write_turn(&crate::telemetry::TurnEvent {
-                        ts: SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        model: self.config.model.clone(),
-                        turn: iteration,
-                        tool_calls: t_tool_calls,
-                        tool_names: t_tool_names,
-                        latency_ms: turn_latency.as_millis() as u64,
-                        tokens_in: t_tokens_in,
-                        tokens_out: t_tokens_out,
-                        error: None,
-                        bench_suite: None,
-                        compacted: false,
-                    });
+                    telemetry
+                        .write_turn(&crate::telemetry::TurnEvent {
+                            ts: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            model: self.config.model.clone(),
+                            turn: iteration,
+                            tool_calls: t_tool_calls,
+                            tool_names: t_tool_names,
+                            latency_ms: turn_latency.as_millis() as u64,
+                            tokens_in: t_tokens_in,
+                            tokens_out: t_tokens_out,
+                            error: None,
+                            bench_suite: None,
+                            compacted: false,
+                        })
+                        .await;
 
                     // Reset thinking budget for next turn
                     self.thinking_budget.reset_turn();
@@ -409,30 +413,49 @@ enum Verification {
 use crate::config::verify_loop_enabled;
 
 /// `true` when a Makefile declares a `test:` target (column-0 target line).
-pub(super) fn makefile_has_test_target(path: &Path) -> bool {
-    std::fs::read_to_string(path)
+/// W1 async: todo-file 1-op via tokio::fs.
+pub(super) async fn makefile_has_test_target(path: &Path) -> bool {
+    tokio::fs::read_to_string(path)
+        .await
         .map(|content| content.lines().any(|l| l.starts_with("test:")))
         .unwrap_or(false)
 }
 
 /// Detect the workspace test command (priority order: Rust → Python → JS/TS →
 /// Go → generic Makefile). `None` when no recognizable project marker exists.
-pub(super) fn detect_test_command(workspace: &Path) -> Option<String> {
-    if workspace.join("Cargo.toml").exists() {
+/// W1 async: marker checks via try_exists + makefile content via tokio::fs.
+pub(super) async fn detect_test_command(workspace: &Path) -> Option<String> {
+    if tokio::fs::try_exists(workspace.join("Cargo.toml"))
+        .await
+        .unwrap_or(false)
+    {
         return Some("cargo test --workspace -- -q".to_string());
     }
-    if workspace.join("pyproject.toml").exists() || workspace.join("setup.py").exists() {
+    if tokio::fs::try_exists(workspace.join("pyproject.toml"))
+        .await
+        .unwrap_or(false)
+        || tokio::fs::try_exists(workspace.join("setup.py"))
+            .await
+            .unwrap_or(false)
+    {
         return Some("python3 -m pytest --tb=short -q".to_string());
     }
-    if workspace.join("package.json").exists() {
+    if tokio::fs::try_exists(workspace.join("package.json"))
+        .await
+        .unwrap_or(false)
+    {
         return Some("npm test -- --brief".to_string());
     }
-    if workspace.join("go.mod").exists() {
+    if tokio::fs::try_exists(workspace.join("go.mod"))
+        .await
+        .unwrap_or(false)
+    {
         return Some("go test ./...".to_string());
     }
     for name in ["Makefile", "makefile"] {
         let mk = workspace.join(name);
-        if mk.is_file() && makefile_has_test_target(&mk) {
+        if tokio::fs::try_exists(&mk).await.unwrap_or(false) && makefile_has_test_target(&mk).await
+        {
             return Some("make test".to_string());
         }
     }
@@ -450,7 +473,7 @@ impl Agent {
         if !verify_loop_enabled() {
             return Verification::Skipped;
         }
-        let Some(command) = detect_test_command(&self.config.workspace) else {
+        let Some(command) = detect_test_command(&self.config.workspace).await else {
             debug!("verification skipped: no test command detected");
             return Verification::Skipped;
         };
@@ -470,7 +493,7 @@ impl Agent {
             }
             Ok(r) => {
                 warn!(command = %command, "verification: tests failed");
-                Verification::Failed(truncate_tool_output(r.output, TRUNCATION_MAX_BYTES))
+                Verification::Failed(truncate_tool_output(r.output, TRUNCATION_MAX_BYTES).await)
             }
             Err(e) => {
                 // Blocked / sandbox failure running the test command itself:

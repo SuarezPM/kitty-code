@@ -22,6 +22,8 @@ impl Agent {
                 self.empty_response_streak = 0;
                 // Add assistant message with tool calls (F2.3: push handles tokens)
                 self.push_message(response.message.clone()).await;
+                // W7: this turn's reasoning seeds each ReActStep's Thought.
+                let thinking_text: Option<String> = response.message.thinking.clone();
 
                 // Also parse text content for XML-style tool calls
                 let mut all_tool_calls: Vec<ParsedToolCall> = Vec::new();
@@ -80,7 +82,10 @@ impl Agent {
                     }
 
                     // If retry requested, the file changed — break to re-read
-                    if self.execute_and_push_tool_result(tc).await? {
+                    if self
+                        .execute_and_push_tool_result(tc, thinking_text.as_deref())
+                        .await?
+                    {
                         break;
                     }
                 }
@@ -175,7 +180,7 @@ impl Agent {
         if !parsed.is_empty() {
             // There are tool calls in the text, process them
             for tc in &parsed {
-                self.execute_and_push_tool_result(tc).await?;
+                self.execute_and_push_tool_result(tc, None).await?;
             }
             return Ok(()); // Process tool results next iteration
         }
@@ -195,6 +200,11 @@ impl Agent {
     /// Execute one tool call and push its result message (shared by the
     /// native tool_calls path and the XML-in-text path).
     ///
+    /// W7: builds one [`ReActStep`] per execution (Thought from `thinking`,
+    /// Action from the call, Observation from the outcome), feeds the REAL
+    /// [`DoomLoopGuard`] through the step's action (no mirrored key), and
+    /// records the step on the agent trace in loop order.
+    ///
     /// Applies the E3 deterministic guards around every execution:
     /// - doom-loop detection (3× identical → system nudge, 6× → fail-fast),
     /// - truncation-to-disk for oversized outputs.
@@ -202,7 +212,11 @@ impl Agent {
     /// F2.2: tool errors become failed result messages, never aborts (except
     /// the doom-loop fail-fast, which is an explicit loop-level abort).
     /// Returns `true` when the caller should break and re-read (retry).
-    async fn execute_and_push_tool_result(&mut self, tc: &ParsedToolCall) -> Result<bool> {
+    async fn execute_and_push_tool_result(
+        &mut self,
+        tc: &ParsedToolCall,
+        thinking: Option<&str>,
+    ) -> Result<bool> {
         // F2.2: Tool errors become failed results, never abort.
         // F4.3: Track invalid streak for schema breaker.
         let result = match self.registry.execute(tc).await {
@@ -229,10 +243,14 @@ impl Agent {
         };
         debug!(name = tc.name, success = result.success, "Tool executed");
 
-        // E3 doom-loop guard — deterministic repetition detector. The result
-        // message is pushed FIRST so history stays consistent even on the
-        // fail-fast verdict (F2.5 ordering: results before corrective msgs).
-        let doom = self.doom_loop.record(&tc.name, &tc.arguments);
+        // E3 doom-loop guard — deterministic repetition detector, fed
+        // through the step's action (W7: the REAL guard, no mirrored key).
+        // The step is recorded BEFORE the message push / verdict match so a
+        // fail-fast abort still leaves the full trace behind.
+        let mut step = ReActStep::new(thinking, tc);
+        let doom = self
+            .doom_loop
+            .record(&step.action.name, &step.action.arguments);
 
         // E3 truncation-to-disk: oversized outputs are persisted in full and
         // replaced by a head+tail excerpt with a pointer to the file.
@@ -240,7 +258,18 @@ impl Agent {
         // cap) so a big tool result cannot overflow the window between
         // compaction checks.
         let budget_cap = effective_output_cap(self.budget.remaining());
-        let output = truncate_tool_output(result.output, TRUNCATION_MAX_BYTES.min(budget_cap));
+        let output =
+            truncate_tool_output(result.output, TRUNCATION_MAX_BYTES.min(budget_cap)).await;
+
+        // W7: close the step with the pushed outcome, then record it. The
+        // `truncated` flag mirrors `Observation::from_result` but against the
+        // FINAL pushed output (which carries the truncation pointer).
+        step = step.with_observation(Observation {
+            output: output.clone(),
+            success: result.success,
+            truncated: output.contains("[truncated: full output at "),
+        });
+        self.react_steps.push(step);
 
         self.push_message(Message {
             role: "tool".to_string(),
@@ -372,7 +401,7 @@ impl Agent {
     /// effort — never fails the agent on memory errors.
     pub(super) async fn save_episode(&mut self, goal: &str, outcome: &str, success: bool) {
         if let Some(store) = self.memory_store.take() {
-            let files_touched = self.list_workspace_files();
+            let files_touched = self.list_workspace_files().await;
             let ep = Episode::new(
                 goal.to_string(),
                 files_touched,
@@ -393,10 +422,12 @@ impl Agent {
     }
 
     /// List top-level files in the workspace directory.
-    fn list_workspace_files(&self) -> Vec<String> {
+    /// W1 async: metadata-only traversal stays on read_dir (no todo-file
+    /// content read); async so episode save never parks the reactor.
+    async fn list_workspace_files(&self) -> Vec<String> {
         let mut files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.config.workspace) {
-            for entry in entries.flatten() {
+        if let Ok(mut entries) = tokio::fs::read_dir(&self.config.workspace).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
                 if let Some(name) = entry.file_name().to_str() {
                     files.push(name.to_string());
                 }

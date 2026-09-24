@@ -4,8 +4,6 @@
 //! or message content — only metadata (model, tokens, latency, errors).
 //! Controlled by `KITTY_TELEMETRY` env var (default: enabled, "off" to disable).
 
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -87,7 +85,10 @@ impl TelemetryWriter {
     }
 
     /// Write a turn event. Applies redaction. Rotates if needed.
-    pub fn write_turn(&mut self, event: &TurnEvent) {
+    /// W1 async: the append runs on the blocking pool via `spawn_blocking`
+    /// (established pattern tools.rs:1338, response.rs:329) so per-turn
+    /// telemetry never parks the reactor; rotation (rare, 10MB) stays sync.
+    pub async fn write_turn(&mut self, event: &TurnEvent) {
         if !self.enabled {
             return;
         }
@@ -100,12 +101,19 @@ impl TelemetryWriter {
             self.rotate();
         }
 
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.current_file)
-        {
-            let _ = writeln!(file, "{json}");
+        let path = self.current_file.clone();
+        let line = format!("{json}\n");
+        let appended = tokio::task::spawn_blocking(move || {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(mut file) => file.write_all(line.as_bytes()).is_ok(),
+                Err(_) => false,
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if appended {
             self.current_size += json.len() as u64 + 1;
         }
     }
@@ -166,20 +174,33 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Serializes env-mutating telemetry tests: KITTY_TELEMETRY is
+    /// process-global, so the disabled-by-env case must not interleave
+    /// with enabled cases (W1 async widened the race window).
+    static ENV_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn tmp_dir() -> PathBuf {
+        // Unique across parallel tests: nanos alone collide when tests
+        // start within the same tick (latent flake, exposed by W1 async).
+        static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "kitty_telemetry_test_{}",
+            "kitty_telemetry_test_{}_{}_{}",
+            std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            n
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    #[test]
-    fn write_turn_creates_file() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_SERIAL serializes env-mutating tests; per-test current-thread runtime
+    async fn write_turn_creates_file() {
+        let _env = ENV_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir();
         let mut writer = TelemetryWriter::new(Some(&dir));
         let event = TurnEvent {
@@ -195,7 +216,7 @@ mod tests {
             bench_suite: None,
             compacted: false,
         };
-        writer.write_turn(&event);
+        writer.write_turn(&event).await;
 
         let content = fs::read_to_string(dir.join("current.jsonl")).unwrap();
         assert!(content.contains("\"model\":\"test\""));
@@ -203,8 +224,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn telemetry_disabled_by_env() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_SERIAL serializes env-mutating tests; per-test current-thread runtime
+    async fn telemetry_disabled_by_env() {
+        let _env = ENV_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir();
         std::env::set_var("KITTY_TELEMETRY", "off");
         let mut writer = TelemetryWriter::new(Some(&dir));
@@ -221,15 +244,17 @@ mod tests {
             bench_suite: None,
             compacted: false,
         };
-        writer.write_turn(&event);
+        writer.write_turn(&event).await;
 
         assert!(!dir.join("current.jsonl").exists());
         std::env::set_var("KITTY_TELEMETRY", "");
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn redaction_applied_to_telemetry() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_SERIAL serializes env-mutating tests; per-test current-thread runtime
+    async fn redaction_applied_to_telemetry() {
+        let _env = ENV_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir();
         let mut writer = TelemetryWriter::new(Some(&dir));
         let event = TurnEvent {
@@ -245,7 +270,7 @@ mod tests {
             bench_suite: None,
             compacted: false,
         };
-        writer.write_turn(&event);
+        writer.write_turn(&event).await;
 
         let content = fs::read_to_string(dir.join("current.jsonl")).unwrap();
         assert!(content.contains("[REDACTED]"));
@@ -253,8 +278,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn rotation_triggered_at_max_size() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_SERIAL serializes env-mutating tests; per-test current-thread runtime
+    async fn rotation_triggered_at_max_size() {
+        let _env = ENV_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir();
         // Create a file close to max size to trigger rotation
         let file_path = dir.join("current.jsonl");
@@ -277,7 +304,7 @@ mod tests {
             bench_suite: None,
             compacted: false,
         };
-        writer.write_turn(&event);
+        writer.write_turn(&event).await;
 
         // Should have rotated: old file renamed, new current.jsonl created
         let entries: Vec<_> = fs::read_dir(&dir)
