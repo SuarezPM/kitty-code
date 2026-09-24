@@ -9,11 +9,18 @@ stdio server, and optional ratatui TUI. No agent logic — only orchestration.
 - `main.rs` (~633L, thin dispatch): `Cli { url, model, thinking_budget,
   profile, knowledge, knowledge_dir, context_window, max_iterations,
   bash_timeout, semantic_memory, cloud_fallback }` + `Commands
-  Run/Bench/BenchAb/Info/Mcp/Tui`. Helpers `default_db_path`,
+  Run/Bench/BenchAb/Info/Mcp/Tui`. Backend selection is env-driven up front:
+  `KITTY_BACKEND=kitty-infer` (`backend_selected`, pure) builds
+  `KittyInferClient::from_env()` (feature-gated; without it an honest
+  `unavailable_error`), otherwise `OllamaClient`; `bench_backend`
+  (`"ollama"` default, `"kitty-infer"` opt-in, never silent) flows into
+  `BenchCliCtx`, and a `bench_client()` closure builds the matching
+  `BenchClient` arm. Helpers `default_db_path`,
   `resolve_project_root` (marker walk `.git/Cargo.toml/...`, Gate-4 sandbox
   allow-root), `resolve_session_num_ctx` → `NumCtxResolution { num_ctx,
   source: env|native|fallback }` (env `KITTY_NUM_CTX` wins verbatim, else
-  one-shot `/api/show` probe clamped [4096,32768], else `DEFAULT_NUM_CTX`).
+  one-shot `/api/show` probe clamped [4096,32768], else `DEFAULT_NUM_CTX`;
+  infer arm skips the probe — ctx owned by `KITTY_INFER_CTX`).
   `Run` builds `AgentConfig` + `with_profile`, then applies `RunOverrides`
   (context_window/max_iterations/thinking `Budget`/bash_timeout; `tiny/nano`
   guard warns on `--semantic-memory`; `KITTY_AUTORUN_HOPS` only here+TUI,
@@ -30,9 +37,14 @@ stdio server, and optional ratatui TUI. No agent logic — only orchestration.
   `json_to_bench_item`/`load_json_exercises`, `exercises()` 15 homemade
   polyglot items, `bench_exit_code` (gate 50% + baseline delta 2%),
   `is_small_model` (resolved `tiny|nano` → memory off), `language_of` +
-  `tally_by_language`, `resolve_timeout_from_flag` (flag > env
-  `KITTY_BENCH_TIMEOUT_SECS` > `DEFAULT_...=120`), `file_contains`,
-  `file_is_executable`. `run.rs`: `run_bench` loop over `limit`,
+  `tally_by_language`, `BenchClient` enum (`Ollama`/`Infer`, itself a
+  `ChatClient` so metrics stay backend-identical) + `TimeoutManifest`
+  (`timeouts.json`, embedded): per-exercise cap resolves per (model, backend)
+  cell (`timeout_for_manifest`: model entry → backend default → 120) with
+  precedence explicit flag > `KITTY_BENCH_TIMEOUT_SECS` env > cell
+  (`resolve_timeout_for_bench`/`resolve_timeout_from_flag`; clap defaults
+  equal the constant so an unset flag never counts as explicit),
+  `file_contains`, `file_is_executable`. `run.rs`: `run_bench` loop over `limit`,
   `run_one_bench` (`tempfile::tempdir` + absolute `Save to {tmp}/{file}`
   prompt, `ENV_VERIFY_LOOP=off`, per-exercise `timeout`, verdict
   pass/fail/error/timeout + `Episode` persist), `tb2_exercises()` 8 shell.
@@ -86,7 +98,8 @@ print + JSON `--out` (+ `bench_exit_code` vs `benches/baseline.json`).
 - Depends on: `kitty-harness` (`Agent`, `AgentConfig`, `RunOverrides`,
   `ModelProfile`, `ThinkingMode`, `ToolRegistry`, `standard_tool_definitions`,
   `KnowledgeConfig`, `ENV_VERIFY_LOOP`/`ENV_BENCH_MODE`), `kitty-runtime`
-  (`OllamaClient`, `DEFAULT_NUM_CTX`, `ENV_NUM_CTX`, cloud/KV preflight),
+  (`OllamaClient`, `KittyInferClient` + `unavailable_error` (feature-gated),
+  `DEFAULT_NUM_CTX`, `ENV_NUM_CTX`, `ENV_BACKEND`, cloud/KV preflight),
   `kitty-memory` (`EpisodeStore`, `Episode`).
 - Bench harness lives here, not in `kitty-harness` — keeps harness lib pure.
   Grading is substring/file-check or local approximation (`polyglot` unit

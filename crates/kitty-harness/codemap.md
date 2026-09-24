@@ -41,10 +41,15 @@ budget sub-systems. This is "the product" (the harness, not the model).
 - Compaction (`compaction.rs`: `CompactionSummary::{empty,format_markdown}`;
   `context.rs` halt-guard): structured Goal/Constraints/Progress summary replaces old
   turns at threshold; consecutive-compaction halt stops the loop when nothing is freed.
-- Parser (`parser.rs`: `ToolCallParser`, `ParsedToolCall`, `DEFAULT_KNOWN_TOOLS`,
-  `repair_json`, `levenshtein`; `json_repair.rs`: `repair_json`, `coerce_with_schema`):
-  native `tool_calls` + Qwen/Mistral tags + `<tool_call>` XML + fenced/bare JSON +
-  `<think>`-embedded, with structural repair, empty-args recovery, fuzzy names (≤2).
+- Parser (`parser.rs`: `ToolCallParser`, `ParsedToolCall { name, arguments, id }`,
+  `DEFAULT_KNOWN_TOOLS`, `repair_json`, `levenshtein`; `json_repair.rs`:
+  `repair_json`, `coerce_with_schema`): native `tool_calls` (server ids kept)
+  + Qwen/Mistral tags + `<tool_call>` XML + fenced/bare JSON + Gemma
+  channel-tagged (`to=`/`tool=`/`name=`) + loose `call:NAME{json}` +
+  MiniCPM5/Liquid kwarg form (`<|tool_call_start|>[fn(k=v)]`) +
+  `<think>`-embedded, with structural repair, `_raw` salvage convention
+  (unparsable args retained, counted empty), empty-args recovery (bounded
+  window scan for a JSON object), fuzzy names (≤2).
 - Quality (`quality_monitor.rs`: `QualityMonitor`, `QualityConfig`, `QualityViolation`,
   `QualityEvent`): empty-response / tool-loop (3×, blake3 args-aware) / hallucinated-tool
   detection with corrective messages; window persists across turns.
@@ -74,6 +79,10 @@ re-seed → verify/autorun outer loops → bounded `for` loop: `should_compact` 
 `ToolRegistry::execute` w/ Guard+Sandbox → push result before correctives) →
 exhaustion → `force_response` → `verify_workspace` (≤2 revisions) → episode save → Done.
 `overflow::detect_overflow` / `detect_silent_overflow` reroute to compaction on window errors.
+`tool_call_id` threads end-to-end: server ids ride `ParsedToolCall.id` into
+dispatch and back onto result `Message`s so the next turn pairs
+responses↔results (text-parsed calls keep `None`; the runtime falls back
+positionally).
 
 ## Integration
 - Consumed by: `kitty-cli`. Depends on: `kitty-runtime` (`ChatClient`, `GrammarClient`,

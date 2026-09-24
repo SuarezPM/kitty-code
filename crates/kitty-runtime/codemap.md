@@ -63,6 +63,32 @@ spike, `RuntimeError` taxonomy, and the `gbnf-probe` measurement binary.
   `CanaryTok` / `Full` / `Off` baseline) via `generate()` + `run_diag_tokens()`
   (`--diag-tokens`), `bench_tools()` Read/Write/Edit/Bash. No double-`accept`
   (`sample` already accepts). `lib.rs` re-exports all clients + wire types.
+- `KittyInferClient` (kitty_infer.rs, feature `kitty-infer[-cuda]`): embedded
+  GGUF backend behind `ChatClient`, selected by `KITTY_BACKEND=kitty-infer`
+  (`backend_selected`, pure). `KittyInferConfig::from_env` reads
+  `KITTY_INFER_MODEL` (.gguf path) + `KITTY_INFER_CTX` (default 4096) +
+  `KITTY_INFER_TOKENIZER_DIR` (`<dir>/MiniCPM5-2B/tokenizer.json` sidecar,
+  honest error when missing) + `KITTY_INFER_GPU_LAYERS` (spill knob, internal
+  ≤12) + `KITTY_INFER_F32_PREFIXES`. Single-resident registry
+  (`global_registry` evict-before-load + OOM retry, `loaded_map` reuse,
+  `vram_precheck` fail-closed with bytes, spill estimate vs
+  `SPILL_WARN_HEADROOM`): concurrent same-spec loads compile once.
+  `to_request` threads harness `tool_call_id` through `add_tool_message`
+  (positional `tool-{idx}` fallback, warn past the first); assistant history
+  with tool calls re-emits engine `ToolCallResponse` (missing ids →
+  `"call-0"`); engine ids surface as `Some(id)` on `ToolCall`.
+  `chat_with_options` honors `RequestOptions` (`num_predict` clamped to 8192)
+  plus env-mapped sampler (`SamplerOpts` from `KITTY_INFER_TEMP/TOP_P/TOP_K`,
+  `KITTY_INFER_NO_THINK`, `KITTY_INFER_TOOL_FORMAT`,
+  `KITTY_INFER_REASONING_EFFORT`). `count_tokens` is a len/4 heuristic on
+  purpose (tokenizing must not trigger a 5GB load); usage counters flow into
+  `eval_count`/`prompt_eval_count`. `health_check` is file-level only (GGUF
+  exists + tokenizer resolvable), never loads. Without the feature the module
+  still compiles with `unavailable_error()` so the CLI names the missing
+  feature instead of `cfg`-branching call sites.
+- Features: `kitty-infer = ["dep:mistralrs", "dep:anyhow"]`,
+  `kitty-infer-cuda = ["kitty-infer", "mistralrs/cuda"]` (internal
+  `engine/mistralrs` path-dep post-mono; default builds stay CPU-only).
 
 ## Flow
 Harness → `ChatClient::chat_with_options(model, messages, tools, RequestOptions)`
@@ -75,7 +101,10 @@ generation) → status check (`classify_api_error`: 400 + `exceed_context_size_e
 (`GrammarClient::apply_strict_filter` drops schema-invalid `tool_calls`) →
 harness parser normalizes downstream (`thinking` kept separate from `content`,
 never fed back as visible text; `dynamic_max_output` = `ctx − estimate − 1024`,
-floor 256).
+floor 256). `KittyInferClient` arm: `ensure_loaded` (registry reuse or
+evict→vram_precheck→build→`resident ready` log) → `to_request` (env sampler +
+tool_format + reasoning effort) → engine `send_chat_request` → classified
+`RuntimeError::KittyInfer` with hints on failure, never a silent fallback.
 
 ## Integration
 - Consumed by: `kitty-harness` (agent loop injects `Box<dyn ChatClient>`,
@@ -84,4 +113,5 @@ floor 256).
   derive_trigger_tokens_pub/tool_schemas_to_gbnf_pub` + `GrammarConfig::validate`.
 - Depends on: `reqwest` (rustls HTTP), `serde`/`serde_json`, `thiserror`,
   `tokio`, `tracing`, `zeroize`; optional `llama-cpp-2` (`llama`/`llama-vulkan`
-  features). No internal workspace deps.
+  features); optional internal `engine/mistralrs` + `anyhow`
+  (`kitty-infer[-cuda]` features, never default).

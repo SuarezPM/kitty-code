@@ -1,42 +1,55 @@
 # Repository Atlas: Kitty Code
 
 ## Project Responsibility
-`Kitty Code` is a **local coding agent** written in Rust, optimized to run the
-`ornith:9b` model (Q4_K_M, ~5.6 GB) on a consumer GPU (RTX 2060 Super 8 GB) via the
-Ollama HTTP API. It is a research harness, not a production system. The differentiator
-is the **harness** (tool loop, safety guards, hashline edits, quality monitor,
-context budget, knowledge injection, episodic memory) around a small local LLM.
+`Kitty Code` is a **local coding agent** written in Rust (mono-repo: harness +
+embedded inference engine), optimized to run small GGUF models (1–35B) on a
+consumer GPU (RTX 2060 Super 8 GB) via Ollama HTTP API **or** the embedded
+`kitty-infer` backend (`KITTY_BACKEND=kitty-infer`, default Ollama byte-identical).
+It is a research harness, not a production system. The differentiators are the
+**harness** (tool loop, safety guards, hashline edits, quality monitor,
+context budget, knowledge injection, episodic memory) around small local LLMs,
+plus an **honest-bench culture** (manifests per run, non-claims, k≥3) and a
+**private engine fork** (K2-Horizon support nobody else ships).
 
 ## System Entry Points
-- `crates/kitty-cli/src/main.rs` (~633L thin dispatch: `Cli`/`Commands` + `resolve_project_root` + `resolve_session_num_ctx`, bench delegated to `bench/`) — CLI binary (`run`, `bench`, `bench-ab`, `info`, `mcp`, `tui`); bench suite in `crates/kitty-cli/src/bench/{common,run,ab,polyglot,tb2,gpqa,claweval}.rs` + suite support libs.
-- `Cargo.toml` — virtual workspace, 4 member crates (`crates/`) + 7 engine crates (`engine/mistralrs*`, mono M1–M3; `mistralrs-cli` dormant), un solo lock, release profile (LTO, strip, `panic="abort"`).
+- `crates/kitty-cli/src/main.rs` (thin dispatch: `Cli`/`Commands` + `resolve_project_root` + `resolve_session_num_ctx`, bench delegated to `bench/`) — CLI binary (`run`, `bench`, `bench-ab`, `info`, `mcp`, `tui`); backend switch `backend_selected(ENV_BACKEND)` → `Box<dyn ChatClient>` (Ollama vs `KittyInferClient`); bench suite in `crates/kitty-cli/src/bench/{common,run,ab,polyglot,tb2,gpqa,claweval}.rs` + suite support libs.
+- `crates/kitty-runtime/src/kitty_infer.rs` — embedded backend: `KittyInferConfig` (env `KITTY_INFER_*`: model, tokenizer, ctx, dtype policy, GPU layers, sampler, tool format), `KittyInferClient` (single-resident registry + evict, VRAM precheck, tool_call_id threading) behind `ChatClient`, feature-gated (`kitty-infer[-cuda]`, zero cost default).
+- `crates/kitty-cli/src/bench/timeouts.json` — per-(model, backend) timeout manifest (minicpm5 60/150s, qwen3 120/180s); thresholds/seeds/interleave are contract, never tuned to pass.
+- `engine/mistralrs-core/src/serving/` — engine serving layer: `ModelSpec::auto`, single-resident registry + evict, OpenAI-shape API, SSE, errors with hints, GPU snapshot health, `infer_policy` (dtype F16 + F32 overrides, tokenizer sidecar-or-error), warm preload.
+- `Cargo.toml` — single virtual workspace: `crates/*` + 7 `engine/mistralrs*` (mono M1–M3; `mistralrs-cli` dormant), one lock, release profile (LTO, strip, `panic="abort"`).
 - `AUDIT.md` / `CNAS.md` — honesty-first benchmark documentation (homemade quizzes,
   explicitly **not** Aider Polyglot / Terminal-Bench 2.0; Harbor oracle verifier 15/15 + 5/5 100%).
 - `docs/STRATEGY.md` — F6.4 ADR-005 GBNF defer spike final + roadmap P0/P1.
 - `docs/FLOOR-BENCHMARK.md` — W4 GBNF A/B + W5 Consumer vs Vendor evidence.
+- `docs/SDD-MONOREPO-UPGRADE.md` — mono-repo + upgrade program (decisions: squash+mirror, archive, 40min).
+- `docs/BACKEND-DEFAULT-CRITERIA.md` — 8 criteria + NO-SWITCH verdict with numbers.
 
 ## Directory Map (Aggregated)
 | Directory | Responsibility Summary | Detailed Map |
 |-----------|------------------------|--------------|
-| `crates/kitty-runtime/` | `ChatClient` trait + Ollama (`num_ctx`/`truncate`/think + LRU) / Cloud (`SecretString`) / llama.cpp (vocab-probe + `grammar_lazy`) clients + post-hoc `GrammarClient` filter + tool wire-types + `gbnf-probe` binary. | [View Map](crates/kitty-runtime/codemap.md) |
-| `crates/kitty-harness/` | Agent loop (`agent/{mod,run,response}`, autorun hops, `RunOverrides`), tool registry, layered guard (`guard/{mod,patterns,shell_parse,interpreters}`), Landlock/seccomp sandbox, fuzzy edit ladder, parser + JSON repair, quality monitor, router, contract done-guard, `config.rs` typed `KITTY_*`, compaction, telemetry, skills, knowledge, bootstrap. | [View Map](crates/kitty-harness/codemap.md) |
-| `crates/kitty-memory/` | Episodic memory (`Episode`/`EpisodeStore`, blake3 + SQLite WAL) + `Bm25Index` (k1 1.2/b 0.75) + opt-in dense embeddings (MiniLM-L6-v2, dim 384) fused via RRF K=60. | [View Map](crates/kitty-memory/codemap.md) |
-| `crates/kitty-cli/` | Thin-dispatch CLI + `bench/` suite (`common`/`run`/`ab` + polyglot/tb2/gpqa/claweval runners, wilson CI, seed-42 interleave) + suite support libs + MCP stdio server + ratatui TUI. | [View Map](crates/kitty-cli/codemap.md) |
-| `engine/` | Fork mistral.rs (upstream MIT: `engine/NOTICE` + `engine/LICENSE`) como backend embebido GGUF (`KITTY_BACKEND=kitty-infer`): facade `mistralrs` + `mistralrs-core`/`quant`/`paged-attn`/`metal-compile`/`flash-attn`/`macros` (naming `mistralrs-*` conservado); `mistralrs-cli` dormant; docs `engine/F0-RECON.md` + `engine/docs/patches/` (guard candle#3909). | — |
+| `crates/kitty-runtime/` | `ChatClient` trait + Ollama/Cloud/llama.cpp clients + embedded `KittyInferClient` (config, single-resident, tool ids, sampler envs) + wire types. | [View Map](crates/kitty-runtime/codemap.md) |
+| `crates/kitty-harness/` | Agent loop, tool registry, layered guard, sandbox, fuzzy edits, parser (channel/kwarg/_raw + tool_call_id), quality monitor, router, config, compaction, telemetry, skills. | [View Map](crates/kitty-harness/codemap.md) |
+| `crates/kitty-memory/` | Episodic memory (blake3 + SQLite WAL) + BM25 + opt-in dense RRF hybrid. | [View Map](crates/kitty-memory/codemap.md) |
+| `crates/kitty-cli/` | Thin-dispatch CLI + `bench/` suite (common/run/ab + runners, wilson CI, per-cell timeouts, `BenchClient` Ollama/Infer) + MCP + TUI. | [View Map](crates/kitty-cli/codemap.md) |
+| `crates/kitty-cli/src/bench/` | Bench dispatch per suite + timeout manifest data + gates. | [View Map](crates/kitty-cli/src/bench/codemap.md) |
+| `engine/mistralrs-core/src/serving/` | Model registry + preload, API shapes, SSE, friendly errors, GPU health, inference policy. | [View Map](engine/mistralrs-core/src/serving/codemap.md) |
+| `engine/mistralrs-core/src/pipeline/loaders/` | Loader registry incl. K2Horizon, GGUF loader + VRAM precheck, auto device-map (GPU-first, audible). | [View Map](engine/mistralrs-core/src/pipeline/loaders/codemap.md) |
+| `engine/mistralrs-core/src/kv_cache/` | SingleCache (dtype-unified) + paged-attention block scheduler. | [View Map](engine/mistralrs-core/src/kv_cache/codemap.md) |
+| `engine/mistralrs-core/src/models/` | Text towers (upstream inherited) + `k2_horizon.rs` port + registry. | [View Map](engine/mistralrs-core/src/models/codemap.md) |
+| `engine/mistralrs/` | Facade crate: builders, `best_device`, re-exports, cuda/metal/flash-attn features. | [View Map](engine/mistralrs/codemap.md) |
+| `engine/` | Fork mistral.rs (upstream MIT: `engine/NOTICE` + `engine/LICENSE`) como backend embebido GGUF; naming `mistralrs-*` conservado; `mistralrs-cli` dormant; docs `engine/F0-RECON.md` + `engine/docs/patches/` (guard candle#3909). | — |
 | `bench/official/` | Vendored official benchmarks (aider-harbor 225, terminal-bench-2 89, polyglot-benchmark 225) — Harbor oracle verifier. | — |
-| `benches/` | Homemade benches + exercises JSON (228) + baseline + A/B benches (recall, GBNF) + bench scripts. | — |
-| `docs/` | STRATEGY (F6.4 ADR final), FLOOR-BENCHMARK, PLUGIN, TUI, ADR-GBNF-GO, AUDIT mirror. | — |
+| `benches/` | Homemade benches + exercises JSON (228) + baseline + A/B benches (recall, GBNF) + bench scripts + `ab/manifests/` (per-run manifests). | — |
+| `docs/` | STRATEGY, FLOOR-BENCHMARK, PLUGIN, TUI, ADR-GBNF-GO, AUDIT mirror, SDD-MONOREPO-UPGRADE, BACKEND-DEFAULT-CRITERIA, EMBEDDED-BENCH-SPEC. | — |
 
 ## Data & Control Flow (one `run`)
-1. CLI builds `AgentConfig` + `ChatClient` (OllamaClient default — injects the session-fixed `num_ctx` (`KITTY_NUM_CTX`, default 32768) + `"truncate": false` into every chat payload, LlamaCppClient tiny fallback, CloudClient opt-in).
- 2. `Agent::run(prompt)`: bootstrap detect → preflight system hint (FIRST, so the
-    system message leads the conversation) → episodic recall (BM25 / hybrid RRF if `--semantic-memory`) → knowledge inject →
-    push user msg → loop:
-   - `ChatClient::chat` → `ToolCallParser` (native + text) → tool-call normalization (`crate::tools::normalize_tool_call`, choke point UPSTREAM of quality gate: synonyms/aliases resolved before diagnostics/memory/dispatch) → `GrammarClient` post-hoc filter → `QualityMonitor`
-     → `ToolRegistry::execute` (HashlineEditor with fuzzy replacer fallback ladder (`edit_replacers.rs`) + disproportionate-match guard / Bash via Sandbox + Guard / Glob / Grep / Plugin delegated with Guard inheritance) → push result.
-   - context pressure → `trigger_compaction` (LLM summary of old turns).
-   - empty streak 2 / iteration cap = size preset overridden only by a matched per-model turn-cap entry (static table or `KITTY_MODEL_TURN_CAPS`) / ToolLoop → optional `CloudClient` fallback (1 retry, `--cloud-fallback`) else fail-fast.
-3. Final text returned; episode saved (best-effort, with embedding BLOB if `embedding` feature).
+1. CLI builds `AgentConfig` + `ChatClient` via backend switch (`KITTY_BACKEND`; OllamaClient default — session-fixed `num_ctx`, `"truncate": false`; `KittyInferClient::from_env()` for embedded: warm preload, VRAM precheck, dtype policy).
+2. `Agent::run(prompt)`: bootstrap detect → preflight system hint (FIRST) → episodic recall → knowledge inject → push user msg → loop:
+   - `ChatClient::chat` → `ToolCallParser` (native + text) → tool-call normalization → `GrammarClient` post-hoc filter → `QualityMonitor`
+     → `ToolRegistry::execute` (HashlineEditor + fuzzy ladder + Guard / Bash via Sandbox + Guard / Glob / Grep / Plugin) → push result (tool_call_id threaded end-to-end).
+   - context pressure → `trigger_compaction`; empty streak 2 / iteration cap → CloudClient fallback (1 retry) else fail-fast.
+3. Final text returned; episode saved (best-effort).
+4. Bench path: same loop per exercise with per-cell timeouts (manifest), warm resident, manifests persisted per run (never `/tmp`).
 
 ## Structure Remediations (2026-09-03, audit Fase 1-6)
 - `kitty-cli/src/main.rs` is a thin dispatch layer (<1K LOC); benchmark
@@ -54,6 +67,8 @@ context budget, knowledge injection, episodic memory) around a small local LLM.
   `--all-features` tests, CycloneDX SBOM job, weekly `cargo audit`,
   llvm-cov gate (kitty-harness ≥70%, measured 89.7% at remediation time).
 - Zero `#[allow(dead_code)]` in production code; root orphan scripts removed.
+- Mono-repo M1–M3 (2026-09-23): `engine/` + `crates/` one workspace, one lock,
+  dual-dep epochs documented, `pre-mono` tags as rollback.
 
 ## Honesty Notes (verified 2026-08-30 — f8 + F2 B1-l225 autonomous)
 - **560 tests pass** (`cargo test --workspace --all-features`: 46 cli +425 harness +25 memory +64 runtime) 0 failed, `cargo clippy --all-targets --all-features -- -D warnings` **FAIL 2× await_holding_lock in tools.rs:3189 pre-existente (no introducido por benches, cargo test OK)**, `cargo fmt --all --check` clean. Release build ~30s LTO strip. `cargo deny check` clean.
@@ -68,8 +83,10 @@ context budget, knowledge injection, episodic memory) around a small local LLM.
 - **F2 B1-l225 autonomous (2026-08-30, G1 APPROVE):** `b1-l225-rerun-20260830T042258Z.json` **221/225 98.2%** (0 errored ≤22 PASS, `grep400=0`, wall 182m21s) mix real `50py→50js→30ts→45rust→30go→10cpp→10java` (225 base, 3py bonus excluded, fingerprint `0d38e3c`), manifest pre-registro. GPQA Diamond / ClawEval 300t **blocked-harness** (`kitty bench` solo `polyglot/tb2/smoke`, sin loader) — gaps explícitos en `AUDIT §7.1b` / `STRATEGY`.
 - **F0-F5 hardened**: guard (command substitution, eval block, timeout 30s bench), hashline prefix matching, tool error handling, budget single-point accounting (`push_message` sole), cross-turn tool-loop detection (args-aware blake3), message ordering, thinking retry (cap 2), Read truncation (300 lines), Grep via ignore crate, dead code removal, CLI flags (`--profile tiny|medium|large`, `--no-memory` auto, `--semantic-memory`, `--cloud-fallback`), JSON exercise loading, `bench-ab` interleaved + wilson CI.
 - **Empty response fix**: assistant msg pushed to history, no orphaned LLM round-trips, `MAX_EMPTY_STREAK=2` + fail-fast → latency 87s→4s smollm2, 39s→24s qwen3.
-- **Bench/Knowledge (F6 W5):** `bench/official/` exists (aider-harness, polyglot-benchmark 225, terminal-bench-2 89, aider-harbor 225), `benches/exercises_polyglot.json` 228 (225 +3 Python: list-comp/decorators/async), floor 225 smollm2 45.3% (<50% → demo re-frame, `docs/FLOOR-BENCHMARK.md`), knowledge 5 cards (`knowledge/*.md` rust-traits/go-generics/python-list-comp/python-decorators/python-async) scoring word1.0/bigram2.0, `benches/baseline.json` 96.44, `kitty mcp` stdio 6 tools via Guard, `cargo deny` + `deny.toml` allowlist, `CODEOWNERS`, workflows pinned SHA.
+- **Bench/Knowledge (F6 W5):** `bench/official/` exists (aider-harbor, polyglot-benchmark 225, terminal-bench-2 89, aider-harbor 225), `benches/exercises_polyglot.json` 228 (225 +3 Python: list-comp/decorators/async), floor 225 smollm2 45.3% (<50% → demo re-frame, `docs/FLOOR-BENCHMARK.md`), knowledge 5 cards (`knowledge/*.md` rust-traits/go-generics/python-list-comp/python-decorators/python-async) scoring word1.0/bigram2.0, `benches/baseline.json` 96.44, `kitty mcp` stdio 6 tools via Guard, `cargo deny` + `deny.toml` allowlist, `CODEOWNERS`, workflows pinned SHA.
+- **Septiembre 2026 (mono-repo + infer embebido):** workspace único `crates/*` + `engine/mistralrs*` (M1–M3, un lock); backend `kitty-infer` tras `ChatClient` (`KITTY_BACKEND`, feature-gated, default Ollama intacto); paridad motor bit-igual CPU 3/3 y mismo-GPU funcional; bench k≥3 con manifiestos en repo + timeouts por (modelo,backend) + warm-resident; veredicto NO-SWITCH con números; K2-Horizon porteado con envelope documentado; guard candle#3909 persistido; auto-map GPU-first audible.
 
-## Codemap Freshness (2026-09-08)
-- Submaps re-read from source after `codemap.mjs changes` reported 42 added / 2 removed / 18 modified: `kitty-cli` 94L, `kitty-harness` 86L, `kitty-memory` 46L, `kitty-runtime` 78L — all verified by re-read, disjoint ownership, no other files touched.
-- State saved via `codemap.mjs update`. `AGENTS.md` already references this atlas — Step 5 skipped as idempotent.
+## Codemap Freshness (2026-09-23)
+- Full run post-fusión: init con 150 ficheros trackeados (`.slim/codemap.json`), backup de 10 maps previos (intactos), 114 stubs vacíos eliminados.
+- Maps refrescados/creados: 10 crates (incl. `bench/` nuevo) + 5 engine (serving, loaders, kv_cache, models-K2, facade) + este atlas; 0 marcadores `Fixer:` restantes.
+- `AGENTS.md` ya referencia este atlas — Step 5 exento como idempotente.
