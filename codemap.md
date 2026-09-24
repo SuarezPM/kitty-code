@@ -9,7 +9,7 @@ context budget, knowledge injection, episodic memory) around a small local LLM.
 
 ## System Entry Points
 - `crates/kitty-cli/src/main.rs` (~633L thin dispatch: `Cli`/`Commands` + `resolve_project_root` + `resolve_session_num_ctx`, bench delegated to `bench/`) — CLI binary (`run`, `bench`, `bench-ab`, `info`, `mcp`, `tui`); bench suite in `crates/kitty-cli/src/bench/{common,run,ab,polyglot,tb2,gpqa,claweval}.rs` + suite support libs.
-- `Cargo.toml` — virtual workspace, 4 member crates, release profile (LTO, strip, `panic="abort"`).
+- `Cargo.toml` — virtual workspace, 4 member crates (`crates/`) + 7 engine crates (`engine/mistralrs*`, mono M1–M3; `mistralrs-cli` dormant), un solo lock, release profile (LTO, strip, `panic="abort"`).
 - `AUDIT.md` / `CNAS.md` — honesty-first benchmark documentation (homemade quizzes,
   explicitly **not** Aider Polyglot / Terminal-Bench 2.0; Harbor oracle verifier 15/15 + 5/5 100%).
 - `docs/STRATEGY.md` — F6.4 ADR-005 GBNF defer spike final + roadmap P0/P1.
@@ -22,6 +22,7 @@ context budget, knowledge injection, episodic memory) around a small local LLM.
 | `crates/kitty-harness/` | Agent loop (`agent/{mod,run,response}`, autorun hops, `RunOverrides`), tool registry, layered guard (`guard/{mod,patterns,shell_parse,interpreters}`), Landlock/seccomp sandbox, fuzzy edit ladder, parser + JSON repair, quality monitor, router, contract done-guard, `config.rs` typed `KITTY_*`, compaction, telemetry, skills, knowledge, bootstrap. | [View Map](crates/kitty-harness/codemap.md) |
 | `crates/kitty-memory/` | Episodic memory (`Episode`/`EpisodeStore`, blake3 + SQLite WAL) + `Bm25Index` (k1 1.2/b 0.75) + opt-in dense embeddings (MiniLM-L6-v2, dim 384) fused via RRF K=60. | [View Map](crates/kitty-memory/codemap.md) |
 | `crates/kitty-cli/` | Thin-dispatch CLI + `bench/` suite (`common`/`run`/`ab` + polyglot/tb2/gpqa/claweval runners, wilson CI, seed-42 interleave) + suite support libs + MCP stdio server + ratatui TUI. | [View Map](crates/kitty-cli/codemap.md) |
+| `engine/` | Fork mistral.rs (upstream MIT: `engine/NOTICE` + `engine/LICENSE`) como backend embebido GGUF (`KITTY_BACKEND=kitty-infer`): facade `mistralrs` + `mistralrs-core`/`quant`/`paged-attn`/`metal-compile`/`flash-attn`/`macros` (naming `mistralrs-*` conservado); `mistralrs-cli` dormant; docs `engine/F0-RECON.md` + `engine/docs/patches/` (guard candle#3909). | — |
 | `bench/official/` | Vendored official benchmarks (aider-harbor 225, terminal-bench-2 89, polyglot-benchmark 225) — Harbor oracle verifier. | — |
 | `benches/` | Homemade benches + exercises JSON (228) + baseline + A/B benches (recall, GBNF) + bench scripts. | — |
 | `docs/` | STRATEGY (F6.4 ADR final), FLOOR-BENCHMARK, PLUGIN, TUI, ADR-GBNF-GO, AUDIT mirror. | — |

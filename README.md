@@ -50,6 +50,7 @@ the 6 tools via the Guard), and `tui` (status display, opt-in feature).
 | `kitty-harness` | Agent loop (`agent/`), tools + hashline edits, parser, guard (`guard/`), sandbox (Landlock+seccomp), quality monitor, budgets, config, knowledge, bootstrap |
 | `kitty-memory`  | Episodic memory (BLAKE3 + SQLite, BM25 with cached index) |
 | `kitty-cli`     | CLI, benchmark suites (`bench/`), MCP server, TUI |
+| `engine/`       | Fork mistral.rs como backend embebido GGUF (upstream MIT: `engine/NOTICE` + `engine/LICENSE`); `mistralrs-cli` dormant |
 
 See [`codemap.md`](./codemap.md) for the full architecture map.
 

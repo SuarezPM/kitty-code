@@ -57,3 +57,16 @@ explícito no hay switch.
 No re-correr bench con caps 30s; no quant-ladder; no tocar thresholds del bench;
 no quedarse en C; no switch sin GO; no reabrir gates (paridad, F2/HOLD, NO-SWITCH);
 no polyglot/qwen25 como gates; no feature nueva en la migración.
+
+## 6. M6 — preparación de archivado (NO ejecutado en GitHub)
+
+Estado: tag local `mono-mirror-point` en kitty-infer HEAD (punto espejo
+post-M1; local, sin push). El repo origen queda intacto como respaldo
+(workflows CUDA originales incluidos) hasta el archivado.
+
+Pasos para archivar tras 1 release del mono-repo (otro carril, con GO):
+1. Verificar que `main` del mono-repo compila + CI verde post-merge.
+2. En GitHub: settings del repo kitty-infer → Danger Zone → Archive repository.
+3. Avisar a contribuidores (el mirror queda de solo-lectura; PRs/issues van al
+   mono-repo). NO borrar el repo (decisión 2: mirror, no borrado).
+4. Prohibido: `gh repo archive` sin GO explícito; cambiar remotos del mono-repo.

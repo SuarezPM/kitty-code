@@ -38,9 +38,8 @@ carril.
    los paths probados (hoy: `expect` del scheduler paged en prompt largo
    con CTX corto — mitigado con CTX mínimo documentado, pendiente endurecer
    a error amable).
-6. **Docs al día**: tabla CTX-mínimo (apéndice serving en F0-RECON.md de
-   kitty-infer) y este archivo actualizados con los números del humo que
-   propone el cambio.
+6. **Docs al día**: tabla CTX-mínimo (apéndice serving en `engine/F0-RECON.md`)
+   y este archivo actualizados con los números del humo que propone el cambio.
 7. **Robustez en runs encadenados**: entre runs GPU consecutivos se verifica
    contexto sano (`nvidia-smi` + cola del log previo sin `CUDA_ERROR_*`); un
    crash CUDA envenena al siguiente run en silencio (Gate C).
