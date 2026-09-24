@@ -23,15 +23,15 @@ pub use client::{
 };
 pub use cloud::{CloudClient, MockCloud};
 pub use error::{ErrorClass, Result, RuntimeError};
+pub use grammar::{GrammarClient, GrammarConfig};
+#[cfg(not(feature = "kitty-infer"))]
+pub use kitty_infer::unavailable_error;
 #[cfg(feature = "kitty-infer")]
 pub use kitty_infer::KittyInferClient;
 pub use kitty_infer::{
-    BACKEND_KITTY_INFER, ENV_BACKEND, ENV_CTX, ENV_F32_PREFIXES, ENV_MODEL, ENV_TOKENIZER_DIR,
-    KittyInferConfig, backend_selected,
+    backend_selected, KittyInferConfig, BACKEND_KITTY_INFER, ENV_BACKEND, ENV_CTX,
+    ENV_F32_PREFIXES, ENV_MODEL, ENV_TOKENIZER_DIR,
 };
-#[cfg(not(feature = "kitty-infer"))]
-pub use kitty_infer::unavailable_error;
-pub use grammar::{GrammarClient, GrammarConfig};
 #[cfg(feature = "llama")]
 pub use llama::LlamaCppClient;
 #[cfg(not(feature = "llama"))]

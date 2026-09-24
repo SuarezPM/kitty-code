@@ -27,15 +27,15 @@ use std::path::PathBuf;
 use crate::error::{Result, RuntimeError};
 
 #[cfg(feature = "kitty-infer")]
+use crate::client::{ChatClient, ChatResponse, Message};
+#[cfg(feature = "kitty-infer")]
+use crate::tools::ToolDefinition;
+#[cfg(feature = "kitty-infer")]
 use std::future::Future;
 #[cfg(feature = "kitty-infer")]
 use std::pin::Pin;
 #[cfg(feature = "kitty-infer")]
 use std::sync::Arc;
-#[cfg(feature = "kitty-infer")]
-use crate::client::{ChatClient, ChatResponse, Message};
-#[cfg(feature = "kitty-infer")]
-use crate::tools::ToolDefinition;
 
 #[cfg(feature = "kitty-infer")]
 use mistralrs::{
@@ -65,7 +65,8 @@ const DEFAULT_CTX: usize = 4096;
 /// Returns true when the operator selected the embedded backend. Pure and
 /// unit-testable (env read stays at the call site).
 pub fn backend_selected(raw: Option<&str>) -> bool {
-    raw.map(|v| v.trim() == BACKEND_KITTY_INFER).unwrap_or(false)
+    raw.map(|v| v.trim() == BACKEND_KITTY_INFER)
+        .unwrap_or(false)
 }
 
 /// Parse the GPU-layer spill override. `None` = unset/invalid = automatic
@@ -207,7 +208,7 @@ fn skip_gguf_value(f: &mut std::fs::File, ty: u32) -> Option<()> {
         2 | 3 => {
             f.seek(SeekFrom::Current(2)).ok()?;
         }
-        4 | 5 | 6 => {
+        4..=6 => {
             f.seek(SeekFrom::Current(4)).ok()?;
         }
         7 => {
@@ -216,7 +217,8 @@ fn skip_gguf_value(f: &mut std::fs::File, ty: u32) -> Option<()> {
         8 => {
             let mut len = [0u8; 8];
             f.read_exact(&mut len).ok()?;
-            f.seek(SeekFrom::Current(u64::from_le_bytes(len) as i64)).ok()?;
+            f.seek(SeekFrom::Current(u64::from_le_bytes(len) as i64))
+                .ok()?;
         }
         9 => {
             // array: element type + count, then elements (assume no nesting)
@@ -233,7 +235,7 @@ fn skip_gguf_value(f: &mut std::fs::File, ty: u32) -> Option<()> {
                 skip_gguf_value(f, elem)?;
             }
         }
-        10 | 11 | 12 => {
+        10..=12 => {
             f.seek(SeekFrom::Current(8)).ok()?;
         }
         _ => return None,
@@ -320,7 +322,10 @@ fn sampler_opts_from(options: Option<crate::client::RequestOptions>) -> SamplerO
     if let Some(o) = options {
         // Clamp to something sane: harness-derived caps can exceed the
         // resident window when they were computed against another backend.
-        out.max_len = o.num_predict.filter(|n| *n > 0).map(|n| (n as usize).min(8192));
+        out.max_len = o
+            .num_predict
+            .filter(|n| *n > 0)
+            .map(|n| (n as usize).min(8192));
         out.temperature = o
             .temperature
             .map(|t| t as f64)
@@ -329,10 +334,7 @@ fn sampler_opts_from(options: Option<crate::client::RequestOptions>) -> SamplerO
             .top_p
             .map(|p| p as f64)
             .filter(|p| p.is_finite() && (0.0..=1.0).contains(p));
-        out.top_k = o
-            .top_k
-            .filter(|k| *k > 0)
-            .map(|k| (k as usize).min(1000));
+        out.top_k = o.top_k.filter(|k| *k > 0).map(|k| (k as usize).min(1000));
     }
     out
 }
@@ -346,7 +348,10 @@ fn tool_fallback_id(id: Option<&str>, idx: usize) -> String {
 }
 
 fn thinking_enabled(raw: Option<&str>) -> bool {
-    !matches!(raw.map(|v| v.trim()), Some("1") | Some("true") | Some("yes"))
+    !matches!(
+        raw.map(|v| v.trim()),
+        Some("1") | Some("true") | Some("yes")
+    )
 }
 
 /// Resolved configuration for one embedded resident.
@@ -392,7 +397,10 @@ impl KittyInferConfig {
         tokenizer_sidecar_dir: Option<PathBuf>,
         ctx_len: usize,
     ) -> Result<Self> {
-        if model_path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase())
+        if model_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
             != Some("gguf".to_string())
         {
             return Err(RuntimeError::InvalidArgument(format!(
@@ -432,6 +440,479 @@ fn map_role(role: &str) -> (&'static str, bool) {
         "assistant" => ("assistant", false),
         _ => ("user", false),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Loaded client (feature-gated; mirrors LlamaCppClient structure)
+// ---------------------------------------------------------------------------
+
+/// Process-wide loaded models, keyed by [`ModelSpec`](mistralrs::serving::ModelSpec)
+/// id. The single-flight lock lives in `global_registry`; this map only
+/// makes a registry-shared load visible to every client (a per-client slot
+/// would diverge: client B would miss a model client A just built).
+/// Pruned to the winner on every successful load, so the map honors the
+/// single-resident contract instead of pinning evicted models in VRAM.
+/// Plain std mutex, never held across await.
+#[cfg(feature = "kitty-infer")]
+static LOADED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<Model>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "kitty-infer")]
+fn loaded_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<Model>>> {
+    LOADED.get_or_init(Default::default)
+}
+
+/// Embedded kitty-infer backend: single-resident GGUF behind [`ChatClient`].
+///
+/// Concurrency contract (D1): serialization lives in `global_registry`,
+/// which holds its guard across evict → load → store and reuses the
+/// resident for same-spec waiters — two concurrent `ensure_loaded` (same
+/// or different clients, same spec) compile the model exactly once, and
+/// both read it from [`loaded_map`]. Cross-spec races serialize with
+/// last-writer-wins residency, same as the registry metadata.
+#[cfg(feature = "kitty-infer")]
+#[derive(Clone)]
+pub struct KittyInferClient {
+    config: KittyInferConfig,
+}
+
+#[cfg(feature = "kitty-infer")]
+impl KittyInferClient {
+    pub fn new(config: KittyInferConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        Ok(Self::new(KittyInferConfig::from_env()?))
+    }
+
+    pub fn config(&self) -> &KittyInferConfig {
+        &self.config
+    }
+
+    fn spec_id(&self) -> Option<String> {
+        ki::ModelSpec::auto(&format!("local:{}", self.config.model_path.display()))
+            .ok()
+            .map(|spec| spec.id)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        // Non-blocking probe only; never loads here.
+        self.spec_id()
+            .and_then(|id| loaded_map().lock().ok().map(|m| m.contains_key(&id)))
+            .unwrap_or(false)
+    }
+
+    fn friendly(err: impl std::fmt::Display) -> RuntimeError {
+        let classified = ki::KittyError::classify(&err.to_string());
+        let body = classified.body();
+        RuntimeError::KittyInfer(format!("{} — hint: {}", body.error, body.hint))
+    }
+
+    /// Load (or reuse) the single resident. Evict-before-load + OOM retry
+    /// come from `global_registry`; the `gpu_fraction` attempt scales the
+    /// context (the KV lever this client controls), and `vram_precheck`
+    /// fails fast with byte counts before touching the engine.
+    async fn ensure_loaded(&self) -> Result<Arc<Model>> {
+        let cfg = self.config.clone();
+        let file_name = cfg
+            .model_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let parent = cfg
+            .model_path
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let extra = ki::extra_f32_prefixes(std::env::var(ENV_F32_PREFIXES).ok().as_deref());
+        let dtype = ki::resolve_dtype(&file_name, &extra);
+        let tok_json =
+            ki::resolve_tokenizer_json(&cfg.model_path, cfg.tokenizer_sidecar_dir.as_deref())
+                .map_err(Self::friendly)?;
+        let file_len = ki::file_bytes(&cfg.model_path).map_err(Self::friendly)?;
+        // Spill validation is relative to the model's own layer total
+        // (read from the GGUF header, no load): n > total always bails.
+        // Unknown total allows through (documented: legacy had no per-model
+        // view either) with the byte pre-check below staying fail-closed.
+        // Internal knob documented ≤12 (measured 8GB envelope).
+        let gpu_layers = parse_gpu_layers(std::env::var(ENV_GPU_LAYERS).ok().as_deref());
+        let total_layers = gpu_layers
+            .is_some()
+            .then(|| gguf_block_count(&cfg.model_path))
+            .flatten();
+        if let Some(n) = gpu_layers {
+            validate_gpu_layers(n, total_layers)?;
+        }
+        let spec = ki::ModelSpec::auto(&format!("local:{}", cfg.model_path.display()))
+            .map_err(Self::friendly)?;
+        let spec_id = spec.id.clone();
+
+        // Fast path: another client (or an earlier turn) already built it.
+        if let Some(model) = loaded_map()
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&spec_id).cloned())
+        {
+            return Ok(model);
+        }
+
+        let resident = ki::global_registry()
+            .load_with_retry(spec, |fraction| {
+                let file_name = file_name.clone();
+                let parent = parent.clone();
+                let tok_json = tok_json.clone();
+                let spec_id = spec_id.clone();
+                let gpu_layers = gpu_layers;
+                let total_layers = total_layers;
+                async move {
+                    // Attempt ctx scales with the retry fraction (1.0 → ~0.66):
+                    // KV cache is the OOM lever this client owns.
+                    let ctx = ((cfg.ctx_len as f32 * fraction) as usize).max(512);
+                    let free = ki::health::snapshot()
+                        .devices
+                        .first()
+                        .map(|d| d.total_bytes.saturating_sub(d.used_bytes));
+                    // Layered estimate: with spill only n/total of the file
+                    // sits on GPU. Warn above headroom (not fail — the
+                    // scaled pre-check below stays fail-closed with bytes).
+                    if let (Some(n), Some(t)) = (gpu_layers, total_layers) {
+                        let est = spill_estimate_bytes(file_len, Some(n), Some(t), fraction, ctx);
+                        if let Some(free_bytes) = free {
+                            if est as f64 > free_bytes as f64 * SPILL_WARN_HEADROOM {
+                                tracing::warn!(
+                                    estimate_bytes = est,
+                                    free_bytes,
+                                    gpu_layers = n,
+                                    total_layers = t,
+                                    "spill estimate within headroom of free VRAM; \
+                                     prefill transients may still OOM — failure will be loud"
+                                );
+                            }
+                        }
+                    }
+                    // Scale the precheck input so a spill passes on its real
+                    // GPU share instead of the full file (spill-20 passed the
+                    // legacy check and OOMed late — the HOLD this fixes).
+                    let eff_file = match (gpu_layers, total_layers) {
+                        (Some(n), Some(t)) if t > 0 => {
+                            ((file_len as f64 * n.min(t) as f64 / t as f64) as u64).max(1)
+                        }
+                        _ => file_len,
+                    };
+                    ki::vram_precheck(eff_file, free, fraction, ctx)
+                        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                    let mut builder = GgufModelBuilder::new(parent, vec![file_name])
+                        .with_logging()
+                        .with_max_model_len(ctx)
+                        .with_dtype(dtype.clone())
+                        // Paged KV capacity must follow the attempt ctx: the
+                        // builder default pins ContextSize(4096) = 128 blocks,
+                        // which starves agent prompts (measured K2 panic).
+                        .with_paged_attn(
+                            PagedAttentionMetaBuilder::default()
+                                .with_gpu_memory(mistralrs::MemoryGpuConfig::ContextSize(ctx))
+                                .build()?,
+                        );
+                    // Pre-validated above (relative clamp); the spill itself is
+                    // honored verbatim here so load matches what passed checks.
+                    if let Some(n) = gpu_layers {
+                        builder = builder.with_device_mapping(mistralrs::DeviceMapSetting::Map(
+                            mistralrs::DeviceMapMetadata::from_num_device_layers(vec![
+                                mistralrs::DeviceLayerMapMetadata {
+                                    ordinal: 0,
+                                    layers: n,
+                                },
+                            ]),
+                        ));
+                    }
+                    if let Some(tj) = tok_json {
+                        builder = builder.with_tokenizer_json(tj.to_string_lossy().into_owned());
+                    }
+                    let model = builder
+                        .build()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                    loaded_map()
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("loaded-model map is poisoned"))?
+                        .insert(spec_id, Arc::new(model));
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(Self::friendly)?;
+        tracing::info!(
+            model = %resident.spec.id,
+            gpu_fraction = resident.gpu_fraction,
+            ctx = cfg.ctx_len,
+            gpu_layers = ?gpu_layers,
+            thinking = thinking_enabled(std::env::var(ENV_NO_THINK).ok().as_deref()),
+            "kitty-infer resident ready"
+        );
+        // Prune evicted models so the map honors single-residence.
+        let mut map = loaded_map()
+            .lock()
+            .map_err(|_| RuntimeError::KittyInfer("loaded-model map is poisoned".to_string()))?;
+        map.retain(|id, _| id == &resident.spec.id);
+        map.get(&resident.spec.id).cloned().ok_or_else(|| {
+            RuntimeError::KittyInfer(
+                "load reported success but no model is resident — retry once; \
+                 if it repeats, capture RUST_LOG=info output"
+                    .to_string(),
+            )
+        })
+    }
+
+    fn to_request(messages: Vec<Message>, tools: Option<Vec<ToolDefinition>>) -> RequestBuilder {
+        let mut req = RequestBuilder::new().enable_thinking(thinking_enabled(
+            std::env::var(ENV_NO_THINK).ok().as_deref(),
+        ));
+        if let Some(fmt) = tool_format(std::env::var(ENV_TOOL_FORMAT).ok().as_deref()) {
+            req = req.with_tool_call_format(fmt);
+        }
+        match std::env::var(ENV_EFFORT).ok().as_deref() {
+            Some("low") => req = req.with_reasoning_effort(ReasoningEffort::Low),
+            Some("medium") => req = req.with_reasoning_effort(ReasoningEffort::Medium),
+            _ => {}
+        }
+        let mut tool_idx = 0usize;
+        for m in messages {
+            let text = m.content.clone().unwrap_or_default();
+            if m.role == "tool" {
+                // Threaded tool_call_id (harness-filled); id-less results
+                // get a positional `tool-{idx}` fallback (idx 0 keeps the
+                // legacy `"tool-0"`). First id-less result is debug-level
+                // (legacy single-tool path); idx ≥ 1 is genuinely ambiguous
+                // and stays warn-level — bounded by tool count, never a loop.
+                let id = tool_fallback_id(m.tool_call_id.as_deref(), tool_idx);
+                if m.tool_call_id.is_none() {
+                    if tool_idx == 0 {
+                        tracing::debug!(
+                            "tool result without tool_call_id; positional fallback \"tool-0\""
+                        );
+                    } else {
+                        tracing::warn!(
+                            tool_idx,
+                            "id-less tool result past the first cannot pair reliably; \
+                             positional fallback used (multi-tool turns need ids)"
+                        );
+                    }
+                }
+                tool_idx += 1;
+                req = req.add_tool_message(text, id);
+                continue;
+            }
+            let (kind, _) = map_role(&m.role);
+            match kind {
+                "system" => {
+                    req = req.add_message(TextMessageRole::System, text);
+                }
+                "assistant" if m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) => {
+                    let calls = m
+                        .tool_calls
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|c| mistralrs::ToolCallResponse {
+                            index: 0,
+                            id: c.id.unwrap_or_else(|| "call-0".to_string()),
+                            tp: mistralrs::ToolCallType::Function,
+                            function: mistralrs::CalledFunction {
+                                name: c.function.name,
+                                arguments: c.function.arguments.to_string(),
+                            },
+                        })
+                        .collect();
+                    req = req.add_message_with_tool_call(TextMessageRole::Assistant, text, calls);
+                }
+                "assistant" => {
+                    req = req.add_message(TextMessageRole::Assistant, text);
+                }
+                _ => {
+                    req = req.add_message(TextMessageRole::User, text);
+                }
+            }
+        }
+        if let Some(tools) = tools {
+            if !tools.is_empty() {
+                req = req.set_tools(
+                    tools
+                        .into_iter()
+                        .map(|t| mistralrs::Tool {
+                            tp: mistralrs::ToolType::Function,
+                            function: mistralrs::Function {
+                                name: t.function.name,
+                                description: Some(t.function.description),
+                                parameters: Some(t.function.parameters),
+                                strict: None,
+                            },
+                        })
+                        .collect(),
+                );
+            }
+        }
+        req
+    }
+
+    async fn chat_inner(
+        &self,
+        model: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        samp: SamplerOpts,
+    ) -> Result<ChatResponse> {
+        let loaded = self.ensure_loaded().await?;
+        let mut req = Self::to_request(messages, tools);
+        if let Some(n) = samp.max_len {
+            req = req.set_sampler_max_len(n);
+        }
+        if let Some(t) = samp.temperature {
+            req = req.set_sampler_temperature(t);
+        }
+        if let Some(p) = samp.top_p {
+            req = req.set_sampler_topp(p);
+        }
+        if let Some(k) = samp.top_k {
+            req = req.set_sampler_topk(k);
+        }
+        let resp = loaded
+            .send_chat_request(req)
+            .await
+            .map_err(Self::friendly)?;
+        let choice = resp.choices.first().ok_or_else(|| {
+                RuntimeError::KittyInfer(
+                    "engine returned zero choices — retry once; hint: check RUST_LOG=info for pipeline errors".to_string(),
+                )
+            })?;
+        let tool_calls = choice.message.tool_calls.as_ref().map(|calls| {
+            calls
+                .iter()
+                .map(|c| crate::client::ToolCall {
+                    id: Some(c.id.clone()),
+                    function: crate::client::ToolCallFunction {
+                        name: c.function.name.clone(),
+                        arguments: serde_json::from_str(&c.function.arguments)
+                            .unwrap_or(serde_json::Value::String(c.function.arguments.clone())),
+                    },
+                })
+                .collect()
+        });
+        Ok(ChatResponse {
+            model: model.to_string(),
+            message: Message {
+                role: "assistant".to_string(),
+                content: choice.message.content.clone(),
+                thinking: None,
+                tool_calls,
+                tool_call_id: None,
+            },
+            done: true,
+            eval_count: Some(resp.usage.completion_tokens as i64),
+            eval_duration: None,
+            prompt_eval_count: Some(resp.usage.prompt_tokens as i64),
+        })
+    }
+}
+
+#[cfg(feature = "kitty-infer")]
+impl std::fmt::Debug for KittyInferClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KittyInferClient")
+            .field("model_path", &self.config.model_path)
+            .field("ready", &self.is_ready())
+            .finish()
+    }
+}
+
+#[cfg(feature = "kitty-infer")]
+impl ChatClient for KittyInferClient {
+    fn chat<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            self.chat_inner(model, messages, tools, SamplerOpts::default())
+                .await
+        })
+    }
+
+    /// Honor `RequestOptions` (token cap + sampler). The trait default
+    /// IGNORES options, which left embedded generation unbounded (up to
+    /// `max_model_len`) and turned agent turns into 25-min timeouts.
+    /// `num_predict` clamps to 8192 (harness caps computed against another
+    /// backend can exceed the resident window); temperature/top_p/top_k
+    /// pass through when finite and in range, else engine defaults hold.
+    fn chat_with_options<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: Option<crate::client::RequestOptions>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
+        let samp = sampler_env_override(
+            sampler_opts_from(options),
+            std::env::var(ENV_TEMP).ok().as_deref(),
+            std::env::var(ENV_TOP_P).ok().as_deref(),
+            std::env::var(ENV_TOP_K).ok().as_deref(),
+        );
+        Box::pin(async move { self.chat_inner(model, messages, tools, samp).await })
+    }
+
+    fn count_tokens<'a>(
+        &'a self,
+        _model: &'a str,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            // Heuristic on purpose: tokenizing must not trigger a 5GB load.
+            Ok(text.len().div_ceil(4))
+        })
+    }
+
+    fn health_check<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // File-level probe, never loads the model.
+            if !self.config.model_path.is_file() {
+                return Err(RuntimeError::ModelNotFound(format!(
+                    "GGUF not found at {} — hint: check {ENV_MODEL}",
+                    self.config.model_path.display()
+                )));
+            }
+            let file_name = self
+                .config
+                .model_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if ki::needs_external_tokenizer(file_name) {
+                ki::resolve_tokenizer_json(
+                    &self.config.model_path,
+                    self.config.tokenizer_sidecar_dir.as_deref(),
+                )
+                .map_err(Self::friendly)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// No-feature stub: honest compile-time-off error (never a silent fallback)
+// ---------------------------------------------------------------------------
+
+/// Selected backend is unavailable in this build. Always compiled so the CLI
+/// can name the missing feature without cfg-conditional call sites.
+#[cfg(not(feature = "kitty-infer"))]
+pub fn unavailable_error() -> RuntimeError {
+    RuntimeError::InvalidArgument(
+        "KITTY_BACKEND=kitty-infer needs the `kitty-infer` cargo feature — \
+         rebuild with --features kitty-infer (mono M3: engine/mistralrs interno)"
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -549,7 +1030,10 @@ mod mapping_tests {
         use super::sampler_opts_from;
         use crate::client::RequestOptions;
         let d = sampler_opts_from(None);
-        assert_eq!((d.max_len, d.temperature, d.top_p, d.top_k), (None, None, None, None));
+        assert_eq!(
+            (d.max_len, d.temperature, d.top_p, d.top_k),
+            (None, None, None, None)
+        );
         let o = sampler_opts_from(Some(RequestOptions {
             temperature: Some(1.0),
             top_p: Some(0.95),
@@ -589,10 +1073,7 @@ mod mapping_tests {
         assert_eq!(o.top_k, None);
         // Invalid values leave fields untouched.
         let o = sampler_env_override(base, Some("nope"), Some("7"), Some("0"));
-        assert_eq!(
-            (o.temperature, o.top_p, o.top_k),
-            (Some(0.3), None, None)
-        );
+        assert_eq!((o.temperature, o.top_p, o.top_k), (Some(0.3), None, None));
     }
 
     #[test]
@@ -601,7 +1082,10 @@ mod mapping_tests {
         assert_eq!(tool_format(None), None);
         assert_eq!(tool_format(Some("json")), Some("json".to_string()));
         assert_eq!(tool_format(Some(" xml ")), Some("xml".to_string()));
-        assert_eq!(tool_format(Some("xml_typed")), Some("xml_typed".to_string()));
+        assert_eq!(
+            tool_format(Some("xml_typed")),
+            Some("xml_typed".to_string())
+        );
         assert_eq!(tool_format(Some("JSON")), None);
         assert_eq!(tool_format(Some("yaml")), None);
         assert_eq!(tool_format(Some("")), None);
@@ -651,10 +1135,12 @@ mod mapping_tests {
     fn config_rejects_non_gguf_and_missing() {
         use super::KittyInferConfig;
         assert!(KittyInferConfig::from_path("/tmp/x.safetensors".into(), None, 4096).is_err());
-        assert!(
-            KittyInferConfig::from_path("/tmp/does-not-exist-kitty-infer.gguf".into(), None, 4096)
-                .is_err()
-        );
+        assert!(KittyInferConfig::from_path(
+            "/tmp/does-not-exist-kitty-infer.gguf".into(),
+            None,
+            4096
+        )
+        .is_err());
     }
 
     #[test]
@@ -666,12 +1152,8 @@ mod mapping_tests {
         let dir = std::env::temp_dir();
         let fake = dir.join("kitty-infer-test-K2-Horizon-4B-BF16.gguf");
         std::fs::write(&fake, b"GGUF").unwrap();
-        let cfg = KittyInferConfig::from_path(
-            fake.clone(),
-            Some(dir.join("tokenizers")),
-            2048,
-        )
-        .unwrap();
+        let cfg =
+            KittyInferConfig::from_path(fake.clone(), Some(dir.join("tokenizers")), 2048).unwrap();
         assert_eq!(cfg.model_path, fake);
         assert_eq!(cfg.tokenizer_sidecar_dir, Some(dir.join("tokenizers")));
         assert_eq!(cfg.ctx_len, 2048);
@@ -680,482 +1162,4 @@ mod mapping_tests {
         assert_eq!(cfg.ctx_len, 512);
         std::fs::remove_file(&fake).unwrap();
     }
-}
-
-// ---------------------------------------------------------------------------
-// Loaded client (feature-gated; mirrors LlamaCppClient structure)
-// ---------------------------------------------------------------------------
-
-/// Process-wide loaded models, keyed by [`ModelSpec`](mistralrs::serving::ModelSpec)
-/// id. The single-flight lock lives in `global_registry`; this map only
-/// makes a registry-shared load visible to every client (a per-client slot
-/// would diverge: client B would miss a model client A just built).
-/// Pruned to the winner on every successful load, so the map honors the
-/// single-resident contract instead of pinning evicted models in VRAM.
-/// Plain std mutex, never held across await.
-#[cfg(feature = "kitty-infer")]
-static LOADED: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, Arc<Model>>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(feature = "kitty-infer")]
-fn loaded_map(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<Model>>> {
-    LOADED.get_or_init(Default::default)
-}
-
-/// Embedded kitty-infer backend: single-resident GGUF behind [`ChatClient`].
-///
-/// Concurrency contract (D1): serialization lives in `global_registry`,
-/// which holds its guard across evict → load → store and reuses the
-/// resident for same-spec waiters — two concurrent `ensure_loaded` (same
-/// or different clients, same spec) compile the model exactly once, and
-/// both read it from [`loaded_map`]. Cross-spec races serialize with
-/// last-writer-wins residency, same as the registry metadata.
-#[cfg(feature = "kitty-infer")]
-#[derive(Clone)]
-pub struct KittyInferClient {
-    config: KittyInferConfig,
-}
-
-#[cfg(feature = "kitty-infer")]
-impl KittyInferClient {
-    pub fn new(config: KittyInferConfig) -> Self {
-        Self { config }
-    }
-
-    pub fn from_env() -> Result<Self> {
-        Ok(Self::new(KittyInferConfig::from_env()?))
-    }
-
-    pub fn config(&self) -> &KittyInferConfig {
-        &self.config
-    }
-
-    fn spec_id(&self) -> Option<String> {
-        ki::ModelSpec::auto(&format!("local:{}", self.config.model_path.display()))
-            .ok()
-            .map(|spec| spec.id)
-    }
-
-    pub fn is_ready(&self) -> bool {
-        // Non-blocking probe only; never loads here.
-        self.spec_id()
-            .and_then(|id| loaded_map().lock().ok().map(|m| m.contains_key(&id)))
-            .unwrap_or(false)
-    }
-
-    fn friendly(err: impl std::fmt::Display) -> RuntimeError {
-        let classified = ki::KittyError::classify(&err.to_string());
-        let body = classified.body();
-        RuntimeError::KittyInfer(format!("{} — hint: {}", body.error, body.hint))
-    }
-
-    /// Load (or reuse) the single resident. Evict-before-load + OOM retry
-    /// come from `global_registry`; the `gpu_fraction` attempt scales the
-    /// context (the KV lever this client controls), and `vram_precheck`
-    /// fails fast with byte counts before touching the engine.
-    async fn ensure_loaded(&self) -> Result<Arc<Model>> {
-        let cfg = self.config.clone();
-        let file_name = cfg
-            .model_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-        let parent = cfg
-            .model_path
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| ".".to_string());
-        let extra = ki::extra_f32_prefixes(std::env::var(ENV_F32_PREFIXES).ok().as_deref());
-        let dtype = ki::resolve_dtype(&file_name, &extra);
-        let tok_json =
-            ki::resolve_tokenizer_json(&cfg.model_path, cfg.tokenizer_sidecar_dir.as_deref())
-                .map_err(Self::friendly)?;
-        let file_len =
-            ki::file_bytes(&cfg.model_path).map_err(Self::friendly)?;
-        // Spill validation is relative to the model's own layer total
-        // (read from the GGUF header, no load): n > total always bails.
-        // Unknown total allows through (documented: legacy had no per-model
-        // view either) with the byte pre-check below staying fail-closed.
-        // Internal knob documented ≤12 (measured 8GB envelope).
-        let gpu_layers = parse_gpu_layers(std::env::var(ENV_GPU_LAYERS).ok().as_deref());
-        let total_layers = gpu_layers
-            .is_some()
-            .then(|| gguf_block_count(&cfg.model_path))
-            .flatten();
-        if let Some(n) = gpu_layers {
-            validate_gpu_layers(n, total_layers)?;
-        }
-        let spec = ki::ModelSpec::auto(&format!("local:{}", cfg.model_path.display()))
-            .map_err(Self::friendly)?;
-        let spec_id = spec.id.clone();
-
-        // Fast path: another client (or an earlier turn) already built it.
-        if let Some(model) = loaded_map().lock().ok().and_then(|m| m.get(&spec_id).cloned()) {
-            return Ok(model);
-        }
-
-        let resident = ki::global_registry()
-            .load_with_retry(spec, |fraction| {
-                let file_name = file_name.clone();
-                let parent = parent.clone();
-                let tok_json = tok_json.clone();
-                let spec_id = spec_id.clone();
-                let gpu_layers = gpu_layers;
-                let total_layers = total_layers;
-                async move {
-                    // Attempt ctx scales with the retry fraction (1.0 → ~0.66):
-                    // KV cache is the OOM lever this client owns.
-                    let ctx = ((cfg.ctx_len as f32 * fraction) as usize).max(512);
-                    let free = ki::health::snapshot()
-                        .devices
-                        .first()
-                        .map(|d| d.total_bytes.saturating_sub(d.used_bytes));
-                    // Layered estimate: with spill only n/total of the file
-                    // sits on GPU. Warn above headroom (not fail — the
-                    // scaled pre-check below stays fail-closed with bytes).
-                    if let (Some(n), Some(t)) = (gpu_layers, total_layers) {
-                        let est = spill_estimate_bytes(file_len, Some(n), Some(t), fraction, ctx);
-                        if let Some(free_bytes) = free {
-                            if est as f64 > free_bytes as f64 * SPILL_WARN_HEADROOM {
-                                tracing::warn!(
-                                    estimate_bytes = est,
-                                    free_bytes,
-                                    gpu_layers = n,
-                                    total_layers = t,
-                                    "spill estimate within headroom of free VRAM; \
-                                     prefill transients may still OOM — failure will be loud"
-                                );
-                            }
-                        }
-                    }
-                    // Scale the precheck input so a spill passes on its real
-                    // GPU share instead of the full file (spill-20 passed the
-                    // legacy check and OOMed late — the HOLD this fixes).
-                    let eff_file = match (gpu_layers, total_layers) {
-                        (Some(n), Some(t)) if t > 0 => {
-                            ((file_len as f64 * n.min(t) as f64 / t as f64) as u64).max(1)
-                        }
-                        _ => file_len,
-                    };
-                    ki::vram_precheck(eff_file, free, fraction, ctx).map_err(|e| {
-                        anyhow::anyhow!("{e:#}")
-                    })?;
-                    let mut builder = GgufModelBuilder::new(parent, vec![file_name])
-                        .with_logging()
-                        .with_max_model_len(ctx)
-                        .with_dtype(dtype.clone())
-                        // Paged KV capacity must follow the attempt ctx: the
-                        // builder default pins ContextSize(4096) = 128 blocks,
-                        // which starves agent prompts (measured K2 panic).
-                        .with_paged_attn(
-                            PagedAttentionMetaBuilder::default()
-                                .with_gpu_memory(mistralrs::MemoryGpuConfig::ContextSize(ctx))
-                                .build()?,
-                        );
-                    // Pre-validated above (relative clamp); the spill itself is
-                    // honored verbatim here so load matches what passed checks.
-                    if let Some(n) = gpu_layers {
-                        builder = builder.with_device_mapping(
-                            mistralrs::DeviceMapSetting::Map(
-                                mistralrs::DeviceMapMetadata::from_num_device_layers(vec![
-                                    mistralrs::DeviceLayerMapMetadata {
-                                        ordinal: 0,
-                                        layers: n,
-                                    },
-                                ]),
-                            ),
-                        );
-                    }
-                    if let Some(tj) = tok_json {
-                        builder = builder.with_tokenizer_json(tj.to_string_lossy().into_owned());
-                    }
-                    let model = builder.build().await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
-                    loaded_map()
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("loaded-model map is poisoned"))?
-                        .insert(spec_id, Arc::new(model));
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(Self::friendly)?;
-        tracing::info!(
-            model = %resident.spec.id,
-            gpu_fraction = resident.gpu_fraction,
-            ctx = cfg.ctx_len,
-            gpu_layers = ?gpu_layers,
-            thinking = thinking_enabled(std::env::var(ENV_NO_THINK).ok().as_deref()),
-            "kitty-infer resident ready"
-        );
-        // Prune evicted models so the map honors single-residence.
-        let mut map = loaded_map()
-            .lock()
-            .map_err(|_| {
-                RuntimeError::KittyInfer("loaded-model map is poisoned".to_string())
-            })?;
-        map.retain(|id, _| id == &resident.spec.id);
-        map.get(&resident.spec.id).cloned().ok_or_else(|| {
-            RuntimeError::KittyInfer(
-                "load reported success but no model is resident — retry once; \
-                 if it repeats, capture RUST_LOG=info output"
-                    .to_string(),
-            )
-        })
-    }
-
-    fn to_request(
-        messages: Vec<Message>,
-        tools: Option<Vec<ToolDefinition>>,
-    ) -> RequestBuilder {
-        let mut req =
-            RequestBuilder::new().enable_thinking(thinking_enabled(std::env::var(ENV_NO_THINK).ok().as_deref()));
-        if let Some(fmt) = tool_format(std::env::var(ENV_TOOL_FORMAT).ok().as_deref()) {
-            req = req.with_tool_call_format(fmt);
-        }
-        match std::env::var(ENV_EFFORT).ok().as_deref() {
-            Some("low") => req = req.with_reasoning_effort(ReasoningEffort::Low),
-            Some("medium") => req = req.with_reasoning_effort(ReasoningEffort::Medium),
-            _ => {}
-        }
-        let mut tool_idx = 0usize;
-        for m in messages {
-            let text = m.content.clone().unwrap_or_default();
-            if m.role == "tool" {
-                // Threaded tool_call_id (harness-filled); id-less results
-                // get a positional `tool-{idx}` fallback (idx 0 keeps the
-                // legacy `"tool-0"`). First id-less result is debug-level
-                // (legacy single-tool path); idx ≥ 1 is genuinely ambiguous
-                // and stays warn-level — bounded by tool count, never a loop.
-                let id = tool_fallback_id(m.tool_call_id.as_deref(), tool_idx);
-                if m.tool_call_id.is_none() {
-                    if tool_idx == 0 {
-                        tracing::debug!(
-                            "tool result without tool_call_id; positional fallback \"tool-0\""
-                        );
-                    } else {
-                        tracing::warn!(
-                            tool_idx,
-                            "id-less tool result past the first cannot pair reliably; \
-                             positional fallback used (multi-tool turns need ids)"
-                        );
-                    }
-                }
-                tool_idx += 1;
-                req = req.add_tool_message(text, id);
-                continue;
-            }
-            let (kind, _) = map_role(&m.role);
-            match kind {
-                "system" => {
-                    req = req.add_message(TextMessageRole::System, text);
-                }
-                "assistant" if m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) => {
-                    let calls = m
-                        .tool_calls
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|c| mistralrs::ToolCallResponse {
-                            index: 0,
-                            id: c.id.unwrap_or_else(|| "call-0".to_string()),
-                            tp: mistralrs::ToolCallType::Function,
-                            function: mistralrs::CalledFunction {
-                                name: c.function.name,
-                                arguments: c.function.arguments.to_string(),
-                            },
-                        })
-                        .collect();
-                    req = req.add_message_with_tool_call(TextMessageRole::Assistant, text, calls);
-                }
-                "assistant" => {
-                    req = req.add_message(TextMessageRole::Assistant, text);
-                }
-                _ => {
-                    req = req.add_message(TextMessageRole::User, text);
-                }
-            }
-        }
-        if let Some(tools) = tools {
-            if !tools.is_empty() {
-                req = req.set_tools(
-                    tools
-                        .into_iter()
-                        .map(|t| mistralrs::Tool {
-                            tp: mistralrs::ToolType::Function,
-                            function: mistralrs::Function {
-                                name: t.function.name,
-                                description: Some(t.function.description),
-                                parameters: Some(t.function.parameters),
-                                strict: None,
-                            },
-                        })
-                        .collect(),
-                );
-            }
-        }
-        req
-    }
-
-    async fn chat_inner(
-        &self,
-        model: &str,
-        messages: Vec<Message>,
-        tools: Option<Vec<ToolDefinition>>,
-        samp: SamplerOpts,
-    ) -> Result<ChatResponse> {
-        let loaded = self.ensure_loaded().await?;
-        let mut req = Self::to_request(messages, tools);
-        if let Some(n) = samp.max_len {
-            req = req.set_sampler_max_len(n);
-        }
-        if let Some(t) = samp.temperature {
-            req = req.set_sampler_temperature(t);
-        }
-        if let Some(p) = samp.top_p {
-            req = req.set_sampler_topp(p);
-        }
-        if let Some(k) = samp.top_k {
-            req = req.set_sampler_topk(k);
-        }
-        let resp = loaded
-            .send_chat_request(req)
-            .await
-            .map_err(Self::friendly)?;
-            let choice = resp.choices.first().ok_or_else(|| {
-                RuntimeError::KittyInfer(
-                    "engine returned zero choices — retry once; hint: check RUST_LOG=info for pipeline errors".to_string(),
-                )
-            })?;
-            let tool_calls = choice.message.tool_calls.as_ref().map(|calls| {
-                calls
-                    .iter()
-                    .map(|c| crate::client::ToolCall {
-                        id: Some(c.id.clone()),
-                        function: crate::client::ToolCallFunction {
-                            name: c.function.name.clone(),
-                            arguments: serde_json::from_str(&c.function.arguments).unwrap_or(
-                                serde_json::Value::String(c.function.arguments.clone()),
-                            ),
-                        },
-                    })
-                    .collect()
-            });
-            Ok(ChatResponse {
-                model: model.to_string(),
-                message: Message {
-                    role: "assistant".to_string(),
-                    content: choice.message.content.clone(),
-                    thinking: None,
-                    tool_calls,
-                    tool_call_id: None,
-                },
-                done: true,
-                eval_count: Some(resp.usage.completion_tokens as i64),
-                eval_duration: None,
-                prompt_eval_count: Some(resp.usage.prompt_tokens as i64),
-            })
-    }
-
-}
-
-#[cfg(feature = "kitty-infer")]
-impl std::fmt::Debug for KittyInferClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KittyInferClient")
-            .field("model_path", &self.config.model_path)
-            .field("ready", &self.is_ready())
-            .finish()
-    }
-}
-
-#[cfg(feature = "kitty-infer")]
-impl ChatClient for KittyInferClient {
-    fn chat<'a>(
-        &'a self,
-        model: &'a str,
-        messages: Vec<Message>,
-        tools: Option<Vec<ToolDefinition>>,
-    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
-        Box::pin(async move {
-            self.chat_inner(model, messages, tools, SamplerOpts::default())
-                .await
-        })
-    }
-
-    /// Honor `RequestOptions` (token cap + sampler). The trait default
-    /// IGNORES options, which left embedded generation unbounded (up to
-    /// `max_model_len`) and turned agent turns into 25-min timeouts.
-    /// `num_predict` clamps to 8192 (harness caps computed against another
-    /// backend can exceed the resident window); temperature/top_p/top_k
-    /// pass through when finite and in range, else engine defaults hold.
-    fn chat_with_options<'a>(
-        &'a self,
-        model: &'a str,
-        messages: Vec<Message>,
-        tools: Option<Vec<ToolDefinition>>,
-        options: Option<crate::client::RequestOptions>,
-    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse>> + Send + 'a>> {
-        let samp = sampler_env_override(
-            sampler_opts_from(options),
-            std::env::var(ENV_TEMP).ok().as_deref(),
-            std::env::var(ENV_TOP_P).ok().as_deref(),
-            std::env::var(ENV_TOP_K).ok().as_deref(),
-        );
-        Box::pin(async move { self.chat_inner(model, messages, tools, samp).await })
-    }
-
-
-    fn count_tokens<'a>(
-        &'a self,
-        _model: &'a str,
-        text: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>> {
-        Box::pin(async move {
-            // Heuristic on purpose: tokenizing must not trigger a 5GB load.
-            Ok(text.len().div_ceil(4))
-        })
-    }
-
-    fn health_check<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            // File-level probe, never loads the model.
-            if !self.config.model_path.is_file() {
-                return Err(RuntimeError::ModelNotFound(format!(
-                    "GGUF not found at {} — hint: check {ENV_MODEL}",
-                    self.config.model_path.display()
-                )));
-            }
-            let file_name = self
-                .config
-                .model_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            if ki::needs_external_tokenizer(file_name) {
-                ki::resolve_tokenizer_json(
-                    &self.config.model_path,
-                    self.config.tokenizer_sidecar_dir.as_deref(),
-                )
-                .map_err(Self::friendly)?;
-            }
-            Ok(())
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// No-feature stub: honest compile-time-off error (never a silent fallback)
-// ---------------------------------------------------------------------------
-
-/// Selected backend is unavailable in this build. Always compiled so the CLI
-/// can name the missing feature without cfg-conditional call sites.
-#[cfg(not(feature = "kitty-infer"))]
-pub fn unavailable_error() -> RuntimeError {
-    RuntimeError::InvalidArgument(
-        "KITTY_BACKEND=kitty-infer needs the `kitty-infer` cargo feature — \
-         rebuild with --features kitty-infer (mono M3: engine/mistralrs interno)"
-            .to_string(),
-    )
 }

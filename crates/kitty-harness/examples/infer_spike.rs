@@ -22,8 +22,7 @@ const PROMPTS: &[&str] = &[
 ];
 
 fn build_client() -> Box<dyn ChatClient> {
-    if kitty_runtime::backend_selected(std::env::var(kitty_runtime::ENV_BACKEND).ok().as_deref())
-    {
+    if kitty_runtime::backend_selected(std::env::var(kitty_runtime::ENV_BACKEND).ok().as_deref()) {
         #[cfg(feature = "kitty-infer")]
         {
             let client = kitty_runtime::KittyInferClient::from_env().unwrap_or_else(|e| {

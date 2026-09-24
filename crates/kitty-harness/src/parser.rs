@@ -395,12 +395,9 @@ impl ToolCallParser {
     /// Parse `<|tool_call_start|>...` regions with a Python-kwarg payload
     /// parser (see [`Self::parse_python_kwarg_call`]).
     fn parse_python_kwarg_calls(&self, content: &str) -> Vec<ParsedToolCall> {
-        self.parse_delimited_calls_with(
-            content,
-            KWARG_CALL_OPENER,
-            KWARG_CALL_CLOSERS,
-            |payload| self.parse_python_kwarg_call(payload),
-        )
+        self.parse_delimited_calls_with(content, KWARG_CALL_OPENER, KWARG_CALL_CLOSERS, |payload| {
+            self.parse_python_kwarg_call(payload)
+        })
     }
 
     /// Parse one `[name(k='v', n=3)]` (or bare `name(k='v')`) payload into a
@@ -2292,7 +2289,10 @@ mid
         let calls = parser.parse(input);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["tags"], serde_json::json!(["a", "b"]));
-        assert_eq!(calls[0].arguments["opts"], serde_json::json!({"k": 1, "v": true}));
+        assert_eq!(
+            calls[0].arguments["opts"],
+            serde_json::json!({"k": 1, "v": true})
+        );
     }
 
     #[test]

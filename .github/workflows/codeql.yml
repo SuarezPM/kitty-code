@@ -20,7 +20,7 @@ jobs:
       security-events: write
       actions: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
       - uses: github/codeql-action/init@49c5498669e3d9b1e47c6f6ad2a8d895c8c6a7b9 # v3.28.12
         with:
           languages: rust

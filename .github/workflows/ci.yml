@@ -24,14 +24,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
       - name: Install Rust toolchain (rustup, no archived actions)
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
-      # Target cache (mono M4). Tag-pinned: substituting the verified SHA
-      # needs network; the commit lane pins it like the rest below.
-      - uses: Swatinem/rust-cache@v2 # M4-TODO: pin SHA
+      # Target cache (mono M4), SHA-pinned.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: "mono-cpu"
       # Engine compile signal (lib+bins; engine TEST targets are pre-red in
@@ -42,6 +41,13 @@ jobs:
       # their test targets do not compile on default features (pre-existing).
       - name: cargo test (kitty suites)
         run: cargo test -p kitty-cli -p kitty-harness -p kitty-runtime -p kitty-memory
+      # Opt-in feature compile signal (Gate 3): embedding (fastembed/ort) y
+      # tui (ratatui/crossterm) no compilan en default — este espejo detecta
+      # rotura de API tras bumps sin pagar el coste del download de modelos.
+      - name: cargo check (kitty-memory --features embedding)
+        run: cargo check -p kitty-memory --features embedding
+      - name: cargo check (kitty-cli --features tui)
+        run: cargo check -p kitty-cli --features tui
 
   clippy:
     name: clippy
@@ -49,12 +55,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
       - name: Install Rust toolchain (rustup, no archived actions)
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
-      - uses: Swatinem/rust-cache@v2 # M4-TODO: pin SHA
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: "mono-cpu"
       # Fase 5.2 strict gate, scoped to kitty-* (green, proven): engine/ carries
@@ -81,7 +87,7 @@ jobs:
       CC: gcc-14
       CXX: g++-14
     steps:
-      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
       - name: Install Rust 1.98.0
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.0 --profile minimal
@@ -93,12 +99,12 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends gcc-14 g++-14 curl ca-certificates patch
-      - uses: Swatinem/rust-cache@v2 # M4-TODO: pin SHA
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: "mono-cuda"
       # cudaforge kernel cache (cutile/cuda kernel artifacts live outside
-      # target/). Tag-pinned like rust-cache above.
-      - uses: actions/cache@v4 # M4-TODO: pin SHA
+      # target/), SHA-pinned.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cudaforge
           key: cudaforge-12.9-${{ hashFiles('Cargo.lock') }}
@@ -136,7 +142,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
       - name: Install Rust toolchain (rustup, no archived actions)
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
@@ -152,7 +158,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
       - uses: EmbarkStudios/cargo-deny-action@1ad33e49304de844c2c6cc106246e37cb1c21dc4e # v2.0.5
         with:
           command: check
@@ -163,7 +169,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
       - name: Install Rust toolchain (rustup, no archived actions)
         run: |
           rustup toolchain install stable --profile minimal
@@ -184,7 +190,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
       - name: Install Rust toolchain (rustup, no archived actions)
         run: |
           rustup toolchain install stable --profile minimal
@@ -208,7 +214,7 @@ jobs:
     # Weekly sweep via the workflow-level `schedule` trigger; also runs on
     # every PR (audit is cheap and stricter than the spec minimum).
     steps:
-      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
       - name: Install Rust toolchain (rustup, no archived actions)
         run: |
           rustup toolchain install stable --profile minimal
@@ -217,3 +223,16 @@ jobs:
         run: cargo install --locked cargo-audit
       - name: cargo audit
         run: cargo audit
+
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          fetch-depth: 0
+      # PENDING: el tag v8.30.1 no existe en gitleaks/gitleaks-action (tags
+      # reales: v2.x/v3.x); pineado a v3.0.0 con SHA verificado por red.
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0

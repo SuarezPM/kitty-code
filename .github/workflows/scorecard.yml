@@ -20,7 +20,7 @@ jobs:
       id-token: write
       actions: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b02b8e763ed2bdc05d6d33f3bb19 # v4.1.7
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
         with:
           persist-credentials: false
       - uses: ossf/scorecard-action@05b42c6244331c54d2a233bba1c88c6d9970e45e8 # v2.4.1

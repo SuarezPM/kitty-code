@@ -84,6 +84,12 @@ To verify a downloaded asset (example: the `kitty-cli` binary with its
 Both commands must succeed. If either fails, do not run the binary — please
 report it through the private channels above.
 
+## Embedded serving bind scope
+
+El serving embebido default-abierto es loopback-only por diseño
+(`engine/mistralrs-core/src/serving/api.rs:219`, `check_auth` sin token
+configurado): no exponer sin auth + rate-limit + bind 127.0.0.1.
+
 ## Credit
 
 We believe in giving credit to security researchers. With your permission, we will publicly acknowledge your contribution in the advisory, release notes, and in this repository. If you prefer to remain anonymous, we will respect that choice.

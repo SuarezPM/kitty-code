@@ -48,17 +48,15 @@ pub const DEFAULT_OPENAI_COMPAT_BASE_URL: &str = "http://127.0.0.1:30000";
 /// Tool-call names must be identifier-shaped and bounded: anything else is
 /// dropped before it reaches the harness (anti prompt-injection via server).
 fn is_safe_tool_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && {
-            let mut chars = name.chars();
-            match chars.next() {
-                Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-                }
-                _ => false,
+    !name.is_empty() && name.len() <= 64 && {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
             }
+            _ => false,
         }
+    }
 }
 
 /// OpenAI-style chat message as sent on the wire.
@@ -223,9 +221,7 @@ impl OpenAiCompatClient {
                     // the fallback for results that predate the field.
                     let id = match m.tool_call_id.clone() {
                         Some(explicit) => {
-                            if let Some(pos) =
-                                pending_ids.iter().position(|p| p == &explicit)
-                            {
+                            if let Some(pos) = pending_ids.iter().position(|p| p == &explicit) {
                                 pending_ids.remove(pos);
                             }
                             explicit
@@ -310,9 +306,9 @@ impl OpenAiCompatClient {
         let extra_body = if thinking_off {
             None
         } else {
-            self.reasoning_effort.clone().map(|effort| {
-                serde_json::json!({ "reasoning_effort": effort })
-            })
+            self.reasoning_effort
+                .clone()
+                .map(|effort| serde_json::json!({ "reasoning_effort": effort }))
         };
         CompatChatRequest {
             model: model.to_string(),
@@ -337,10 +333,7 @@ impl OpenAiCompatClient {
         let msg = choice.message;
         let content = match msg.content {
             Some(serde_json::Value::String(s)) => Some(s),
-            Some(other) => Some(
-                serde_json::to_string(&other)
-                    .unwrap_or_default(),
-            ),
+            Some(other) => Some(serde_json::to_string(&other).unwrap_or_default()),
             None => None,
         };
         let mut tool_calls = Vec::new();
@@ -633,10 +626,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn chat_with_options_forwards_recipe() {
-        let server = mock_chat_server(chat_response_body("ok", None, serde_json::json!([]), 5))
-            .await;
-        let client = OpenAiCompatClient::with_base_url(server.uri())
-            .with_reasoning_effort("high");
+        let server =
+            mock_chat_server(chat_response_body("ok", None, serde_json::json!([]), 5)).await;
+        let client = OpenAiCompatClient::with_base_url(server.uri()).with_reasoning_effort("high");
         let options = RequestOptions {
             temperature: Some(1.0),
             top_p: Some(0.95),
@@ -659,10 +651,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn think_false_drops_reasoning_effort() {
-        let server = mock_chat_server(chat_response_body("ok", None, serde_json::json!([]), 5))
-            .await;
-        let client = OpenAiCompatClient::with_base_url(server.uri())
-            .with_reasoning_effort("high");
+        let server =
+            mock_chat_server(chat_response_body("ok", None, serde_json::json!([]), 5)).await;
+        let client = OpenAiCompatClient::with_base_url(server.uri()).with_reasoning_effort("high");
         let options = RequestOptions {
             think: Some(false),
             ..Default::default()

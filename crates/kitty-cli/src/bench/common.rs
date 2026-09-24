@@ -7,11 +7,11 @@
 use anyhow::{Context, Result};
 use kitty_harness::config::ENV_BENCH_TIMEOUT_SECS;
 use kitty_harness::ModelProfile;
+#[cfg(feature = "kitty-infer")]
+use kitty_runtime::KittyInferClient;
 use kitty_runtime::{
     client::RequestOptions, ChatClient, ChatResponse, Message, OllamaClient, ToolDefinition,
 };
-#[cfg(feature = "kitty-infer")]
-use kitty_runtime::KittyInferClient;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -401,8 +401,8 @@ pub(crate) struct TimeoutEntry {
     pub(crate) origin: String,
 }
 
-/// Embedded `timeouts.json`: `models[model][backend]` > `backends[backend]`
-/// > `default_secs`. Unknown keys fall through; a zero `secs` (or zero
+/// Embedded `timeouts.json`: `models[model][backend]` takes precedence over
+/// `backends[backend]`, then `default_secs`. Unknown keys fall through; a zero `secs` (or zero
 /// `default_secs`) normalizes to [`DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS`].
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub(crate) struct TimeoutManifest {
@@ -411,7 +411,8 @@ pub(crate) struct TimeoutManifest {
     #[serde(default)]
     pub(crate) backends: std::collections::HashMap<String, TimeoutEntry>,
     #[serde(default)]
-    pub(crate) models: std::collections::HashMap<String, std::collections::HashMap<String, TimeoutEntry>>,
+    pub(crate) models:
+        std::collections::HashMap<String, std::collections::HashMap<String, TimeoutEntry>>,
 }
 
 const EMBEDDED_TIMEOUT_MANIFEST: &str = include_str!("timeouts.json");
@@ -777,8 +778,8 @@ mod small_model_gate_tests {
 #[cfg(test)]
 mod timeout_manifest_tests {
     use super::{
-        load_timeout_manifest, resolve_bench_timeout_secs, timeout_for_manifest,
-        TimeoutManifest, DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS,
+        load_timeout_manifest, resolve_bench_timeout_secs, timeout_for_manifest, TimeoutManifest,
+        DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS,
     };
 
     #[test]

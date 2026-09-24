@@ -324,14 +324,16 @@ async fn main() -> Result<()> {
     // F2 embedded backend: KITTY_BACKEND=kitty-infer selects the in-process
     // kitty-infer GGUF client (KITTY_INFER_MODEL=<path.gguf>). Default (unset
     // or any other value) keeps the Ollama path byte-for-byte as before.
-    let use_infer = kitty_runtime::backend_selected(
-        std::env::var(kitty_runtime::ENV_BACKEND).ok().as_deref(),
-    );
+    let use_infer =
+        kitty_runtime::backend_selected(std::env::var(kitty_runtime::ENV_BACKEND).ok().as_deref());
     if use_infer {
         info!("backend=kitty-infer (embedded GGUF)");
     }
-    let ollama_client: Option<OllamaClient> =
-        if use_infer { None } else { Some(OllamaClient::new(&cli.url)) };
+    let ollama_client: Option<OllamaClient> = if use_infer {
+        None
+    } else {
+        Some(OllamaClient::new(&cli.url))
+    };
 
     // f8 T2.2: resolve the session context window ONCE per process, BEFORE
     // any Agent/client construction, shared by Run/Bench/BenchAb. The value
