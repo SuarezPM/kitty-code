@@ -68,6 +68,52 @@ impl GrammarConfig {
         )
     }
 
+    /// JSON-Schema mask for llguidance decode-time enforcement (W3/T3.1).
+    ///
+    /// Canonical flat shape `{"name": <enum>, "arguments": <anyOf per-tool>}`.
+    /// Semantics mirror [`Self::validate`]: `name` must be a known tool and
+    /// `arguments` must satisfy at least one tool branch (each branch carries
+    /// that tool's own `required`, so parity holds when the caller routes by
+    /// name — cross-branch satisfaction is the documented spike looseness).
+    /// Only widely-supported keywords (`type`/`properties`/`required`/`enum`/
+    /// `anyOf`) so llguidance `TopLevelGrammar::from_json_schema` accepts it
+    /// (floor manifest 1.2.0, lock resuelto 1.8.0). Applied via
+    /// `RequestBuilder::set_constraint` in `kitty_infer::to_request`;
+    /// [`GrammarClient`] stays as fallback-compat.
+    /// Caveat: no measured decode-time A/B backs this mask here —
+    /// `bench_grammar_ab_k3` stays ignored without a local GGUF and
+    /// `bench_results.json` tracks the polyglot suite only.
+    pub fn to_json_schema(&self) -> serde_json::Value {
+        if self.tool_schemas.is_empty() {
+            return serde_json::json!({"type": "null"});
+        }
+        let names: Vec<&str> = self
+            .tool_schemas
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        let branches: Vec<serde_json::Value> = self
+            .tool_schemas
+            .iter()
+            .map(|t| {
+                if t.function.parameters.is_object() {
+                    t.function.parameters.clone()
+                } else {
+                    serde_json::json!({"type": "object"})
+                }
+            })
+            .collect();
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"enum": names},
+                "arguments": {"anyOf": branches}
+            },
+            "required": ["name", "arguments"],
+            "additionalProperties": false
+        })
+    }
+
     /// Validate that `json` represents a tool-call matching one of the schemas.
     ///
     /// Expected shape: `{{"name": "<tool>", "arguments": {{ ... }} }}` or
@@ -153,16 +199,6 @@ impl<C: ChatClient> GrammarClient<C> {
     /// Create a new grammar-constrained client.
     pub fn new(inner: C, grammar: GrammarConfig) -> Self {
         Self { inner, grammar }
-    }
-
-    /// Access the grammar config.
-    pub fn grammar(&self) -> &GrammarConfig {
-        &self.grammar
-    }
-
-    /// Access the inner client.
-    pub fn inner(&self) -> &C {
-        &self.inner
     }
 
     /// Post-hoc GBNF validation of a response's tool_calls (strict mode only;
@@ -519,5 +555,112 @@ mod tests {
         let calls = out.message.tool_calls.expect("valid call must survive");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "Write");
+    }
+
+    #[test]
+    fn to_json_schema_empty_is_null() {
+        let cfg = GrammarConfig::new(vec![], true);
+        assert_eq!(cfg.to_json_schema(), serde_json::json!({"type": "null"}));
+    }
+
+    #[test]
+    fn to_json_schema_shape_has_name_enum_and_required() {
+        let cfg = GrammarConfig::from_tools(sample_tools());
+        let s = cfg.to_json_schema();
+        let names: Vec<&str> = s["properties"]["name"]["enum"]
+            .as_array()
+            .expect("name.enum must be an array")
+            .iter()
+            .map(|v| v.as_str().expect("enum entries are strings"))
+            .collect();
+        assert_eq!(names, vec!["Read", "Write"]);
+        assert_eq!(s["required"], serde_json::json!(["name", "arguments"]));
+        assert_eq!(
+            s["properties"]["arguments"]["anyOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// Offline mask check (no TokEnv without a model): a test-only evaluator
+    /// over our known mask shape must AGREE with `validate` on the full
+    /// fixture matrix — schemas→mask→accept/reject.
+    #[test]
+    fn json_schema_mask_agrees_with_validate() {
+        fn mask_accepts(cfg: &GrammarConfig, schema: &serde_json::Value, json: &str) -> bool {
+            let v: serde_json::Value = match serde_json::from_str(json) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let obj = match v.as_object() {
+                Some(o) => o,
+                None => return false,
+            };
+            let name = match obj.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return false,
+            };
+            let args = match obj.get("arguments") {
+                Some(a) if a.is_object() => a,
+                _ => return false,
+            };
+            let in_enum = schema["properties"]["name"]["enum"]
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|e| e.as_str() == Some(name)));
+            if !in_enum {
+                return false;
+            }
+            // Parity with validate(): the NAMED tool's own branch (positional =
+            // tool order, same source as the mask) must have `required`
+            // satisfied. Cross-branch satisfaction is the documented spike
+            // looseness and is NOT granted here.
+            let required_ok = cfg
+                .tool_schemas
+                .iter()
+                .find(|t| t.function.name == name)
+                .is_some_and(|def| {
+                    def.function
+                        .parameters
+                        .get("required")
+                        .and_then(|r| r.as_array())
+                        .is_none_or(|req| {
+                            req.iter()
+                                .all(|f| f.as_str().is_some_and(|k| args.get(k).is_some()))
+                        })
+                });
+            in_enum && required_ok
+        }
+
+        let cfg = GrammarConfig::from_tools(sample_tools());
+        let schema = cfg.to_json_schema();
+        // NOTE: nested `{"function": ...}` shape is post-hoc-only (validate
+        // accepts it); the decode-time mask emits the canonical flat shape.
+        let cases = [
+            (
+                r#"{"name": "Read", "arguments": {"path": "/tmp/foo.rs"}}"#,
+                true,
+            ),
+            (
+                r#"{"name": "Write", "arguments": {"path": "/tmp/x", "content": "hi"}}"#,
+                true,
+            ),
+            (
+                r#"{"name": "NotATool", "arguments": {"path": "/tmp/x"}}"#,
+                false,
+            ),
+            (r#"{"name": "Read", "arguments": {}}"#, false),
+            (
+                r#"{"name": "Write", "arguments": {"path": "/tmp/x"}}"#,
+                false,
+            ),
+            (r#"not json"#, false),
+            (r#"{"name": "Read"}"#, false),
+        ];
+        for (json, expected) in cases {
+            assert_eq!(cfg.validate(json), expected, "validate({json})");
+            assert_eq!(mask_accepts(&cfg, &schema, json), expected, "mask({json})");
+        }
     }
 }

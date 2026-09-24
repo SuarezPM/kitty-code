@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 /// An episode stored in memory.
+///
+/// `importance` (T6.2, 3-factor scoring) is in-memory only with serde default
+/// 0.0: old rows and old DBs read back as neutral without any migration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {
     pub id: String,
@@ -15,6 +18,8 @@ pub struct Episode {
     pub outcome: String,
     pub hash: String,
     pub timestamp: i64,
+    #[serde(default)]
+    pub importance: f32,
 }
 
 impl Episode {
@@ -50,6 +55,7 @@ impl Episode {
             outcome,
             hash,
             timestamp,
+            importance: 0.0,
         }
     }
 }
@@ -263,6 +269,12 @@ impl EpisodeStore {
             CREATE INDEX IF NOT EXISTS idx_episodes_ts ON episodes(timestamp DESC);",
         )?;
         let _ = conn.execute("ALTER TABLE episodes ADD COLUMN embedding BLOB", []);
+        // T6.2: importance as REAL with DEFAULT 0.0 — existing rows read as
+        // neutral, no data migration. Errors ignored like the column above.
+        let _ = conn.execute(
+            "ALTER TABLE episodes ADD COLUMN importance REAL DEFAULT 0.0",
+            [],
+        );
         Ok(Self {
             conn,
             bm25_cache: std::cell::RefCell::new(None),
@@ -272,8 +284,8 @@ impl EpisodeStore {
     /// Save an episode (insert or replace).
     pub fn save(&self, episode: &Episode) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO episodes (id, goal, files_touched, test_verdict, outcome, hash, timestamp)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO episodes (id, goal, files_touched, test_verdict, outcome, hash, timestamp, importance)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 episode.id,
                 episode.goal,
@@ -282,6 +294,7 @@ impl EpisodeStore {
                 episode.outcome,
                 episode.hash,
                 episode.timestamp,
+                episode.importance as f64,
             ],
         )?;
         self.bm25_cache.borrow_mut().take();
@@ -291,13 +304,15 @@ impl EpisodeStore {
     /// Recall the N most recent episodes.
     pub fn recall_recent(&self, limit: usize) -> Result<Vec<Episode>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, goal, files_touched, test_verdict, outcome, hash, timestamp
+            "SELECT id, goal, files_touched, test_verdict, outcome, hash, timestamp, importance
               FROM episodes
               ORDER BY timestamp DESC
               LIMIT ?1",
         )?;
         let episodes = stmt
             .query_map(rusqlite::params![limit as i64], |row| {
+                // Tolerant read: pre-T6.2 DBs (or a missing column) yield 0.0.
+                let importance: f64 = row.get::<_, Option<f64>>(7).ok().flatten().unwrap_or(0.0);
                 Ok(Episode {
                     id: row.get(0)?,
                     goal: row.get(1)?,
@@ -307,6 +322,7 @@ impl EpisodeStore {
                     outcome: row.get(4)?,
                     hash: row.get(5)?,
                     timestamp: row.get(6)?,
+                    importance: importance as f32,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -412,6 +428,7 @@ mod bm25_cache_tests {
             outcome: "pass".into(),
             hash: "h".into(),
             timestamp: ts,
+            importance: 0.0,
         }
     }
 
@@ -460,6 +477,202 @@ pub fn reciprocal_rank_fusion_k60(
     rankings: &[Vec<String>],
 ) -> std::collections::HashMap<String, f32> {
     reciprocal_rank_fusion(rankings, RRF_K)
+}
+
+// ---------------------------------------------------------------------------
+// T6.1: parametrized fusion over the existing RRF (reenfocar, no reconstruir)
+// ---------------------------------------------------------------------------
+
+/// Channel rankings with raw scores: `(channel, [(doc_id, raw_score)])`
+/// ordered best-first per channel. Raw scores feed stage-2; id order feeds
+/// RRF fusion.
+pub type ChannelRankings = Vec<(FuseChannel, Vec<(String, f32)>)>;
+
+/// Retrieval channel feeding the fusion. Sparse (BGE-M3) is HELD: it needs a
+/// multi-GB model download plus a sparse-vector storage schema, neither
+/// available offline — the weight plumbing below already admits it when a
+/// third channel lands (no fusion rewrite then).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuseChannel {
+    Lexical,
+    Dense,
+}
+
+/// Fusion knobs (plan `RrfParams{k=60, alpha, N=100}`).
+/// - `k`: RRF smoothing constant (existing `RRF_K`).
+/// - `alpha`: dense-channel weight in [0,1] (lexical gets `1-alpha`).
+///   `0.5` reproduces the legacy equal-weight sum exactly.
+/// - `n`: candidate window pulled before fusion (legacy path uses 50).
+#[derive(Debug, Clone, Copy)]
+pub struct RrfParams {
+    pub k: f32,
+    pub alpha: f32,
+    pub n: usize,
+}
+
+impl Default for RrfParams {
+    fn default() -> Self {
+        Self {
+            k: RRF_K,
+            alpha: 0.5,
+            n: 100,
+        }
+    }
+}
+
+fn channel_weight(channel: FuseChannel, alpha: f32) -> f32 {
+    let a = alpha.clamp(0.0, 1.0);
+    match channel {
+        FuseChannel::Lexical => 1.0 - a,
+        FuseChannel::Dense => a,
+    }
+}
+
+/// Channel-weighted RRF: same `1/(k+rank+1)` summands as
+/// [`reciprocal_rank_fusion`], scaled by channel weight. With `alpha = 0.5`
+/// the output equals the legacy unweighted sum.
+pub fn fuse_rankings_weighted(
+    rankings: &[(FuseChannel, Vec<String>)],
+    params: &RrfParams,
+) -> std::collections::HashMap<String, f32> {
+    let mut fused: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for (channel, ranking) in rankings {
+        let w = channel_weight(*channel, params.alpha);
+        if w <= 0.0 {
+            continue;
+        }
+        for (rank, id) in ranking.iter().enumerate() {
+            let score = w / (params.k + rank as f32 + 1.0);
+            *fused.entry(id.clone()).or_insert(0.0) += score;
+        }
+    }
+    fused
+}
+
+// ---------------------------------------------------------------------------
+// T6.2: 3-factor scoring (recency + relevance + importance)
+// ---------------------------------------------------------------------------
+
+/// Half-life for recency decay: a week-old episode scores half of "now".
+pub const RECENCY_HALF_LIFE_SECS: f64 = 7.0 * 24.0 * 3600.0;
+
+/// Blend weights for [`three_factor_score`]. Default puts relevance first;
+/// recency breaks ties, importance (operator-set, 0..1) breaks the rest.
+#[derive(Debug, Clone, Copy)]
+pub struct ScoringWeights {
+    pub w_recency: f32,
+    pub w_relevance: f32,
+    pub w_importance: f32,
+}
+
+impl Default for ScoringWeights {
+    fn default() -> Self {
+        Self {
+            w_recency: 0.2,
+            w_relevance: 0.6,
+            w_importance: 0.2,
+        }
+    }
+}
+
+/// Exponential recency in [0,1]: 1.0 at/after `now`, half per half-life back.
+pub fn recency_score(timestamp: i64, now: i64, half_life_secs: f64) -> f32 {
+    if timestamp >= now || half_life_secs <= 0.0 {
+        return 1.0;
+    }
+    let age = (now - timestamp) as f64;
+    0.5_f64.powf(age / half_life_secs) as f32
+}
+
+/// Linear 3-factor blend. All inputs are [0,1]; weights need not sum to 1
+/// (relative proportions decide).
+pub fn three_factor_score(
+    recency: f32,
+    relevance: f32,
+    importance: f32,
+    weights: &ScoringWeights,
+) -> f32 {
+    weights.w_recency * recency.clamp(0.0, 1.0)
+        + weights.w_relevance * relevance.clamp(0.0, 1.0)
+        + weights.w_importance * importance.clamp(0.0, 1.0)
+}
+
+// ---------------------------------------------------------------------------
+// Stage-2 rerank (offline): exact-phrase boost over fused top candidates.
+// Neural cross-encoder rerank (`fastembed::TextRerank`) is HELD-network — it
+// needs a model download, so the second stage stays a pure, testable
+// re-score until a vendored reranker exists.
+// ---------------------------------------------------------------------------
+
+/// Multiplicative boost when the episode goal contains the whole query
+/// (case-insensitive). Pure and offline.
+pub fn phrase_boost(query: &str, goal: &str, boost: f32) -> f32 {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return 1.0;
+    }
+    if goal.to_lowercase().contains(&q) {
+        1.0 + boost.max(0.0)
+    } else {
+        1.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T6.3: offline IR metrics over ranked id lists (binary relevance).
+// ---------------------------------------------------------------------------
+
+/// Fraction of relevant ids present in the first `k` ranks. 1.0 when
+/// `relevant` is empty (nothing to miss).
+pub fn recall_at_k(
+    ranked: &[String],
+    relevant: &std::collections::HashSet<String>,
+    k: usize,
+) -> f32 {
+    if relevant.is_empty() || k == 0 {
+        return 1.0;
+    }
+    let hits = ranked
+        .iter()
+        .take(k)
+        .filter(|id| relevant.contains(*id))
+        .count();
+    hits as f32 / relevant.len() as f32
+}
+
+/// Reciprocal rank of the first relevant hit (0.0 when absent). Averaged over
+/// queries it is the MRR.
+pub fn reciprocal_rank(ranked: &[String], relevant: &std::collections::HashSet<String>) -> f32 {
+    for (i, id) in ranked.iter().enumerate() {
+        if relevant.contains(id) {
+            return 1.0 / (i as f32 + 1.0);
+        }
+    }
+    0.0
+}
+
+/// Binary nDCG@k: DCG = Σ 1/log2(rank+1) over relevant hits, normalized by
+/// the ideal ranking (all relevant first).
+pub fn ndcg_at_k(ranked: &[String], relevant: &std::collections::HashSet<String>, k: usize) -> f32 {
+    if relevant.is_empty() || k == 0 {
+        return 1.0;
+    }
+    let dcg: f32 = ranked
+        .iter()
+        .take(k)
+        .enumerate()
+        .filter(|(_, id)| relevant.contains(*id))
+        .map(|(i, _)| 1.0 / ((i as f32 + 2.0).log2()))
+        .sum();
+    let ideal_hits = relevant.len().min(k);
+    let idcg: f32 = (0..ideal_hits)
+        .map(|i| 1.0 / ((i as f32 + 2.0).log2()))
+        .sum();
+    if idcg <= 0.0 {
+        0.0
+    } else {
+        dcg / idcg
+    }
 }
 
 pub fn encode_embedding(v: &[f32]) -> Vec<u8> {
@@ -518,7 +731,7 @@ impl EpisodeStore {
         self.ensure_embedding_column()?;
         let blob = encode_embedding(embedding);
         self.conn.execute(
-            "INSERT OR REPLACE INTO episodes (id, goal, files_touched, test_verdict, outcome, hash, timestamp, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO episodes (id, goal, files_touched, test_verdict, outcome, hash, timestamp, embedding, importance) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 episode.id,
                 episode.goal,
@@ -528,6 +741,7 @@ impl EpisodeStore {
                 episode.hash,
                 episode.timestamp,
                 blob,
+                episode.importance as f64,
             ],
         )?;
         Ok(())
@@ -701,6 +915,238 @@ impl EpisodeStore {
             }
         }
         Ok(out)
+    }
+
+    /// Shared channel-ranking builder (T6.1): BM25 lexical + dense cosine
+    /// over the given candidates, with RAW channel scores attached.
+    /// `recall_hybrid` keeps its inline copy frozen; the parametrized paths
+    /// below build on this helper. Raw scores (not RRF ranks) feed stage-2
+    /// relevance: RRF `1/(k+rank+1)` compresses magnitudes (~1.6%/rank at
+    /// k=60), which would let recency dominate the blend.
+    fn build_channel_rankings(
+        &self,
+        candidates: &[Episode],
+        goal: &str,
+        query_embedding: Option<&[f32]>,
+    ) -> Result<ChannelRankings> {
+        let mut rankings: Vec<(FuseChannel, Vec<(String, f32)>)> = Vec::new();
+        let query_tokens = tokenize(goal);
+        if !query_tokens.is_empty() {
+            let doc_tokens: Vec<Vec<String>> =
+                candidates.iter().map(|ep| tokenize(&ep.goal)).collect();
+            let index = Bm25Index::new(&doc_tokens);
+            let mut bm25_scored: Vec<(f32, usize)> = candidates
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| (index.score(&query_tokens, idx), idx))
+                .filter(|(s, _)| *s > 0.0)
+                .collect();
+            bm25_scored.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(candidates[b.1].timestamp.cmp(&candidates[a.1].timestamp))
+            });
+            if !bm25_scored.is_empty() {
+                rankings.push((
+                    FuseChannel::Lexical,
+                    bm25_scored
+                        .into_iter()
+                        .map(|(s, idx)| (candidates[idx].id.clone(), s))
+                        .collect(),
+                ));
+            }
+        }
+        if let Some(qemb) = query_embedding {
+            self.ensure_embedding_column()?;
+            let mut dense_scored: Vec<(f32, String)> = Vec::new();
+            for ep in candidates {
+                if let Ok(Some(emb)) = self.get_embedding(&ep.id) {
+                    if emb.len() != qemb.len() {
+                        continue;
+                    }
+                    let s = cosine_similarity(qemb, &emb);
+                    if s.is_finite() && s > 0.0 {
+                        dense_scored.push((s, ep.id.clone()));
+                    }
+                }
+            }
+            dense_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            if !dense_scored.is_empty() {
+                rankings.push((
+                    FuseChannel::Dense,
+                    dense_scored.into_iter().map(|(s, id)| (id, s)).collect(),
+                ));
+            }
+        }
+        Ok(rankings)
+    }
+
+    /// Min-max normalize raw channel scores over the fused candidate set.
+    /// All-equal (or empty) maps to 1.0: no discrimination, no distortion.
+    fn normalize_channel(
+        raws: &[(String, f32)],
+        fused_ids: &std::collections::HashSet<String>,
+    ) -> std::collections::HashMap<String, f32> {
+        let vals: Vec<f32> = raws
+            .iter()
+            .filter(|(id, _)| fused_ids.contains(id))
+            .map(|(_, s)| *s)
+            .collect();
+        let (Some(&min), Some(&max)) = (
+            vals.iter().min_by(|a, b| a.partial_cmp(b).unwrap()),
+            vals.iter().max_by(|a, b| a.partial_cmp(b).unwrap()),
+        ) else {
+            return std::collections::HashMap::new();
+        };
+        let span = max - min;
+        raws.iter()
+            .filter(|(id, _)| fused_ids.contains(id))
+            .map(|(id, s)| {
+                let n = if span <= f32::EPSILON {
+                    1.0
+                } else {
+                    (s - min) / span
+                };
+                (id.clone(), n)
+            })
+            .collect()
+    }
+
+    fn fill_recent(
+        &self,
+        mut out: Vec<Episode>,
+        candidates: &[Episode],
+        limit: usize,
+    ) -> Vec<Episode> {
+        if out.len() < limit {
+            for ep in candidates {
+                if out.iter().any(|e| e.id == ep.id) {
+                    continue;
+                }
+                out.push(ep.clone());
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Hybrid recall with [`RrfParams`]: `n`-sized window + channel-weighted
+    /// fusion. With default params and `n = 50` it matches `recall_hybrid`.
+    pub fn recall_hybrid_params(
+        &self,
+        goal: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+        params: &RrfParams,
+    ) -> Result<Vec<Episode>> {
+        let candidates = self.recall_recent(params.n.max(1))?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rankings = self.build_channel_rankings(&candidates, goal, query_embedding)?;
+        if rankings.is_empty() {
+            return Ok(candidates.into_iter().take(limit).collect());
+        }
+        // Fusion works on id order; raw scores stay attached for stage-2.
+        let id_rankings: Vec<(FuseChannel, Vec<String>)> = rankings
+            .iter()
+            .map(|(ch, scored)| (*ch, scored.iter().map(|(id, _)| id.clone()).collect()))
+            .collect();
+        if id_rankings.len() == 1 {
+            let rank = &id_rankings[0].1;
+            let map: std::collections::HashMap<String, &Episode> =
+                candidates.iter().map(|ep| (ep.id.clone(), ep)).collect();
+            let mut out: Vec<Episode> = Vec::new();
+            for id in rank.iter().take(limit) {
+                if let Some(ep) = map.get(id) {
+                    out.push((*ep).clone());
+                }
+            }
+            return Ok(self.fill_recent(out, &candidates, limit));
+        }
+        let fused = fuse_rankings_weighted(&id_rankings, params);
+        let mut with_ts: Vec<(&Episode, f32)> = candidates
+            .iter()
+            .filter_map(|ep| fused.get(&ep.id).map(|s| (ep, *s)))
+            .collect();
+        with_ts.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.0.timestamp.cmp(&a.0.timestamp))
+        });
+        let out: Vec<Episode> = with_ts
+            .into_iter()
+            .take(limit)
+            .map(|(ep, _)| ep.clone())
+            .collect();
+        Ok(self.fill_recent(out, &candidates, limit))
+    }
+
+    /// Ranked recall (T6.2): stage-1 weighted fusion, then stage-2 rescoring
+    /// with 3-factor blend + exact-phrase boost. `now` is a parameter so the
+    /// recency term stays pure and testable.
+    pub fn recall_hybrid_ranked(
+        &self,
+        goal: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+        params: &RrfParams,
+        weights: &ScoringWeights,
+        now: i64,
+    ) -> Result<Vec<Episode>> {
+        let candidates = self.recall_recent(params.n.max(1))?;
+        if candidates.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rankings = self.build_channel_rankings(&candidates, goal, query_embedding)?;
+        if rankings.is_empty() {
+            return Ok(candidates.into_iter().take(limit).collect());
+        }
+        let id_rankings: Vec<(FuseChannel, Vec<String>)> = rankings
+            .iter()
+            .map(|(ch, scored)| (*ch, scored.iter().map(|(id, _)| id.clone()).collect()))
+            .collect();
+        let fused = fuse_rankings_weighted(&id_rankings, params);
+        // Stage-2 relevance from RAW channel scores (best channel wins), NOT
+        // from RRF ranks — see the helper comment for why ranks mislead here.
+        let fused_ids: std::collections::HashSet<String> = fused.keys().cloned().collect();
+        let mut relevance: std::collections::HashMap<String, f32> =
+            std::collections::HashMap::new();
+        for (channel, scored) in &rankings {
+            let _ = channel;
+            for (id, n) in Self::normalize_channel(scored, &fused_ids) {
+                let e = relevance.entry(id).or_insert(0.0);
+                if n > *e {
+                    *e = n;
+                }
+            }
+        }
+        let mut rescored: Vec<(f32, &Episode)> = candidates
+            .iter()
+            .filter_map(|ep| {
+                let rel = relevance.get(&ep.id).copied().unwrap_or(0.0);
+                if rel <= 0.0 {
+                    return None;
+                }
+                let recency = recency_score(ep.timestamp, now, RECENCY_HALF_LIFE_SECS);
+                let s = three_factor_score(recency, rel, ep.importance, weights)
+                    * phrase_boost(goal, &ep.goal, 0.5);
+                Some((s, ep))
+            })
+            .collect();
+        rescored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.1.timestamp.cmp(&a.1.timestamp))
+        });
+        let out: Vec<Episode> = rescored
+            .into_iter()
+            .take(limit)
+            .map(|(_, ep)| ep.clone())
+            .collect();
+        Ok(self.fill_recent(out, &candidates, limit))
     }
 }
 
@@ -980,5 +1426,260 @@ mod tests {
             .build();
         let q_emb = embedder.embed("bash");
         assert!(!q_emb.is_empty());
+    }
+
+    // ── T6.1: parametrized fusion ─────────────────────────────────────────
+
+    #[test]
+    fn rrf_params_default_matches_legacy() {
+        let p = RrfParams::default();
+        assert_eq!(p.k, RRF_K);
+        assert_eq!(p.alpha, 0.5);
+        assert_eq!(p.n, 100);
+    }
+
+    #[test]
+    fn weighted_fusion_alpha_half_equals_legacy_sum() {
+        let rankings = vec![
+            (FuseChannel::Lexical, vec!["a".into(), "b".into()]),
+            (FuseChannel::Dense, vec!["b".into(), "a".into()]),
+        ];
+        let legacy = reciprocal_rank_fusion(&[rankings[0].1.clone(), rankings[1].1.clone()], RRF_K);
+        let weighted = fuse_rankings_weighted(&rankings, &RrfParams::default());
+        // alpha=0.5 halves each channel: ratios (hence order) are preserved.
+        for id in ["a", "b"] {
+            let l = legacy[id] / 2.0;
+            let w = weighted[id];
+            assert!((l - w).abs() < 1e-6, "{id}: {l} vs {w}");
+        }
+    }
+
+    #[test]
+    fn fusion_k_alternative_changes_scores() {
+        // Plan explicitly wants k alternatives 10-20 exercised.
+        let rankings = vec![(FuseChannel::Lexical, vec!["a".into(), "b".into()])];
+        let s10 = fuse_rankings_weighted(
+            &rankings,
+            &RrfParams {
+                k: 10.0,
+                ..RrfParams::default()
+            },
+        );
+        let s20 = fuse_rankings_weighted(
+            &rankings,
+            &RrfParams {
+                k: 20.0,
+                ..RrfParams::default()
+            },
+        );
+        assert!(s10["a"] > s20["a"], "smaller k concentrates top ranks");
+        // Order preserved across k (RRF is rank-monotone).
+        assert!(s10["a"] > s10["b"] && s20["a"] > s20["b"]);
+    }
+
+    #[test]
+    fn fusion_alpha_extremes_isolate_channels() {
+        let rankings = vec![
+            (FuseChannel::Lexical, vec!["lex".into()]),
+            (FuseChannel::Dense, vec!["dense".into()]),
+        ];
+        let lex_only = fuse_rankings_weighted(
+            &rankings,
+            &RrfParams {
+                alpha: 0.0,
+                ..RrfParams::default()
+            },
+        );
+        assert!(lex_only.contains_key("lex"));
+        assert!(!lex_only.contains_key("dense"));
+        let dense_only = fuse_rankings_weighted(
+            &rankings,
+            &RrfParams {
+                alpha: 1.0,
+                ..RrfParams::default()
+            },
+        );
+        assert!(dense_only.contains_key("dense"));
+        assert!(!dense_only.contains_key("lex"));
+    }
+
+    // ── T6.2: 3-factor scoring ────────────────────────────────────────────
+
+    #[test]
+    fn recency_decay_half_life() {
+        let now = 1_000_000;
+        assert_eq!(recency_score(now, now, RECENCY_HALF_LIFE_SECS), 1.0);
+        assert_eq!(recency_score(now + 50, now, RECENCY_HALF_LIFE_SECS), 1.0);
+        let half = recency_score(
+            (now as f64 - RECENCY_HALF_LIFE_SECS) as i64,
+            now,
+            RECENCY_HALF_LIFE_SECS,
+        );
+        assert!(
+            (half - 0.5).abs() < 1e-6,
+            "one half-life back = 0.5, got {half}"
+        );
+        let older = recency_score(now - 10_000_000_000, now, RECENCY_HALF_LIFE_SECS);
+        assert!(older < half && older >= 0.0);
+    }
+
+    #[test]
+    fn three_factor_relevance_dominates_by_default() {
+        let w = ScoringWeights::default();
+        // High relevance + stale beats fresh irrelevance under default weights.
+        let relevant = three_factor_score(0.0, 1.0, 0.0, &w);
+        let fresh = three_factor_score(1.0, 0.0, 0.0, &w);
+        assert!(relevant > fresh);
+    }
+
+    #[test]
+    fn three_factor_importance_breaks_ties() {
+        let w = ScoringWeights::default();
+        let plain = three_factor_score(0.5, 0.5, 0.0, &w);
+        let starred = three_factor_score(0.5, 0.5, 1.0, &w);
+        assert!(starred > plain);
+        assert!((starred - plain - w.w_importance).abs() < 1e-6);
+    }
+
+    #[test]
+    fn phrase_boost_only_on_substring() {
+        assert_eq!(
+            phrase_boost("websocket reconnect", "fix websocket reconnect loop", 0.5),
+            1.5
+        );
+        assert_eq!(
+            phrase_boost("websocket reconnect", "deploy kubernetes", 0.5),
+            1.0
+        );
+        assert_eq!(phrase_boost("   ", "anything", 0.5), 1.0);
+    }
+
+    #[test]
+    fn importance_roundtrips_without_migration() {
+        // Old rows (no importance set) read as 0.0; new rows keep theirs.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = EpisodeStore::open(tmp.path().to_str().unwrap()).unwrap();
+        let mut starred = Episode::new("critical deploy runbook".into(), vec![], None, "ok".into());
+        starred.importance = 0.9;
+        store.save(&starred).unwrap();
+        store
+            .save(&Episode::new(
+                "routine lint fix".into(),
+                vec![],
+                None,
+                "ok".into(),
+            ))
+            .unwrap();
+        let all = store.recall_recent(10).unwrap();
+        let back = all.iter().find(|e| e.id == starred.id).unwrap();
+        assert!((back.importance - 0.9).abs() < 1e-6);
+        let plain = all.iter().find(|e| e.goal == "routine lint fix").unwrap();
+        assert_eq!(plain.importance, 0.0);
+    }
+
+    #[test]
+    fn hybrid_params_matches_legacy_on_fixture() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = EpisodeStore::open(tmp.path().to_str().unwrap()).unwrap();
+        store
+            .save(&Episode::new(
+                "bash script".into(),
+                vec!["a.sh".into()],
+                None,
+                "created".into(),
+            ))
+            .unwrap();
+        store
+            .save(&Episode::new(
+                "bash bash bash script".into(),
+                vec!["b.sh".into()],
+                None,
+                "created".into(),
+            ))
+            .unwrap();
+        let legacy = store.recall_hybrid("bash", None, 10).unwrap();
+        let params = RrfParams {
+            n: MAX_RECALL_CANDIDATES,
+            ..RrfParams::default()
+        };
+        let paramed = store
+            .recall_hybrid_params("bash", None, 10, &params)
+            .unwrap();
+        assert_eq!(legacy.len(), paramed.len());
+        assert_eq!(legacy[0].goal, paramed[0].goal);
+        assert!(paramed[0].goal.contains("bash bash bash"));
+    }
+
+    #[test]
+    fn hybrid_ranked_promotes_important_match() {
+        // Same tokens (BM25 tie) + older timestamp loses on recency, but an
+        // operator-starred importance must still win the top-1.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = EpisodeStore::open(tmp.path().to_str().unwrap()).unwrap();
+        let mut starred = Episode::new(
+            "restart gateway service".into(),
+            vec!["gateway/svc.rs".into()],
+            None,
+            "restarted".into(),
+        );
+        starred.timestamp -= 30 * 24 * 3600; // a month older
+        starred.id = Episode::compute_id(&starred.goal, starred.timestamp);
+        starred.importance = 1.0;
+        store.save(&starred).unwrap();
+        store
+            .save(&Episode::new(
+                "restart gateway service".into(),
+                vec!["gateway/other.rs".into()],
+                None,
+                "restarted".into(),
+            ))
+            .unwrap();
+        let now = chrono_now();
+        let top = store
+            .recall_hybrid_ranked(
+                "restart gateway",
+                None,
+                2,
+                &RrfParams {
+                    n: MAX_RECALL_CANDIDATES,
+                    ..RrfParams::default()
+                },
+                &ScoringWeights::default(),
+                now,
+            )
+            .unwrap();
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].id, starred.id, "starred episode must win top-1");
+    }
+
+    #[test]
+    fn ir_metrics_perfect_and_empty() {
+        use std::collections::HashSet;
+        let ranked = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let rel: HashSet<String> = ["a".into(), "c".into()].into_iter().collect();
+        assert!((recall_at_k(&ranked, &rel, 3) - 1.0).abs() < 1e-6);
+        assert!((recall_at_k(&ranked, &rel, 1) - 0.5).abs() < 1e-6);
+        assert!((reciprocal_rank(&ranked, &rel) - 1.0).abs() < 1e-6);
+        // Not ideal: relevant {a,c} ideally ranks [a,c] (DCG 1+1/log2(3));
+        // here c sits at rank 3 → DCG 1+1/log2(4), nDCG ≈ 0.9197.
+        let ndcg = ndcg_at_k(&ranked, &rel, 3);
+        assert!((ndcg - 0.9197).abs() < 1e-3, "got {ndcg}");
+        let missing: HashSet<String> = ["z".into()].into_iter().collect();
+        assert_eq!(recall_at_k(&ranked, &missing, 3), 0.0);
+        assert_eq!(reciprocal_rank(&ranked, &missing), 0.0);
+        assert_eq!(ndcg_at_k(&ranked, &missing, 3), 0.0);
+        let empty: HashSet<String> = HashSet::new();
+        assert_eq!(recall_at_k(&ranked, &empty, 3), 1.0);
+    }
+
+    #[test]
+    fn ir_metrics_partial_ranking_value() {
+        use std::collections::HashSet;
+        // Relevant at rank 3 (index 2): RR = 1/3; nDCG = (1/log2(4)) / (1/log2(2)) = 0.5.
+        let ranked = vec!["x".to_string(), "y".to_string(), "a".to_string()];
+        let rel: HashSet<String> = ["a".into()].into_iter().collect();
+        assert!((reciprocal_rank(&ranked, &rel) - 1.0 / 3.0).abs() < 1e-6);
+        assert!((ndcg_at_k(&ranked, &rel, 3) - 0.5).abs() < 1e-6);
+        assert!((recall_at_k(&ranked, &rel, 10) - 1.0).abs() < 1e-6);
     }
 }

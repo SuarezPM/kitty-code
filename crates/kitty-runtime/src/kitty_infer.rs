@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "kitty-infer")]
 use mistralrs::{
-    serving as ki, GgufModelBuilder, Model, PagedAttentionMetaBuilder, ReasoningEffort,
+    serving as ki, Constraint, GgufModelBuilder, Model, PagedAttentionMetaBuilder, ReasoningEffort,
     RequestBuilder, TextMessageRole,
 };
 
@@ -312,6 +312,41 @@ fn sampler_env_override(
         out.top_k = Some(k.min(1000));
     }
     out
+}
+
+/// Opt-in decode-time grammar mask (W3/T3.1 spike): `KITTY_INFER_GRAMMAR=1`
+/// threads `GrammarConfig::to_json_schema` into the engine sampler via the
+/// existing `RequestBuilder::set_constraint` (no engine change — the
+/// `Constraint::JsonSchema → llg_factory → Llguidance` mask path already
+/// exists: `build_sequence_recognizer` + `pipeline/llg.rs`). Unset/other =
+/// post-hoc `GrammarClient` only (previous behavior, default).
+pub const ENV_GRAMMAR: &str = "KITTY_INFER_GRAMMAR";
+
+/// Pure and unit-testable; anything else (unset/invalid) keeps post-hoc only.
+#[cfg(any(feature = "kitty-infer", test))]
+fn grammar_enabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim()),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// Build the llguidance JSON-Schema mask for this request. `None` = no
+/// decode-time constraint (mask off, empty tool set, or no tools passed).
+/// Pure and unit-testable.
+#[cfg(any(feature = "kitty-infer", test))]
+fn grammar_schema_for(
+    tools: Option<&Vec<crate::tools::ToolDefinition>>,
+    enabled: bool,
+) -> Option<serde_json::Value> {
+    if !enabled {
+        return None;
+    }
+    let tools = tools?;
+    if tools.is_empty() {
+        return None;
+    }
+    Some(crate::grammar::GrammarConfig::from_tools(tools.clone()).to_json_schema())
 }
 
 /// Map harness options onto sampler overrides. Pure and unit-testable:
@@ -666,7 +701,11 @@ impl KittyInferClient {
         })
     }
 
-    fn to_request(messages: Vec<Message>, tools: Option<Vec<ToolDefinition>>) -> RequestBuilder {
+    fn to_request(
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        grammar_schema: Option<serde_json::Value>,
+    ) -> RequestBuilder {
         let mut req = RequestBuilder::new().enable_thinking(thinking_enabled(
             std::env::var(ENV_NO_THINK).ok().as_deref(),
         ));
@@ -753,6 +792,14 @@ impl KittyInferClient {
                 );
             }
         }
+        // W3/T3.1: decode-time llguidance mask. Pre-existing engine path
+        // (`Constraint::JsonSchema` → `build_sequence_recognizer` →
+        // `pipeline/llg.rs` factory → `SequenceRecognizer::Llguidance`
+        // biasing logits in `sample_sequence`); a bad schema fails the
+        // request loudly, never silently unconstrained.
+        if let Some(schema) = grammar_schema {
+            req = req.set_constraint(Constraint::JsonSchema(schema));
+        }
         req
     }
 
@@ -764,7 +811,13 @@ impl KittyInferClient {
         samp: SamplerOpts,
     ) -> Result<ChatResponse> {
         let loaded = self.ensure_loaded().await?;
-        let mut req = Self::to_request(messages, tools);
+        // W3/T3.0 plumbing: GrammarConfig (from this request's tools) →
+        // JSON-Schema mask → pipeline llg. Opt-in via KITTY_INFER_GRAMMAR.
+        let grammar_schema = grammar_schema_for(
+            tools.as_ref(),
+            grammar_enabled(std::env::var(ENV_GRAMMAR).ok().as_deref()),
+        );
+        let mut req = Self::to_request(messages, tools, grammar_schema);
         if let Some(n) = samp.max_len {
             req = req.set_sampler_max_len(n);
         }
@@ -1103,6 +1156,42 @@ mod mapping_tests {
     }
 
     #[test]
+    fn grammar_mask_is_opt_in_and_needs_tools() {
+        use super::{grammar_enabled, grammar_schema_for};
+        assert!(grammar_enabled(Some("1")));
+        assert!(grammar_enabled(Some(" true ")));
+        assert!(grammar_enabled(Some("yes")));
+        assert!(!grammar_enabled(None));
+        assert!(!grammar_enabled(Some("0")));
+        assert!(!grammar_enabled(Some("nope")));
+        assert!(!grammar_enabled(Some("")));
+
+        // Mask off → None even with tools; on but no/empty tools → None.
+        let tools = vec![crate::tools::ToolDefinition::new(
+            "Read",
+            "Read a file",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        )];
+        assert!(grammar_schema_for(Some(&tools), false).is_none());
+        assert!(grammar_schema_for(None, true).is_none());
+        assert!(grammar_schema_for(Some(&vec![]), true).is_none());
+        // On + tools → mask carrying the tool-name enum (plumbing anchor:
+        // this Value is what `to_request` hands to `set_constraint`).
+        let schema = grammar_schema_for(Some(&tools), true).expect("mask must build");
+        let names: Vec<&str> = schema["properties"]["name"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Read"]);
+    }
+
+    #[test]
     fn roles_map_with_tool_id_threaded() {
         // Non-tool roles map plainly; `tool` is intercepted before the
         // classifier (see `to_request`), so it falls through to `user` here
@@ -1129,6 +1218,84 @@ mod mapping_tests {
         assert!(!backend_selected(Some("KITTY-INFER"))); // case-sensitive
         assert!(!backend_selected(Some("ollama")));
         assert!(!backend_selected(None));
+    }
+
+    /// T3.2 A/B k=3: post-hoc (`KITTY_INFER_GRAMMAR` unset) vs decode-time
+    /// mask (`=1`). Needs a local GGUF (`KITTY_INFER_MODEL`, e.g.
+    /// Qwen3-4B-Q4_K_M.gguf — no sidecar needed). Run single-threaded:
+    /// `cargo test -p kitty-runtime --features kitty-infer bench_grammar_ab
+    ///  -- --ignored --test-threads=1`. Skips honestly when no model is set.
+    #[cfg(feature = "kitty-infer")]
+    #[tokio::test]
+    #[ignore = "needs local GGUF via KITTY_INFER_MODEL"]
+    async fn bench_grammar_ab_k3() {
+        use crate::client::{ChatClient, Message, RequestOptions};
+
+        let Ok(_) = std::env::var(super::ENV_MODEL) else {
+            eprintln!("SKIP bench_grammar_ab_k3: KITTY_INFER_MODEL not set");
+            return;
+        };
+        let tools = vec![crate::tools::ToolDefinition::new(
+            "Read",
+            "Read a file",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        )];
+        let grammar = crate::grammar::GrammarConfig::from_tools(tools.clone());
+        // str::repeat is on &str: build prompt without format! noise.
+        let prompt =
+            "Call the Read tool with path \"/tmp/x\". Reply with ONLY the tool call, no prose. "
+                .repeat(1);
+        let options = Some(RequestOptions {
+            num_predict: Some(64),
+            temperature: Some(0.0),
+            ..Default::default()
+        });
+        let mut report = String::new();
+        for (arm, grammar_env) in [("posthoc", "0"), ("mask", "1")] {
+            // SAFETY: this test runs alone (--test-threads=1); no other
+            // test reads KITTY_INFER_GRAMMAR concurrently.
+            unsafe { std::env::set_var(super::ENV_GRAMMAR, grammar_env) };
+            let client = super::KittyInferClient::from_env().expect("config from env");
+            if let Err(e) = client.health_check().await {
+                eprintln!("SKIP bench_grammar_ab_k3: health_check failed: {e}");
+                unsafe { std::env::remove_var(super::ENV_GRAMMAR) };
+                return;
+            }
+            let t0 = std::time::Instant::now();
+            let mut valid = 0;
+            let mut total = 0;
+            for _ in 0..3 {
+                let resp = client
+                    .chat_with_options(
+                        "bench",
+                        vec![Message::user(prompt.clone())],
+                        Some(tools.clone()),
+                        options.clone(),
+                    )
+                    .await
+                    .expect("generation must succeed");
+                if let Some(calls) = resp.message.tool_calls {
+                    for c in &calls {
+                        total += 1;
+                        let json = serde_json::json!({
+                            "name": c.function.name,
+                            "arguments": c.function.arguments
+                        })
+                        .to_string();
+                        valid += grammar.validate(&json) as usize;
+                    }
+                }
+            }
+            let dt = t0.elapsed();
+            report.push_str(&format!("arm={arm} valid={valid}/{total} wall={dt:?}\n"));
+        }
+        unsafe { std::env::remove_var(super::ENV_GRAMMAR) };
+        eprintln!("BENCH-AB-k3:\n{report}");
+        assert!(report.contains("arm=posthoc") && report.contains("arm=mask"));
     }
 
     #[test]
