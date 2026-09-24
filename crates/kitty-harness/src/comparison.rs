@@ -26,67 +26,6 @@ pub struct HarnessComparison {
     pub avg_latency_delta_ms: f64,
 }
 
-/// Compare two harness results.
-pub fn compare_harnesses(
-    baseline_name: &str,
-    candidate_name: &str,
-    baseline: &[ExerciseResult],
-    candidate: &[ExerciseResult],
-) -> HarnessComparison {
-    let baseline_passed = baseline.iter().filter(|r| r.passed).count();
-    let candidate_passed = candidate.iter().filter(|r| r.passed).count();
-
-    let baseline_rate = if baseline.is_empty() {
-        0.0
-    } else {
-        baseline_passed as f64 / baseline.len() as f64 * 100.0
-    };
-    let candidate_rate = if candidate.is_empty() {
-        0.0
-    } else {
-        candidate_passed as f64 / candidate.len() as f64 * 100.0
-    };
-
-    // Pair results by exercise ID
-    let mut baseline_wins = 0;
-    let mut candidate_wins = 0;
-    let mut ties = 0;
-    let mut latency_delta_sum = 0.0;
-    let mut paired_count = 0;
-
-    for b in baseline {
-        if let Some(c) = candidate.iter().find(|c| c.id == b.id) {
-            paired_count += 1;
-            latency_delta_sum += c.latency_ms as f64 - b.latency_ms as f64;
-
-            match (b.passed, c.passed) {
-                (true, false) => baseline_wins += 1,
-                (false, true) => candidate_wins += 1,
-                (true, true) | (false, false) => ties += 1,
-            }
-        }
-    }
-
-    let avg_latency_delta = if paired_count > 0 {
-        latency_delta_sum / paired_count as f64
-    } else {
-        0.0
-    };
-
-    HarnessComparison {
-        baseline_name: baseline_name.to_string(),
-        candidate_name: candidate_name.to_string(),
-        total_exercises: baseline.len().max(candidate.len()),
-        baseline_pass_rate: baseline_rate,
-        candidate_pass_rate: candidate_rate,
-        correctness_lift: candidate_rate - baseline_rate,
-        baseline_wins,
-        candidate_wins,
-        ties,
-        avg_latency_delta_ms: avg_latency_delta,
-    }
-}
-
 /// Format comparison as a readable report.
 pub fn format_comparison(comp: &HarnessComparison) -> String {
     format!(
@@ -111,46 +50,6 @@ pub fn format_comparison(comp: &HarnessComparison) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compare_equal_results() {
-        let results = vec![
-            ExerciseResult {
-                id: "1".into(),
-                lang: "python".into(),
-                passed: true,
-                latency_ms: 100,
-            },
-            ExerciseResult {
-                id: "2".into(),
-                lang: "python".into(),
-                passed: false,
-                latency_ms: 200,
-            },
-        ];
-        let comp = compare_harnesses("baseline", "candidate", &results, &results);
-        assert_eq!(comp.correctness_lift, 0.0);
-        assert_eq!(comp.ties, 2);
-    }
-
-    #[test]
-    fn compare_candidate_wins() {
-        let baseline = vec![ExerciseResult {
-            id: "1".into(),
-            lang: "python".into(),
-            passed: false,
-            latency_ms: 100,
-        }];
-        let candidate = vec![ExerciseResult {
-            id: "1".into(),
-            lang: "python".into(),
-            passed: true,
-            latency_ms: 80,
-        }];
-        let comp = compare_harnesses("baseline", "candidate", &baseline, &candidate);
-        assert_eq!(comp.correctness_lift, 100.0);
-        assert_eq!(comp.candidate_wins, 1);
-    }
 
     #[test]
     fn format_report() {

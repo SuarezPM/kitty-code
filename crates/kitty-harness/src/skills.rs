@@ -6,7 +6,6 @@
 //! the full skill content is read on-demand by the agent when needed.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 /// A discovered skill.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,67 +16,6 @@ pub struct Skill {
     pub description: String,
     /// Absolute path to the skill directory (parent of SKILL.md).
     pub location: std::path::PathBuf,
-}
-
-/// Discover skills from one or more skill directories.
-///
-/// Each directory is scanned for `SKILL.md` files. Duplicate names are
-/// skipped with a warning (first wins).
-pub fn discover_skills(skill_dirs: &[&Path]) -> Vec<Skill> {
-    let mut skills = Vec::new();
-    let mut seen_names = std::collections::HashSet::new();
-
-    for dir in skill_dirs {
-        if !dir.exists() {
-            continue;
-        }
-
-        for entry in std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.is_file() && path.file_name().and_then(|n| n.to_str()) == Some("SKILL.md") {
-                if let Some(skill) = parse_skill_file(&path) {
-                    if seen_names.insert(skill.name.clone()) {
-                        skills.push(skill);
-                    }
-                }
-            }
-        }
-    }
-
-    skills
-}
-
-/// Parse a SKILL.md file for name and description.
-///
-/// Expects simple frontmatter-style lines: `name: ...` and `description: ...`.
-fn parse_skill_file(path: &std::path::Path) -> Option<Skill> {
-    let content = std::fs::read_to_string(path).ok()?;
-
-    let mut name = None;
-    let mut description = None;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(val) = line.strip_prefix("name:") {
-            name = Some(val.trim().to_string());
-        } else if let Some(val) = line.strip_prefix("description:") {
-            description = Some(val.trim().to_string());
-        }
-    }
-
-    let name = name?;
-    let description = description.unwrap_or_default();
-    let location = path.parent()?.to_path_buf();
-
-    Some(Skill {
-        name,
-        description,
-        location,
-    })
 }
 
 /// Format skills as XML for the system prompt.
@@ -151,17 +89,5 @@ mod tests {
     fn skill_content_path_not_found() {
         let skills: Vec<Skill> = vec![];
         assert_eq!(skill_content_path(&skills, "nope"), None);
-    }
-
-    #[test]
-    fn discover_skills_empty_dirs() {
-        let skills = discover_skills(&[]);
-        assert!(skills.is_empty());
-    }
-
-    #[test]
-    fn discover_skills_nonexistent_dir() {
-        let skills = discover_skills(&[std::path::Path::new("/nonexistent/path")]);
-        assert!(skills.is_empty());
     }
 }

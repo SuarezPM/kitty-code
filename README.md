@@ -42,6 +42,9 @@ Other commands: `info` (status + tool list), `bench polyglot|tb2|tb2-official|gp
 `bench-ab` (interleaved A/B with Wilson CI), `mcp` (stdio MCP server exposing
 the 6 tools via the Guard), and `tui` (status display, opt-in feature).
 
+TUI is not on by default: build/run it with `cargo run -p kitty-cli --features tui -- tui`.
+Embedded-backend `count_tokens` is an honest heuristic (`len/4`, no model load by design).
+
 ## Project layout
 
 | Crate | Responsibility |

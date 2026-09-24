@@ -1,0 +1,35 @@
+name: mutants (advisory)
+
+on:
+  # Nightly advisory only — never a merge gate (see `continue-on-error`).
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    name: cargo mutants (advisory, kitty-harness)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    continue-on-error: true
+    # Crate-wide advisory scope (T5.3 full-crate sweep, not per-file): bounded
+    # by the job timeout below instead of `--file` filters.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      - name: Install Rust toolchain (rustup, no archived actions)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install cargo-mutants
+        # Pinned version below was verify-at-execution (`cargo search`,
+        # 2026-09-24); re-verify if the install step ever 404s.
+        run: cargo install --locked cargo-mutants --version 27.1.0
+      # Advisory: informs, never blocks. Promote to gate only with a measured
+      # caught-mutant baseline (see docs/ADR-ROUTER-CONTRACT.md).
+      - name: cargo mutants (advisory)
+        run: cargo mutants -p kitty-harness 2>&1 | tail -20 || true

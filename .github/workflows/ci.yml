@@ -131,6 +131,9 @@ jobs:
       # Compile gates only (no model downloads, no test-run): the M3 feature
       # chain (kitty-infer-cuda -> mistralrs/cuda, internal path) plus the
       # engine cuda build itself. Runtime smoke stays lane-local (k5-style).
+      # T5.7: `llama-vulkan` is OUT OF SCOPE here — neither ubuntu-latest nor
+      # this CUDA container ships the Vulkan SDK (see coverage-job comment),
+      # so the check could never stay green. Revisit with a vulkan runner.
       - name: cargo check (cuda features)
         run: |
           cargo check -p kitty-runtime --features kitty-infer-cuda
@@ -197,7 +200,7 @@ jobs:
           rustup default stable
           rustup component add llvm-tools-preview
       - name: Install cargo-llvm-cov
-        run: cargo install --locked cargo-llvm-cov
+        run: cargo install --locked cargo-llvm-cov --version 0.9.0
       # Mono M4: default features (was --all-features). Rationale: all-features
       # enables kitty-infer-cuda + llama-vulkan, which need an NVIDIA toolkit
       # and the Vulkan SDK — absent on ubuntu-latest, so the job could never
