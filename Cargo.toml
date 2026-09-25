@@ -108,7 +108,7 @@ mimalloc = "0.1"
 # M2: anyhow = "1.0.100" — ya cubierto por la entrada Kitty-Code (compatible), no duplicado
 # M2: serde = "1.0.228" — ya cubierto por la entrada Kitty-Code (compatible), no duplicado
 # M2: serde_json = "1.0.149" — ya cubierto por la entrada Kitty-Code (compatible), no duplicado
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 indexmap = { version = "2.13.0", features = ["serde"] }
 either = { version = "1.15.0", features = ["serde"] }
 accelerate-src = { version = "0.3.2" }
