@@ -119,7 +119,7 @@ metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
 futures = "0.3"
 # M2: clap origin con wrap_help — conservado Kitty-Code (derive); wrap_help sin uso en codigo engine (verificado), no duplicado
-pyo3 = { version = "0.25.1", features = ["full", "extension-module", "either", "abi3-py310"] }
+pyo3 = { version = "0.29.2", features = ["full", "extension-module", "either", "abi3-py310"] }
 # M2: tokio 1.49 full+rt-multi-thread — cubierto por Kitty-Code "1"+full (full incluye rt-multi), no duplicado
 # All features but avif, avif increases the msrv dramatically
 image = { version = "0.25.9", default-features = false, features = [
