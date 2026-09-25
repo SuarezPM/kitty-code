@@ -684,23 +684,10 @@ impl Loader for GGUFLoader {
             .unwrap_or(self.model_id.as_ref().unwrap_or(&self.quantized_model_id))
             .to_string()
     }
-
     fn get_kind(&self) -> ModelKind {
         self.kind.clone()
     }
 }
-
-
-
-
-
-
-
-
-
-#[async_trait::async_trait]
-
-
 
 #[cfg(test)]
 mod tests {

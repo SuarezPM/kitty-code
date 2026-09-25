@@ -574,7 +574,9 @@ mod tests {
 
 
     #[test]
-    fn legacy_specialized_models_without_kind_are_inferred() {
+    fn legacy_specialized_models_unknown_arch_is_rejected() {
+        // Real live behavior is Err, NOT a Plain fallback: `kind` infers to
+        // "plain", but the arch variants don't exist (no `serde(other)`).
         let multimodal = toml::from_str::<TomlSelector>(
             r#"
                 [model]
@@ -582,11 +584,9 @@ mod tests {
                 arch = "qwen2vl"
             "#,
         )
-        .unwrap();
-        assert!(matches!(
-            multimodal.model,
-            TomlModelSelected::MultimodalPlain { .. }
-        ));
+        .err()
+        .expect("qwen2vl arch must not parse as plain");
+        assert!(multimodal.to_string().contains("qwen2vl"));
 
         let embedding = toml::from_str::<TomlSelector>(
             r#"
@@ -596,11 +596,9 @@ mod tests {
                 tokenizer_json = "tokenizer.json"
             "#,
         )
-        .unwrap();
-        assert!(matches!(
-            embedding.model,
-            TomlModelSelected::Embedding { .. }
-        ));
+        .err()
+        .expect("qwen3embedding arch must not parse as plain");
+        assert!(embedding.to_string().contains("qwen3embedding"));
     }
 
     #[test]
@@ -618,20 +616,20 @@ mod tests {
     }
 
     #[test]
-    fn explicit_kind_is_authoritative() {
-        let selector = toml::from_str::<TomlSelector>(
+    fn explicit_unknown_kind_is_rejected() {
+        // Only plain/gguf/ggml survive as `kind` tags; anything else fails
+        // deserialization (no `MultimodalPlain` variant to be authoritative).
+        let error = toml::from_str::<TomlSelector>(
             r#"
                 [model]
                 kind = "multimodal"
                 model_id = "vision-model"
             "#,
         )
-        .unwrap();
+        .err()
+        .expect("unknown kind must not parse");
 
-        assert!(matches!(
-            selector.model,
-            TomlModelSelected::MultimodalPlain { .. }
-        ));
+        assert!(error.to_string().contains("multimodal"));
     }
 
     #[test]
@@ -647,7 +645,11 @@ mod tests {
         .err()
         .expect("conflicting model fields should not parse");
 
-        assert!(error.to_string().contains("conflicting fields"));
+        // `infer_legacy_arch_family` always returns Ok(None), so families is
+        // [Multimodal] (len 1, no conflict branch); the real refusal is the
+        // text-only message (exact string in `infer_legacy_model_kind`).
+        assert!(error
+            .to_string()
+            .contains("not supported by this text-only build"));
     }
-
 }

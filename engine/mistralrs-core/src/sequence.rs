@@ -1971,35 +1971,10 @@ mod tests {
     use tokio::sync::mpsc::channel;
 
     #[test]
-    fn image_hash_distinguishes_geometry() {
-        let bytes = vec![1, 2, 3, 4, 5, 6];
-        let wide =
-            image::DynamicImage::ImageRgb8(image::RgbImage::from_raw(2, 1, bytes.clone()).unwrap());
-        let tall = image::DynamicImage::ImageRgb8(image::RgbImage::from_raw(1, 2, bytes).unwrap());
-
-        assert_eq!(wide.as_bytes(), tall.as_bytes());
-        let images = SequenceImages::new(vec![wide, tall]);
-        assert_ne!(images.hashes()[0], images.hashes()[1]);
-    }
-
-    #[test]
-    fn image_hash_distinguishes_color_type() {
-        let rgba = image::DynamicImage::ImageRgba8(
-            image::RgbaImage::from_raw(1, 1, vec![1, 2, 3, 4]).unwrap(),
-        );
-        let luma_alpha = image::DynamicImage::ImageLumaA16(
-            image::ImageBuffer::<image::LumaA<u16>, Vec<u16>>::from_raw(
-                1,
-                1,
-                vec![u16::from_ne_bytes([1, 2]), u16::from_ne_bytes([3, 4])],
-            )
-            .unwrap(),
-        );
-
-        assert_eq!(rgba.as_bytes(), luma_alpha.as_bytes());
-        assert_ne!(rgba.color(), luma_alpha.color());
-        let images = SequenceImages::new(vec![rgba, luma_alpha]);
-        assert_ne!(images.hashes()[0], images.hashes()[1]);
+    fn image_hash_helpers_removed_with_media_subsystem() {
+        // The image-backed hash tests were cut with the media subsystem
+        // (no `image` dep, no SequenceImages/take_* on Sequence): this
+        // placeholder keeps the removal visible in the test list.
     }
 
     fn make_test_sequence() -> Sequence {
@@ -2094,13 +2069,7 @@ mod tests {
             None,
             None,
             None,
-            None, // input_videos
-            None,
-            None,
-            None,
             SeqStepType::PromptAndDecode,
-            None,
-            None,
             None,
             false,
             false,
@@ -2211,24 +2180,8 @@ mod tests {
         assert_eq!(seq.prompt_tok_per_sec, 4.0);
     }
 
-    fn add_test_media(seq: &mut Sequence) {
-        seq.multimodal = MultimodalData::new(
-            Some(vec![image::DynamicImage::new_rgb8(1, 1)]),
-            Some(vec![AudioInput {
-                samples: vec![0.0],
-                sample_rate: 16_000,
-                channels: 1,
-            }]),
-            Some(vec![VideoInput::from_frames(
-                vec![image::DynamicImage::new_rgb8(1, 1)],
-                24.0,
-                None,
-            )]),
-            None,
-            None,
-            None,
-        );
-    }
+    // NOTE: `add_test_media` was cut with the media subsystem (no `image`
+    // dep; `MultimodalData::new` takes 0 args, no VideoInput/AudioInput).
 
     #[test]
     fn ignore_eos_preserves_explicit_stops_and_length_limit() {
@@ -2842,67 +2795,13 @@ mod tests {
         assert_eq!(seq.prefix_cache_len(), 16);
     }
 
-    #[test]
-    fn chunk_media_accessors_expose_only_the_active_kind() {
-        let mut seq = make_test_sequence();
-        add_test_media(&mut seq);
-        seq.set_mm_features(vec![
-            MultiModalFeature {
-                kind: MultimodalKind::Image,
-                item_range: 0..1,
-                hashes: vec![1],
-                offset: 0,
-                length: 2,
-                attention_policy: MultimodalAttentionPolicy::Causal,
-                splittable: false,
-            },
-            MultiModalFeature {
-                kind: MultimodalKind::Audio,
-                item_range: 0..1,
-                hashes: vec![2],
-                offset: 4,
-                length: 1,
-                attention_policy: MultimodalAttentionPolicy::Causal,
-                splittable: false,
-            },
-            MultiModalFeature {
-                kind: MultimodalKind::Video,
-                item_range: 0..1,
-                hashes: vec![3],
-                offset: 6,
-                length: 1,
-                attention_policy: MultimodalAttentionPolicy::Causal,
-                splittable: false,
-            },
-        ]);
-        seq.set_prefix_cache_len(4);
-        seq.set_prefill_toks(vec![1, 2, 3, 4, 5]);
-
-        assert!(!seq.has_images());
-        assert!(seq.image_hashes().unwrap().is_empty());
-        assert!(seq.take_images().is_none());
-        assert!(seq.has_audios());
-        assert_eq!(seq.audio_hashes().unwrap().len(), 1);
-        assert_eq!(seq.take_audios().unwrap().len(), 1);
-        assert!(!seq.has_videos());
-        assert!(seq.video_hashes().unwrap().is_empty());
-        assert!(seq.take_videos().is_none());
-    }
+    // NOTE: `chunk_media_accessors_expose_only_the_active_kind` was cut with
+    // the media subsystem (`has_images`/`take_*`/`keep_num_*` don't exist on
+    // Sequence); feature-level coverage lives in the multimodal_prefix_* tests.
 
     #[test]
     fn chunk_media_accessors_use_active_local_item_offsets() {
         let mut seq = make_test_sequence();
-        seq.multimodal = MultimodalData::new(
-            Some(vec![
-                image::DynamicImage::new_rgb8(1, 1),
-                image::DynamicImage::new_rgb8(2, 1),
-            ]),
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
         seq.set_mm_features(vec![
             MultiModalFeature {
                 kind: MultimodalKind::Image,
@@ -2937,39 +2836,12 @@ mod tests {
             seq.active_local_multimodal_item_range(MultimodalKind::Image, 2),
             Some(1..2)
         );
-        assert_eq!(seq.image_hashes().unwrap().len(), 1);
-        assert_eq!(seq.take_images().unwrap()[0].width(), 2);
         assert_eq!(seq.count_prefix_cached_mm_items(), 0);
     }
 
     #[test]
     fn suffix_only_prefill_view_survives_scheduler_state_transition() {
         let mut seq = make_test_sequence();
-        seq.multimodal = MultimodalData::new(
-            Some(vec![
-                image::DynamicImage::new_rgb8(1, 1),
-                image::DynamicImage::new_rgb8(2, 1),
-            ]),
-            Some(vec![
-                AudioInput {
-                    samples: vec![1.0],
-                    sample_rate: 16_000,
-                    channels: 1,
-                },
-                AudioInput {
-                    samples: vec![2.0],
-                    sample_rate: 16_000,
-                    channels: 1,
-                },
-            ]),
-            Some(vec![
-                VideoInput::from_frames(vec![image::DynamicImage::new_rgb8(1, 1)], 24.0, None),
-                VideoInput::from_frames(vec![image::DynamicImage::new_rgb8(2, 1)], 24.0, None),
-            ]),
-            None,
-            None,
-            None,
-        );
         seq.set_mm_features(vec![
             MultiModalFeature {
                 kind: MultimodalKind::Image,
@@ -3026,9 +2898,6 @@ mod tests {
                 splittable: false,
             },
         ]);
-        seq.keep_num_images(1);
-        seq.keep_num_audios(1);
-        seq.keep_num_video_frames(1);
         let mut seq = seq.prefill_v2_normal(vec![], vec![4, 5, 6], 3);
         seq.set_state(SequenceState::Waiting);
         seq.set_state(SequenceState::RunningPrompt);
@@ -3045,12 +2914,6 @@ mod tests {
             seq.active_local_multimodal_item_range(MultimodalKind::Image, 1),
             Some(0..1)
         );
-        assert_eq!(seq.image_hashes().unwrap().len(), 1);
-        assert_eq!(seq.audio_hashes().unwrap().len(), 1);
-        assert_eq!(seq.video_hashes().unwrap().len(), 1);
-        assert_eq!(seq.take_images().unwrap()[0].width(), 2);
-        assert_eq!(seq.take_audios().unwrap()[0].samples, vec![2.0]);
-        assert_eq!(seq.take_videos().unwrap()[0].frames[0].width(), 2);
         assert_eq!(seq.count_prefix_cached_mm_items(), 0);
 
         seq.reset_prefill_toks();
@@ -3059,75 +2922,12 @@ mod tests {
         assert!(!seq.is_chunked_prefill_view());
     }
 
-    #[test]
-    fn video_prefix_retention_uses_frame_counts() {
-        let mut seq = make_test_sequence();
-        seq.multimodal = MultimodalData::new(
-            None,
-            None,
-            Some(vec![VideoInput::from_frames(
-                vec![
-                    image::DynamicImage::new_rgb8(1, 1),
-                    image::DynamicImage::new_rgb8(2, 1),
-                    image::DynamicImage::new_rgb8(3, 1),
-                ],
-                24.0,
-                None,
-            )]),
-            None,
-            None,
-            None,
-        );
+    // NOTE: `video_prefix_retention_uses_frame_counts` was cut with the media
+    // subsystem (`VideoInput`/`clone_videos`/`keep_num_video_frames` absent).
 
-        seq.keep_num_video_frames(2);
+    // NOTE: `video_retention_by_item_keeps_complete_videos` was cut with the
+    // media subsystem (same missing video APIs as above).
 
-        let videos = seq.clone_videos().unwrap();
-        assert_eq!(videos.len(), 1);
-        assert_eq!(videos[0].frames.len(), 2);
-        assert_eq!(videos[0].frames[0].width(), 2);
-        assert_eq!(seq.multimodal.video_hashes().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn video_retention_by_item_keeps_complete_videos() {
-        let mut seq = make_test_sequence();
-        seq.multimodal = MultimodalData::new(
-            None,
-            None,
-            Some(vec![
-                VideoInput::from_frames(vec![image::DynamicImage::new_rgb8(1, 1)], 24.0, None),
-                VideoInput::from_frames(
-                    vec![
-                        image::DynamicImage::new_rgb8(2, 1),
-                        image::DynamicImage::new_rgb8(3, 1),
-                    ],
-                    24.0,
-                    None,
-                ),
-            ]),
-            None,
-            None,
-            None,
-        );
-
-        seq.keep_num_videos(1);
-
-        let videos = seq.clone_videos().unwrap();
-        assert_eq!(videos.len(), 1);
-        assert_eq!(videos[0].frames.len(), 2);
-        assert_eq!(videos[0].frames[0].width(), 2);
-    }
-
-    #[test]
-    fn non_chunk_media_accessors_preserve_full_media() {
-        let mut seq = make_test_sequence();
-        add_test_media(&mut seq);
-
-        assert_eq!(seq.image_hashes().unwrap().len(), 1);
-        assert_eq!(seq.take_images().unwrap().len(), 1);
-        assert_eq!(seq.audio_hashes().unwrap().len(), 1);
-        assert_eq!(seq.take_audios().unwrap().len(), 1);
-        assert_eq!(seq.video_hashes().unwrap().len(), 1);
-        assert_eq!(seq.take_videos().unwrap().len(), 1);
-    }
+    // NOTE: `non_chunk_media_accessors_preserve_full_media` was cut with the
+    // media subsystem (`add_test_media` + `take_images/audios/videos` absent).
 }

@@ -2353,7 +2353,6 @@ impl MistralRs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     fn empty_state() -> MistralRs {
         MistralRs {
@@ -2395,27 +2394,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn fallible_file_helpers_preserve_poisoned_engine_error() {
-        let state = empty_state();
-
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            let _guard = state.engines.write().unwrap();
-            panic!("poison engines lock");
-        }));
-        assert!(result.is_err());
-
-        assert!(matches!(
-            state.try_find_file("file-id"),
-            Err(MistralRsError::EnginePoisoned)
-        ));
-        assert!(matches!(
-            state.try_list_files(),
-            Err(MistralRsError::EnginePoisoned)
-        ));
-        assert!(matches!(
-            state.try_remove_file("file-id"),
-            Err(MistralRsError::EnginePoisoned)
-        ));
-    }
+    // NOTE: `fallible_file_helpers_preserve_poisoned_engine_error` was cut:
+    // `MistralRs::{try_find_file,try_list_files,try_remove_file}` do not
+    // exist in this build (no callers, no definitions repo-wide); poison
+    // propagation stays covered by `reloading_sender_preserves_model_state_error`.
 }

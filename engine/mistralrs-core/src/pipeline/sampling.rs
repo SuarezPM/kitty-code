@@ -1534,15 +1534,14 @@ pub async fn sample_sequence(
 
 #[cfg(test)]
 mod tests {
-    use mistralrs_mcp::{Function, Tool, ToolType};
+    use super::*;
+    use crate::tools::{Function, Tool, ToolCallState, ToolChoice, ToolType};
     #[cfg(feature = "cuda")]
     use rand::RngCore;
     use rand::SeedableRng;
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{mpsc::channel, Mutex};
 
-    use super::*;
-    use crate::tools::{ToolCallState, ToolChoice};
     use crate::{
         sampler::Sampler,
         sequence::{SeqStepType, SequenceGroup},
@@ -1591,13 +1590,7 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
             SeqStepType::PromptAndDecode,
-            None,
-            None,
             None,
             false,
             ignore_eos,
@@ -1645,13 +1638,7 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
             SeqStepType::PromptAndDecode,
-            None,
-            None,
             None,
             false,
             false,
