@@ -194,7 +194,7 @@ tokio-rayon = "2.1.0"
 rand_isaac = "0.4.0"
 indicatif = { version = "0.18.3", features = ["rayon"] }
 async-trait = "0.1.89"
-strum = { version = "0.27.2", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 derive_more = { version = "2.1.1", default-features = false, features = ["from"] }
 akin = "0.4.0"
 variantly = "0.4.0"
