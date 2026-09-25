@@ -447,43 +447,67 @@ fn run_app(
                             }
                             app.is_running = true;
                             app.status.current_step = "Thinking...".to_string();
-                            // Spawn agent run with channel
+                            // NOTE (TUI panic fix): no `spawn_local` here — run_tui
+                            // executes on the multi-thread runtime without a
+                            // `LocalSet`, so it panics on Enter. Plain
+                            // `tokio::spawn` is wrong too: the future is
+                            // `!Send` (Agent holds rusqlite `RefCell`s). A
+                            // dedicated OS thread with a current-thread
+                            // runtime + `LocalSet` drives it with zero
+                            // restructuring of run_app.
                             let tx_clone = tx.clone();
                             let model_clone = app.status.model.clone();
                             let url_clone = app.status.url.clone();
                             let window = app.status.context_window;
                             let prompt_clone = prompt.clone();
-                            tokio::task::spawn_local(async move {
-                                let client = OllamaClient::new(&url_clone);
-                                // f8 T1.1: interactive TUI sessions may grant
-                                // autorun hops via env (bench paths never read
-                                // this). Invalid/absent ⇒ 0.
-                                let autorun_hops =
-                                    std::env::var(kitty_harness::config::ENV_AUTORUN_HOPS)
-                                        .ok()
-                                        .and_then(|v| v.trim().parse::<usize>().ok())
-                                        .unwrap_or(0);
-                                let config = AgentConfig {
-                                    model: model_clone,
-                                    context_window: window,
-                                    autorun_hops: kitty_harness::agent::clamp_autorun_hops(
-                                        autorun_hops,
-                                    ),
-                                    ..Default::default()
-                                };
-                                let mut agent = Agent::new(client, config);
-                                let local_prompt = prompt_clone.clone();
-                                // Use run_with_events if available, fallback to run
-                                let res = agent.run(&local_prompt).await;
-                                match res {
-                                    Ok(text) => {
-                                        let _ = tx_clone.send(AgentEvent::Done(text)).await;
+                            std::thread::spawn(move || {
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .expect("tui agent runtime");
+                                let local = tokio::task::LocalSet::new();
+                                rt.block_on(local.run_until(async move {
+                                    // Anti-stuck: a panic here must still
+                                    // clear `is_running` via an `Error`
+                                    // event. `spawn_local` JoinHandle converts
+                                    // a panic into `Err` (no propagation).
+                                    let join = tokio::task::spawn_local(async move {
+                                        let client = OllamaClient::new(&url_clone);
+                                        // f8 T1.1: interactive TUI sessions may grant
+                                        // autorun hops via env (bench paths never read
+                                        // this). Invalid/absent ⇒ 0.
+                                        let autorun_hops =
+                                            std::env::var(kitty_harness::config::ENV_AUTORUN_HOPS)
+                                                .ok()
+                                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                                .unwrap_or(0);
+                                        let config = AgentConfig {
+                                            model: model_clone,
+                                            context_window: window,
+                                            autorun_hops: kitty_harness::agent::clamp_autorun_hops(
+                                                autorun_hops,
+                                            ),
+                                            ..Default::default()
+                                        };
+                                        let mut agent = Agent::new(client, config);
+                                        let local_prompt = prompt_clone.clone();
+                                        // Use run_with_events if available, fallback to run
+                                        agent.run(&local_prompt).await
+                                    });
+                                    let res: std::result::Result<String, String> = match join.await
+                                    {
+                                        Ok(r) => r.map_err(|e| e.to_string()),
+                                        Err(_) => Err("agent panicked; run cleared".to_string()),
+                                    };
+                                    match res {
+                                        Ok(text) => {
+                                            let _ = tx_clone.send(AgentEvent::Done(text)).await;
+                                        }
+                                        Err(e) => {
+                                            let _ = tx_clone.send(AgentEvent::Error(e)).await;
+                                        }
                                     }
-                                    Err(e) => {
-                                        let _ =
-                                            tx_clone.send(AgentEvent::Error(e.to_string())).await;
-                                    }
-                                }
+                                }));
                             });
                             // tokio::select! style poll already handled via try_recv
                         }

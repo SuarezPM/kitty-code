@@ -10,8 +10,9 @@
 //! below drives the REAL guard through [`ReActStep`] actions (no mirrored
 //! streak logic).
 //!
-//! NOTE: these types are exported but the agent loop does not construct
-//! `ReActStep` yet — no loop migration, no persistence change (W7 scope).
+//! NOTE: the agent loop constructs one `ReActStep` per executed tool
+//! (`run.rs:31` clears the per-run trace, `response.rs:250-253` builds each
+//! step and feeds the REAL guard, `setup.rs:46` owns the trace).
 
 use crate::parser::ParsedToolCall;
 use crate::tools::ToolResult;

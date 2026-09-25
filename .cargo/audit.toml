@@ -1,0 +1,12 @@
+# cargo-audit config — Gate 1 remediation (2026-09-25).
+#
+# Rationale for the two ignores below: both advisories fire ONLY on
+# pyo3-feature builds (engine/mistralrs Python bindings); the default, CPU
+# and CUDA gates in CI never enable those features, so the finding is not
+# exploitable in any shipped/tested configuration. Bumping the pinned
+# candle rev (35d7ae7) to chase them would break the M4 supply-chain pin
+# without observable benefit — revisit only if a default-features build
+# starts pulling the affected code.
+
+[advisories]
+ignore = ["RUSTSEC-2026-0176", "RUSTSEC-2026-0177"]
