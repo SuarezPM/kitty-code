@@ -765,7 +765,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "vob",
+ "vob 3.0.6",
+]
+
+[[package]]
+name = "cfgrammar"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac7daac375d1da174c0ec14cb5c3b244eb2bbf6a50c07b41442376ca6633af38"
+dependencies = [
+ "indexmap 2.14.2",
+ "num-traits",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "vob 4.0.1",
 ]
 
 [[package]]
@@ -3750,11 +3764,11 @@ version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bcbe6a005a604615ab7aab7d1f74be563e508f5c6e42f85fbf65c38fe1f5f268"
 dependencies = [
- "cfgrammar",
+ "cfgrammar 0.14.2",
  "fnv",
  "num-traits",
  "sparsevec",
- "vob",
+ "vob 3.0.6",
 ]
 
 [[package]]
@@ -4023,7 +4037,7 @@ dependencies = [
  "candle-flash-attn-v3",
  "candle-metal-kernels",
  "candle-nn",
- "cfgrammar",
+ "cfgrammar 0.15.0",
  "chrono",
  "clap",
  "csv",
@@ -4095,7 +4109,7 @@ dependencies = [
  "utoipa",
  "uuid 1.26.1",
  "variantly",
- "vob",
+ "vob 3.0.6",
 ]
 
 [[package]]
@@ -6544,7 +6558,7 @@ checksum = "68b4a8ce3045f0fe173fb5ae3c6b7dcfbec02bfa650bb8618b2301f52af0134d"
 dependencies = [
  "num-traits",
  "packedvec",
- "vob",
+ "vob 3.0.6",
 ]
 
 [[package]]
@@ -7745,6 +7759,15 @@ name = "vob"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc936b5a7202a703aeaf7ce05e7931db2e0c8126813f97db3e9e06d867b0bb38"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "vob"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60681a44bd4be4b4da58435befb00f60f63372fb43a86cd977183114ad851198"
 dependencies = [
  "num-traits",
 ]

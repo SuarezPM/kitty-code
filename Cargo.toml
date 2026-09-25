@@ -185,7 +185,7 @@ minijinja-contrib = { version = "2.14.0", features = ["pycompat"] }
 regex-automata = { version = "0.4.13", features = ["meta"] }
 rustc-hash = "2.1.1"
 vob = "3.0.6"
-cfgrammar = "0.14.1"
+cfgrammar = "0.15.0"
 lrtable = "0.14.1"
 galil-seiferas = "0.1.5"
 radix_trie = "0.3.0"
