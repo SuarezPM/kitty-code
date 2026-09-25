@@ -28,6 +28,12 @@
         "origin": "max repo-interno 26.0s polyglot-smoke15 (avg 13.9s, p95 25.6s, benches/bench_polyglot_ornith_smoke15.json:smoketest) y 21.4s tb2-builtin8 (avg 13.3s, benches/bench_tb2_ornith9b_builtin8.json); 60 = max medido x2 + margen (precedente minicpm5-ollama de esta tabla). Sin celda kitty-infer: sin numeros infer repo-internos para ornith -> backend default 150s"
       }
     },
+    "k2-horizon": {
+      "kitty-infer": {
+        "secs": 310,
+        "origin": "cold wall 151s x2 = 302, redondeo AL ALZA + margen (convencion repo); perfil debug-CPU; trigger real observado tool-timeout 30s"
+      }
+    },
     "qwen3:4b": {      "ollama": {
         "secs": 120,
         "origin": "3/15 con cap 30s (2026-09-23, sin latencias finas conservadas); se mantiene el default actual, sin claim"
