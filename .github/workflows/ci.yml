@@ -162,7 +162,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
-      - uses: EmbarkStudios/cargo-deny-action@1ad33e49304de844c2c6cc106246e37cb1c21dc4e # v2.0.5
+      - uses: EmbarkStudios/cargo-deny-action@f20e90f289e90a40fd814d92ea2935d9db5da04f # v2.0.5
         with:
           command: check
 
@@ -239,3 +239,5 @@ jobs:
       # PENDING: el tag v8.30.1 no existe en gitleaks/gitleaks-action (tags
       # reales: v2.x/v3.x); pineado a v3.0.0 con SHA verificado por red.
       - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
