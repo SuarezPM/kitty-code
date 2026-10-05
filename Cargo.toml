@@ -108,7 +108,7 @@ mimalloc = "0.1"
 # M2: anyhow = "1.0.100" — ya cubierto por la entrada Kitty-Code (compatible), no duplicado
 # M2: serde = "1.0.228" — ya cubierto por la entrada Kitty-Code (compatible), no duplicado
 # M2: serde_json = "1.0.149" — ya cubierto por la entrada Kitty-Code (compatible), no duplicado
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 indexmap = { version = "2.13.0", features = ["serde"] }
 either = { version = "1.15.0", features = ["serde"] }
 accelerate-src = { version = "0.3.2" }
@@ -119,7 +119,7 @@ metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
 futures = "0.3"
 # M2: clap origin con wrap_help — conservado Kitty-Code (derive); wrap_help sin uso en codigo engine (verificado), no duplicado
-pyo3 = { version = "0.25.1", features = ["full", "extension-module", "either", "abi3-py310"] }
+pyo3 = { version = "0.29.2", features = ["full", "extension-module", "either", "abi3-py310"] }
 # M2: tokio 1.49 full+rt-multi-thread — cubierto por Kitty-Code "1"+full (full incluye rt-multi), no duplicado
 # All features but avif, avif increases the msrv dramatically
 image = { version = "0.25.9", default-features = false, features = [
@@ -163,7 +163,7 @@ objc2-foundation = "0.3.2"
 dispatch2 = { version = "0.3.0", default-features = false, features = ["block2"] }
 safetensors = "0.8.0"
 toml = "0.9.11"
-hf-hub = { version = "0.4.3", default-features = false, features = [
+hf-hub = { version = "0.5.0", default-features = false, features = [
     "ureq",
     "tokio",
     "rustls-tls",
@@ -171,9 +171,10 @@ hf-hub = { version = "0.4.3", default-features = false, features = [
 itertools = "0.14.0"
 rand09 = { package = "rand", version = "0.9.3" }
 # DUAL rand con motivo (M2): kitty-cli usa 0.10 (BenchAb shuffle, seed 42);
-# engine usa 0.9 (mistralrs + mistralrs-core, con rand_distr 0.5 / rand_isaac
-# 0.4). Idem reqwest.
-rand_distr = "0.5.1"
+# engine usa 0.9 (mistralrs + mistralrs-core, con rand_distr 0.6 / rand_isaac
+# 0.4 — isaac 0.5 exige rand_core 0.10, incompatible con rand 0.9 del engine).
+# Idem reqwest.
+rand_distr = "0.6.0"
 dirs = "6.0.0"
 # M2: thiserror = "2.0.18" — ya cubierto por la entrada Kitty-Code (compatible), no duplicado
 tokenizers = { version = "0.21.4", default-features = false }
@@ -185,7 +186,7 @@ minijinja-contrib = { version = "2.14.0", features = ["pycompat"] }
 regex-automata = { version = "0.4.13", features = ["meta"] }
 rustc-hash = "2.1.1"
 vob = "3.0.6"
-cfgrammar = "0.14.1"
+cfgrammar = "0.15.0"
 lrtable = "0.14.1"
 galil-seiferas = "0.1.5"
 radix_trie = "0.3.0"
@@ -194,7 +195,7 @@ tokio-rayon = "2.1.0"
 rand_isaac = "0.4.0"
 indicatif = { version = "0.18.3", features = ["rayon"] }
 async-trait = "0.1.89"
-strum = { version = "0.27.2", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 derive_more = { version = "2.1.1", default-features = false, features = ["from"] }
 akin = "0.4.0"
 variantly = "0.4.0"
