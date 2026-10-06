@@ -754,4 +754,89 @@ mod tests {
             vec!["cat > f", "echo hi"]
         );
     }
+
+    // === P1 fix-mutants: Guard::scan dd-refinement isolates ===
+    // Each benign `of=/dev/*` target in isolation must Allow. Before this,
+    // only `dd if=/dev/null` / `of=/dev/null` were covered, so the tail
+    // `||` mutants (of=/dev/stderr|stdin|tty|zero) survived masked by the
+    // early-true disjuncts. One isolated Allow per disjunct kills them.
+
+    #[test]
+    fn dd_of_dev_stdout_allowed_isolated() {
+        assert_eq!(
+            Guard::check_command("dd if=/dev/zero of=/dev/stdout"),
+            GuardVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn dd_of_dev_stderr_allowed_isolated() {
+        assert_eq!(
+            Guard::check_command("dd if=/dev/zero of=/dev/stderr"),
+            GuardVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn dd_of_dev_stdin_allowed_isolated() {
+        assert_eq!(
+            Guard::check_command("dd if=/dev/zero of=/dev/stdin"),
+            GuardVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn dd_of_dev_tty_allowed_isolated() {
+        assert_eq!(
+            Guard::check_command("dd if=/dev/zero of=/dev/tty"),
+            GuardVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn dd_of_dev_zero_allowed_isolated() {
+        assert_eq!(
+            Guard::check_command("dd if=/dev/zero of=/dev/zero"),
+            GuardVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn dd_refinement_needs_dd_prefix() {
+        // Outer `&&` killer (mod.rs:93): a non-dd blocked pattern that
+        // happens to contain a benign `of=` must still Block. Under
+        // `&&`→`||` this would `continue` past the `rm -rf /` pattern.
+        match Guard::check_command("rm -rf / of=/dev/null") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_substitution_output_blocked() {
+        // `>(...)` killer for `has_command_substitution` tail `||`→`&&`:
+        // only `>(` is present here (`$(`, backtick, `<(` absent).
+        match Guard::check_command("cat >(rm -rf /)") {
+            GuardVerdict::Block(_) => {}
+            other => panic!("Expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_non_destructive_target_edge_cases() {
+        // Kills `&&`→`||` / `||`→`&&` survivors in shell_parse.rs:
+        // fd-number spellings, plumbing spellings, and empty/non-numeric
+        // `/dev/fd/` which must stay non-destructive=false.
+        assert!(is_non_destructive_target("1"));
+        assert!(is_non_destructive_target("2"));
+        assert!(is_non_destructive_target("&2"));
+        assert!(is_non_destructive_target("2>"));
+        assert!(is_non_destructive_target("&>"));
+        assert!(is_non_destructive_target(">&"));
+        assert!(is_non_destructive_target("2>&1"));
+        assert!(is_non_destructive_target(">&2"));
+        assert!(!is_non_destructive_target("/dev/fd/"));
+        assert!(!is_non_destructive_target("/dev/fd/abc"));
+        assert!(is_non_destructive_target("/dev/fd/2"));
+    }
 }

@@ -30,3 +30,26 @@
 Signal: boolean-composition mutants in `Guard::scan` survive (also :96);
 sandbox `||`→`&&` / `Ok(())` replacements survive (`sandbox.rs:330,467,635`).
 Remediation is another lane (this file is the ledger, not the fix).
+
+## 2026-10-05 — P1 guard slice re-measure (Guard::scan only)
+
+- Scope: `-f "crates/kitty-harness/src/guard/mod.rs" -F "Guard::scan"`
+  (9 listed). Full guard scope lists 351 mutants (mod+patterns+shell_parse+
+  interpreters); full run still needs hours → HELD-timebox stands.
+- Counts (decided 8/8, VERIFIED with `--baseline skip`, ~2 min, -j4):
+
+| outcome  | count |
+|----------|-------|
+| caught   | 8     |
+| missed   | 0     |
+| timeout  | 0     |
+| unviable | 1     |
+
+- Score slice: **8/8 = 100%** (unviable excluded; was 4× `||→&&`
+  missed at :97–:99 + :96 in baseline partial).
+- Tests added (8, `crates/kitty-harness/src/guard/mod.rs` only):
+  5× isolated `dd of=/dev/{stdout,stderr,stdin,tty,zero}` Allow,
+  `dd_refinement_needs_dd_prefix`, `process_substitution_output_blocked`,
+  `is_non_destructive_target_edge_cases`.
+- Status: slice DONE (100%); full guard ≥80% NOT reached → HELD-timebox
+  (342/351 guard mutants unevaluated; sandbox.rs untouched this lane).
