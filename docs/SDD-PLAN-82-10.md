@@ -38,3 +38,7 @@ Safeguards: sandbox fail-closed, guard intacto, deny 0 advisories nuevos, `--loc
 - Cierre: re-auditoría PASO 1-5 (esperado 8.2) + T11.2 externa (humano) para el 10.
 
 **Mapa**: E1+E2 (D5 8→9 +.2) + Q2 (D3 7→8 +.15) + Q1 (D6 sostén) + M1/C1 (credibilidad E2E/CI) = 7.85+0.35 ≈ **8.2**; ramas: sin HU-8 → 8.0, sin Q1 → 8.1 o 7.9, todo-verde → 8.2. 10 = T11.2 externa revocando techos D1/D2/D3/D5/D6 de Nº1 + unlock E2E-con-modelo-en-CI (definición literal, no "mejor estado").
+
+## 5. FOLLOW-UPS / DEBT (post-ejecución T1.4 — evidencia en `benches/ab/manifests/evidence-t14/`)
+
+- MCP-tracing-stdout: formateador escribe a stdout, contamina 1 línea JSON-RPC (preexistente, fuera de T1.4).

@@ -310,14 +310,41 @@ pub enum Commands {
     Tui,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
+/// T1.4 (SDD-82-10 Q2): coexistencia tokio-console + fmt en un solo dispatcher.
+///
+/// Con `RUSTFLAGS="--cfg tokio_unstable"` (SOLO sesion, nunca commiteado) el
+/// registry compone `fmt + console` (gRPC 127.0.0.1:6669); sin la flag es un
+/// `fmt` plano identico al anterior — delta no-op (mismo filtro
+/// `kitty=info,warn`; `try_init` en vez de `init` para no panicar en doble
+/// init). `init()` a secas con dos dispatchers panica: por eso una sola via.
+#[cfg(tokio_unstable)]
+fn init_tracing() {
+    use tracing_subscriber::prelude::*;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "kitty=info,warn".into());
+    let console_layer = console_subscriber::ConsoleLayer::builder()
+        .with_default_env()
+        .spawn();
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(filter))
+        .with(console_layer)
+        .try_init();
+}
+
+/// Via sin flag: comportamiento identico al `fmt().init()` previo.
+#[cfg(not(tokio_unstable))]
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "kitty=info,warn".into()),
         )
-        .init();
+        .try_init();
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_tracing();
 
     let cli = Cli::parse();
 
