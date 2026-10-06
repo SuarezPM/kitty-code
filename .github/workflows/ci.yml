@@ -23,6 +23,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # Runner bloquea user-ns: sandbox fail-closed tumbaría mcp.rs:243,291
+      # (`echo hello` vía execute_bash). KITTY_SANDBOX=off honrado en
+      # bash.rs:84-93 (Guard sigue activo); los tests siguen probando
+      # Guard+MCP (blocked/redirect) y el wiring-test skipea honesto.
+      KITTY_SANDBOX: off
     steps:
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
       - name: Install Rust toolchain (rustup, no archived actions)
@@ -78,7 +84,8 @@ jobs:
       contents: read
     container:
       image: nvidia/cuda:12.9.1-devel-ubuntu24.04
-      options: --gpus all
+      # Compile-only: cargo check no necesita device; sin --gpus all el job
+      # corre en runner sin GPU (toolkit del image basta para nvcc).
     env:
       # Playbook lane: CUDA builds pin 1.98.0 (verified local rustc 1.98.0),
       # overriding the repo-wide stable default above.
@@ -162,7 +169,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
-      - uses: EmbarkStudios/cargo-deny-action@f20e90f289e90a40fd814d92ea2935d9db5da04f # v2.0.5
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
 
