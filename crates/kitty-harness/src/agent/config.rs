@@ -136,7 +136,7 @@ pub struct RunOverrides {
 #[cfg(test)]
 mod tests {
     use super::super::{env_lock, with_clean_tuning_env, Agent, AgentConfig};
-    use crate::model_profile::{ModelProfile, PromptStyle, ThinkingMode};
+    use crate::model_profile::{EnvRestoreGuard, ModelProfile, PromptStyle, ThinkingMode};
     use kitty_runtime::MockClient;
 
     #[test]
@@ -180,8 +180,7 @@ mod tests {
     fn no_think_env_forces_thinking_off_and_request_flag() {
         let _g = env_lock();
         let key = kitty_runtime::client::ENV_NO_THINK;
-        let prev = std::env::var(key).ok();
-        std::env::set_var(key, "1");
+        let _e = EnvRestoreGuard::set(key, "1");
         let agent = Agent::new(
             MockClient::new(vec![]),
             AgentConfig {
@@ -189,10 +188,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        match prev {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
         // KITTY_NO_THINK wins over the ornith profile's ThinkingMode::On…
         assert_eq!(agent.config().tuning.thinking, ThinkingMode::Off);
         // …and reaches the wire as think:false on every request.

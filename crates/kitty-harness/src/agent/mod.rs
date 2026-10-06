@@ -21,6 +21,8 @@ use tracing::{debug, info, warn};
 
 use crate::context::{ContextBudget, ContextError};
 #[cfg(test)]
+use crate::model_profile::EnvRestoreGuard;
+#[cfg(test)]
 use crate::model_profile::ModelProfile;
 use crate::model_profile::{PromptStyle, ThinkingMode};
 use crate::parser::ParsedToolCall;
@@ -110,30 +112,15 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Run `f` with the tuning-relevant env vars cleared (restored
-/// afterwards) so profile-resolution tests are hermetic.
+/// afterwards via `EnvRestoreGuard` so a panicking assert cannot leak
+/// dirty env to the next parallel test) so profile-resolution tests are
+/// hermetic.
 #[cfg(test)]
 pub(crate) fn with_clean_tuning_env(f: impl FnOnce()) {
     let _g = env_lock();
-    let vars = [
-        (
-            crate::model_profile::ENV_MODEL_TURN_CAPS,
-            std::env::var(crate::model_profile::ENV_MODEL_TURN_CAPS).ok(),
-        ),
-        (
-            kitty_runtime::client::ENV_NO_THINK,
-            std::env::var(kitty_runtime::client::ENV_NO_THINK).ok(),
-        ),
-    ];
-    for (key, _) in &vars {
-        std::env::remove_var(key);
-    }
+    let _a = EnvRestoreGuard::remove(crate::model_profile::ENV_MODEL_TURN_CAPS);
+    let _b = EnvRestoreGuard::remove(kitty_runtime::client::ENV_NO_THINK);
     f();
-    for (key, prev) in &vars {
-        match prev {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
 }
 
 /// Write a Makefile whose `test` target exits with `code`.
@@ -359,9 +346,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
     async fn test_contract_integration_nudge_injected() {
-        let prev = std::env::var("SMALLCODE_CONTRACT").ok();
-        std::env::remove_var("SMALLCODE_CONTRACT");
+        // P1 fix-coverace: this was the only env-mutating test WITHOUT the
+        // shared lock — its transient SMALLCODE_CONTRACT removal raced every
+        // parallel check_done_guard/process_response reader.
+        let _g = env_lock();
+        let _e = EnvRestoreGuard::remove("SMALLCODE_CONTRACT");
         let mock = MockClient::new(vec![]);
         let mut agent = Agent::new(
             mock,
@@ -392,11 +383,6 @@ mod tests {
             "expected blocker a01 in nudge, got: {content}"
         );
         assert_eq!(last.role, "user");
-        if let Some(v) = prev {
-            std::env::set_var("SMALLCODE_CONTRACT", v);
-        } else {
-            std::env::remove_var("SMALLCODE_CONTRACT");
-        }
     }
 
     #[test]
@@ -672,8 +658,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
     async fn verify_loop_triggers_on_test_failure() {
         let _g = env_lock();
-        let prev = std::env::var(ENV_VERIFY_LOOP).ok();
-        std::env::remove_var(ENV_VERIFY_LOOP);
+        let _e = EnvRestoreGuard::remove(ENV_VERIFY_LOOP);
 
         let dir = tempfile::tempdir().unwrap();
         let ws = makefile_workspace(dir.path(), 1); // `make test` fails
@@ -721,19 +706,13 @@ mod tests {
             out, "done v3",
             "final output comes from the last forced response"
         );
-        if let Some(v) = prev {
-            std::env::set_var("KITTY_VERIFY_LOOP", v);
-        } else {
-            std::env::remove_var("KITTY_VERIFY_LOOP");
-        }
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
     async fn verify_loop_not_triggered_on_success() {
         let _g = env_lock();
-        let prev = std::env::var(ENV_VERIFY_LOOP).ok();
-        std::env::remove_var(ENV_VERIFY_LOOP);
+        let _e = EnvRestoreGuard::remove(ENV_VERIFY_LOOP);
 
         let dir = tempfile::tempdir().unwrap();
         let ws = makefile_workspace(dir.path(), 0); // `make test` succeeds
@@ -772,19 +751,13 @@ mod tests {
             0,
             "no feedback message when tests pass"
         );
-        if let Some(v) = prev {
-            std::env::set_var(ENV_VERIFY_LOOP, v);
-        } else {
-            std::env::remove_var(ENV_VERIFY_LOOP);
-        }
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
     async fn verify_loop_disabled_via_env() {
         let _g = env_lock();
-        let prev = std::env::var(ENV_VERIFY_LOOP).ok();
-        std::env::set_var(ENV_VERIFY_LOOP, "off");
+        let _e = EnvRestoreGuard::set(ENV_VERIFY_LOOP, "off");
 
         let dir = tempfile::tempdir().unwrap();
         let ws = makefile_workspace(dir.path(), 1); // would fail — but loop is off
@@ -823,19 +796,13 @@ mod tests {
             0,
             "KITTY_VERIFY_LOOP=off must disable the feedback loop"
         );
-        if let Some(v) = prev {
-            std::env::set_var(ENV_VERIFY_LOOP, v);
-        } else {
-            std::env::remove_var(ENV_VERIFY_LOOP);
-        }
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
     async fn verify_loop_skipped_without_file_edits() {
         let _g = env_lock();
-        let prev = std::env::var(ENV_VERIFY_LOOP).ok();
-        std::env::remove_var(ENV_VERIFY_LOOP);
+        let _e = EnvRestoreGuard::remove(ENV_VERIFY_LOOP);
 
         let dir = tempfile::tempdir().unwrap();
         let ws = makefile_workspace(dir.path(), 1); // fails, but agent edited nothing
@@ -870,11 +837,6 @@ mod tests {
             0,
             "failing tests without file edits must not trigger revisions"
         );
-        if let Some(v) = prev {
-            std::env::set_var(ENV_VERIFY_LOOP, v);
-        } else {
-            std::env::remove_var(ENV_VERIFY_LOOP);
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -946,8 +908,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
     async fn verify_failed_consumes_revision_not_hop() {
         let _g = env_lock();
-        let prev = std::env::var(ENV_VERIFY_LOOP).ok();
-        std::env::remove_var(ENV_VERIFY_LOOP);
+        let _e = EnvRestoreGuard::remove(ENV_VERIFY_LOOP);
 
         let dir = tempfile::tempdir().unwrap();
         let ws = makefile_workspace(dir.path(), 1); // always failing tests
@@ -1007,11 +968,6 @@ mod tests {
             continues, 1,
             "verification-driven retries must not consume hops"
         );
-        if let Some(v) = prev {
-            std::env::set_var(ENV_VERIFY_LOOP, v);
-        } else {
-            std::env::remove_var(ENV_VERIFY_LOOP);
-        }
     }
 
     #[tokio::test]
@@ -1061,8 +1017,7 @@ mod tests {
     async fn tool_result_truncated_by_remaining_budget() {
         let _g = env_lock();
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var(ENV_TRUNCATION_DIR).ok();
-        std::env::set_var(ENV_TRUNCATION_DIR, tmp.path());
+        let _e = EnvRestoreGuard::set(ENV_TRUNCATION_DIR, tmp.path());
 
         // 10KB file: passes the old fixed-50KB guard, must still spill when
         // the remaining context budget is (near) zero.
@@ -1097,12 +1052,6 @@ mod tests {
             "expected budget-driven truncation, got tail: {}",
             &content[content.len().saturating_sub(120)..]
         );
-
-        if let Some(v) = prev {
-            std::env::set_var(ENV_TRUNCATION_DIR, v);
-        } else {
-            std::env::remove_var(ENV_TRUNCATION_DIR);
-        }
     }
 
     // -----------------------------------------------------------------------

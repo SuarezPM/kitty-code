@@ -514,12 +514,52 @@ fn turn_cap_static_for(model_id: &str) -> Option<usize> {
 /// threads in parallel inside a single test binary, and every module's test
 /// mod shares that binary). Used by this module's tests; `agent.rs` tests
 /// delegate their `env_lock` here so both modules exclude each other.
+///
+/// Poison-tolerant (`into_inner`): if a test panics while holding the lock,
+/// the next test still proceeds instead of cascading 30× `PoisonError`
+/// (P1 fix-coverace: the cascade hid the real first failure in CI).
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Panic-safe env restore for env-mutating tests (P1 fix-coverace).
+///
+/// Manual save/restore (`prev` + restore after the asserts) skips the
+/// restore when an assert panics, leaving the process env dirty for the
+/// next test on another thread. Hold this guard instead: `Drop` restores
+/// even on panic. Always pair with [`test_env_lock`].
+#[cfg(test)]
+pub(crate) struct EnvRestoreGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+#[cfg(test)]
+impl EnvRestoreGuard {
+    pub(crate) fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, prev }
+    }
+    pub(crate) fn remove(key: &'static str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvRestoreGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -664,19 +704,15 @@ mod tests {
     // ── Tier 4: per-model turn caps ────────────────────────────────
 
     /// Run `f` with `ENV_MODEL_TURN_CAPS` set to `val` (or removed when
-    /// `None`), restoring the previous value afterwards.
+    /// `None`), restoring the previous value afterwards (via
+    /// [`EnvRestoreGuard` so a panicking assert cannot leak dirty env).
     fn with_env_turn_caps(val: Option<&str>, f: impl FnOnce()) {
         let _g = test_env_lock();
-        let prev = std::env::var(ENV_MODEL_TURN_CAPS).ok();
-        match val {
-            Some(v) => std::env::set_var(ENV_MODEL_TURN_CAPS, v),
-            None => std::env::remove_var(ENV_MODEL_TURN_CAPS),
-        }
+        let _e = match val {
+            Some(v) => EnvRestoreGuard::set(ENV_MODEL_TURN_CAPS, v),
+            None => EnvRestoreGuard::remove(ENV_MODEL_TURN_CAPS),
+        };
         f();
-        match prev {
-            Some(v) => std::env::set_var(ENV_MODEL_TURN_CAPS, v),
-            None => std::env::remove_var(ENV_MODEL_TURN_CAPS),
-        }
     }
 
     #[test]

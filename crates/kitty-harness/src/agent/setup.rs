@@ -335,14 +335,14 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::super::{env_lock, Agent, AgentConfig};
+    use crate::model_profile::EnvRestoreGuard;
     use crate::model_profile::ModelProfile;
     use kitty_runtime::OllamaClient;
 
     #[test]
     fn turn_cap_applied_per_model_in_new_inner() {
         let _g = env_lock();
-        let prev = std::env::var(crate::model_profile::ENV_MODEL_TURN_CAPS).ok();
-        std::env::remove_var(crate::model_profile::ENV_MODEL_TURN_CAPS);
+        let _e = EnvRestoreGuard::remove(crate::model_profile::ENV_MODEL_TURN_CAPS);
 
         // Matching model id → static-table cap overrides the profile default.
         let client = OllamaClient::new("http://localhost:11434");
@@ -376,11 +376,5 @@ mod tests {
             agent.config().max_iterations,
             ModelProfile::medium().max_iterations
         );
-
-        if let Some(v) = prev {
-            std::env::set_var(crate::model_profile::ENV_MODEL_TURN_CAPS, v);
-        } else {
-            std::env::remove_var(crate::model_profile::ENV_MODEL_TURN_CAPS);
-        }
     }
 }

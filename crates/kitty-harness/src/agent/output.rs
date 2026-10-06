@@ -136,6 +136,7 @@ pub(crate) fn effective_output_cap(remaining_tokens: usize) -> usize {
 mod tests {
     use super::super::{env_lock, ENV_TRUNCATION_DIR};
     use super::*;
+    use crate::model_profile::EnvRestoreGuard;
 
     #[tokio::test]
     async fn truncate_small_output_passthrough() {
@@ -176,8 +177,7 @@ mod tests {
     async fn truncate_large_output_spills_to_disk_with_pointer() {
         let _g = env_lock();
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var(ENV_TRUNCATION_DIR).ok();
-        std::env::set_var(ENV_TRUNCATION_DIR, tmp.path());
+        let _e = EnvRestoreGuard::set(ENV_TRUNCATION_DIR, tmp.path());
 
         // >50KB triggers spill
         let big = "x".repeat(60 * 1024);
@@ -203,12 +203,6 @@ mod tests {
         let many_lines = "line\n".repeat(2500);
         let out2 = truncate_tool_output(many_lines, TRUNCATION_MAX_BYTES).await;
         assert!(out2.contains("[truncated: full output at "));
-
-        if let Some(v) = prev {
-            std::env::set_var(ENV_TRUNCATION_DIR, v);
-        } else {
-            std::env::remove_var(ENV_TRUNCATION_DIR);
-        }
     }
 
     #[test]
@@ -237,8 +231,7 @@ mod tests {
     async fn truncate_exceeding_small_injected_budget_spills() {
         let _g = env_lock();
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var(ENV_TRUNCATION_DIR).ok();
-        std::env::set_var(ENV_TRUNCATION_DIR, tmp.path());
+        let _e = EnvRestoreGuard::set(ENV_TRUNCATION_DIR, tmp.path());
 
         // 10KB exceeds a SMALL injected cap even though the fixed 50KB
         // threshold would not fire — exactly the Tier 3 overflow class.
@@ -256,11 +249,5 @@ mod tests {
             .trim_start_matches("[truncated: full output at ")
             .trim_end_matches(']');
         assert_eq!(std::fs::read_to_string(path).unwrap().len(), medium.len());
-
-        if let Some(v) = prev {
-            std::env::set_var(ENV_TRUNCATION_DIR, v);
-        } else {
-            std::env::remove_var(ENV_TRUNCATION_DIR);
-        }
     }
 }

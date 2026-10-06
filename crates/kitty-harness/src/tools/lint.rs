@@ -576,6 +576,7 @@ pub(crate) fn truncate_lines(text: &str, max: usize) -> String {
 mod tests {
     use super::super::ToolRegistry;
     use super::*;
+    use crate::model_profile::EnvRestoreGuard;
     use std::time::Duration;
 
     #[tokio::test]
@@ -664,12 +665,8 @@ mod tests {
     #[tokio::test]
     async fn lint_gate_disabled_by_default() {
         let _g = lint_env_lock();
-        let prev = std::env::var("KITTY_LINT_GATE").ok();
-        std::env::remove_var("KITTY_LINT_GATE");
+        let _e = EnvRestoreGuard::remove("KITTY_LINT_GATE");
         assert!(!lint_gate_enabled(), "lint gate must default to off");
-        if let Some(v) = prev {
-            std::env::set_var("KITTY_LINT_GATE", v);
-        }
     }
 
     #[tokio::test]
@@ -784,8 +781,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
     async fn execute_write_appends_lint_section_when_enabled() {
         let _g = lint_env_lock();
-        let prev = std::env::var("KITTY_LINT_GATE").ok();
-        std::env::set_var("KITTY_LINT_GATE", "1");
+        let _e = EnvRestoreGuard::set("KITTY_LINT_GATE", "1");
 
         let dir = tempfile::tempdir().unwrap();
         let py = dir.path().join("bad.py");
@@ -806,19 +802,13 @@ mod tests {
             "syntax-broken .py must be flagged, got: {}",
             result.output
         );
-
-        match prev {
-            Some(v) => std::env::set_var("KITTY_LINT_GATE", v),
-            None => std::env::remove_var("KITTY_LINT_GATE"),
-        }
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
     async fn execute_write_has_no_lint_section_when_disabled() {
         let _g = lint_env_lock();
-        let prev = std::env::var("KITTY_LINT_GATE").ok();
-        std::env::remove_var("KITTY_LINT_GATE");
+        let _e = EnvRestoreGuard::remove("KITTY_LINT_GATE");
 
         let dir = tempfile::tempdir().unwrap();
         let py = dir.path().join("fine.py");
@@ -833,11 +823,6 @@ mod tests {
             "gate off → no lint section, got: {}",
             result.output
         );
-
-        match prev {
-            Some(v) => std::env::set_var("KITTY_LINT_GATE", v),
-            None => std::env::remove_var("KITTY_LINT_GATE"),
-        }
     }
 
     #[tokio::test]
