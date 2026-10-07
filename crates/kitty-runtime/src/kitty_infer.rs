@@ -198,6 +198,83 @@ fn gguf_block_count(path: &std::path::Path) -> Option<usize> {
     usize::try_from(count).ok().filter(|v| *v > 0)
 }
 
+/// GGUF architectures the embedded engine can serve. Mirror of
+/// `engine/mistralrs-core/src/gguf/normal_registry.rs` `as_str`; if the
+/// registry gains an arch, add its string here.
+const SUPPORTED_GGUF_ARCHITECTURES: &[&str] = &[
+    "llama",
+    "mistral3",
+    "gemma",
+    "gemma2",
+    "phi2",
+    "phi3",
+    "phimoe",
+    "qwen2",
+    "qwen3",
+    "qwen3moe",
+    "qwen3next",
+    "qwen35",
+    "qwen35moe",
+    "starcoder2",
+    "deepseek2",
+    "glm4",
+    "glm4moe",
+    "smollm3",
+    "granite",
+    "granitemoe",
+    "granitehybrid",
+    "gpt-oss",
+    "hunyuan-dense",
+    "hunyuan-moe",
+    "lfm2",
+    "lfm2moe",
+    "k2-horizon",
+];
+
+/// Read `general.architecture` from a GGUF header. `None` = unreadable
+/// header (fail-open: the loader gives the final verdict).
+fn gguf_architecture(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).ok()?;
+    if &magic != b"GGUF" {
+        return None;
+    }
+    gguf_read_u32(&mut f)?; // version
+    let tensor_count = gguf_read_u64(&mut f)?;
+    let kv_count = gguf_read_u64(&mut f)?;
+    if tensor_count > 1_000_000 || kv_count > 1_000_000 {
+        return None;
+    }
+    for _ in 0..kv_count {
+        let key = gguf_read_str(&mut f)?;
+        let ty = gguf_read_u32(&mut f)?;
+        if key == "general.architecture" && ty == 8 {
+            return gguf_read_str(&mut f);
+        }
+        skip_gguf_value(&mut f, ty)?;
+    }
+    None
+}
+
+fn is_supported_gguf_arch(arch: &str) -> bool {
+    SUPPORTED_GGUF_ARCHITECTURES.contains(&arch)
+}
+
+/// Early arch gate: fail fast with an actionable message instead of a late
+/// loader error. Unreadable headers fail OPEN (the loader decides).
+fn check_gguf_arch(path: &std::path::Path) -> Result<()> {
+    match gguf_architecture(path) {
+        None => Ok(()),
+        Some(arch) if is_supported_gguf_arch(&arch) => Ok(()),
+        Some(arch) => Err(RuntimeError::InvalidArgument(format!(
+            "GGUF architecture `{arch}` is not served by the embedded backend — \
+             check docs/SUPPORTED-MODELS.md for the supported list, or run it via Ollama",
+        ))),
+    }
+}
+
 /// Skip one GGUF metadata value of the given type tag.
 fn skip_gguf_value(f: &mut std::fs::File, ty: u32) -> Option<()> {
     use std::io::{Read, Seek, SeekFrom};
@@ -935,6 +1012,7 @@ impl ChatClient for KittyInferClient {
                     self.config.model_path.display()
                 )));
             }
+            check_gguf_arch(&self.config.model_path)?;
             let file_name = self
                 .config
                 .model_path
@@ -1065,6 +1143,48 @@ mod mapping_tests {
         kv_str(&mut blob3, "general.architecture", "qwen3");
         std::fs::write(&path, &blob3).unwrap();
         assert_eq!(gguf_block_count(&path), Some(36));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn gguf_arch_early_check_accepts_rejects_and_fails_open() {
+        use super::{check_gguf_arch, gguf_architecture, is_supported_gguf_arch};
+        fn blob_with_arch(arch: &str) -> Vec<u8> {
+            fn u32le(v: u32, out: &mut Vec<u8>) {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            fn u64le(v: u64, out: &mut Vec<u8>) {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            fn kv_str(out: &mut Vec<u8>, key: &str, val: &str) {
+                u64le(key.len() as u64, out);
+                out.extend_from_slice(key.as_bytes());
+                u32le(8, out);
+                u64le(val.len() as u64, out);
+                out.extend_from_slice(val.as_bytes());
+            }
+            let mut blob = vec![];
+            blob.extend_from_slice(b"GGUF");
+            u32le(3, &mut blob);
+            u64le(0, &mut blob);
+            u64le(1, &mut blob);
+            kv_str(&mut blob, "general.architecture", arch);
+            blob
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join("kitty-infer-test-arch-check.gguf");
+        assert!(is_supported_gguf_arch("qwen3"));
+        assert!(is_supported_gguf_arch("k2-horizon"));
+        assert!(!is_supported_gguf_arch("falcon"));
+        std::fs::write(&path, blob_with_arch("qwen3")).unwrap();
+        assert_eq!(gguf_architecture(&path), Some("qwen3".to_string()));
+        assert!(check_gguf_arch(&path).is_ok());
+        std::fs::write(&path, blob_with_arch("falcon")).unwrap();
+        assert_eq!(gguf_architecture(&path), Some("falcon".to_string()));
+        assert!(check_gguf_arch(&path).is_err());
+        std::fs::write(&path, b"NOPE").unwrap();
+        assert_eq!(gguf_architecture(&path), None);
+        assert!(check_gguf_arch(&path).is_ok());
         std::fs::remove_file(&path).unwrap();
     }
 

@@ -1353,6 +1353,24 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
         modify_draft_cache: bool,
         _load_preallocated_cache: bool,
     ) -> Result<()> {
+        // P2 acquire (twin of release): prefill entry is the admission point with
+        // capacity context (KV blocks were already admitted by the scheduler).
+        // Seqs without a slot (fresh admit or post-evict readmission) acquire one
+        // here; running seqs keep theirs so accounting is untouched. clone_in
+        // deliberately does NOT acquire: a missing slot there is a leak/bug and
+        // silent re-allocation would corrupt accounting.
+        // Zeroed (`allocate_seq`), not Deferred: prefill consumes conv+temporal
+        // state in this same step, so the slot must be initialized before forward;
+        // Deferred would expose uninitialized memory to the first matmul. On
+        // eviction `release_seq` frees unconditionally, so re-admit + Zeroed
+        // restores the clean-slate invariant with no prewarm pass.
+        let mut hybrid_cache = pipeline.cache().hybrid();
+        for seq in seqs.iter_mut() {
+            if seq.recurrent_state_idx().is_none() {
+                let slot_idx = hybrid_cache.allocate_seq(*seq.id())?;
+                seq.set_recurrent_state_idx(Some(slot_idx));
+            }
+        }
         let sequence_slots = seqs
             .iter()
             .map(|seq| {
@@ -1366,7 +1384,6 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut hybrid_cache = pipeline.cache().hybrid();
         hybrid_cache.validate_sequence_slots(&sequence_slots)?;
         for seq in seqs.iter_mut() {
             let seq_cache = if modify_draft_cache {

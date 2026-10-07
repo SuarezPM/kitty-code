@@ -3867,6 +3867,159 @@ mod tests {
         pool.conv_state = original_second;
         Ok(())
     }
+
+    // P2: the same prompt admitted twice (seq0/seq1) must start from byte-identical
+    // recurrent state, so greedy decode from identical tokens is identical. Release
+    // must hand back a clean slot and re-admission must reuse it zeroed.
+    #[test]
+    fn readmitted_slot_reuses_zeroed_bytes_byte_identity() -> Result<()> {
+        let mut cache = HybridCache::new(
+            gdn_config(vec![HybridLayerType::Recurrent]),
+            DType::F32,
+            &[Device::Cpu],
+        )?;
+        let first = cache.allocate_seq(0)?;
+        let first_snap = cache.snapshot_recurrent_state(0, first)?;
+        assert_eq!(first_snap.len(), 1);
+        let first_conv = first_snap[0]
+            .conv_state
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let first_temporal = first_snap[0]
+            .recurrent_state
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(first_conv.iter().all(|&v| v == 0.0));
+        assert!(first_temporal.iter().all(|&v| v == 0.0));
+
+        assert!(cache.release_seq(0, first)?);
+        // Same prompt admitted again as a new sequence: reuse the slot zeroed.
+        let second = cache.allocate_seq(1)?;
+        assert_eq!(second, first);
+        let second_snap = cache.snapshot_recurrent_state(1, second)?;
+        let second_conv = second_snap[0]
+            .conv_state
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let second_temporal = second_snap[0]
+            .recurrent_state
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(second_conv, first_conv);
+        assert_eq!(second_temporal, first_temporal);
+        assert!(cache.release_seq(1, second)?);
+        assert_eq!(cache.recurrent_slots_used(), 0);
+        Ok(())
+    }
+
+    // P2: retract (release) then re-admit + restore must bring back both the conv
+    // state and the temporal (GDN key/value) state byte-exact, passing the same
+    // slot-validation gate `clone_in` uses before forward.
+    #[test]
+    fn retracted_slot_restores_conv_and_temporal_bytes() -> Result<()> {
+        let mut cache = HybridCache::new(
+            gdn_config(vec![HybridLayerType::Recurrent]),
+            DType::F32,
+            &[Device::Cpu],
+        )?;
+        let slot = cache.allocate_seq(10)?;
+        let pristine = cache.snapshot_recurrent_state(10, slot)?;
+        assert_eq!(pristine.len(), 1);
+        // Stand in for decoded tokens: write a nonzero conv+temporal state.
+        let dirty: Vec<RecurrentStateSnapshot> = pristine
+            .iter()
+            .map(|snap| {
+                Ok(RecurrentStateSnapshot {
+                    conv_state: Tensor::ones_like(&snap.conv_state)?,
+                    recurrent_state: Tensor::ones_like(&snap.recurrent_state)?,
+                    state_layout: snap.state_layout,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        cache.restore_recurrent_state(10, slot, &dirty)?;
+        let before = cache.snapshot_recurrent_state(10, slot)?;
+        let before_conv = before[0]
+            .conv_state
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let before_temporal = before[0]
+            .recurrent_state
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(before_conv.iter().all(|&v| v == 1.0));
+        assert!(before_temporal.iter().all(|&v| v == 1.0));
+
+        // Retract: release the slot (preempt/finish path).
+        assert!(cache.release_seq(10, slot)?);
+        // Re-admit the same sequence and restore the checkpoint.
+        let readmitted = cache.allocate_seq(10)?;
+        assert_eq!(readmitted, slot);
+        cache.restore_recurrent_state(10, readmitted, &dirty)?;
+        cache.validate_sequence_slots(&[(10, readmitted)])?;
+        let after = cache.snapshot_recurrent_state(10, readmitted)?;
+        let after_conv = after[0]
+            .conv_state
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let after_temporal = after[0]
+            .recurrent_state
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(after_conv, before_conv);
+        assert_eq!(after_temporal, before_temporal);
+        assert!(cache.release_seq(10, readmitted)?);
+        assert_eq!(cache.recurrent_slots_used(), 0);
+        Ok(())
+    }
+
+    // P2: deterministic admit/evict interleave (proptest substitute: Cargo.toml is
+    // off-limits so no new dev-deps). Fill, evict evens, re-admit: freed slots must
+    // be reused exactly once each and accounting must balance at every step.
+    #[test]
+    fn slot_interleave_reuses_freed_slots_exactly_once() -> Result<()> {
+        let mut cache = HybridCache::new(
+            config(vec![HybridLayerType::Recurrent, HybridLayerType::Recurrent]),
+            DType::F32,
+            &[Device::Cpu, Device::Cpu],
+        )?;
+        let cap = cache.recurrent_capacity();
+        let mut live: Vec<(usize, usize)> = Vec::new();
+        for seq in 0..cap {
+            live.push((seq, cache.allocate_seq(seq)?));
+        }
+        assert_eq!(cache.recurrent_slots_used(), cap);
+        // Evict evens (retract path).
+        let mut freed = Vec::new();
+        live.retain(|(seq, slot)| {
+            if seq % 2 == 0 {
+                assert!(cache.release_seq(*seq, *slot).unwrap());
+                freed.push(*slot);
+                false
+            } else {
+                true
+            }
+        });
+        assert_eq!(cache.recurrent_slots_used(), live.len());
+        // Re-admit new seqs: must reuse exactly the freed slots, no aliases.
+        let mut reused = HashSet::new();
+        for seq in 1000..1000 + freed.len() {
+            let slot = cache.allocate_seq(seq)?;
+            assert!(reused.insert(slot), "slot {slot} aliased on re-admit");
+            live.push((seq, slot));
+        }
+        assert_eq!(
+            reused,
+            freed.into_iter().collect::<HashSet<_>>(),
+            "re-admit must reuse exactly the freed slots"
+        );
+        assert_eq!(cache.recurrent_slots_used(), live.len());
+        cache.validate_sequence_slots(&live)?;
+        for (seq, slot) in live {
+            assert!(cache.release_seq(seq, slot)?);
+        }
+        assert_eq!(cache.recurrent_slots_used(), 0);
+        Ok(())
+    }
 }
 
 impl PastKvLenCache for HybridCache {

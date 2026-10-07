@@ -106,7 +106,7 @@ pub(crate) fn lark_tool_name_alternatives(tools: &[Tool]) -> String {
 mod tests {
     use super::super::parsers;
     use crate::Tool;
-    use crate::{Function, Tool, ToolType};
+    use crate::{Function, ToolType};
 
     fn sample_tools() -> Vec<Tool> {
         vec![

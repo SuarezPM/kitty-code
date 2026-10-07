@@ -1693,7 +1693,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let seq = Sequence::new_waiting(
+        let mut seq = Sequence::new_waiting(
             vec![1; len],
             "prompt".to_string(),
             id,
@@ -1715,6 +1715,7 @@ mod tests {
             Some(8),
             None,
             SeqStepType::PromptAndDecode,
+            None,
             false,
             false,
             vec![],
@@ -2403,9 +2404,7 @@ mod tests {
         let (oversized, mut receiver) = test_sequence_with_media_and_receiver(
             1,
             1_024,
-            true,
-            None,
-            None,
+            Some(MultimodalKind::Image),
         );
         {
             let mut oversized = get_mut_arcmutex!(oversized);

@@ -424,10 +424,10 @@ print(1 < 2)
         let tool = crate::Tool {
             tp: ToolType::Function,
             function: Function {
-                name: "mistralrs_execute_python".to_string(),
-                description: None,
-                parameters: Some(parameters),
-                strict: Some(true),
+                    name: "mistralrs_execute_python".to_string(),
+                    description: None,
+                    parameters: Some(Value::Object(parameters.into_iter().collect())),
+                    strict: Some(true),
             },
         };
 
@@ -483,10 +483,10 @@ print(1 < 2)
         let tool = crate::Tool {
             tp: ToolType::Function,
             function: Function {
-                name: "get_weather".to_string(),
-                description: None,
-                parameters: Some(parameters),
-                strict: None,
+                    name: "get_weather".to_string(),
+                    description: None,
+                    parameters: Some(Value::Object(parameters.into_iter().collect())),
+                    strict: None,
             },
         };
         let grammar = QwenParser.tool_call_grammar(&[tool], "<tool_call>");

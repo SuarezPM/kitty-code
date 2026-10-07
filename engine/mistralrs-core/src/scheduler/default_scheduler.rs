@@ -423,6 +423,7 @@ mod tests {
             Some(8),
             None,
             SeqStepType::PromptAndDecode,
+            None,
             false,
             false,
             vec![],

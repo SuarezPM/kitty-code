@@ -781,6 +781,21 @@ impl Engine {
                         self.logger.add_prefix_cache_hit();
                     }
 
+                    // Gate-2 remediation (twin of the set_none acquire): a hybrid
+                    // sequence arriving without slot (prefix-restore path with
+                    // offset != 0) must acquire one before snapshots restore,
+                    // else clone_in bails with "has no recurrent state slot".
+                    // Zeroed: restore consumes state in the following steps.
+                    if seq.recurrent_state_idx().is_none() {
+                        let pipeline = get_mut_arcmutex!(self.pipeline);
+                        if pipeline.cache().is_hybrid() {
+                            let slot_idx = handle_seq_error!(
+                                pipeline.cache().hybrid().allocate_seq(*seq.id()),
+                                request.response
+                            );
+                            seq.set_recurrent_state_idx(Some(slot_idx));
+                        }
+                    }
                     if let Some(snapshots) = recurrent_snapshots {
                         if let Some(slot_idx) = seq.recurrent_state_idx() {
                             let restore_result = {
