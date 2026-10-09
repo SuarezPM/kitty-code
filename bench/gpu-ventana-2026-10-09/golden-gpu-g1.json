@@ -1,0 +1,20 @@
+{
+  "backend": "ollama",
+  "model": "ornith:9b",
+  "seed": 42,
+  "rep": 1,
+  "task": "Create /tmp/golden-g1/hello.txt with content: hola",
+  "verdict": "success",
+  "exit": 0,
+  "file_content": "hola",
+  "file_bytes": 4,
+  "journal": {
+    "path": "/tmp/golden-g1/hello.txt",
+    "before": null,
+    "after": "hola"
+  },
+  "stdout_tool_mentions": [],
+  "tool_execution_failed": 0,
+  "empty_responses": 3,
+  "wall_s": 8.0
+}

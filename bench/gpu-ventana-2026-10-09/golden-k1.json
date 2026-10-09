@@ -1,0 +1,26 @@
+{
+  "backend": "ollama",
+  "by_language": {
+    "bash": {
+      "attempted": 1,
+      "errored": 1,
+      "failed": 0,
+      "passed": 0
+    }
+  },
+  "details": [
+    {
+      "id": "tb2-bash-count",
+      "lang": "bash",
+      "latency_ms": 30000.0,
+      "passed": false,
+      "verdict": "timeout"
+    }
+  ],
+  "memory": false,
+  "model": "minicpm5:2b",
+  "passed": 0,
+  "rate_pct": 0.0,
+  "suite": "tb2",
+  "total": 1
+}

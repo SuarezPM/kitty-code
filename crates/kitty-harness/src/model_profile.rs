@@ -113,6 +113,22 @@ static LARGE: ModelProfile = ModelProfile {
     prompt_style: PromptStyle::Full,
 };
 
+/// W4 execution tier (SDD estado-arte): triaje vs ejecución.
+///
+/// - `Triage`: constrained presets (nano/tiny — 4K ctx, 5 iter, 4 tools)
+///   that classify/route cheaply. Gets the minimal prompt surface, enforced
+///   grammar (see `new_inner`), and compact-QR compaction summaries.
+/// - `Execution`: full-context presets (small/medium/large) that do the
+///   work. Gets the full prompt and the full compaction summary.
+///
+/// Unknown profile names map to `Execution` (fail-open: never silently
+/// degrade an unrecognized preset to triage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Triage,
+    Execution,
+}
+
 impl ModelProfile {
     /// Preset for sub-2B small-family models (4K ctx, 5 iter, 4 tools,
     /// read cap 80, minimal prompt).
@@ -137,6 +153,36 @@ impl ModelProfile {
         &LARGE
     }
 
+    /// W4: execution tier for this preset (triaje for the constrained
+    /// nano/tiny presets, ejecución for the rest; unknown names fail open
+    /// to `Execution`).
+    pub fn tier(&self) -> Tier {
+        match self.name {
+            "nano" | "tiny" => Tier::Triage,
+            _ => Tier::Execution,
+        }
+    }
+}
+
+impl Tier {
+    /// W8: auto-detect tier from a model id with the SAME order as
+    /// [`ModelProfile::from_cli`] auto mode (small-check first, then nano).
+    /// Explicit `--profile` still wins at runtime (`profile.tier()` is the
+    /// authority); this is the fail-open default for docs, tables, and
+    /// pre-construction routing.
+    #[must_use]
+    pub fn for_model(model_id: &str) -> Tier {
+        if is_small_sized_model(model_id) {
+            return Tier::Execution;
+        }
+        if is_nano_sized_model(model_id) {
+            return Tier::Triage;
+        }
+        Tier::Execution
+    }
+}
+
+impl ModelProfile {
     /// An explicitly recognized profile name always wins (`--profile medium`
     /// on a 3B model stays medium). Otherwise ("auto" or any unrecognized
     /// value) the MODEL NAME decides via [`is_small_sized_model`] /
@@ -973,6 +1019,56 @@ mod tests {
             let t = ModelTuning::resolve(model, Some("1"), None);
             assert_eq!(t.thinking, ThinkingMode::Off, "{model} must honor NO_THINK");
         }
+    }
+
+    /// W8: `Tier::for_model` replica el orden auto de `from_cli`
+    /// (small primero, luego nano) para los 8 modelos medidos en
+    /// `bench/gpu-ventana-2026-10-09/manifest-w6-vram.json` (+ casos borde).
+    /// Fija la columna tier de `docs/SUPPORTED-MODELS-8GB.md`.
+    #[test]
+    fn tier_for_model_matches_measured_matrix() {
+        // Medidos → Execution, salvo granite4:3b (token ":3b" = nano-shape).
+        for id in [
+            "smollm2:1.7b",
+            "minicpm5:2b",
+            "alibayram/smollm3:latest",
+            "qwen3:4b",
+            "qwen3.5:4b",
+            "ornith:9b",
+            "ornith:9b-opt",
+            "qwen38-27b:latest",
+        ] {
+            assert_eq!(Tier::for_model(id), Tier::Execution, "{id}");
+        }
+        assert_eq!(Tier::for_model("granite4:3b"), Tier::Triage);
+        // Bordes: nano-shapes → Triage; resto fail-open a Execution.
+        assert_eq!(Tier::for_model("qwen2.5:3b"), Tier::Triage);
+        assert_eq!(Tier::for_model("k2-horizon-3.7b"), Tier::Execution);
+        assert_eq!(Tier::for_model("unknown-model:7b"), Tier::Execution);
+        // Coherencia con from_cli auto: mismo perfil ⇒ mismo tier.
+        for id in ["granite4:3b", "qwen3:4b", "ornith:9b", "minicpm5:2b"] {
+            assert_eq!(
+                ModelProfile::from_cli("auto", id).tier(),
+                Tier::for_model(id),
+                "{id}"
+            );
+        }
+    }
+
+    /// W4: tiers triaje/ejecución por preset (desconocidos → Execution).
+    #[test]
+    fn tier_maps_presets() {
+        assert_eq!(ModelProfile::nano().tier(), Tier::Triage);
+        assert_eq!(ModelProfile::tiny().tier(), Tier::Triage);
+        assert_eq!(ModelProfile::small().tier(), Tier::Execution);
+        assert_eq!(ModelProfile::medium().tier(), Tier::Execution);
+        assert_eq!(ModelProfile::large().tier(), Tier::Execution);
+        // Fail-open: un preset no reconocido nunca degrada a triaje.
+        let unknown = ModelProfile {
+            name: "custom-xl",
+            ..ModelProfile::medium().clone()
+        };
+        assert_eq!(unknown.tier(), Tier::Execution);
     }
 
     #[test]

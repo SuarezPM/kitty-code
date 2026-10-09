@@ -5,6 +5,7 @@
 //! Every call goes through the same security stack (Guard + write-vs-edit
 //! + permission-gate) because it reuses `ToolRegistry::execute`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use kitty_harness::parser::ParsedToolCall;
@@ -13,10 +14,27 @@ use kitty_runtime::ToolDefinition;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+/// Canonicalize a tool name for plan/journal decisions (mirrors the
+/// harness `normalize_tool_name` real-name fold; synonyms stay untouched —
+/// the registry resolves those after our gate).
+fn canonical_tool_name(name: &str) -> &str {
+    for real in ["Read", "Edit", "Write", "Bash", "Glob", "Grep"] {
+        if real.eq_ignore_ascii_case(name) {
+            return real;
+        }
+    }
+    name
+}
+
 /// MCP server that advertises Kitty Code tools.
 pub struct McpServer {
     tools: Vec<ToolDefinition>,
     registry: Arc<tokio::sync::Mutex<ToolRegistry>>,
+    /// W3 plan mode: `Edit`/`Write` are refused (see `crate::plan`).
+    plan_mode: bool,
+    /// W3 edit journal: `Edit`/`Write` successes are recorded for `kitty undo`.
+    /// `None` = journaling disabled (unit tests use an explicit temp path).
+    journal_path: Option<PathBuf>,
 }
 
 impl McpServer {
@@ -29,7 +47,21 @@ impl McpServer {
             registry: Arc::new(tokio::sync::Mutex::new(
                 ToolRegistry::new().with_workspace(crate::resolve_project_root()),
             )),
+            plan_mode: false,
+            journal_path: None,
         }
+    }
+
+    /// Enable/disable W3 plan mode (blocks `Edit`/`Write`).
+    pub fn with_plan_mode(mut self, plan_mode: bool) -> Self {
+        self.plan_mode = plan_mode;
+        self
+    }
+
+    /// Record `Edit`/`Write` successes into `journal` for `kitty undo`.
+    pub fn with_journal(mut self, journal: Option<PathBuf>) -> Self {
+        self.journal_path = journal;
+        self
     }
 
     /// Return the tool definitions as JSON value (array).
@@ -41,7 +73,26 @@ impl McpServer {
     ///
     /// This goes through `ToolRegistry::execute` so Guard, write-vs-edit and
     /// Bash timeout are enforced identically to the normal agent loop.
+    /// W3: plan mode refuses `Edit`/`Write` before touching the registry;
+    /// successful `Edit`/`Write` calls are journaled for `kitty undo`.
     pub async fn call_tool(&self, name: &str, args: Value) -> Value {
+        let canonical = canonical_tool_name(name);
+        if self.plan_mode && crate::plan::plan_blocks_tool(canonical) {
+            return json!({
+                "success": false,
+                "output": crate::plan::plan_block_message(canonical)
+            });
+        }
+        // Pre-image for the journal (only meaningful for file mutations).
+        let journal_target: Option<PathBuf> =
+            if self.journal_path.is_some() && matches!(canonical, "Edit" | "Write") {
+                args.get("path").and_then(|v| v.as_str()).map(PathBuf::from)
+            } else {
+                None
+            };
+        let before = journal_target
+            .as_ref()
+            .and_then(|p| crate::journal::snapshot(p));
         let tc = ParsedToolCall {
             name: name.to_string(),
             arguments: args,
@@ -50,10 +101,18 @@ impl McpServer {
         };
         let mut registry = self.registry.lock().await;
         match registry.execute(&tc).await {
-            Ok(result) => json!({
-                "success": result.success,
-                "output": result.output
-            }),
+            Ok(result) => {
+                if result.success {
+                    if let (Some(journal), Some(target)) = (&self.journal_path, &journal_target) {
+                        let after = crate::journal::snapshot(target).unwrap_or_default();
+                        let _ = crate::journal::record_file_edit(journal, target, before, after);
+                    }
+                }
+                json!({
+                    "success": result.success,
+                    "output": result.output
+                })
+            }
             Err(e) => json!({
                 "success": false,
                 "output": e.to_string()
@@ -184,8 +243,10 @@ impl Default for McpServer {
 }
 
 /// Entrypoint for `kitty mcp` subcommand.
-pub async fn run() -> anyhow::Result<()> {
-    let server = McpServer::new();
+pub async fn run(plan_mode: bool) -> anyhow::Result<()> {
+    let server = McpServer::new()
+        .with_plan_mode(plan_mode)
+        .with_journal(Some(crate::journal::default_journal_path()));
     server.run_stdio().await;
     Ok(())
 }
@@ -291,8 +352,15 @@ mod tests {
         assert_eq!(result.get("success").and_then(|v| v.as_bool()), Some(true));
     }
 
+    // NB: the lock intentionally spans awaits (the env must stay put for
+    // the whole edit); test-only, no executor block risk that matters here.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_mcp_persist_read_then_edit_sequential() {
+        // Successful `Edit` goes through the harness journal hook, which
+        // reads process-global `KITTY_JOURNAL` — serialize against tests
+        // that swap it (see `crate::journal::test_journal_env_lock`).
+        let _lock = crate::journal::test_journal_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("persist_test.txt");
         std::fs::write(&path, "hello\nworld").unwrap();
@@ -362,5 +430,91 @@ mod tests {
                 || output.to_lowercase().contains("blocked"),
             "expected redirect block, got: {output}"
         );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_edit_but_allows_read() {
+        let server = McpServer::new().with_plan_mode(true);
+        let edit = server
+            .call_tool(
+                "Edit",
+                json!({"path": "/tmp/x.txt", "hash": "abcdef", "new": "y"}),
+            )
+            .await;
+        assert_eq!(edit.get("success").and_then(|v| v.as_bool()), Some(false));
+        assert!(
+            edit.get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("--plan"),
+            "got {edit:?}"
+        );
+        // Case-insensitive canonicalization also blocks.
+        let write = server
+            .call_tool("write", json!({"path": "/tmp/x.txt", "content": "y"}))
+            .await;
+        assert_eq!(write.get("success").and_then(|v| v.as_bool()), Some(false));
+        // Reads still work in plan mode.
+        let read = server
+            .call_tool(
+                "Read",
+                json!({"path": "/tmp/kitty_mcp_nonexistent_12345_xyz.txt"}),
+            )
+            .await;
+        let output = read.get("output").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            !output.contains("--plan"),
+            "reads must not be plan-blocked, got {read:?}"
+        );
+    }
+
+    // NB: same intentional hold-across-await as above (test-only).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn journal_records_edit_for_undo() {
+        // Same global-env reason as above: the `Edit` below is also seen
+        // by the harness `ToolRegistry::execute` hook.
+        let _lock = crate::journal::test_journal_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        let target = dir.path().join("note.txt");
+        std::fs::write(&target, "before").unwrap();
+
+        let server = McpServer::new().with_journal(Some(journal.clone()));
+        // Read first (read-before-edit guard), then edit via hash.
+        let read = server
+            .call_tool("Read", json!({"path": target.to_str().unwrap()}))
+            .await;
+        assert_eq!(read.get("success").and_then(|v| v.as_bool()), Some(true));
+        let output = read.get("output").and_then(|v| v.as_str()).unwrap_or("");
+        let hash = output
+            .lines()
+            .nth(1)
+            .expect("tagged lines")
+            .split(':')
+            .nth(1)
+            .unwrap()
+            .split('|')
+            .next()
+            .unwrap();
+        let edit = server
+            .call_tool(
+                "Edit",
+                json!({"path": target.to_str().unwrap(), "hash": hash, "new": "AFTER"}),
+            )
+            .await;
+        assert_eq!(
+            edit.get("success").and_then(|v| v.as_bool()),
+            Some(true),
+            "got {edit:?}"
+        );
+
+        let entries = crate::journal::read_entries(&journal).unwrap();
+        assert_eq!(entries.len(), 1, "got {entries:?}");
+        assert_eq!(entries[0].before.as_deref(), Some("before"));
+
+        let undone = crate::journal::undo_last(&journal).unwrap().expect("entry");
+        assert_eq!(undone, target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
     }
 }

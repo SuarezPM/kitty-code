@@ -20,6 +20,25 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 rand = "0.10"
+# W3 probe params derivan JsonSchema: el derive de rmcp exige `schemars` en
+# scope directo (rmcp 3.5.1 usa schemars 1.x).
+schemars = "1"
+
+# W3 MCP client (rmcp 3.5.1): client + child-process transport. Server+schemars
+# solo para el probe de self-test (mcp_client.rs #[cfg(test)]); el servidor
+# producto sigue siendo mcp.rs (stdio JSON-RPC propio).
+[dependencies.rmcp]
+version = "3.5.1"
+default-features = false
+features = ["client", "server", "transport-child-process", "transport-io", "macros", "schemars"]
+
+# W1: binario `kitty` (plan SDD-ESTADO-ARTE §3 W-INSTALAR). Se mantiene el
+# autobin `kitty-cli` por compatibilidad (harbor adapter, benches/*.sh y
+# release.yml referencian `target/release/kitty-cli`); ambos compilan desde
+# el mismo src/main.rs.
+[[bin]]
+name = "kitty"
+path = "src/main.rs"
 
 [features]
 default = []
@@ -36,6 +55,12 @@ optional = true
 [dependencies.crossterm]
 version = "0.29"
 optional = true
+
+# W2 TUI: streaming NDJSON de /api/chat (chunk a chunk). Solo bajo feature
+# `tui`; `reqwest` es además el transporte HTTPS de `kitty update`
+# (releases/latest, fail-closed sin red) y por eso es dependencia directa.
+[dependencies.reqwest]
+workspace = true
 
 # T1.4: declara la cfg custom de sesion (RUSTFLAGS="--cfg tokio_unstable")
 # para que check/clippy no emitan unexpected_cfgs ni con ni sin la flag.

@@ -1,0 +1,99 @@
+{
+  "backend": "ollama",
+  "by_language": {
+    "bash": {
+      "attempted": 3,
+      "errored": 0,
+      "failed": 0,
+      "passed": 3
+    },
+    "ci": {
+      "attempted": 1,
+      "errored": 0,
+      "failed": 0,
+      "passed": 1
+    },
+    "docker": {
+      "attempted": 1,
+      "errored": 0,
+      "failed": 0,
+      "passed": 1
+    },
+    "makefile": {
+      "attempted": 1,
+      "errored": 0,
+      "failed": 0,
+      "passed": 1
+    },
+    "python": {
+      "attempted": 2,
+      "errored": 0,
+      "failed": 0,
+      "passed": 2
+    }
+  },
+  "details": [
+    {
+      "id": "tb2-bash-count",
+      "lang": "bash",
+      "latency_ms": 32583.0,
+      "passed": true,
+      "verdict": "pass"
+    },
+    {
+      "id": "tb2-py-csv",
+      "lang": "python",
+      "latency_ms": 26774.0,
+      "passed": true,
+      "verdict": "pass"
+    },
+    {
+      "id": "tb2-makefile",
+      "lang": "makefile",
+      "latency_ms": 19500.0,
+      "passed": true,
+      "verdict": "pass"
+    },
+    {
+      "id": "tb2-dockerfile",
+      "lang": "docker",
+      "latency_ms": 25323.0,
+      "passed": true,
+      "verdict": "pass"
+    },
+    {
+      "id": "tb2-gh-actions",
+      "lang": "ci",
+      "latency_ms": 35034.0,
+      "passed": true,
+      "verdict": "pass"
+    },
+    {
+      "id": "tb2-sh-find-modified",
+      "lang": "bash",
+      "latency_ms": 27152.0,
+      "passed": true,
+      "verdict": "pass"
+    },
+    {
+      "id": "tb2-py-dirsize",
+      "lang": "python",
+      "latency_ms": 40610.0,
+      "passed": true,
+      "verdict": "pass"
+    },
+    {
+      "id": "tb2-sh-backup",
+      "lang": "bash",
+      "latency_ms": 24863.0,
+      "passed": true,
+      "verdict": "pass"
+    }
+  ],
+  "memory": false,
+  "model": "ornith:9b",
+  "passed": 8,
+  "rate_pct": 100.0,
+  "suite": "tb2",
+  "total": 8
+}

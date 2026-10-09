@@ -146,6 +146,110 @@ impl CompactionSummary {
     pub fn progress_count(&self) -> usize {
         self.progress_done.len() + self.progress_in_progress.len() + self.progress_blocked.len()
     }
+
+    /// W4 compact-QR summary (triage tier): Goal + verbatim Open Queries +
+    /// file lists. QR = the compacted context preserves the Q(uery) lines
+    /// the next turns must answer and the R(ecall) file sets — no prose
+    /// regeneration, fully deterministic (no model call). Distinct from
+    /// [`Self::format_compact`] (whose adoption is gated on the QR bench-ab
+    /// victory): this one is tier-governed, not bench-gated.
+    ///
+    /// `open_queries` are the most recent user turns (newest last); at most
+    /// [`QR_MAX_QUERIES`] are kept, each truncated to [`QR_MAX_QUERY_CHARS`].
+    pub fn format_qr(&self, open_queries: &[String]) -> String {
+        let mut out = String::new();
+        out.push_str("## Goal\n");
+        if self.goal.is_empty() {
+            out.push_str("(none)\n");
+        } else {
+            out.push_str(&self.goal);
+            out.push('\n');
+        }
+
+        out.push_str("\n## Open Queries\n");
+        if open_queries.is_empty() {
+            out.push_str("(none)\n");
+        } else {
+            for q in open_queries.iter().take(QR_MAX_QUERIES) {
+                let mut chars = q.chars();
+                let clipped: String = chars.by_ref().take(QR_MAX_QUERY_CHARS).collect();
+                out.push_str("- ");
+                out.push_str(&clipped);
+                if chars.next().is_some() {
+                    out.push('…');
+                }
+                out.push('\n');
+            }
+        }
+
+        if !self.read_files.is_empty() {
+            out.push_str("\n<read-files>\n");
+            for f in &self.read_files {
+                out.push_str(&format!("  {f}\n"));
+            }
+            out.push_str("</read-files>\n");
+        }
+
+        if !self.modified_files.is_empty() {
+            out.push_str("\n<modified-files>\n");
+            for f in &self.modified_files {
+                out.push_str(&format!("  {f}\n"));
+            }
+            out.push_str("</modified-files>\n");
+        }
+
+        out
+    }
+
+    /// W5 variante compacta (candidata A/B vs [`Self::format_markdown`]).
+    /// Solo Goal + Done(top 3) + Next(top 3): sin constraints, decisiones,
+    /// contexto ni listas de ficheros. NO es el path por defecto — la
+    /// adopción la decide el QR bench-ab (wilson significativo) en
+    /// `kitty-cli/src/bench/ab.rs`; sin victoria se revierte (queda este
+    /// método + su QR como evidencia, sin cablear).
+    pub fn format_compact(&self) -> String {
+        const TOP: usize = 3;
+        let mut out = String::new();
+        out.push_str("## Goal\n");
+        if self.goal.is_empty() {
+            out.push_str("(none)\n");
+        } else {
+            out.push_str(&self.goal);
+            out.push('\n');
+        }
+        out.push_str("\n## Done\n");
+        if self.progress_done.is_empty() {
+            out.push_str("(none)\n");
+        } else {
+            for d in self.progress_done.iter().take(TOP) {
+                out.push_str(&format!("- ✅ {d}\n"));
+            }
+        }
+        out.push_str("\n## Next\n");
+        if self.next_steps.is_empty() {
+            out.push_str("(none)\n");
+        } else {
+            for s in self.next_steps.iter().take(TOP) {
+                out.push_str(&format!("- {s}\n"));
+            }
+        }
+        out
+    }
+}
+
+/// W4: caps for [`CompactionSummary::format_qr`].
+pub const QR_MAX_QUERIES: usize = 3;
+/// W4: per-query char cap for [`CompactionSummary::format_qr`].
+pub const QR_MAX_QUERY_CHARS: usize = 400;
+
+/// W5 métrica QR: fracción de ahorro en caracteres (proxy de tokens) de
+/// la variante compacta frente al formato completo. En (0,1) cuando
+/// compacta; ≤0 si no ahorra (señal de revertir).
+pub fn compact_saving_pct(full: &str, compact: &str) -> f32 {
+    if full.is_empty() {
+        return 0.0;
+    }
+    1.0 - (compact.len() as f32 / full.len() as f32)
 }
 
 /// Extract file operations from a list of tool results.
@@ -299,5 +403,89 @@ mod tests {
         assert!(extract_path("open README").is_none());
         // No recognized extension
         assert!(extract_path("wrote some/dir/file.xyz").is_none());
+    }
+
+    #[test]
+    fn compact_es_mas_corto_y_conserva_goal_done_next() {
+        let mut s = CompactionSummary::empty();
+        s.goal = "Ship feature X".to_string();
+        for i in 0..5 {
+            s.progress_done.push(format!("done {i}"));
+            s.next_steps.push(format!("next {i}"));
+        }
+        s.constraints.push("be fast".to_string());
+        s.key_decisions.push("use Y".to_string());
+        s.critical_context.push("secret".to_string());
+        let full = s.format_markdown();
+        let compact = s.format_compact();
+        assert!(compact.len() < full.len());
+        assert!(compact.contains("Ship feature X"));
+        assert!(compact.contains("done 0"));
+        assert!(compact.contains("next 0"));
+        // Top-3: recorta la cola.
+        assert!(!compact.contains("done 4"));
+        assert!(!compact.contains("next 4"));
+        // Sin secciones pesadas.
+        assert!(!compact.contains("be fast"));
+        assert!(!compact.contains("secret"));
+        let saving = super::compact_saving_pct(&full, &compact);
+        assert!(
+            saving > 0.0 && saving < 1.0,
+            "ahorro QR en (0,1), got {saving}"
+        );
+    }
+
+    #[test]
+    fn compact_saving_guarda_full_vacio() {
+        assert_eq!(super::compact_saving_pct("", "## Goal"), 0.0);
+        assert_eq!(super::compact_saving_pct("abc", "abc"), 0.0);
+    }
+
+    /// W4: QR conserva goal + queries verbatim + ficheros, sin prosa.
+    #[test]
+    fn qr_keeps_goal_queries_and_files() {
+        let mut s = CompactionSummary::empty();
+        s.goal = "Ship feature X".to_string();
+        s.read_files.push("src/main.rs".to_string());
+        s.modified_files.push("src/lib.rs".to_string());
+        let qr = s.format_qr(&["fix the login bug".to_string()]);
+        assert!(qr.contains("Ship feature X"));
+        assert!(qr.contains("fix the login bug"));
+        assert!(qr.contains("src/main.rs"));
+        assert!(qr.contains("src/lib.rs"));
+        assert!(qr.contains("## Open Queries"));
+        // Sin secciones pesadas del formato completo.
+        assert!(!qr.contains("## Key Decisions"));
+        assert!(!qr.contains("## Critical Context"));
+    }
+
+    /// W4: QR recorta a 3 queries × 400 chars (determinista).
+    #[test]
+    fn qr_caps_queries() {
+        let s = CompactionSummary::empty();
+        let queries: Vec<String> = (0..5).map(|i| format!("query number {i}")).collect();
+        let qr = s.format_qr(&queries);
+        assert!(qr.contains("query number 0"));
+        assert!(qr.contains("query number 2"));
+        assert!(!qr.contains("query number 3"));
+        assert!(!qr.contains("query number 4"));
+
+        let long = "x".repeat(super::QR_MAX_QUERY_CHARS + 50);
+        let qr = s.format_qr(&[long]);
+        assert!(qr.contains("…"), "long queries must show truncation");
+        assert!(
+            qr.len()
+                < "## Goal\n(none)\n\n## Open Queries\n- ".len() + super::QR_MAX_QUERY_CHARS + 16,
+            "query must be clipped near the cap"
+        );
+    }
+
+    /// W4: QR sin queries marca (none) explícito.
+    #[test]
+    fn qr_empty_queries() {
+        let s = CompactionSummary::empty();
+        let qr = s.format_qr(&[]);
+        assert!(qr.contains("## Open Queries"));
+        assert!(qr.contains("(none)"));
     }
 }

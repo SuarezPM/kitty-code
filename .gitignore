@@ -19,6 +19,7 @@ __pycache__/
 /[a-z]*.py
 /[a-z]*.js
 /[a-z]*.sh
+!/install.sh
 results/
 /jobs/
 

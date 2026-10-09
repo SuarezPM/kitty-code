@@ -20,6 +20,14 @@ pub struct Episode {
     pub timestamp: i64,
     #[serde(default)]
     pub importance: f32,
+    /// W6: episodio verificado/cerrado. Con TTL obligatorio
+    /// ([`SETTLED_TTL_SECS`]): estados permanentes prohibidos.
+    /// `false` en filas viejas (serde default + DEFAULT 0 en migración).
+    #[serde(default)]
+    pub settled: bool,
+    /// Epoch-secs hasta el que vale `settled`. 0 = sin TTL / no settled.
+    #[serde(default)]
+    pub settled_until: i64,
 }
 
 impl Episode {
@@ -56,7 +64,26 @@ impl Episode {
             hash,
             timestamp,
             importance: 0.0,
+            settled: false,
+            settled_until: 0,
         }
+    }
+}
+
+/// W6: TTL del estado settled: una semana. Caducado ⇒ no settled
+/// (re-verificable, nunca permanente).
+pub const SETTLED_TTL_SECS: i64 = 7 * 24 * 3600;
+
+impl Episode {
+    /// Marca el episodio como settled con TTL desde `now` (epoch-secs).
+    pub fn mark_settled(&mut self, now: i64) {
+        self.settled = true;
+        self.settled_until = now.saturating_add(SETTLED_TTL_SECS);
+    }
+
+    /// Settled vigente: flag + TTL no caducado.
+    pub fn is_settled(&self, now: i64) -> bool {
+        self.settled && self.settled_until > 0 && now <= self.settled_until
     }
 }
 
@@ -275,6 +302,15 @@ impl EpisodeStore {
             "ALTER TABLE episodes ADD COLUMN importance REAL DEFAULT 0.0",
             [],
         );
+        // W6: settled con TTL — filas viejas leen no-settled, sin migración.
+        let _ = conn.execute(
+            "ALTER TABLE episodes ADD COLUMN settled INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE episodes ADD COLUMN settled_until INTEGER DEFAULT 0",
+            [],
+        );
         Ok(Self {
             conn,
             bm25_cache: std::cell::RefCell::new(None),
@@ -284,8 +320,8 @@ impl EpisodeStore {
     /// Save an episode (insert or replace).
     pub fn save(&self, episode: &Episode) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO episodes (id, goal, files_touched, test_verdict, outcome, hash, timestamp, importance)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO episodes (id, goal, files_touched, test_verdict, outcome, hash, timestamp, importance, settled, settled_until)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 episode.id,
                 episode.goal,
@@ -295,6 +331,8 @@ impl EpisodeStore {
                 episode.hash,
                 episode.timestamp,
                 episode.importance as f64,
+                episode.settled as i64,
+                episode.settled_until,
             ],
         )?;
         self.bm25_cache.borrow_mut().take();
@@ -304,7 +342,7 @@ impl EpisodeStore {
     /// Recall the N most recent episodes.
     pub fn recall_recent(&self, limit: usize) -> Result<Vec<Episode>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, goal, files_touched, test_verdict, outcome, hash, timestamp, importance
+            "SELECT id, goal, files_touched, test_verdict, outcome, hash, timestamp, importance, settled, settled_until
               FROM episodes
               ORDER BY timestamp DESC
               LIMIT ?1",
@@ -313,6 +351,9 @@ impl EpisodeStore {
             .query_map(rusqlite::params![limit as i64], |row| {
                 // Tolerant read: pre-T6.2 DBs (or a missing column) yield 0.0.
                 let importance: f64 = row.get::<_, Option<f64>>(7).ok().flatten().unwrap_or(0.0);
+                // W6 tolerant read: pre-W6 DBs yield no-settled.
+                let settled: i64 = row.get::<_, Option<i64>>(8).ok().flatten().unwrap_or(0);
+                let settled_until: i64 = row.get::<_, Option<i64>>(9).ok().flatten().unwrap_or(0);
                 Ok(Episode {
                     id: row.get(0)?,
                     goal: row.get(1)?,
@@ -323,6 +364,8 @@ impl EpisodeStore {
                     hash: row.get(5)?,
                     timestamp: row.get(6)?,
                     importance: importance as f32,
+                    settled: settled != 0,
+                    settled_until,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -429,6 +472,8 @@ mod bm25_cache_tests {
             hash: "h".into(),
             timestamp: ts,
             importance: 0.0,
+            settled: false,
+            settled_until: 0,
         }
     }
 
@@ -731,7 +776,7 @@ impl EpisodeStore {
         self.ensure_embedding_column()?;
         let blob = encode_embedding(embedding);
         self.conn.execute(
-            "INSERT OR REPLACE INTO episodes (id, goal, files_touched, test_verdict, outcome, hash, timestamp, embedding, importance) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO episodes (id, goal, files_touched, test_verdict, outcome, hash, timestamp, embedding, importance, settled, settled_until) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 episode.id,
                 episode.goal,
@@ -742,6 +787,8 @@ impl EpisodeStore {
                 episode.timestamp,
                 blob,
                 episode.importance as f64,
+                episode.settled as i64,
+                episode.settled_until,
             ],
         )?;
         Ok(())
@@ -1681,5 +1728,46 @@ mod tests {
         assert!((reciprocal_rank(&ranked, &rel) - 1.0 / 3.0).abs() < 1e-6);
         assert!((ndcg_at_k(&ranked, &rel, 3) - 0.5).abs() < 1e-6);
         assert!((recall_at_k(&ranked, &rel, 10) - 1.0).abs() < 1e-6);
+    }
+
+    // ── W6: settled + TTL ────────────────────────────────────────────
+
+    #[test]
+    fn settled_nuevo_es_falso_sin_ttl() {
+        let ep = Episode::new("x".into(), vec![], None, "ok".into());
+        assert!(!ep.settled);
+        assert_eq!(ep.settled_until, 0);
+        assert!(!ep.is_settled(chrono_now()));
+    }
+
+    #[test]
+    fn settled_vigente_y_caducado() {
+        let mut ep = Episode::new("x".into(), vec![], None, "ok".into());
+        let now = chrono_now();
+        ep.mark_settled(now);
+        assert!(ep.is_settled(now));
+        assert!(ep.is_settled(now + SETTLED_TTL_SECS));
+        // Caducado ⇒ no settled (re-verificable, nunca permanente).
+        assert!(!ep.is_settled(now + SETTLED_TTL_SECS + 1));
+    }
+
+    #[test]
+    fn settled_roundtrip_store() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = EpisodeStore::open(tmp.path().to_str().unwrap()).unwrap();
+        let now = chrono_now();
+        let mut ep = Episode::new("deploy".into(), vec![], None, "ok".into());
+        ep.mark_settled(now);
+        store.save(&ep).unwrap();
+        store
+            .save(&Episode::new("lint".into(), vec![], None, "ok".into()))
+            .unwrap();
+        let all = store.recall_recent(10).unwrap();
+        let back = all.iter().find(|e| e.id == ep.id).unwrap();
+        assert!(back.settled);
+        assert!(back.is_settled(now));
+        assert!(!back.is_settled(now + SETTLED_TTL_SECS + 1));
+        let plain = all.iter().find(|e| e.goal == "lint").unwrap();
+        assert!(!plain.settled);
     }
 }

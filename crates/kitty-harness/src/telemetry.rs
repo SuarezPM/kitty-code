@@ -43,6 +43,58 @@ pub struct TurnEvent {
     pub bench_suite: Option<String>,
     /// Whether compaction was triggered this turn.
     pub compacted: bool,
+    /// W0: autorun hops consumed so far (`None` = unknown/legacy).
+    /// Omitted from JSON when `None` so old telemetry stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hops: Option<usize>,
+    /// W0: tool-loop iterations consumed in the current cycle, 1-based
+    /// (`None` = unknown/legacy). Omitted from JSON when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iters: Option<usize>,
+    /// W0: top1-top2 margin when available. Always `None` for now — no
+    /// logits plumbing in this lane (unlocked by the W3 logprobs spike).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margin: Option<f32>,
+    /// W0 (SDD estado-arte): LLM-call wall time for this turn (ms).
+    /// Same clock as `latency_ms`; the explicit name anchors the
+    /// `wall = modelo/guard/sandbox/tools` breakdown. `None` = unknown/legacy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wall_model_ms: Option<u64>,
+    /// W0: accumulated `Guard::check_chain` time within this turn (ms,
+    /// truncated — a single check is ~µs, so this is often 0; still a real
+    /// measurement, not a placeholder). `None` = unknown/legacy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guard_ms: Option<u64>,
+    /// W0: accumulated Bash child-execution wall within this turn (ms) —
+    /// the same quantity `SandboxOutcome::duration_ms` measures for the
+    /// direct `Sandbox::run` API, taken here at the `ToolRegistry` spawn
+    /// site (which owns its own timeout/kill-tree plumbing and does not
+    /// route through `Sandbox::run`). Includes containment overhead when
+    /// the sandbox is armed. 0/`None` when no Bash ran this turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_ms: Option<u64>,
+    /// W0: `process_response` (tool execution + result handling) wall for
+    /// this turn (ms). Always `>= guard_ms + sandbox_ms` (nested intervals,
+    /// same clock; floor-truncation preserves the ordering).
+    /// `None` = unknown/legacy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_ms: Option<u64>,
+}
+
+/// W0 (SDD estado-arte): per-turn latency breakdown, mirroring the four
+/// `TurnEvent` breakdown fields. Kept on `Agent` as `last_turn_breakdown`
+/// so tests/benches can observe the desglose without scraping JSONL
+/// (the telemetry writer points at the process cwd).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnBreakdown {
+    /// LLM-call wall (ms).
+    pub wall_model_ms: u64,
+    /// `Guard::check_chain` accumulation (ms).
+    pub guard_ms: u64,
+    /// Bash child-execution accumulation (ms).
+    pub sandbox_ms: u64,
+    /// `process_response` wall (ms).
+    pub tools_ms: u64,
 }
 
 /// Telemetry writer with file rotation.
@@ -215,6 +267,13 @@ mod tests {
             error: None,
             bench_suite: None,
             compacted: false,
+            hops: None,
+            iters: None,
+            margin: None,
+            wall_model_ms: None,
+            guard_ms: None,
+            sandbox_ms: None,
+            tools_ms: None,
         };
         writer.write_turn(&event).await;
 
@@ -243,6 +302,13 @@ mod tests {
             error: None,
             bench_suite: None,
             compacted: false,
+            hops: None,
+            iters: None,
+            margin: None,
+            wall_model_ms: None,
+            guard_ms: None,
+            sandbox_ms: None,
+            tools_ms: None,
         };
         writer.write_turn(&event).await;
 
@@ -269,6 +335,13 @@ mod tests {
             error: Some("API key sk-abc123def456ghi789jkl012mno failed".into()),
             bench_suite: None,
             compacted: false,
+            hops: None,
+            iters: None,
+            margin: None,
+            wall_model_ms: None,
+            guard_ms: None,
+            sandbox_ms: None,
+            tools_ms: None,
         };
         writer.write_turn(&event).await;
 
@@ -303,6 +376,13 @@ mod tests {
             error: None,
             bench_suite: None,
             compacted: false,
+            hops: None,
+            iters: None,
+            margin: None,
+            wall_model_ms: None,
+            guard_ms: None,
+            sandbox_ms: None,
+            tools_ms: None,
         };
         writer.write_turn(&event).await;
 
@@ -319,5 +399,136 @@ mod tests {
             .collect();
         assert!(entries.len() >= 2, "should have rotated file");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// W0: `None` effort fields are omitted, so legacy telemetry JSON is
+    /// byte-compatible (no new keys unless there is real data).
+    #[test]
+    fn effort_fields_omitted_when_none_keeps_old_format() {
+        let event = TurnEvent {
+            ts: 1,
+            model: "m".into(),
+            turn: 0,
+            tool_calls: 0,
+            tool_names: vec![],
+            latency_ms: 0,
+            tokens_in: None,
+            tokens_out: None,
+            error: None,
+            bench_suite: None,
+            compacted: false,
+            hops: None,
+            iters: None,
+            margin: None,
+            wall_model_ms: None,
+            guard_ms: None,
+            sandbox_ms: None,
+            tools_ms: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("hops"),
+            "old format must not gain keys: {json}"
+        );
+        assert!(
+            !json.contains("iters"),
+            "old format must not gain keys: {json}"
+        );
+        assert!(
+            !json.contains("margin"),
+            "old format must not gain keys: {json}"
+        );
+    }
+
+    /// W0: present effort fields serialize with their values.
+    #[test]
+    fn effort_fields_serialize_when_present() {
+        let event = TurnEvent {
+            ts: 1,
+            model: "m".into(),
+            turn: 3,
+            tool_calls: 1,
+            tool_names: vec!["Read".into()],
+            latency_ms: 10,
+            tokens_in: None,
+            tokens_out: None,
+            error: None,
+            bench_suite: None,
+            compacted: false,
+            hops: Some(2),
+            iters: Some(4),
+            margin: Some(0.07),
+            wall_model_ms: None,
+            guard_ms: None,
+            sandbox_ms: None,
+            tools_ms: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["hops"], serde_json::json!(2));
+        assert_eq!(v["iters"], serde_json::json!(4));
+        assert!((v["margin"].as_f64().unwrap_or(-1.0) - 0.07).abs() < 1e-6);
+    }
+
+    /// W0: the latency-breakdown fields are omitted when `None`, so legacy
+    /// telemetry JSON stays byte-identical (no migrations).
+    #[test]
+    fn breakdown_fields_omitted_when_none_keeps_old_format() {
+        let event = TurnEvent {
+            ts: 1,
+            model: "m".into(),
+            turn: 0,
+            tool_calls: 0,
+            tool_names: vec![],
+            latency_ms: 5,
+            tokens_in: None,
+            tokens_out: None,
+            error: None,
+            bench_suite: None,
+            compacted: false,
+            hops: None,
+            iters: None,
+            margin: None,
+            wall_model_ms: None,
+            guard_ms: None,
+            sandbox_ms: None,
+            tools_ms: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        for key in ["wall_model_ms", "guard_ms", "sandbox_ms", "tools_ms"] {
+            assert!(
+                !json.contains(key),
+                "old format must not gain {key}: {json}"
+            );
+        }
+    }
+
+    /// W0: present breakdown fields serialize with their values.
+    #[test]
+    fn breakdown_fields_serialize_when_present() {
+        let event = TurnEvent {
+            ts: 1,
+            model: "m".into(),
+            turn: 0,
+            tool_calls: 1,
+            tool_names: vec!["Bash".into()],
+            latency_ms: 120,
+            tokens_in: None,
+            tokens_out: None,
+            error: None,
+            bench_suite: None,
+            compacted: false,
+            hops: None,
+            iters: None,
+            margin: None,
+            wall_model_ms: Some(120),
+            guard_ms: Some(0),
+            sandbox_ms: Some(95),
+            tools_ms: Some(100),
+        };
+        let v: serde_json::Value = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["wall_model_ms"], serde_json::json!(120));
+        assert_eq!(v["guard_ms"], serde_json::json!(0));
+        assert_eq!(v["sandbox_ms"], serde_json::json!(95));
+        assert_eq!(v["tools_ms"], serde_json::json!(100));
     }
 }

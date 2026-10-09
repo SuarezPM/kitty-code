@@ -146,6 +146,9 @@ impl Default for KnowledgeConfig {
 pub struct KnowledgeBase {
     config: KnowledgeConfig,
     cards: Vec<KnowledgeCard>,
+    /// W7-code: determinism seed for score tie-breaks (`None` = legacy:
+    /// stable sort keeps filesystem load order).
+    seed: Option<u64>,
 }
 
 impl KnowledgeBase {
@@ -159,7 +162,25 @@ impl KnowledgeBase {
         } else {
             Vec::new()
         };
-        Self { config, cards }
+        Self {
+            config,
+            cards,
+            seed: None,
+        }
+    }
+
+    /// Build from an explicit card set (tests, benches, seeded suites).
+    pub fn from_cards(config: KnowledgeConfig, cards: Vec<KnowledgeCard>) -> Self {
+        Self {
+            config,
+            cards,
+            seed: None,
+        }
+    }
+
+    /// W7-code: set the determinism seed for score tie-breaks.
+    pub fn with_seed(&mut self, seed: u64) {
+        self.seed = Some(seed);
     }
 
     /// Async constructor for runtimes that prefer non-blocking startup.
@@ -170,7 +191,11 @@ impl KnowledgeBase {
         } else {
             Vec::new()
         };
-        Self { config, cards }
+        Self {
+            config,
+            cards,
+            seed: None,
+        }
     }
 
     /// Async card loader: todo-file 1-op reads via tokio::fs (W1).
@@ -241,8 +266,19 @@ impl KnowledgeBase {
             .filter(|(_, score)| *score >= self.config.threshold)
             .collect();
 
-        // Sort by score descending
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by score descending. W7-code: ties break by seeded id hash
+        // (same seed + same cards ⇒ same order, regardless of load order);
+        // unseeded keeps the legacy stable-sort load order.
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| match self.seed {
+                    Some(s) => {
+                        crate::seed::mix_str(s, &a.0.id).cmp(&crate::seed::mix_str(s, &b.0.id))
+                    }
+                    None => std::cmp::Ordering::Equal,
+                })
+        });
 
         // Take top N, respecting token budget
         let mut result = Vec::new();
@@ -298,6 +334,53 @@ impl KnowledgeBase {
 mod tests {
     use super::*;
 
+    /// W7-code: mismo seed + mismas cards ⇒ mismo orden aunque el orden de
+    /// carga difiera (desempate sembrado, no orden de `read_dir`).
+    #[test]
+    fn seeded_tiebreak_is_load_order_independent() {
+        let cfg = || KnowledgeConfig {
+            enabled: true,
+            threshold: 0.0,
+            max_cards: 10,
+            ..KnowledgeConfig::default()
+        };
+        // Contenidos idénticos ⇒ scores idénticos ⇒ empate total.
+        let cards_ab: Vec<KnowledgeCard> = ["a", "b", "c"]
+            .iter()
+            .map(|id| KnowledgeCard::parse(id, "alpha alpha alpha"))
+            .collect();
+        let cards_ba: Vec<KnowledgeCard> = ["c", "b", "a"]
+            .iter()
+            .map(|id| KnowledgeCard::parse(id, "alpha alpha alpha"))
+            .collect();
+        let mut base_ab = KnowledgeBase::from_cards(cfg(), cards_ab);
+        let mut base_ba = KnowledgeBase::from_cards(cfg(), cards_ba);
+        base_ab.with_seed(7);
+        base_ba.with_seed(7);
+        let order_ab: Vec<_> = base_ab
+            .find_relevant("alpha")
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        let order_ba: Vec<_> = base_ba
+            .find_relevant("alpha")
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        assert_eq!(order_ab.len(), 3);
+        assert_eq!(
+            order_ab, order_ba,
+            "seeded order must not depend on load order"
+        );
+        // Determinista entre llamadas.
+        let again: Vec<_> = base_ab
+            .find_relevant("alpha")
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        assert_eq!(order_ab, again);
+    }
+
     #[test]
     fn card_parse_extracts_words() {
         let card = KnowledgeCard::parse("test", "hello world hello");
@@ -347,6 +430,7 @@ mod tests {
         let mut base = KnowledgeBase {
             config,
             cards: Vec::new(),
+            seed: None,
         };
         base.cards.push(KnowledgeCard::parse(
             "big",
@@ -378,6 +462,7 @@ mod tests {
         let mut base = KnowledgeBase {
             config,
             cards: Vec::new(),
+            seed: None,
         };
         base.cards.push(KnowledgeCard::parse(
             "rust-tips",
@@ -448,6 +533,7 @@ mod tests {
         let mut base = KnowledgeBase {
             config,
             cards: Vec::new(),
+            seed: None,
         };
         base.cards.push(KnowledgeCard::parse("test", "hello world"));
         let relevant = base.find_relevant("hello");

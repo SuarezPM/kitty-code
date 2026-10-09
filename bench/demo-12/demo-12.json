@@ -1,0 +1,130 @@
+{
+  "suite": "demo-12",
+  "version": "1.0.0",
+  "fairness": {
+    "protocol": "Mismo modelo, backend, turnos y timeouts para ambos agentes; k>=3 reps por agente; serie exclusiva (1 modelo residente, ollama stop entre TODAS las reps, ps vacío verificado); sin tareas con modelo en paralelo.",
+    "model": {
+      "id": "FIJAR_AL_CORRER",
+      "digest": "FIJAR_AL_CORRER (ollama show digest, pineado por manifiesto)",
+      "note": "Fijar el mismo modelo+digest para kitty y rival en el manifiesto de la corrida."
+    },
+    "backend": "ollama",
+    "pinned_versions": {
+      "kitty": "0.1.0",
+      "ollama": "0.40.1",
+      "rival": "FIJAR_AL_CORRER (nombre+versión pineados por manifiesto)"
+    },
+    "max_turns": 20,
+    "timeout_secs_per_exercise": 60,
+    "k": 3,
+    "grade": "evidence (12 ejercicios fijos, sin --limit; --limit Joy entra solo como smoke y lo invalida como evidencia)",
+    "gates_off": {
+      "autorun_hops": 0,
+      "knowledge": false,
+      "memory": false,
+      "effort_router": "pass-through (registrar effort_off_in_bench por celda)",
+      "note": "Trampa conocida: el bench aísla latencia base sin router/knowledge/memory."
+    },
+    "exclusivity": [
+      "1 modelo residente durante la serie",
+      "ollama stop entre TODAS las reps de ambos agentes (ps vacío verificado)",
+      "ninguna otra tarea con modelo en paralelo"
+    ],
+    "declared_asymmetries": [
+      "Kitty guard+sandbox activos (producto) vs rival accept-all sin gates (es producto, no se corrige; precedente shootout 20261007).",
+      "Declarar num_ctx de sesión de cada lado (asimetría tb2-8: kitty 32768 vs rival 16384) y KV-cache."
+    ],
+    "verdicts": ["pass", "fail", "error", "timeout"],
+    "stats": "p50/p99 sobre wall real por celda (nunca latency_ms en timeout), pass-rate con k>=3, manifiesto por corrida"
+  },
+  "exercises": [
+    {
+      "id": "demo-bash-count",
+      "lang": "bash",
+      "prompt": "Create a bash script called count_lines.sh that counts the number of lines in all .rs files in the current directory recursively. Save it to count_lines.sh and make it executable.",
+      "check_type": "file_executable",
+      "check_path": "count_lines.sh",
+      "setup": "file_ops"
+    },
+    {
+      "id": "demo-py-csv",
+      "lang": "python",
+      "prompt": "Write a Python script called csv_to_json.py that reads a CSV file (input path as first argument) and outputs JSON to stdout. Save it to csv_to_json.py.",
+      "check_str": "json",
+      "check_file": "csv_to_json.py"
+    },
+    {
+      "id": "demo-makefile",
+      "lang": "makefile",
+      "prompt": "Create a Makefile with three targets: test (runs cargo test), build (runs cargo build), and clean (removes target directory). Save to Makefile.",
+      "check_str": "test:",
+      "check_file": "Makefile"
+    },
+    {
+      "id": "demo-dockerfile",
+      "lang": "docker",
+      "prompt": "Write a Dockerfile for a Rust project that uses multi-stage builds: builder stage compiles, runtime stage copies binary. Save to Dockerfile.",
+      "check_str": "FROM",
+      "check_file": "Dockerfile"
+    },
+    {
+      "id": "demo-gh-actions",
+      "lang": "ci",
+      "prompt": "Create a GitHub Actions CI workflow at .github/workflows/ci.yml that runs cargo test and cargo build on push/PR. Save to .github/workflows/ci.yml.",
+      "check_str": "cargo test",
+      "check_file": ".github/workflows/ci.yml"
+    },
+    {
+      "id": "demo-sh-find-modified",
+      "lang": "bash",
+      "prompt": "Write a bash script called find_recent.sh that finds all files modified in the last 24 hours in a given directory (first argument). Save to find_recent.sh and make it executable.",
+      "check_type": "file_executable",
+      "check_path": "find_recent.sh",
+      "setup": "file_ops"
+    },
+    {
+      "id": "demo-py-dirsize",
+      "lang": "python",
+      "prompt": "Write a Python script called dirsize.py that calculates and prints the total size of each subdirectory in the current directory. Save to dirsize.py.",
+      "check_str": "os",
+      "check_file": "dirsize.py"
+    },
+    {
+      "id": "demo-sh-backup",
+      "lang": "bash",
+      "prompt": "Write a bash script called backup.sh that backs up files from a source directory (first argument) to a destination with a timestamp suffix (e.g. backup_20260817_120000). Save to backup.sh and make it executable.",
+      "check_type": "file_executable",
+      "check_path": "backup.sh",
+      "setup": "file_ops"
+    },
+    {
+      "id": "demo-js-fetch",
+      "lang": "javascript",
+      "prompt": "Write a Node.js script called fetch_url.js that fetches the URL given as first argument and prints the response status code. Save to fetch_url.js.",
+      "check_str": "fetch",
+      "check_file": "fetch_url.js"
+    },
+    {
+      "id": "demo-rs-args",
+      "lang": "rust",
+      "prompt": "Write a Rust program called greet.rs that prints each command-line argument on its own line. Save to greet.rs.",
+      "check_str": "args",
+      "check_file": "greet.rs"
+    },
+    {
+      "id": "demo-json-config",
+      "lang": "json",
+      "prompt": "Write a JSON config file called service.json with keys name (string), port (number) and enabled (boolean). Save to service.json.",
+      "check_str": "\"port\"",
+      "check_file": "service.json"
+    },
+    {
+      "id": "demo-sh-words",
+      "lang": "bash",
+      "prompt": "Write a bash script called words.sh that prints the number of words in the file given as first argument. Save to words.sh and make it executable.",
+      "check_type": "file_executable",
+      "check_path": "words.sh",
+      "setup": "file_ops"
+    }
+  ]
+}

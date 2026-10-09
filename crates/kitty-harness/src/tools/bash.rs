@@ -7,7 +7,8 @@ use crate::redact::redact_secrets;
 use crate::sandbox::{Sandbox, SandboxError};
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 impl ToolRegistry {
     /// Execute a Bash tool call.
@@ -60,8 +61,17 @@ impl ToolRegistry {
         timeout: Duration,
         dir: Option<&Path>,
     ) -> Result<ToolResult, ToolError> {
-        // Guard: check the full chain
-        let verdicts = Guard::check_chain(command);
+        // Guard: check the full chain (W0: timed into the turn's
+        // `guard_ms` accumulator — behavior unchanged, policy first).
+        // The span lives in a sync scope (dropped before any await), so
+        // no `entered()` guard ever crosses an await point.
+        let guard_start = Instant::now();
+        let verdicts = {
+            let _guard_span = tracing::debug_span!("guard_check").entered();
+            Guard::check_chain(command)
+        };
+        self.turn_guard_ms
+            .fetch_add(guard_start.elapsed().as_millis() as u64, Ordering::Relaxed);
         for verdict in &verdicts {
             match verdict {
                 GuardVerdict::Block(reason) => {
@@ -147,9 +157,18 @@ impl ToolRegistry {
         // Save PID before consuming child with wait_with_output.
         let child_pid = child.id();
 
+        // W0: child-execution wall (the `SandboxOutcome::duration_ms`
+        // quantity) into the turn's `sandbox_ms` accumulator. Measured
+        // around spawn+wait regardless of containment, so `sandbox_ms` is
+        // the sandbox-stage wall including containment overhead when armed.
+        let exec_start = Instant::now();
         let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(ToolError::Io(e)),
+            Ok(Err(e)) => {
+                self.turn_sandbox_ms
+                    .fetch_add(exec_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                return Err(ToolError::Io(e));
+            }
             Err(_elapsed) => {
                 // F3.1: Explicitly kill the entire process group on timeout.
                 // SIGTERM first for graceful shutdown, then SIGKILL after 2s grace.
@@ -162,6 +181,8 @@ impl ToolRegistry {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     let _ = kill(pgid, Signal::SIGKILL);
                 }
+                self.turn_sandbox_ms
+                    .fetch_add(exec_start.elapsed().as_millis() as u64, Ordering::Relaxed);
                 return Ok(ToolResult {
                     success: false,
                     output: format!("command timed out after {}s (killed)", timeout.as_secs()),
@@ -169,6 +190,8 @@ impl ToolRegistry {
                 });
             }
         };
+        self.turn_sandbox_ms
+            .fetch_add(exec_start.elapsed().as_millis() as u64, Ordering::Relaxed);
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -214,6 +237,43 @@ mod tests {
         let args = serde_json::json!({"command": "rm -rf /"});
         let err = registry.execute_bash(&args).await.unwrap_err();
         assert!(matches!(err, ToolError::BashBlocked(_)));
+    }
+
+    /// W0: `execute_bash` records guard + sandbox wall time into the
+    /// turn accumulators (and `take_turn_timing` resets them).
+    #[tokio::test]
+    async fn w0_bash_records_guard_and_sandbox_timing() {
+        let registry = ToolRegistry::new();
+        registry.reset_turn_timing();
+        // 50ms sleep: comfortably above ms resolution + scheduling jitter,
+        // far below any timeout. `sleep` passes Guard (see the F1.3 timeout
+        // tests) and `nanosleep` is seccomp-allowlisted under containment.
+        let args = serde_json::json!({"command": "sleep 0.05"});
+        let result = registry.execute_bash(&args).await.unwrap();
+        assert!(result.success, "sleep must succeed: {}", result.output);
+        let (guard_ms, sandbox_ms) = registry.take_turn_timing();
+        assert!(
+            sandbox_ms >= 10,
+            "50ms sleep must show sandbox wall time, got {sandbox_ms}ms"
+        );
+        // `guard_ms` is a real ms-truncated measurement of a ~µs check —
+        // often 0 for a single command, so it is read but not asserted.
+        let _ = guard_ms;
+        // Swap-reset discipline: a second read (e.g. the next turn) sees zero.
+        assert_eq!(registry.take_turn_timing(), (0, 0));
+    }
+
+    /// W0: a Guard-blocked command records guard time but no sandbox time
+    /// (no child ever spawns) — and the take still resets.
+    #[tokio::test]
+    async fn w0_blocked_command_records_no_sandbox_time() {
+        let registry = ToolRegistry::new();
+        registry.reset_turn_timing();
+        let args = serde_json::json!({"command": "rm -rf /"});
+        let err = registry.execute_bash(&args).await.unwrap_err();
+        assert!(matches!(err, ToolError::BashBlocked(_)));
+        let (_guard_ms, sandbox_ms) = registry.take_turn_timing();
+        assert_eq!(sandbox_ms, 0, "blocked commands never spawn a child");
     }
 
     #[tokio::test]

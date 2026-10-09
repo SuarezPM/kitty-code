@@ -6,10 +6,16 @@ mod bench;
 mod tui;
 
 mod claweval;
+mod doctor;
 mod gpqa;
+mod journal;
 mod mcp;
+mod mcp_client;
+mod plan;
 mod polyglot;
+mod skills;
 mod tb2;
+mod update;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -221,6 +227,22 @@ pub enum Commands {
         /// Disable episodic memory recall/save
         #[arg(long)]
         no_memory: bool,
+        /// W3 logprobs spike: send ONE `/api/chat` with logprobs on, print
+        /// support + mean top1-top2 margin, and exit BEFORE the agent loop.
+        /// Ollama-only; any other backend reports HELD (never faked).
+        /// Nota probe: anotar (modelo,prompt); margen run-dependiente.
+        #[arg(long)]
+        logprobs_probe: bool,
+        /// W3 plan mode: print what would run and exit WITHOUT entering the
+        /// agent loop (zero file edits; `Edit`/`Write` stay blocked).
+        #[arg(long)]
+        plan: bool,
+        /// Determinism seed (W7): same seed + same inputs ⇒ same retry
+        /// backoffs and knowledge tie-breaks. Wired to the existing harness
+        /// builder `Agent::with_seed` (signature untouched).
+        /// `None` (default) = legacy exact behavior.
+        #[arg(long)]
+        seed: Option<u64>,
     },
     /// Run benchmarks
     Bench {
@@ -303,8 +325,55 @@ pub enum Commands {
     },
     /// Show model info and status
     Info,
+    /// Check for a newer release (fail-closed without network)
+    Update {
+        /// Print machine-readable JSON instead of human text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check the local environment (Ollama, model, VRAM, disk) — W1 doctor
+    Doctor {
+        /// Print the report as JSON instead of human text
+        #[arg(long)]
+        json: bool,
+    },
+    /// List discovered skills (SKILL.md walker) as prompt XML — W3 skills
+    Skills {
+        /// Extra skill roots (repeatable; default: KITTY_SKILLS_DIR, ./skills,
+        /// ~/.config/opencode/skills)
+        #[arg(long)]
+        dir: Vec<PathBuf>,
+    },
+    /// Revert the most recent journaled edit — W3 undo
+    Undo {
+        /// Journal file (default ~/.kitty/journal.jsonl or KITTY_JOURNAL)
+        #[arg(long)]
+        journal: Option<PathBuf>,
+    },
+    /// List tools from an external MCP server spawned as a child — W3 client
+    #[command(name = "mcp-client")]
+    McpClient {
+        /// Server program to spawn (e.g. `npx`)
+        command: String,
+        /// Call this tool after listing (default: only list)
+        #[arg(long)]
+        call: Option<String>,
+        /// JSON object arguments for --call (default: {})
+        #[arg(long, default_value = "{}")]
+        args_json: String,
+        /// Arguments for the server program
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Self-test probe MCP server over stdio (hidden; used by tests)
+    #[command(hide = true, name = "probe-mcp-server")]
+    ProbeMcpServer,
     /// Start MCP server over stdio (exposes Read/Edit/Write/Bash/Glob/Grep)
-    Mcp,
+    Mcp {
+        /// Plan mode: refuse Edit/Write over the MCP transport too
+        #[arg(long)]
+        plan: bool,
+    },
     /// Launch the TUI status display (requires `tui` feature)
     #[cfg(feature = "tui")]
     Tui,
@@ -368,10 +437,14 @@ async fn main() -> Result<()> {
     // stays frozen afterward (num_ctx is never injected per-request).
     // Embedded backend skips the Ollama probe: ctx is owned by InferPolicy
     // (KITTY_INFER_CTX, default 4096).
-    let ctx_resolution = if matches!(
-        cli.command,
-        Commands::Run { .. } | Commands::Bench { .. } | Commands::BenchAb { .. }
-    ) {
+    // W3 plan mode (`run --plan`) is an offline dry-run: it prints and exits
+    // before any client/probe work, so it never touches the network.
+    let plan_dry_run = matches!(&cli.command, Commands::Run { plan: true, .. });
+    let ctx_resolution = if !plan_dry_run
+        && matches!(
+            cli.command,
+            Commands::Run { .. } | Commands::Bench { .. } | Commands::BenchAb { .. }
+        ) {
         match ollama_client.as_ref() {
             Some(oc) => {
                 let res = resolve_session_num_ctx(oc, &cli.model).await;
@@ -434,8 +507,62 @@ async fn main() -> Result<()> {
     let bench_backend: &'static str = if use_infer { "kitty-infer" } else { "ollama" };
 
     match cli.command {
-        Commands::Run { prompt, no_memory } => {
+        Commands::Run {
+            prompt,
+            no_memory,
+            logprobs_probe,
+            plan,
+            seed,
+        } => {
             let prompt = prompt.join(" ");
+            // W3 plan mode: dry-run summary, NEVER the agent loop.
+            if plan {
+                println!("plan mode (--plan): no edits will be applied.");
+                println!("Model: {}", cli.model);
+                println!("URL:   {}", cli.url);
+                println!("Prompt: {}", prompt);
+                println!("Memory: {}", if no_memory { "off" } else { "on" });
+                match seed {
+                    Some(s) => println!("Seed: {}", s),
+                    None => println!("Seed: none (legacy)"),
+                }
+                println!("Tools available: Read, Edit, Write, Bash, Glob, Grep");
+                println!("Blocked in plan mode: Edit, Write");
+                return Ok(());
+            }
+            // W3 spike probe (minimal CLI surface): one logprobs round-trip,
+            // no agent loop, no defaults changed.
+            if logprobs_probe {
+                match ollama_client.as_ref() {
+                    Some(oc) => {
+                        let outcome = oc
+                            .chat_with_logprobs(
+                                &cli.model,
+                                vec![kitty_runtime::Message::user(if prompt.is_empty() {
+                                    "hi"
+                                } else {
+                                    &prompt
+                                })],
+                                None,
+                                None,
+                                5,
+                            )
+                            .await?;
+                        match outcome.logprobs.as_deref() {
+                            Some(lps) => println!(
+                                "logprobs: SUPPORTED n_tokens={} mean_margin_top1_top2={:.3}",
+                                lps.len(),
+                                kitty_runtime::mean_margin(lps).unwrap_or(f32::NAN)
+                            ),
+                            None => println!("logprobs: NOT-RETURNED (server ignored the request)"),
+                        }
+                    }
+                    None => println!(
+                        "logprobs: HELD-backend (kitty-infer/LLM lane: not live-verified here)"
+                    ),
+                }
+                return Ok(());
+            }
             // F2 KV preflight, routed through the T2.2 resolver: the warning
             // must report the RESOLVED window (env/native/fallback), not a
             // raw env read — warn (never fail) when a large window risks OOM
@@ -455,6 +582,16 @@ async fn main() -> Result<()> {
             } else {
                 Some(default_db_path())
             };
+            // C3 (Gate B): arm the agent-loop edit journal (`kitty undo`).
+            // The hook lives in harness `ToolRegistry::execute`; this lane
+            // only ensures `KITTY_JOURNAL` resolves (explicit value wins,
+            // else the default) so the hook has a path to write to.
+            // Format untouched: append-only JSONL, one entry per edit.
+            let journal_path = journal::ensure_run_journal_env();
+            info!(
+                journal = %journal_path.display(),
+                "edit journal armed for run"
+            );
             let base_config = AgentConfig {
                 model: cli.model.clone(),
                 // Gate-4: explicit project root for the Bash sandbox allow-root
@@ -476,6 +613,12 @@ async fn main() -> Result<()> {
             let mut agent = tokio::task::spawn_blocking(move || Agent::new(client, base_config))
                 .await
                 .map_err(|e| anyhow::anyhow!("agent construction task failed: {e}"))?;
+            // C2 (Gate B): determinism seed via the existing harness builder
+            // (`Agent::with_seed`; signature untouched). `None` keeps the
+            // legacy exact behavior.
+            if let Some(s) = seed {
+                agent = agent.with_seed(s);
+            }
             // Per-run overrides (Fase 2.1): explicit CLI flags survive the
             // construction-time profile sync via one auditable override path.
             let mut overrides = RunOverrides::default();
@@ -615,7 +758,74 @@ async fn main() -> Result<()> {
             println!("Bench: polyglot (code), tb2 (terminal), tb2-official (terminal-bench-2.1 via Harbor), gpqa (reasoning, gated, requires --pre-registration and --limit 198), claweval (agent eval, requires claw-eval CLI + OPENROUTER_API_KEY)");
             Ok(())
         }
-        Commands::Mcp => mcp::run().await,
+        Commands::Update { json } => update::run_update(json).await,
+        Commands::Mcp { plan } => mcp::run(plan).await,
+        Commands::Doctor { json } => {
+            // W1: probe Ollama (/api/tags + /api/show via OllamaClient) + host.
+            let report = doctor::run_doctor(&cli.url, &cli.model).await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", doctor::format_human(&report));
+            }
+            Ok(())
+        }
+        Commands::Skills { dir } => {
+            // W3: discover SKILL.md files, render the prompt XML block.
+            let roots = if dir.is_empty() {
+                skills::default_skill_dirs()
+            } else {
+                dir
+            };
+            let found = skills::discover_skills(&roots);
+            println!("skills: {} found", found.len());
+            for s in &found {
+                println!(
+                    "- {} — {} [{}]",
+                    s.name,
+                    s.description,
+                    s.location.display()
+                );
+            }
+            print!("{}", skills::format_skills_xml(&found));
+            Ok(())
+        }
+        Commands::Undo { journal } => {
+            // W3: revert the most recent journaled edit.
+            let path = journal.unwrap_or_else(journal::default_journal_path);
+            match journal::undo_last(&path)? {
+                Some(reverted) => {
+                    println!(
+                        "undone: {} (journal {})",
+                        reverted.display(),
+                        path.display()
+                    );
+                }
+                None => println!("journal empty: {} — nothing to undo", path.display()),
+            }
+            Ok(())
+        }
+        Commands::McpClient {
+            command,
+            call,
+            args_json,
+            args,
+        } => {
+            // W3: list tools from an external MCP server child process.
+            let names = mcp_client::list_tools_via_child(&command, &args).await?;
+            println!("tools: {} found", names.len());
+            for n in &names {
+                println!("- {n}");
+            }
+            if let Some(tool) = call {
+                let arguments: serde_json::Value = serde_json::from_str(&args_json)?;
+                let result =
+                    mcp_client::call_tool_via_child(&command, &args, &tool, arguments).await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            Ok(())
+        }
+        Commands::ProbeMcpServer => mcp_client::serve_probe_stdio().await,
         Commands::BenchAb {
             thinking,
             limit,
@@ -739,5 +949,148 @@ mod num_ctx_resolution_tests {
                 source: "fallback"
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod run_flags_tests {
+    use super::*;
+    use clap::Parser;
+    use kitty_runtime::{ChatResponse, Message, MockClient, ToolCall, ToolCallFunction};
+
+    #[test]
+    fn run_seed_flag_parses_and_defaults_to_none() {
+        // C2: `--seed` is a `Run`-only flag (bench keeps its seed-42 shuffle).
+        let cli = Cli::try_parse_from(["kitty", "run", "hello"]).unwrap();
+        match cli.command {
+            Commands::Run { seed, plan, .. } => {
+                assert_eq!(seed, None);
+                assert!(!plan);
+            }
+            _ => panic!("expected run"),
+        }
+        let cli = Cli::try_parse_from(["kitty", "run", "--seed", "42", "hello"]).unwrap();
+        match cli.command {
+            Commands::Run { seed, .. } => assert_eq!(seed, Some(42)),
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn run_plan_and_seed_combine() {
+        let cli = Cli::try_parse_from(["kitty", "run", "--plan", "--seed", "7", "hi"]).unwrap();
+        match cli.command {
+            Commands::Run { plan, seed, .. } => {
+                assert!(plan);
+                assert_eq!(seed, Some(7));
+            }
+            _ => panic!("expected run"),
+        }
+    }
+
+    fn tool_resp(name: &str, args: serde_json::Value) -> ChatResponse {
+        ChatResponse {
+            model: "test-model".into(),
+            message: Message::tool_calls(vec![ToolCall {
+                id: None,
+                function: ToolCallFunction {
+                    name: name.to_string(),
+                    arguments: args,
+                },
+            }]),
+            done: true,
+            eval_count: None,
+            eval_duration: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    fn text_resp(text: &str) -> ChatResponse {
+        ChatResponse {
+            model: "test-model".into(),
+            message: Message::assistant(text),
+            done: true,
+            eval_count: None,
+            eval_duration: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    /// C3 end-to-end (offline, MockClient): the exact builder chain the `run`
+    /// path uses (`Agent::new` + `with_seed`, journal armed via
+    /// `ensure_run_journal_env`) records an agent-loop `Edit` in the journal,
+    /// and `undo_last` — the same call the `kitty undo` command makes —
+    /// reverts it. No journal-format change: `read_entries` parses what the
+    /// harness hook wrote.
+    // NB: the journal-env lock intentionally spans the `run_with` await
+    // (the env must stay put for the whole agent loop); test-only.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_path_journals_agent_loop_edit_for_undo() {
+        // `KITTY_JOURNAL` is the production wiring (Run path → harness
+        // hook). No other test in this binary swaps it without holding the
+        // shared lock; still restore on drop.
+        let _lock = crate::journal::test_journal_env_lock();
+        let prev = std::env::var(crate::journal::ENV_JOURNAL).ok();
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var(crate::journal::ENV_JOURNAL, v),
+                    None => std::env::remove_var(crate::journal::ENV_JOURNAL),
+                }
+            }
+        }
+        let _restore = Restore(prev);
+
+        let work = tempfile::tempdir().unwrap();
+        let target = work.path().join("note.txt");
+        std::fs::write(&target, "before").unwrap();
+        let jdir = tempfile::tempdir().unwrap();
+        let journal = jdir.path().join("journal.jsonl");
+
+        // Same arming the `run` path performs (explicit value wins).
+        std::env::set_var(crate::journal::ENV_JOURNAL, &journal);
+        assert_eq!(crate::journal::ensure_run_journal_env(), journal);
+
+        let path_str = target.to_str().unwrap().to_string();
+        let mock = MockClient::new(vec![
+            tool_resp("Read", serde_json::json!({"path": path_str})),
+            tool_resp(
+                "Edit",
+                serde_json::json!({
+                    "path": path_str,
+                    "old_string": "before",
+                    "new_string": "AFTER",
+                }),
+            ),
+            text_resp("halfway"),
+            text_resp("final answer"),
+        ]);
+        let mut agent = Agent::new(
+            mock,
+            AgentConfig {
+                workspace: work.path().to_path_buf(),
+                ..Default::default()
+            },
+        )
+        .with_seed(42);
+        // Bound the loop through the public override path (same one the
+        // `run` command uses for `--max-iterations`).
+        let overrides = RunOverrides {
+            max_iterations: Some(3),
+            ..Default::default()
+        };
+        let out = agent.run_with("apply the edit", overrides).await.unwrap();
+        assert_eq!(out, "final answer");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "AFTER");
+
+        let entries = crate::journal::read_entries(&journal).unwrap();
+        assert_eq!(entries.len(), 1, "got {entries:?}");
+        assert_eq!(entries[0].before.as_deref(), Some("before"));
+
+        let undone = crate::journal::undo_last(&journal).unwrap().expect("entry");
+        assert_eq!(undone, target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
     }
 }

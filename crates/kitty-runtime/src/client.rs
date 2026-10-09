@@ -393,6 +393,15 @@ pub struct ChatRequest {
     /// overflow into an audible HTTP 400 instead of silent prompt truncation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncate: Option<bool>,
+    /// W3 logprobs spike: `Some(true)` asks the server for per-token
+    /// logprobs. Top-level field (Ollama `/api/chat` shape, verified live on
+    /// 0.35.1). `None` omits it — wire-identical to before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    /// W3: how many top candidates per token to return. Only meaningful
+    /// with `logprobs == Some(true)`; `None` omits it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -417,6 +426,17 @@ pub struct RequestOptions {
     /// the harness to express a per-model profile's `ThinkingMode::Off`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
+    /// W3 logprobs spike, per-request opt-in. Honored by [`OllamaClient`]
+    /// (top-level `/api/chat` fields, live-verified on Ollama 0.35.1);
+    /// IGNORED by Cloud/OpenAiCompat/KittyInfer/Mock backends in this lane
+    /// (HELD-backend: wire-compatible but not live-verified here). `None`
+    /// (default) keeps every backend byte-identical to before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    /// W3: top candidates per token (Ollama `top_logprobs`). Same
+    /// per-backend semantics as [`RequestOptions::logprobs`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
 }
 
 /// Chat response from Ollama.
@@ -433,6 +453,82 @@ pub struct ChatResponse {
     /// this nears the requested window, earlier turns were likely truncated.
     #[serde(default)]
     pub prompt_eval_count: Option<i64>,
+}
+
+/// W3 logprobs spike outcome: the plain [`ChatResponse`] PLUS the optional
+/// per-token logprobs. Kept OUT of [`ChatResponse`] on purpose: that struct
+/// is built with exhaustive literals in the harness/bench lanes, and growing
+/// it here would break their compilation (other lane's ownership). The spike
+/// reads logprobs through [`OllamaClient::chat_with_logprobs`], which parses
+/// the same payload twice (typed response + logprobs envelope).
+#[derive(Debug, Clone)]
+pub struct LogprobsOutcome {
+    pub response: ChatResponse,
+    /// Present only when requested AND returned by the backend; `None`
+    /// means "no signal" (fail-open), never zero confidence.
+    pub logprobs: Option<Vec<ChatLogprob>>,
+}
+
+/// W3: one alternative candidate for a token (`top_logprobs` entry).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopLogprob {
+    pub token: String,
+    pub logprob: f32,
+}
+
+/// W3: per-token logprob entry (Ollama `/api/chat` shape).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatLogprob {
+    pub token: String,
+    pub logprob: f32,
+    #[serde(default)]
+    pub top_logprobs: Vec<TopLogprob>,
+}
+
+/// W3: top1−top2 margin (natural-log space) for one token: how much more
+/// likely the emitted token was than its runner-up. `None` when the entry
+/// carries no usable candidates (empty `top_logprobs`, NaN, or fewer than 2
+/// entries). Pure — the halting lane feeds this into `EffortSignal`.
+#[must_use]
+pub fn margin_top1_top2(entry: &ChatLogprob) -> Option<f32> {
+    if entry.top_logprobs.len() < 2 {
+        return None;
+    }
+    let mut best = [f32::NEG_INFINITY; 2];
+    for c in &entry.top_logprobs {
+        if !c.logprob.is_finite() {
+            return None;
+        }
+        if c.logprob > best[0] {
+            best[1] = best[0];
+            best[0] = c.logprob;
+        } else if c.logprob > best[1] {
+            best[1] = c.logprob;
+        }
+    }
+    if best[1] == f32::NEG_INFINITY {
+        return None;
+    }
+    Some(best[0] - best[1])
+}
+
+/// W3: mean top1−top2 margin over a whole response (skips tokens without a
+/// usable margin). `None` when no token yields a margin — the caller must
+/// treat it as "no signal" (fail-open), never as zero confidence.
+#[must_use]
+pub fn mean_margin(logprobs: &[ChatLogprob]) -> Option<f32> {
+    let mut sum = 0.0f32;
+    let mut n = 0usize;
+    for e in logprobs {
+        if let Some(m) = margin_top1_top2(e) {
+            sum += m;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    Some(sum / n as f32)
 }
 
 /// Response from Ollama's `/api/tokenize` endpoint.
@@ -584,6 +680,17 @@ impl OllamaClient {
         self.num_ctx
     }
 
+    /// Base URL del servidor (sin barra final). La usa la TUI para abrir su
+    /// propio stream NDJSON contra el mismo endpoint que este cliente.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// El cliente HTTP subyacente, reutilizable para llamadas propias (TUI).
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     /// Request timeout actually configured (default 300s, env-overridable).
     pub fn timeout(&self) -> Duration {
         self.timeout
@@ -641,10 +748,60 @@ impl OllamaClient {
         Ok(response)
     }
 
+    /// W3 logprobs spike: one `/api/chat` round-trip with
+    /// `"logprobs": true, "top_logprobs": top_n` forced on TOP of the
+    /// caller's options (session `num_ctx`, `truncate: false` and thinking
+    /// heuristics still apply via [`OllamaClient::build_chat_request`]).
+    ///
+    /// Returns the plain response plus the logprobs envelope when the server
+    /// sent one. Backends/servers without support yield
+    /// `logprobs: None` — the caller treats that as "no signal" (fail-open).
+    /// Live-verified against Ollama 0.35.1 (`smollm2:1.7b` returned 5
+    /// candidates/token); other backends are HELD (see [`RequestOptions`]).
+    pub async fn chat_with_logprobs(
+        &self,
+        model: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        options: Option<RequestOptions>,
+        top_n: u32,
+    ) -> Result<LogprobsOutcome> {
+        let num_ctx = self.num_ctx;
+        let mut options = options.unwrap_or_default();
+        options.logprobs = Some(true);
+        options.top_logprobs = Some(top_n);
+        let request = self.build_chat_request(model, messages, tools, Some(options));
+
+        let url = format!("{}/api/chat", self.base_url);
+        debug!(url = %url, model = %model, num_ctx, top_n, "sending logprobs chat request");
+
+        let resp = self.http.post(&url).json(&request).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            warn!(status = %status, body = %body, "ollama logprobs chat returned error");
+            return Err(classify_api_error(status.as_u16(), &body, num_ctx));
+        }
+
+        // Same payload parsed twice: typed response (unknown `logprobs` key
+        // is ignored by serde) + logprobs envelope. Keeps `ChatResponse`
+        // frozen for the harness/bench lanes.
+        let value: serde_json::Value = resp.json().await?;
+        let logprobs: Option<Vec<ChatLogprob>> = value
+            .get("logprobs")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()?;
+        let response: ChatResponse = serde_json::from_value(value)?;
+        Ok(LogprobsOutcome { response, logprobs })
+    }
+
     /// Pure payload builder shared by [`OllamaClient::chat`] and tests:
     /// merges the fixed per-session `num_ctx` into the caller's options
     /// (caller-explicit values win), forces `"truncate": false`, and applies
     /// the thinking-disable heuristics (E3 env/model-id + F2 caller override).
+    /// W3: forwards per-request `logprobs`/`top_logprobs` untouched (`None`
+    /// omits them — defaults unchanged).
     #[must_use]
     pub fn build_chat_request(
         &self,
@@ -677,6 +834,9 @@ impl OllamaClient {
                 }
             }
         };
+        // W3: logprobs are pure per-request opt-in; read BEFORE opts moves.
+        let logprobs = opts.logprobs;
+        let top_logprobs = opts.top_logprobs;
         ChatRequest {
             model: model.to_string(),
             messages,
@@ -685,6 +845,8 @@ impl OllamaClient {
             options: Some(opts),
             think,
             truncate: Some(false),
+            logprobs,
+            top_logprobs,
         }
     }
 
@@ -1008,11 +1170,103 @@ mod tests {
             options: None,
             think: None,
             truncate: Some(false),
+            logprobs: None,
+            top_logprobs: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(!json.as_object().unwrap().contains_key("tools"));
         assert!(!json.as_object().unwrap().contains_key("options"));
         assert!(!json.as_object().unwrap().contains_key("think"));
+        // W3: opt-in fields stay off the wire unless requested.
+        assert!(!json.as_object().unwrap().contains_key("logprobs"));
+        assert!(!json.as_object().unwrap().contains_key("top_logprobs"));
+    }
+
+    #[test]
+    fn chat_request_serialization_includes_logprobs_when_asked() {
+        let client = OllamaClient::new("http://localhost:11434");
+        let req = client.build_chat_request(
+            "m",
+            vec![Message::user("hi")],
+            None,
+            Some(RequestOptions {
+                logprobs: Some(true),
+                top_logprobs: Some(5),
+                ..Default::default()
+            }),
+        );
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["logprobs"], serde_json::json!(true));
+        assert_eq!(json["top_logprobs"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn build_chat_request_defaults_leave_logprobs_off() {
+        // W3 seam invariant: no options (or default options) ⇒ wire-identical
+        // payload to before the spike (defaults unchanged).
+        let client = OllamaClient::new("http://localhost:11434");
+        let req = client.build_chat_request("m", vec![Message::user("hi")], None, None);
+        assert_eq!(req.logprobs, None);
+        assert_eq!(req.top_logprobs, None);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("logprobs"));
+    }
+
+    #[test]
+    fn chat_response_parses_ollama_logprobs_shape() {
+        // Shape captured from the live Ollama 0.35.1 probe (`/api/chat` with
+        // `"logprobs": true, "top_logprobs": 5`); the typed response ignores
+        // the unknown key while the envelope extracts it (same split as
+        // `chat_with_logprobs`). Payloads without the key yield None.
+        let with = r#"{"model":"m","message":{"role":"assistant","content":"Hi"},
+            "done":true,"logprobs":[{"token":"Hi","logprob":-0.08,
+            "top_logprobs":[{"token":"Hi","logprob":-0.08},{"token":"Hello","logprob":-2.67}]}]}"#;
+        let value: serde_json::Value = serde_json::from_str(with).unwrap();
+        let lps: Vec<ChatLogprob> =
+            serde_json::from_value(value.get("logprobs").unwrap().clone()).unwrap();
+        assert_eq!(lps.len(), 1);
+        assert_eq!(lps[0].top_logprobs.len(), 2);
+        let m = margin_top1_top2(&lps[0]).unwrap();
+        assert!((m - 2.59).abs() < 1e-2, "top1-top2 margin: {m}");
+        // Typed parse still succeeds with the extra key present.
+        let typed: ChatResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(typed.model, "m");
+
+        let without = r#"{"model":"m","message":{"role":"assistant","content":"Hi"},"done":true}"#;
+        let value: serde_json::Value = serde_json::from_str(without).unwrap();
+        assert!(value.get("logprobs").is_none());
+        assert!(mean_margin(&[]).is_none());
+    }
+
+    #[test]
+    fn margin_helpers_fail_open_on_degenerate_input() {
+        // Fewer than 2 candidates / NaN ⇒ None (no signal), never 0.0.
+        let one = ChatLogprob {
+            token: "x".into(),
+            logprob: -0.1,
+            top_logprobs: vec![TopLogprob {
+                token: "x".into(),
+                logprob: -0.1,
+            }],
+        };
+        assert!(margin_top1_top2(&one).is_none());
+        let nan = ChatLogprob {
+            token: "x".into(),
+            logprob: f32::NAN,
+            top_logprobs: vec![
+                TopLogprob {
+                    token: "a".into(),
+                    logprob: f32::NAN,
+                },
+                TopLogprob {
+                    token: "b".into(),
+                    logprob: -1.0,
+                },
+            ],
+        };
+        assert!(margin_top1_top2(&nan).is_none());
+        // Mean skips degenerate tokens; all-degenerate ⇒ None.
+        assert!(mean_margin(std::slice::from_ref(&one)).is_none());
     }
 
     #[test]
@@ -1334,6 +1588,8 @@ mod tests {
             options: None,
             think: Some(false),
             truncate: Some(false),
+            logprobs: None,
+            top_logprobs: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["think"], serde_json::json!(false));

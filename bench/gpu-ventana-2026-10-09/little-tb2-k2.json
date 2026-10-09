@@ -1,0 +1,82 @@
+{
+  "model": "ollama/ornith:9b",
+  "rep": 2,
+  "timeout_secs": 60,
+  "max_turns": 20,
+  "results": [
+    {
+      "id": "tb2-bash-count",
+      "lang": "bash",
+      "passed": false,
+      "verdict": "fail",
+      "latency_ms": 60856.499433517456,
+      "turns": 0,
+      "tool_calls": 0
+    },
+    {
+      "id": "tb2-py-csv",
+      "lang": "python",
+      "passed": false,
+      "verdict": "fail",
+      "latency_ms": 61135.95485687256,
+      "turns": 0,
+      "tool_calls": 0
+    },
+    {
+      "id": "tb2-makefile",
+      "lang": "makefile",
+      "passed": false,
+      "verdict": "fail",
+      "latency_ms": 61134.22679901123,
+      "turns": 0,
+      "tool_calls": 0
+    },
+    {
+      "id": "tb2-dockerfile",
+      "lang": "docker",
+      "passed": false,
+      "verdict": "fail",
+      "latency_ms": 61240.84377288818,
+      "turns": 1,
+      "tool_calls": 1
+    },
+    {
+      "id": "tb2-gh-actions",
+      "lang": "ci",
+      "passed": false,
+      "verdict": "fail",
+      "latency_ms": 61066.28179550171,
+      "turns": 0,
+      "tool_calls": 0
+    },
+    {
+      "id": "tb2-sh-find-modified",
+      "lang": "bash",
+      "passed": false,
+      "verdict": "fail",
+      "latency_ms": 61083.71686935425,
+      "turns": 0,
+      "tool_calls": 0
+    },
+    {
+      "id": "tb2-py-dirsize",
+      "lang": "python",
+      "passed": false,
+      "verdict": "fail",
+      "latency_ms": 61026.64566040039,
+      "turns": 0,
+      "tool_calls": 0
+    },
+    {
+      "id": "tb2-sh-backup",
+      "lang": "bash",
+      "passed": false,
+      "verdict": "fail",
+      "latency_ms": 61060.945987701416,
+      "turns": 1,
+      "tool_calls": 1
+    }
+  ],
+  "passed": 0,
+  "total": 8
+}

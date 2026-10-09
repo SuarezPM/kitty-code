@@ -8,6 +8,19 @@ The value is not the model — it is the **harness**: the tool-call loop, safety
 guards, hashline-based file edits, quality monitor, context budget, knowledge
 injection, and episodic memory wrapped around a small local LLM.
 
+## Quickstart (3 comandos a primer run funcionando)
+
+```bash
+./install.sh                        # 1. instala `kitty` en ~/.local/bin (+ symlink `kitty-cli`)
+kitty doctor                        # 2. diagnostica Ollama/modelo/VRAM/disco; si falta el modelo propone el `ollama pull <id>` exacto
+kitty run "escribe hola mundo"      # 3. primer run (añade `--plan` para dry-run sin edits)
+```
+
+Requisitos: Linux x86_64, [Ollama](https://ollama.com) sirviendo en
+`http://localhost:11434`. Sin red para descargar el binario de release,
+`./install.sh --from-source` compila con cargo. Detalle de flags en
+`./install.sh --help`.
+
 ## Features
 
 - **Native tool calling** via Ollama's `tools` parameter (the model emits
@@ -32,17 +45,20 @@ injection, and episodic memory wrapped around a small local LLM.
 ## Build & run
 
 ```bash
-cargo build --release
+cargo build --release -p kitty-cli
 ollama pull ornith:9b
-./target/release/kitty-cli run "Write a Rust function that reverses a string"
+./target/release/kitty run "Write a Rust function that reverses a string"
 ```
 
-Other commands: `info` (status + tool list), `bench polyglot|tb2|tb2-official|gpqa|claweval`
+Other commands: `info` (status + tool list), `doctor` (Ollama/model/VRAM/disk
+probe with exact-pull remediation), `skills` (discovered SKILL.md list +
+prompt XML), `undo` (revert last journaled edit), `mcp-client` (list/call
+tools on an external MCP server child process), `bench polyglot|tb2|tb2-official|gpqa|claweval`
 (benchmark suites; gpqa/claweval are gated, offline-first approximations),
 `bench-ab` (interleaved A/B with Wilson CI), `mcp` (stdio MCP server exposing
 the 6 tools via the Guard), and `tui` (status display, opt-in feature).
 
-TUI is not on by default: build/run it with `cargo run -p kitty-cli --features tui -- tui`.
+TUI is not on by default: build/run it with `cargo run -p kitty-cli --bin kitty --features tui -- tui`.
 Embedded-backend `count_tokens` is an honest heuristic (`len/4`, no model load by design).
 
 ## Project layout

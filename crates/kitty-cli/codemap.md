@@ -72,17 +72,41 @@ stdio server, and optional ratatui TUI. No agent logic — only orchestration.
   `handle_request` (`tools/list|call`, `initialize`) all through
   `ToolRegistry::execute` (Guard + workspace `resolve_project_root`);
   `run_stdio` loop; `run()` entrypoint.
-- `tui.rs` (feature `tui`, ratatui 0.29 + crossterm 0.28): `StatusInfo
-  { context_used/context_window, context_pct, session_duration }`,
-  `Message { role, content }`, `App` (input/history/draft/messages/
-  scroll/is_running; `take_input`, `history_up/down`, `handle_event`
-  over `AgentEvent`, `apply_q_policy` q-quits-only-when-empty-idle),
-  `run_tui` → `run_app` (mpsc 100 + `spawn_local` `Agent::run`,
-  `KITTY_AUTORUN_HOPS` allowed here).
+- `tui.rs` + `tui/` (feature `tui`, ratatui 0.30 + crossterm 0.29 +
+  reqwest-stream): W2 rewrite — **UI es función pura del estado**. `App`
+  (input/history/draft/messages/streaming/thinking/is_running, scroll,
+  `focus: Focus { Input, Sessions, Permission, ModelPicker, Console }`,
+  `pending_perms`, `usage: UsageTotals`, `console_lines`, `session:
+  Session`, `price_per_mtok`), `handle_event(TuiEvent)`, `apply_q_policy`
+  (q quits only when input empty + idle), `hints()` per-focus.
+  `run_tui(model, url, ctx)` → `run_app` (crossterm poll 50ms + mpsc drain)
+  + `worker::spawn_worker`. View modules under `tui/`:
+  - `tui/client.rs`: `TuiClient` (ChatClient wrapper over OllamaClient) —
+    NDJSON streaming `/api/chat` (`stream: Some(true)`, `build_chat_request`
+    reuse), emits `TuiEvent { Token, Thinking, PermissionRequest,
+    PermissionResolved, ToolStart, Usage, Done, Error }`. Permission gate:
+    `PermissionBroker` + `PermissionPolicy` (allow/deny sets, `Read/Glob/
+    Grep` auto-allow), verdicts `AllowOnce/AllowAlways/DenyOnce/DenyAlways`,
+    denied tools → synthetic assistant message. `UsageTotals{prompt,eval,
+    cost_usd,turns}`. Read-only `base_url()`/`http()` getters on
+    `OllamaClient` (kitty-runtime).
+  - `tui/view.rs`: pure render — `render(f,&App,&[Session])`, status bar,
+    transcript (wrap+scroll), input, per-focus hints, console overlay,
+    centered modals (permission diff w/ +/- colors, model picker, session
+    picker).
+  - `tui/session.rs`: `Session{ id,model,context_window,created_at,
+    entries }` JSON persistence `~/.kitty/sessions/<id>.json`, `save_session`
+    (called per-turn), `list_sessions` (sorted desc, corrupt files skipped).
+  - `tui/worker.rs`: `spawn_worker` — isolated OS thread + current-thread
+    tokio runtime + `LocalSet` (Agent is `!Send`), reuses one Agent across
+    turns (multi-turn memory), `WorkerCmd { Prompt, SetModel, Reset,
+    Shutdown }`.
 
 ## Flow
 `Cli::parse` → `resolve_session_num_ctx` (Run/Bench/BenchAb only,
-`with_num_ctx` frozen client) → match: `Run` = `Agent::new` +
+`with_num_ctx` frozen client) → match: `Run` = journal-arm (`journal::ensure_run_journal_env` → harness
+`ToolRegistry::execute` hook, same JSONL as MCP edits) + `Agent::new`
+(+ `with_seed` when `--seed`, W7 determinism; `None` = legacy) +
 `run_with(prompt, overrides)`; `Bench/BenchAb` = `BenchCliCtx` +
 `BenchArgs/BenchAbArgs` → `bench_command`/`bench_ab_command` (CWD-stale
 guard, `is_small_model` memory-off, suite switch gpqa→`run_gpqa_suite`,

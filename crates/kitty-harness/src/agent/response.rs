@@ -67,9 +67,21 @@ impl Agent {
                     .quality_monitor
                     .check_response(response.message.content.as_deref(), &all_tool_calls);
 
+                // W5-code: speculative prefetch of the concurrent read-only
+                // subset (Glob/Grep via join_all; `{}` when disabled — the
+                // sequential loop below is then bit-for-bit legacy).
+                let mut prefetched = self.prefetch_batch(&all_tool_calls).await;
+                // W5-code: feed the n-gram predictor the intended sequence.
+                self.predictor.observe(
+                    &all_tool_calls
+                        .iter()
+                        .map(|tc| tc.name.clone())
+                        .collect::<Vec<_>>(),
+                );
+
                 // F2.5: Push tool results FIRST, then corrective user messages.
                 // Ollama message order: assistant(tool_calls) → tool* → next.
-                for tc in &all_tool_calls {
+                for (idx, tc) in all_tool_calls.iter().enumerate() {
                     // Skip hallucinated tools
                     if violations.iter().any(|v| {
                         matches!(
@@ -83,7 +95,11 @@ impl Agent {
 
                     // If retry requested, the file changed — break to re-read
                     if self
-                        .execute_and_push_tool_result(tc, thinking_text.as_deref())
+                        .execute_and_push_tool_result(
+                            tc,
+                            thinking_text.as_deref(),
+                            prefetched.remove(&idx),
+                        )
                         .await?
                     {
                         break;
@@ -114,6 +130,18 @@ impl Agent {
                                     "Please provide a text response instead of repeating the same tool call.",
                                 )
                                 .await?;
+                            // W7 anti-loop: the forced text MUST enter history.
+                            // Previously it was only saved to episodic memory,
+                            // so the next iteration had no record of the
+                            // correction and re-looped until `max_iterations`.
+                            self.push_message(Message {
+                                role: "assistant".to_string(),
+                                content: Some(text.clone()),
+                                thinking: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                            })
+                            .await;
                             self.save_episode(user_prompt, &text, true).await;
                             return Ok(());
                         }
@@ -179,8 +207,12 @@ impl Agent {
         }
         if !parsed.is_empty() {
             // There are tool calls in the text, process them
-            for tc in &parsed {
-                self.execute_and_push_tool_result(tc, None).await?;
+            let mut prefetched = self.prefetch_batch(&parsed).await;
+            self.predictor
+                .observe(&parsed.iter().map(|tc| tc.name.clone()).collect::<Vec<_>>());
+            for (idx, tc) in parsed.iter().enumerate() {
+                self.execute_and_push_tool_result(tc, None, prefetched.remove(&idx))
+                    .await?;
             }
             return Ok(()); // Process tool results next iteration
         }
@@ -212,14 +244,36 @@ impl Agent {
     /// F2.2: tool errors become failed result messages, never aborts (except
     /// the doom-loop fail-fast, which is an explicit loop-level abort).
     /// Returns `true` when the caller should break and re-read (retry).
+    /// W5-code: prefetch the concurrent read-only subset of a batch.
+    /// `{}` when speculative mode is off (zero-cost, legacy path).
+    async fn prefetch_batch(
+        &self,
+        batch: &[ParsedToolCall],
+    ) -> std::collections::HashMap<usize, Result<crate::tools::ToolResult, crate::tools::ToolError>>
+    {
+        if self.speculative {
+            crate::speculative::prefetch_read_only(&self.registry, batch).await
+        } else {
+            std::collections::HashMap::new()
+        }
+    }
+
     async fn execute_and_push_tool_result(
         &mut self,
         tc: &ParsedToolCall,
         thinking: Option<&str>,
+        prefetched: Option<Result<crate::tools::ToolResult, crate::tools::ToolError>>,
     ) -> Result<bool> {
         // F2.2: Tool errors become failed results, never abort.
         // F4.3: Track invalid streak for schema breaker.
-        let result = match self.registry.execute(tc).await {
+        // W5-code: a prefetched outcome replaces `registry.execute` for this
+        // call (same `Result` shape, same arms below — verdicts identical,
+        // only the wall time changes).
+        let executed: Result<crate::tools::ToolResult, crate::tools::ToolError> = match prefetched {
+            Some(outcome) => outcome,
+            None => self.registry.execute(tc).await,
+        };
+        let result = match executed {
             Ok(r) => {
                 self.invalid_streak = 0;
                 r
@@ -593,6 +647,22 @@ impl Agent {
         let tools = Some(self.tools.clone());
         let options = Some(self.request_options(&messages));
 
+        // W5-code: idempotent cache — a byte-identical retry (overflow
+        // retry, thinking retry, transport retry) is served without burning
+        // another model call. Disabled by default (`None` = legacy path).
+        let cache_key = self
+            .response_cache
+            .as_ref()
+            .map(|_| crate::response_cache::cache_key(model, &messages, &tools, &options));
+        if let (Some(cache), Some(key)) = (self.response_cache.as_ref(), &cache_key) {
+            if let Ok(mut guard) = cache.lock() {
+                if let Some(hit) = guard.get(key) {
+                    debug!("response cache hit");
+                    return Ok(hit);
+                }
+            }
+        }
+
         const MAX_RETRIES: usize = 3;
         let mut last_err: Option<anyhow::Error> = None;
 
@@ -602,12 +672,22 @@ impl Agent {
                 .chat_with_options(model, messages.clone(), tools.clone(), options.clone())
                 .await
             {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    if let (Some(cache), Some(key)) = (self.response_cache.as_ref(), &cache_key) {
+                        if let Ok(mut guard) = cache.lock() {
+                            guard.insert(key.clone(), resp.clone());
+                        }
+                    }
+                    return Ok(resp);
+                }
                 Err(e) if e.is_retryable() && attempt < MAX_RETRIES => {
-                    let backoff = Duration::from_millis(500 * 2u64.pow(attempt as u32));
+                    // W7-code: seeded ±20% jitter spreads synchronized
+                    // retries deterministically; unseeded = legacy exact.
+                    let backoff_ms = crate::seed::retry_backoff_ms(attempt as u32, self.seed);
+                    let backoff = Duration::from_millis(backoff_ms);
                     warn!(
                         attempt,
-                        backoff_ms = backoff.as_millis() as u64,
+                        backoff_ms,
                         error = %e,
                         "Transient LLM error, retrying"
                     );
@@ -714,6 +794,14 @@ impl Agent {
             .collect();
         let (read_files, modified_files) =
             crate::compaction::extract_file_operations(&tool_outputs);
+        // W4: open queries for the compact-QR summary = the user turns being
+        // compacted away (newest last), verbatim — the triage tier keeps the
+        // questions it must still answer instead of regenerated prose.
+        let open_queries: Vec<String> = self.messages[..final_split]
+            .iter()
+            .filter(|m| m.role == "user")
+            .filter_map(|m| m.content.clone())
+            .collect();
 
         let old_messages: Vec<Message> = self.messages.drain(..final_split).collect();
         debug_assert_eq!(old_messages.len(), final_split);
@@ -758,7 +846,21 @@ impl Agent {
             modified_files,
             ..crate::compaction::CompactionSummary::empty()
         };
-        let formatted_summary = structured.format_markdown();
+        // W4 tiers: triaje → compact-QR (goal + queries verbatim + files);
+        // ejecución → full summary (legacy exacto).
+        let formatted_summary = match self.tier() {
+            crate::model_profile::Tier::Triage => {
+                let tail: Vec<String> = open_queries
+                    .iter()
+                    .rev()
+                    .take(crate::compaction::QR_MAX_QUERIES)
+                    .rev()
+                    .cloned()
+                    .collect();
+                structured.format_qr(&tail)
+            }
+            crate::model_profile::Tier::Execution => structured.format_markdown(),
+        };
 
         let freed = ContextBudget::estimate_tokens(&freed_text);
         let needed = ContextBudget::estimate_tokens(&formatted_summary) + 100;

@@ -18,8 +18,8 @@ pub mod openai_compat;
 pub mod tools;
 
 pub use client::{
-    ChatClient, ChatRequest, ChatResponse, Message, MockClient, OllamaClient, ToolCall,
-    ToolCallFunction,
+    margin_top1_top2, mean_margin, ChatClient, ChatLogprob, ChatRequest, ChatResponse,
+    LogprobsOutcome, Message, MockClient, OllamaClient, ToolCall, ToolCallFunction, TopLogprob,
 };
 pub use cloud::{CloudClient, MockCloud};
 pub use error::{ErrorClass, Result, RuntimeError};

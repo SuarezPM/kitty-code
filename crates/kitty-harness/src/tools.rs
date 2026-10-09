@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::hashline::HashlineEditor;
@@ -115,6 +116,22 @@ pub struct ToolRegistry {
     /// Kernel containment armed on every Bash child before spawn
     /// (`None` only when explicitly disabled — see [`Self::without_sandbox`]).
     pub(crate) bash_sandbox: Option<Sandbox>,
+    /// W0 (SDD estado-arte): accumulated `Guard::check_chain` wall (ms) for
+    /// the current turn. Atomic so `run_bash_command_in` (`&self`) can
+    /// record without changing its public signature; reset per turn by the
+    /// agent loop via [`Self::reset_turn_timing`]. Truncated to ms — a
+    /// single check is ~µs, so this is often 0; still measured, never a
+    /// placeholder.
+    pub(crate) turn_guard_ms: AtomicU64,
+    /// W0: accumulated Bash child-execution wall (ms) for the current turn
+    /// (the `SandboxOutcome::duration_ms` quantity, taken at this spawn
+    /// site). Same reset/read discipline as [`Self::turn_guard_ms`].
+    pub(crate) turn_sandbox_ms: AtomicU64,
+    /// F3 (Gate A): edit-journal path for `kitty undo`. `None` = journaling
+    /// disabled (default — fully compatible: no file touched, no behavior
+    /// change). Set via [`Self::with_journal`]; the cli lane passes its
+    /// resolved `default_journal_path()` here on the `run` path.
+    pub(crate) journal: Option<PathBuf>,
 }
 
 /// Default Bash-sandbox allowlist root: the process working directory
@@ -139,7 +156,45 @@ impl ToolRegistry {
             bash_output_cap: 5_000,
             max_read_lines: 300,
             bash_sandbox: Some(Sandbox::new(SandboxConfig::new(default_workspace_root()))),
+            turn_guard_ms: AtomicU64::new(0),
+            turn_sandbox_ms: AtomicU64::new(0),
+            journal: None,
         }
+    }
+
+    /// F3: enable the edit journal (W3 `kitty undo`) at `path`. Only
+    /// successful `Edit`/`Write` executions are recorded (before/after
+    /// snapshots); recording is best-effort and never fails the tool call.
+    pub fn with_journal(mut self, path: PathBuf) -> Self {
+        self.journal = Some(path);
+        self
+    }
+
+    /// Resolve the active journal path: explicit builder first, then the
+    /// `KITTY_JOURNAL` env (same name the cli honors). `None` = disabled.
+    fn journal_path(&self) -> Option<PathBuf> {
+        self.journal
+            .clone()
+            .or_else(crate::journal::resolve_journal_path)
+    }
+
+    /// W0: zero the per-turn timing accumulators. Called by the agent loop
+    /// before `process_response` so the turn's `TurnEvent` only carries its
+    /// own guard/sandbox time.
+    pub(crate) fn reset_turn_timing(&self) {
+        self.turn_guard_ms.store(0, Ordering::Relaxed);
+        self.turn_sandbox_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// W0: read (and reset) the current turn's accumulated
+    /// `(guard_ms, sandbox_ms)`. The swap-reset keeps verification-loop
+    /// Bash runs (which happen outside any turn) from leaking into the
+    /// next turn's event.
+    pub(crate) fn take_turn_timing(&self) -> (u64, u64) {
+        (
+            self.turn_guard_ms.swap(0, Ordering::Relaxed),
+            self.turn_sandbox_ms.swap(0, Ordering::Relaxed),
+        )
     }
 
     /// Override the default Read window cap (chainable, f8 T2.3/P4 Rider B).
@@ -178,8 +233,11 @@ impl ToolRegistry {
         self
     }
 
-    /// Execute a parsed tool call.
-    pub async fn execute(&mut self, tc: &ParsedToolCall) -> Result<ToolResult, ToolError> {
+    /// Normalize + repair prelude shared by [`Self::execute`] and the W5
+    /// speculative prefetch (same code path ⇒ same verdicts, no drift).
+    /// `Ok(call)` = dispatchable; `Err(result)` = early failed result
+    /// (unrepairable args) to return as-is.
+    pub(crate) fn prepare_call(tc: &ParsedToolCall) -> Result<ParsedToolCall, ToolResult> {
         // Alias normalization: weaker models emit near-miss tool names and
         // argument keys; both fold onto the canonical forms at this single
         // choke point shared by the agent loop and the MCP server. Unknown
@@ -189,17 +247,17 @@ impl ToolRegistry {
         // G3-5: a salvaged `_raw`-only arguments object means the model's
         // JSON body could not be parsed. Attempt JSON repair pipeline before
         // giving up: parse the raw body, then apply schema-aware coercion.
-        let call = if let Some(raw) = raw_only_arguments(&call.arguments) {
+        if let Some(raw) = raw_only_arguments(&call.arguments) {
             if let Some(repaired) = attempt_raw_repair(raw) {
                 // Repair succeeded — rebuild the call with repaired arguments
                 // and re-normalize (aliases may have been in the raw body).
-                normalize_tool_call(&ParsedToolCall {
+                Ok(normalize_tool_call(&ParsedToolCall {
                     name: call.name,
                     arguments: repaired,
                     id: call.id.clone(),
-                })
+                }))
             } else {
-                return Ok(ToolResult {
+                Err(ToolResult {
                     success: false,
                     output: format!(
                         "Tool call arguments were not valid JSON, so the call \
@@ -209,10 +267,37 @@ impl ToolRegistry {
                         truncate_lines(raw, 6)
                     ),
                     retry: true,
-                });
+                })
             }
         } else {
-            call
+            Ok(call)
+        }
+    }
+
+    /// Execute a parsed tool call.
+    pub async fn execute(&mut self, tc: &ParsedToolCall) -> Result<ToolResult, ToolError> {
+        let call = match Self::prepare_call(tc) {
+            Ok(call) => call,
+            Err(early) => return Ok(early),
+        };
+
+        // F3 (Gate A): journal pre-image for Edit/Write so agent-loop edits
+        // become revertible via `kitty undo` (same schema as the cli
+        // journal). Snapshot BEFORE dispatch; recorded only when the
+        // execution below reports success. Bash write-target commands are
+        // intentionally NOT journaled (multi-target restores are the cli
+        // lane's decision, mirroring `McpServer::call_tool`).
+        let journal_path = self.journal_path();
+        let journal_before: Option<Option<String>> = match (&journal_path, call.name.as_str()) {
+            (Some(_), "Edit" | "Write") => {
+                let p = call
+                    .arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Some(tokio::fs::read_to_string(p).await.ok())
+            }
+            _ => None,
         };
 
         let result = match call.name.as_str() {
@@ -224,6 +309,24 @@ impl ToolRegistry {
             "Grep" => self.execute_grep(&call.arguments).await?,
             other => return Err(ToolError::NotFound(other.to_string())),
         };
+
+        // F3: post-image on success. Best-effort: a journal I/O error warns
+        // but never fails the (already successful) tool call.
+        if let (Some(journal), Some(before)) = (&journal_path, &journal_before) {
+            if result.success {
+                if let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) {
+                    let after = tokio::fs::read_to_string(path).await.unwrap_or_default();
+                    let entry = crate::journal::entry_for(path, before.clone(), after);
+                    if let Err(e) = crate::journal::append_entry(journal, &entry) {
+                        tracing::warn!(
+                            journal = %journal.display(),
+                            error = %e,
+                            "edit journal append failed (tool result kept)"
+                        );
+                    }
+                }
+            }
+        }
         if result.success {
             match call.name.as_str() {
                 "Edit" | "Write" => self.file_modifications += 1,
@@ -404,5 +507,111 @@ mod tests {
         };
         let err = registry.execute(&tc).await.unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    fn read_journal(path: &std::path::Path) -> Vec<crate::journal::JournalEntry> {
+        let text = std::fs::read_to_string(path).unwrap();
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// F3: `Write` of a new file records `{before: None, after}` via `execute`.
+    #[tokio::test]
+    async fn f3_journal_records_write_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        let target = dir.path().join("new.txt");
+        let mut registry = ToolRegistry::new().with_journal(journal.clone());
+        let tc = ParsedToolCall {
+            name: "Write".to_string(),
+            arguments: serde_json::json!({
+                "path": target.to_str().unwrap(),
+                "content": "hello",
+            }),
+            id: None,
+        };
+        let result = registry.execute(&tc).await.unwrap();
+        assert!(result.success);
+        let entries = read_journal(&journal);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, target.to_str().unwrap());
+        assert_eq!(entries[0].before, None);
+        assert_eq!(entries[0].after, "hello");
+    }
+
+    /// F3: `Read` + `Edit` records `{before, after}` with the pre-image.
+    #[tokio::test]
+    async fn f3_journal_records_edit_with_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        let target = dir.path().join("e.txt");
+        std::fs::write(&target, "line1\nline2").unwrap();
+        let mut registry = ToolRegistry::new().with_journal(journal.clone());
+        let path = target.to_str().unwrap();
+        registry
+            .execute(&ParsedToolCall {
+                name: "Read".to_string(),
+                arguments: serde_json::json!({"path": path}),
+                id: None,
+            })
+            .await
+            .unwrap();
+        let edit = registry
+            .execute(&ParsedToolCall {
+                name: "Edit".to_string(),
+                arguments: serde_json::json!({
+                    "path": path,
+                    "old_string": "line1",
+                    "new_string": "LINE1",
+                }),
+                id: None,
+            })
+            .await
+            .unwrap();
+        assert!(edit.success, "edit failed: {}", edit.output);
+        let entries = read_journal(&journal);
+        assert_eq!(entries.len(), 1, "only the Edit is journaled, not the Read");
+        assert_eq!(entries[0].before.as_deref(), Some("line1\nline2"));
+        assert!(entries[0].after.contains("LINE1"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), entries[0].after);
+    }
+
+    /// F3: failed executions (EditBlocked) record nothing.
+    #[tokio::test]
+    async fn f3_journal_skips_failed_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        let target = dir.path().join("e.txt");
+        std::fs::write(&target, "data").unwrap();
+        let mut registry = ToolRegistry::new().with_journal(journal.clone());
+        // No prior Read → EditBlocked error, no mutation, no entry.
+        let err = registry
+            .execute(&ParsedToolCall {
+                name: "Edit".to_string(),
+                arguments: serde_json::json!({
+                    "path": target.to_str().unwrap(),
+                    "old_string": "data",
+                    "new_string": "DATA",
+                }),
+                id: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::EditBlocked(_)));
+        assert!(
+            !journal.exists(),
+            "failed edits must not create journal entries"
+        );
+    }
+
+    /// F3: journaling is disabled by default (no path, no env) — compatible.
+    #[tokio::test]
+    async fn f3_journal_disabled_by_default() {
+        let _g = crate::model_profile::test_env_lock();
+        let _e = crate::model_profile::EnvRestoreGuard::remove(crate::journal::ENV_JOURNAL);
+        let registry = ToolRegistry::new();
+        assert_eq!(registry.journal_path(), None);
     }
 }
