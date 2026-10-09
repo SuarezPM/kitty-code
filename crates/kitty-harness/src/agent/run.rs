@@ -7,6 +7,19 @@ use anyhow::{Context, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
+/// W1B: esfuerzo consumido en un `run` (hops = restarts ejecutados, iters =
+/// turnos LLM totales). Lo devuelve [`Agent::last_run_effort`] para los
+/// manifiestos bench.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunEffort {
+    /// Hop-restarts ejecutados (ciclos extra tras agotar iteraciones).
+    pub hops_used: usize,
+    /// Turnos LLM totales del run (todos los ciclos y revisiones).
+    pub iters_used: usize,
+    /// El `EffortRouter` quedó OFF en ese run (bench o kill-switch).
+    pub router_off: bool,
+}
+
 impl Agent {
     /// Run the agent loop with a user prompt.
     ///
@@ -25,10 +38,17 @@ impl Agent {
     async fn run_impl(&mut self, user_prompt: &str) -> Result<String> {
         // Fase 0 remediation: reset empty streak per run (prevents cross-run contamination)
         self.empty_response_streak = 0;
+        // W1B: reset per-run effort stats (read via `last_run_effort`).
+        self.last_run_hops_used = 0;
+        self.last_run_iters_used = 0;
+        self.last_run_router_off = false;
         // E3: reset the deterministic doom-loop detector per run as well.
         self.doom_loop.reset();
         // W7: the ReAct trace is per-run ephemeral, like the doom streak.
         self.react_steps.clear();
+        // W5-code: the n-gram predictor observes one run's tool sequence;
+        // reset per run so predictions never leak across tasks.
+        self.predictor = crate::pld::NgramPredictor::new();
         // Bootstrap: detect workspace on first turn
         self.run_bootstrap();
 
@@ -73,6 +93,12 @@ impl Agent {
         // f8 AD1: autorun hop budget. Consumed ONLY on iteration exhaustion
         // (never by verification revisions); 0 = byte-identical legacy run.
         let mut hops_remaining = self.config.autorun_hops;
+        // W1B: esfuerzo consumido en este run (señal + manifiesto). Los
+        // contadores viven aquí (locales) y se publican en `self.last_run_*`
+        // cada turno para que cualquier retorno ya los lleve al día.
+        let mut total_turns: usize = 0;
+        let mut vacuous_turns: usize = 0;
+        let mut hops_spent: usize = 0;
         'verify: loop {
             // Fixed state machine (f8 AD1): the inner for restarts on hop
             // consumption; force_response + Verification run ONLY on real
@@ -88,6 +114,9 @@ impl Agent {
                 // (×VERIFY_MAX_REVISIONS) and hops (see ModelTuning docs).
                 for iteration in 0..self.config.max_iterations {
                     debug!(iteration, "Agent loop iteration");
+                    // W7-code: turn-start checkpoint for doom-loop recovery
+                    // (rewind point if this turn aborts the loop).
+                    let checkpoint = self.messages.len();
 
                     // Check context budget before LLM call. Compaction fires when the
                     // tracked usage reaches the compaction threshold (default 80% of
@@ -119,7 +148,7 @@ impl Agent {
                     // F4.3: schema breaker — after 3 consecutive invalid tool calls,
                     // restrict to no tools (Plan category) for the next turn.
                     let saved_tools;
-                    if self.invalid_streak >= 3 {
+                    if self.invalid_streak >= crate::router::INVALID_STREAK_BREAKER_AT {
                         warn!(
                             streak = self.invalid_streak,
                             "Schema breaker: restricting tools for next turn"
@@ -160,7 +189,19 @@ impl Agent {
                             // to normal processing (tool calls and all). Max 1 retry per turn.
                             // Note: empty_response_streak is NOT reset here; thinking retry counts toward streak.
                             let retry_response = self.llm_call_no_thinking().await?;
-                            self.process_response(user_prompt, retry_response).await?;
+                            // W7-code: same doom-loop recovery as the main
+                            // path (terminal `Some` returns the recovered
+                            // text; `None` falls through to the checks below).
+                            if let Some(recovered) = self
+                                .process_response_recoverable(
+                                    user_prompt,
+                                    retry_response,
+                                    checkpoint,
+                                )
+                                .await?
+                            {
+                                return Ok(recovered);
+                            }
                             // Fail-fast after retry as well (handoff §6). Warn with streak always.
                             if should_fail_fast(self.empty_response_streak) {
                                 warn!(streak = self.empty_response_streak, "Empty response streak cap reached (2) after thinking retry, failing fast");
@@ -189,7 +230,54 @@ impl Agent {
                     let t_tokens_in = response.prompt_eval_count.map(|c| c as usize);
                     let t_tokens_out = response.eval_count.map(|c| c as usize);
 
-                    self.process_response(user_prompt, response).await?;
+                    // W1B: vacuity counters for the EffortRouter signal (a turn is
+                    // vacuous when it carries neither text nor tool calls).
+                    total_turns += 1;
+                    let vacuous = response
+                        .message
+                        .content
+                        .as_deref()
+                        .is_none_or(|c| c.trim().is_empty())
+                        && response
+                            .message
+                            .tool_calls
+                            .as_ref()
+                            .is_none_or(|tc| tc.is_empty());
+                    if vacuous {
+                        vacuous_turns += 1;
+                    }
+                    // Publica aquí (no al fin del turno): el fail-fast retorna
+                    // antes y debe llevar los contadores al día.
+                    self.last_run_iters_used = total_turns;
+                    self.last_run_hops_used = hops_spent;
+
+                    // W0 (SDD estado-arte): per-turn latency desglose
+                    // (wall = modelo/guard/sandbox/tools). The registry
+                    // accumulators reset here so this turn's event only
+                    // carries its own guard/sandbox time; `tools_ms` wraps
+                    // the whole `process_response` (tool execution +
+                    // result handling). Read+reset via `take_turn_timing`
+                    // so verification-loop Bash runs (outside any turn)
+                    // never leak into the next event.
+                    self.registry.reset_turn_timing();
+                    let tools_start = std::time::Instant::now();
+                    // W7-code: a doom-loop abort recovers to `checkpoint`
+                    // with a terminal text instead of failing the run.
+                    if let Some(recovered) = self
+                        .process_response_recoverable(user_prompt, response, checkpoint)
+                        .await?
+                    {
+                        return Ok(recovered);
+                    }
+                    let tools_ms = tools_start.elapsed().as_millis() as u64;
+                    let (guard_ms, sandbox_ms) = self.registry.take_turn_timing();
+                    let wall_model_ms = turn_latency.as_millis() as u64;
+                    self.last_turn_breakdown = Some(crate::telemetry::TurnBreakdown {
+                        wall_model_ms,
+                        guard_ms,
+                        sandbox_ms,
+                        tools_ms,
+                    });
 
                     // Fail-fast: 2 consecutive empty responses → terminate quickly
                     // instead of looping until max_iterations/timeout (handoff §6).
@@ -219,8 +307,36 @@ impl Agent {
                             error: None,
                             bench_suite: None,
                             compacted: false,
+                            // W0: hops/iters a telemetría (margen None: sin
+                            // plumbing de logits en esta lane, ver W3).
+                            // W1B: `hops` = restarts ejecutados, `iters` =
+                            // turnos totales del run (no del ciclo).
+                            hops: Some(hops_spent),
+                            iters: Some(total_turns),
+                            margin: None,
+                            // W0 (SDD estado-arte): wall =
+                            // modelo/guard/sandbox/tools. Medidos arriba;
+                            // `latency_ms` se conserva como wall del modelo
+                            // (compat) y `wall_model_ms` lo nombra explícito.
+                            wall_model_ms: Some(wall_model_ms),
+                            guard_ms: Some(guard_ms),
+                            sandbox_ms: Some(sandbox_ms),
+                            tools_ms: Some(tools_ms),
                         })
                         .await;
+                    // W0: turn span as a tracing event (carries the current
+                    // span context; no `entered()` guard is held across
+                    // awaits). Visible in tokio-console once the binary
+                    // enables it (cli lane) and in fmt logs at debug level.
+                    tracing::debug!(
+                        turn = iteration,
+                        wall_model_ms,
+                        guard_ms,
+                        sandbox_ms,
+                        tools_ms,
+                        tool_calls = t_tool_calls,
+                        "turn breakdown"
+                    );
 
                     // Reset thinking budget for next turn
                     self.thinking_budget.reset_turn();
@@ -230,18 +346,66 @@ impl Agent {
 
                 // Iteration budget exhausted WITHOUT a natural terminal return.
                 if hops_remaining > 0 {
-                    // AD1 hop path: NO force_response, NO verification, NO episode
-                    // save — push the continuation prompt into history so context
-                    // persists, spend one hop, restart the full inner loop.
-                    hops_remaining -= 1;
-                    info!(
-                        remaining = hops_remaining,
-                        total = self.config.autorun_hops,
-                        "autorun: iterations exhausted — continuing with a fresh cycle"
+                    // W1B: EffortRouter consultation (fail-open). Los drivers
+                    // bench marcan el proceso (`KITTY_BENCH_MODE=1` /
+                    // `KITTY_VERIFY_LOOP=off`) → `for_bench()`: decide existe
+                    // pero deja pasar intacto, y el manifiesto lo registra vía
+                    // `last_run_router_off`. `Normal` es el legacy AD1 exacto.
+                    // W4: el closer-Done corrobora como evidencia de parar.
+                    let router = Self::effort_router();
+                    let mut signal = crate::router::EffortSignal::new(
+                        crate::router::EffortSignal::vacuity_from_counts(
+                            vacuous_turns,
+                            total_turns,
+                        ),
+                        None, // margin: sin logprobs en esta lane (W3)
+                        self.empty_response_streak,
+                        self.invalid_streak,
+                        self.quality_monitor.events().len(),
+                        false, // verify_fail: este hop es pre-verificación
                     );
-                    self.push_message(Message::user(AUTORUN_CONTINUE_PROMPT))
-                        .await;
-                    continue 'autorun;
+                    signal.closer_done = self.closer_signal();
+                    let decision = router.decide(&signal, hops_remaining);
+                    self.last_run_router_off = decision.off_in_bench;
+                    match decision.route {
+                        crate::router::EffortRoute::Normal => {
+                            hops_remaining -= 1;
+                            hops_spent += 1;
+                            self.last_run_hops_used = hops_spent;
+                            info!(
+                                remaining = hops_remaining,
+                                total = self.config.autorun_hops,
+                                "autorun: iterations exhausted — continuing with a fresh cycle"
+                            );
+                            self.push_message(Message::user(AUTORUN_CONTINUE_PROMPT))
+                                .await;
+                            continue 'autorun;
+                        }
+                        crate::router::EffortRoute::ReduceHops => {
+                            hops_remaining = decision.hops_budget;
+                            if hops_remaining == 0 {
+                                warn!(
+                                    "effort router: evidence against more hops — forcing final answer"
+                                );
+                                break 'autorun;
+                            }
+                            hops_spent += 1;
+                            self.last_run_hops_used = hops_spent;
+                            info!(
+                                remaining = hops_remaining,
+                                total = self.config.autorun_hops,
+                                "autorun: effort router reduced hops — continuing with a fresh cycle"
+                            );
+                            self.push_message(Message::user(AUTORUN_CONTINUE_PROMPT))
+                                .await;
+                            continue 'autorun;
+                        }
+                        crate::router::EffortRoute::Fallback => {
+                            warn!("effort router: compounded evidence — fallback, no more hops");
+                            hops_remaining = 0;
+                            break 'autorun;
+                        }
+                    }
                 }
                 break 'autorun;
             }
@@ -266,20 +430,49 @@ impl Agent {
             };
 
             match verification {
-                Verification::Failed(output) if revision_cycles < VERIFY_MAX_REVISIONS => {
-                    revision_cycles += 1;
-                    warn!(
-                        revision_cycles,
-                        max_revisions = VERIFY_MAX_REVISIONS,
-                        "Verification failed — feeding test output back for revision"
-                    );
-                    self.push_message(Message::user(format!(
-                        "Your changes caused test failures:\n\n{output}\n\nPlease fix."
-                    )))
-                    .await;
-                    continue 'verify;
-                }
                 Verification::Failed(output) => {
+                    // W4 router-donde-decide: el router también decide en el
+                    // presupuesto de revisiones. Sin evidencia → `Continue`
+                    // (1 revisión, legacy exacto); evidencia débil →
+                    // `ConsumeHalf`; compuesta → `Stop` (cae al manejo de
+                    // agotadas de abajo). En bench el router está OFF y deja
+                    // pasar intacto (trampa conocida: gates-en-bench no).
+                    if revision_cycles < VERIFY_MAX_REVISIONS {
+                        let mut signal = crate::router::EffortSignal::new(
+                            crate::router::EffortSignal::vacuity_from_counts(
+                                vacuous_turns,
+                                total_turns,
+                            ),
+                            None, // margin: sin logprobs en esta lane (W3)
+                            self.empty_response_streak,
+                            self.invalid_streak,
+                            self.quality_monitor.events().len(),
+                            false, // verify_fail: aún quedan revisiones
+                        );
+                        signal.closer_done = self.closer_signal();
+                        let left = VERIFY_MAX_REVISIONS - revision_cycles;
+                        match signal.revision_action() {
+                            crate::router::RevisionAction::Stop => {
+                                warn!(
+                                    "effort router: compounded evidence — skipping remaining revisions"
+                                );
+                            }
+                            action => {
+                                revision_cycles += action.consume(left);
+                                debug_assert!(revision_cycles <= VERIFY_MAX_REVISIONS);
+                                warn!(
+                                    revision_cycles,
+                                    max_revisions = VERIFY_MAX_REVISIONS,
+                                    "Verification failed — feeding test output back for revision"
+                                );
+                                self.push_message(Message::user(format!(
+                                    "Your changes caused test failures:\n\n{output}\n\nPlease fix."
+                                )))
+                                .await;
+                                continue 'verify;
+                            }
+                        }
+                    }
                     // Revision budget exhausted (or gate disabled mid-flight):
                     // consume ONE autorun hop iff any remain — a full fresh
                     // cycle retries with the LATEST failure output fed back;
@@ -290,6 +483,9 @@ impl Agent {
                         revision_cycles,
                     ) {
                         hops_remaining -= 1;
+                        // W1B: este hop post-verificación también cuenta.
+                        hops_spent += 1;
+                        self.last_run_hops_used = hops_spent;
                         warn!(remaining = hops_remaining, "Verification failed and revisions exhausted — autorun hop spent, retrying full cycle");
                         self.push_message(Message::user(format!(
                             "Your changes caused test failures:\n\n{output}\n\nPlease fix."
@@ -329,6 +525,56 @@ impl Agent {
     pub async fn run_with(&mut self, user_prompt: &str, overrides: RunOverrides) -> Result<String> {
         self.apply_overrides(&overrides);
         self.run_inner(user_prompt, None).await
+    }
+
+    /// W1B: esfuerzo consumido en el último `run` (para `BenchResult`;
+    /// ceros si aún no hubo run). No requiere nombrar [`RunEffort`] en el
+    /// call-site: basta leer sus campos públicos sobre el valor devuelto.
+    pub fn last_run_effort(&self) -> RunEffort {
+        RunEffort {
+            hops_used: self.last_run_hops_used,
+            iters_used: self.last_run_iters_used,
+            router_off: self.last_run_router_off,
+        }
+    }
+
+    /// W7-code: `process_response` with doom-loop recovery (HU-PODER:
+    /// colapso = abandono/error-no-recuperado). On a doom-loop abort
+    /// (streak at `DOOM_LOOP_FAIL_AT`), rewinds messages to the turn
+    /// `checkpoint`, records the episode as failed, and returns the
+    /// recovered terminal text (`Some`). `None` = turn processed normally,
+    /// continue the loop. Any other error propagates untouched (legacy).
+    async fn process_response_recoverable(
+        &mut self,
+        user_prompt: &str,
+        response: ChatResponse,
+        checkpoint: usize,
+    ) -> Result<Option<String>> {
+        if let Err(e) = self.process_response(user_prompt, response).await {
+            if self.doom_loop.streak >= DOOM_LOOP_FAIL_AT {
+                warn!(
+                    streak = self.doom_loop.streak,
+                    "Doom loop abort — recovering to turn checkpoint"
+                );
+                self.messages.truncate(checkpoint);
+                let text = "Stopped: the same tool was repeated with identical arguments. Recovered with partial progress — please continue with smaller steps.";
+                self.save_episode(user_prompt, text, false).await;
+                return Ok(Some(text.to_string()));
+            }
+            return Err(e);
+        }
+        Ok(None)
+    }
+
+    /// W4: shared router construction for hop AND revision decisions.
+    /// Bench/verify-off drivers get `for_bench()` (decide existe pero deja
+    /// pasar intacto — trampa conocida: nunca gates-en-bench).
+    fn effort_router() -> crate::router::EffortRouter {
+        if crate::config::bench_mode() || !crate::config::verify_loop_enabled() {
+            crate::router::EffortRouter::for_bench()
+        } else {
+            crate::router::EffortRouter::new()
+        }
     }
 
     /// Single application point for per-run overrides. Runs BEFORE the
@@ -502,5 +748,479 @@ impl Agent {
                 Verification::Skipped
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod run_effort_tests {
+    use super::super::{dummy_response, env_lock, tool_call_response, Agent, AgentConfig};
+    use super::*;
+
+    /// W5-test helper: one response carrying TWO native tool calls (one turn,
+    /// one speculative batch).
+    fn tool_call_response_two(
+        name1: &str,
+        args1: serde_json::Value,
+        name2: &str,
+        args2: serde_json::Value,
+    ) -> kitty_runtime::ChatResponse {
+        kitty_runtime::ChatResponse {
+            model: "test-model".into(),
+            message: kitty_runtime::Message {
+                role: "assistant".into(),
+                content: None,
+                thinking: None,
+                tool_calls: Some(vec![
+                    kitty_runtime::ToolCall {
+                        id: None,
+                        function: kitty_runtime::ToolCallFunction {
+                            name: name1.to_string(),
+                            arguments: args1,
+                        },
+                    },
+                    kitty_runtime::ToolCall {
+                        id: None,
+                        function: kitty_runtime::ToolCallFunction {
+                            name: name2.to_string(),
+                            arguments: args2,
+                        },
+                    },
+                ]),
+                tool_call_id: None,
+            },
+            done: true,
+            eval_count: None,
+            eval_duration: None,
+            prompt_eval_count: None,
+        }
+    }
+    use crate::model_profile::EnvRestoreGuard;
+    use kitty_runtime::MockClient;
+
+    fn empty_response() -> kitty_runtime::ChatResponse {
+        kitty_runtime::ChatResponse {
+            model: "test-model".into(),
+            message: kitty_runtime::Message {
+                role: "assistant".to_string(),
+                content: None,
+                thinking: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            done: true,
+            eval_count: None,
+            eval_duration: None,
+            prompt_eval_count: None,
+        }
+    }
+
+    fn continues(agent: &Agent) -> usize {
+        agent
+            .messages
+            .iter()
+            .filter(|m| m.content.as_deref() == Some(AUTORUN_CONTINUE_PROMPT))
+            .count()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock serializes OS-thread tests; runtime is per-test current-thread
+    async fn router_normal_is_legacy_by_default() {
+        let _g = env_lock();
+        let _e = EnvRestoreGuard::remove(ENV_VERIFY_LOOP);
+        // Sin evidencia el router deja pasar: 2 hops gastados como el legacy.
+        let responses = vec![
+            dummy_response("cycle1"),
+            dummy_response("cycle2"),
+            dummy_response("cycle3"),
+            dummy_response("forced final"),
+        ];
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                autorun_hops: 2,
+                ..Default::default()
+            },
+        );
+        agent.config.max_iterations = 1;
+        let out = agent.run("hi").await.unwrap();
+        assert_eq!(out, "forced final");
+        assert_eq!(continues(&agent), 2);
+        assert_eq!(
+            agent.last_run_effort(),
+            RunEffort {
+                hops_used: 2,
+                iters_used: 3,
+                router_off: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ver arriba
+    async fn router_reduce_hops_cuts_useless_cycles() {
+        let _g = env_lock();
+        let _e = EnvRestoreGuard::remove(ENV_VERIFY_LOOP);
+        // Vacuidad 0.5 por ciclo → ReduceHops: 2→1→0, un solo CONTINUE.
+        let responses = vec![
+            dummy_response("work"),
+            empty_response(),
+            dummy_response("work"),
+            empty_response(),
+            dummy_response("forced final"),
+        ];
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                autorun_hops: 2,
+                ..Default::default()
+            },
+        );
+        agent.config.max_iterations = 2;
+        let out = agent.run("hi").await.unwrap();
+        assert_eq!(out, "forced final");
+        assert_eq!(continues(&agent), 1, "ReduceHops debe recortar un hop");
+        assert_eq!(
+            agent.last_run_effort(),
+            RunEffort {
+                hops_used: 1,
+                iters_used: 4,
+                router_off: false,
+            }
+        );
+    }
+
+    /// W4: closer stop-signal — Done sobre la última salida ⇒ `Some(true)`;
+    /// NotDone/abstain/sin closer/deshabilitado ⇒ `None` (fail-open).
+    #[test]
+    fn w4_closer_signal_done_abstain_and_disabled() {
+        use crate::tfidf_closer::{CloserConfig, TfidfCloser, FIXED_TASK};
+        let docs: Vec<(String, bool)> = FIXED_TASK
+            .iter()
+            .map(|(t, b)| (t.to_string(), *b))
+            .collect();
+        let closer = TfidfCloser::fit(&docs);
+        let cfg = CloserConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut agent = Agent::new(MockClient::new(vec![]), AgentConfig::default());
+        agent.set_closer(closer, cfg);
+        // Sin salida del asistente → sin señal.
+        assert_eq!(agent.closer_signal(), None);
+        // Frase done exacta del training → Done.
+        agent.messages.push(Message::assistant(
+            "task complete all tests pass solution saved",
+        ));
+        assert_eq!(agent.closer_signal(), Some(true));
+        // Frase not-done → None (sin anti-evidencia: fail-open).
+        agent.messages.push(Message::assistant(
+            "error failed traceback exception occurred",
+        ));
+        assert_eq!(agent.closer_signal(), None);
+        // Deshabilitado → None aunque el texto sea done.
+        let mut agent = Agent::new(MockClient::new(vec![]), AgentConfig::default());
+        agent.set_closer(
+            TfidfCloser::fit(&docs),
+            CloserConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        agent.messages.push(Message::assistant(
+            "task complete all tests pass solution saved",
+        ));
+        assert_eq!(agent.closer_signal(), None);
+        // Sin modelo (fit vacío) → Abstain → None.
+        let mut agent = Agent::new(MockClient::new(vec![]), AgentConfig::default());
+        agent.set_closer(
+            TfidfCloser::fit(&[]),
+            CloserConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        agent.messages.push(Message::assistant(
+            "task complete all tests pass solution saved",
+        ));
+        assert_eq!(agent.closer_signal(), None);
+    }
+
+    /// W4 tiers: triaje compacta en QR (queries verbatim), ejecución en
+    /// formato completo (legacy exacto).
+    #[tokio::test]
+    async fn w4_triage_compacts_qr_execution_compacts_full() {
+        for (profile, expect_qr) in [("tiny", true), ("medium", false)] {
+            let mut agent = Agent::new(
+                MockClient::new(vec![dummy_response("summary text")]),
+                AgentConfig {
+                    workspace: std::path::PathBuf::from("/tmp"),
+                    ..Default::default()
+                }
+                .with_profile(profile),
+            );
+            agent
+                .messages
+                .push(Message::user("goal: fix the login bug"));
+            agent.messages.push(Message::assistant("working"));
+            agent.messages.push(Message::user("keep going"));
+            agent.messages.push(Message::assistant("a"));
+            agent.messages.push(Message::user("b"));
+            agent.messages.push(Message::assistant("c"));
+            agent.messages.push(Message::user("d"));
+            agent.messages.push(Message::assistant("e"));
+            agent.trigger_compaction().await.unwrap();
+            let summary = agent.messages[0].content.as_deref().unwrap();
+            assert!(
+                summary.contains("[Context Summary]"),
+                "{profile}: {summary}"
+            );
+            assert_eq!(
+                summary.contains("## Open Queries"),
+                expect_qr,
+                "{profile}: {summary}"
+            );
+            if expect_qr {
+                assert!(
+                    summary.contains("fix the login bug"),
+                    "QR must keep the query verbatim: {summary}"
+                );
+            }
+        }
+    }
+
+    /// W5-code: la caché idempotente sirve un retry idéntico sin quemar
+    /// otra llamada al modelo (la cola del Mock solo trae una respuesta: el
+    /// segundo `llm_call` idéntico SOLO puede salir de la caché).
+    #[tokio::test]
+    async fn w5_response_cache_serves_identical_retry() {
+        let agent = Agent::new(
+            MockClient::new(vec![dummy_response("cached")]),
+            AgentConfig::default(),
+        )
+        .with_response_cache(8);
+        let first = agent.llm_call().await.unwrap();
+        assert_eq!(first.message.content.as_deref(), Some("cached"));
+        let second = agent.llm_call().await.unwrap();
+        assert_eq!(second.message.content.as_deref(), Some("cached"));
+        let (hits, misses) = agent
+            .response_cache
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .stats();
+        assert_eq!((hits, misses), (1, 1));
+    }
+
+    /// W5-code: sin caché, el mismo retry sí quema otra llamada (compat:
+    /// dos respuestas encoladas, dos llamadas).
+    #[tokio::test]
+    async fn w5_no_cache_no_reuse() {
+        let agent = Agent::new(
+            MockClient::new(vec![dummy_response("one"), dummy_response("two")]),
+            AgentConfig::default(),
+        );
+        assert!(agent.response_cache.is_none());
+        assert_eq!(
+            agent.llm_call().await.unwrap().message.content.as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            agent.llm_call().await.unwrap().message.content.as_deref(),
+            Some("two")
+        );
+    }
+
+    /// W5-code: el batch especulativo ejecuta Glob+Grep concurrentes y
+    /// conserva orden y resultados idénticos al path secuencial.
+    #[tokio::test]
+    async fn w5_speculative_batch_keeps_order_and_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        let batch = tool_call_response_two(
+            "Grep",
+            serde_json::json!({"pattern": "hello", "path": dir}),
+            "Glob",
+            serde_json::json!({"pattern": format!("{dir}/*.txt")}),
+        );
+        for speculative in [false, true] {
+            let mut agent = Agent::new(
+                MockClient::new(vec![
+                    batch.clone(),
+                    dummy_response("d"),
+                    dummy_response("f"),
+                ]),
+                AgentConfig {
+                    workspace: tmp.path().to_path_buf(),
+                    ..Default::default()
+                },
+            )
+            .with_speculative_readonly(speculative);
+            agent.config.max_iterations = 2;
+            let out = agent.run("search").await.unwrap();
+            assert_eq!(out, "f");
+            let tools: Vec<&str> = agent
+                .messages
+                .iter()
+                .filter(|m| m.role == "tool")
+                .filter_map(|m| m.content.as_deref())
+                .collect();
+            assert_eq!(tools.len(), 2, "speculative={speculative}: {tools:?}");
+            assert!(
+                tools[0].contains("hello"),
+                "Grep result first (turn order kept): {tools:?}"
+            );
+            assert!(tools[1].contains("a.txt"), "Glob result second: {tools:?}");
+        }
+    }
+
+    /// W5-code: el predictor observa la secuencia ejecutada del batch.
+    #[tokio::test]
+    async fn w5_predictor_observes_executed_sequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        let batch = tool_call_response_two(
+            "Grep",
+            serde_json::json!({"pattern": "hello", "path": dir}),
+            "Glob",
+            serde_json::json!({"pattern": format!("{dir}/*.txt")}),
+        );
+        let mut agent = Agent::new(
+            MockClient::new(vec![batch, dummy_response("d"), dummy_response("f")]),
+            AgentConfig {
+                workspace: tmp.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+        agent.config.max_iterations = 2;
+        agent.run("search").await.unwrap();
+        assert_eq!(
+            agent.predict_next_tool(&["Grep".to_string()]),
+            Some("Glob".to_string())
+        );
+        assert_eq!(agent.predict_next_tool(&["Bash".to_string()]), None);
+    }
+
+    /// W7 anti-loop: el texto forzado tras un ToolLoop entra en el
+    /// historial (antes solo iba a memoria episódica y el loop repetía
+    /// hasta `max_iterations` sin registro de la corrección).
+    #[tokio::test]
+    async fn w7_tooloop_forced_text_enters_history() {
+        let tool = || tool_call_response("Bash", serde_json::json!({"command": "echo hi"}));
+        // Solo el force_response del ToolLoop consume del Mock (las 3
+        // llamadas llegan por argumento, no por cola).
+        let mut agent = Agent::new(
+            MockClient::new(vec![dummy_response("forced answer")]),
+            AgentConfig::default(),
+        );
+        for _ in 0..3 {
+            agent.process_response("p", tool()).await.unwrap();
+        }
+        let texts: Vec<&str> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert!(
+            texts.contains(&"forced answer"),
+            "forced correction must be in history: {texts:?}"
+        );
+    }
+
+    /// W7-code: 6 ejecuciones idénticas consecutivas abortaban el run con
+    /// `Err` (colapso); ahora recovery a checkpoint con texto terminal `Ok`.
+    #[tokio::test]
+    async fn w7_doom_loop_abort_recovers_to_checkpoint() {
+        let responses =
+            vec![tool_call_response("Bash", serde_json::json!({"command": "echo hi"}),); 8];
+        // Solo el doom guard dispara: el ToolLoop de quality se desactiva
+        // en la CONFIG previa (el monitor clona su config al construir, así
+        // que mutar `agent.config` después no lo afectaría).
+        let mut cfg = AgentConfig::default();
+        cfg.quality_config.loop_threshold = 100;
+        let mut agent = Agent::new(MockClient::new(responses), cfg);
+        agent.config.max_iterations = 8;
+        let out = agent.run("repeat").await.expect("recovery must return Ok");
+        assert!(
+            out.contains("repeated with identical arguments"),
+            "recovered terminal text, got: {out}"
+        );
+        assert!(
+            agent.doom_loop.streak >= DOOM_LOOP_FAIL_AT,
+            "recovery fires on doom abort, streak={}",
+            agent.doom_loop.streak
+        );
+    }
+
+    /// W0 (SDD estado-arte): a turn that executes a real Bash tool records
+    /// the full `wall = modelo/guard/sandbox/tools` desglose, with the
+    /// nesting invariant `tools_ms >= guard_ms + sandbox_ms` (nested
+    /// intervals on the same clock; floor-truncation preserves it).
+    #[tokio::test]
+    async fn w0_turn_breakdown_recorded_with_bash_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        // max_iterations=1: the single tool turn IS the telemetered turn
+        // (a second text turn would overwrite `last_turn_breakdown`).
+        let responses = vec![
+            tool_call_response("Bash", serde_json::json!({"command": "echo hi"})),
+            dummy_response("forced final"),
+        ];
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                workspace: tmp.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+        agent.config.max_iterations = 1;
+        let out = agent.run("run echo").await.unwrap();
+        assert_eq!(out, "forced final");
+        let b = agent
+            .last_turn_breakdown()
+            .expect("a telemetered turn must record the breakdown");
+        assert!(
+            b.tools_ms >= b.guard_ms + b.sandbox_ms,
+            "nested intervals keep tools >= guard+sandbox: {b:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ver arriba
+    async fn router_never_decides_in_bench() {
+        let _g = env_lock();
+        let _e = EnvRestoreGuard::set(ENV_VERIFY_LOOP, "off"); // marca bench
+                                                               // Misma evidencia que recorta en interactivo: en bench se gastan
+                                                               // los 2 hops igual que el legacy (3 ciclos + forced).
+        let responses = vec![
+            dummy_response("work"),
+            empty_response(),
+            dummy_response("work"),
+            empty_response(),
+            dummy_response("work"),
+            empty_response(),
+            dummy_response("forced final"),
+        ];
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                autorun_hops: 2,
+                ..Default::default()
+            },
+        );
+        agent.config.max_iterations = 2;
+        let out = agent.run("hi").await.unwrap();
+        assert_eq!(out, "forced final");
+        assert_eq!(continues(&agent), 2, "en bench el router no decide");
+        assert_eq!(
+            agent.last_run_effort(),
+            RunEffort {
+                hops_used: 2,
+                iters_used: 6,
+                router_off: true,
+            }
+        );
     }
 }

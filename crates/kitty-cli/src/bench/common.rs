@@ -28,6 +28,82 @@ pub(crate) struct BenchResult {
     /// Outcome verdict: "pass" | "fail" | "error" | "timeout".
     pub(crate) verdict: String,
     pub(crate) latency_ms: f64,
+    /// W0: autorun hops consumidos (`None` = desconocido/legacy; se omite en
+    /// el manifiesto para no romper el formato viejo).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hops: Option<usize>,
+    /// W0: iteraciones del tool-loop consumidas (idem).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) iters: Option<usize>,
+    /// W0: margen top1-top2 si existe (siempre `None` hasta el spike W3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) margin: Option<f32>,
+    /// W1: el `EffortRouter` estuvo OFF en bench (se omite si es false).
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) effort_off_in_bench: bool,
+}
+
+/// Predicado serde para omitir `effort_off_in_bench` cuando es false
+/// (manifiestos nuevos/viejos byte-idénticos mientras el router no actúe).
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[cfg(test)]
+mod effort_manifest_mirror_tests {
+    use super::BenchResult;
+
+    fn empty_result() -> BenchResult {
+        BenchResult {
+            id: "x".to_string(),
+            lang: "python".to_string(),
+            passed: true,
+            verdict: "pass".to_string(),
+            latency_ms: 1.0,
+            hops: None,
+            iters: None,
+            margin: None,
+            effort_off_in_bench: false,
+        }
+    }
+
+    /// Espejo byte-identidad: sin esfuerzo las claves nuevas se omiten, el
+    /// manifiesto conserva el formato viejo exacto.
+    #[test]
+    fn empty_effort_omits_new_keys_old_format_intact() {
+        let v = serde_json::to_value(empty_result()).unwrap();
+        for key in ["hops", "iters", "margin", "effort_off_in_bench"] {
+            assert!(
+                v.get(key).is_none(),
+                "el formato viejo no debe ganar la clave {key}: {v}"
+            );
+        }
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "id": "x",
+                "lang": "python",
+                "passed": true,
+                "verdict": "pass",
+                "latency_ms": 1.0,
+            })
+        );
+    }
+
+    /// Con esfuerzo real las claves aparecen con sus valores.
+    #[test]
+    fn present_effort_serializes_values() {
+        let mut r = empty_result();
+        r.hops = Some(2);
+        r.iters = Some(7);
+        r.margin = None; // sin logprobs: margen siempre ausente
+        r.effort_off_in_bench = true;
+        let v = serde_json::to_value(r).unwrap();
+        assert_eq!(v["hops"], serde_json::json!(2));
+        assert_eq!(v["iters"], serde_json::json!(7));
+        assert!(v.get("margin").is_none());
+        assert_eq!(v["effort_off_in_bench"], serde_json::json!(true));
+    }
 }
 
 /// Language for a bench result: parse polyglot task-name prefixes
@@ -712,6 +788,10 @@ mod language_breakdown_tests {
             passed,
             verdict: verdict.to_string(),
             latency_ms: 0.0,
+            hops: None,
+            iters: None,
+            margin: None,
+            effort_off_in_bench: false,
         }
     }
 

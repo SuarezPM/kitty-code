@@ -17,7 +17,8 @@ use crate::knowledge::KnowledgeBase;
 use crate::model_profile::ModelTuning;
 use crate::parser::ToolCallParser;
 use crate::quality_monitor::QualityMonitor;
-use crate::router::{tools_for_category, ToolRouter};
+use crate::router::ToolRouter;
+use crate::tfidf_closer::{CloserConfig, CloserLabel, TfidfCloser};
 use crate::thinking_budget::ThinkingBudget;
 use crate::tools::ToolRegistry;
 /// The core agent loop.
@@ -49,6 +50,35 @@ pub struct Agent {
     pub(crate) contract: Option<Contract>,
     /// Consecutive invalid tool calls (NotFound, InvalidArgs) — breaker mechanism (F4.3).
     pub(crate) invalid_streak: usize,
+    /// W1B: hops consumidos en el último `run` (para `BenchResult.hops`).
+    pub(crate) last_run_hops_used: usize,
+    /// W1B: iteraciones consumidas en el último `run` (`BenchResult.iters`).
+    pub(crate) last_run_iters_used: usize,
+    /// W1B: el `EffortRouter` quedó OFF en el último `run` (bench o
+    /// kill-switch; alimenta `BenchResult.effort_off_in_bench`).
+    pub(crate) last_run_router_off: bool,
+    /// W0 (SDD estado-arte): desglose de latencia del último turno con
+    /// telemetría (`wall_model_ms/guard_ms/sandbox_ms/tools_ms`). `None`
+    /// si el run aún no emitió ningún turno (p.ej. fail-fast temprano).
+    pub(crate) last_turn_breakdown: Option<crate::telemetry::TurnBreakdown>,
+    /// W4: closer TF-IDF opcional (veredicto Done → evidencia de parar ante
+    /// el `EffortRouter`). `None` = sin closer (compat: el router decide
+    /// solo con sus señales propias). Respetado `CloserConfig.enabled`
+    /// (OFF en bench por trampa conocida).
+    pub(crate) closer: Option<(TfidfCloser, CloserConfig)>,
+    /// W7-code: semilla de determinismo (`None` = legacy exacto: backoff
+    /// fijo, orden de carga en empates). `Some` = jitter determinista +
+    /// desempates sembrados (misma semilla + mismas entradas ⇒ mismo
+    /// resultado, entre runs y máquinas).
+    pub(crate) seed: Option<u64>,
+    /// W5-code: prefetch especulativo read-only en batches nativos
+    /// (`false` por defecto — compat: ejecución secuencial legacy).
+    pub(crate) speculative: bool,
+    /// W5-code: caché idempotente de respuestas (`None` = desactivada).
+    pub(crate) response_cache: Option<std::sync::Mutex<crate::response_cache::ResponseCache>>,
+    /// W5-code: predictor n-gram sobre nombres de tools ejecutados
+    /// (observa cada batch; expone `predict_next_tool`).
+    pub(crate) predictor: crate::pld::NgramPredictor,
 }
 
 impl Agent {
@@ -201,6 +231,15 @@ impl Agent {
             router: ToolRouter::new(),
             contract: None,
             invalid_streak: 0,
+            last_run_hops_used: 0,
+            last_run_iters_used: 0,
+            last_run_router_off: false,
+            last_turn_breakdown: None,
+            closer: None,
+            seed: None,
+            speculative: false,
+            response_cache: None,
+            predictor: crate::pld::NgramPredictor::new(),
         }
     }
 
@@ -210,22 +249,17 @@ impl Agent {
     /// tool set. When true, classifies `prompt` and returns only the
     /// category subset (empty for Plan → saves ~800 tokens). Statefully
     /// preserves affirmation guard via internal `ToolRouter`.
+    ///
+    /// W8 enforcement: the tier subset (not the construction-time profile
+    /// subset) is the authority — category decides WHAT, tier caps HOW MUCH.
+    /// Identical output for standard profiles (pinned by
+    /// `tier_routing_matches_profile_routing`).
     pub fn get_tools_for_prompt(&mut self, prompt: &str) -> Vec<ToolDefinition> {
         if !self.config.use_routing {
             return self.tools.clone();
         }
-        let cat = self.router.classify(prompt);
-        let filtered = tools_for_category(cat);
-        // Intersect router category with profile subset + agent tools for safety
-        let allowed: std::collections::HashSet<&str> = self
-            .tools
-            .iter()
-            .map(|t| t.function.name.as_str())
-            .collect();
-        filtered
-            .into_iter()
-            .filter(|t| allowed.contains(t.function.name.as_str()))
-            .collect()
+        let tier = self.tier();
+        self.router.tools_for_prompt_tiered(prompt, tier)
     }
 
     /// Stateless helper: classify and return tools for `prompt` without mutating router.
@@ -303,6 +337,78 @@ impl Agent {
         self.empty_response_streak
     }
 
+    /// W0 (SDD estado-arte): latency breakdown of the last telemetered turn
+    /// (`None` until the first `TurnEvent` is written). Test/bench hook so
+    /// the desglose is observable without scraping JSONL files.
+    pub fn last_turn_breakdown(&self) -> Option<crate::telemetry::TurnBreakdown> {
+        self.last_turn_breakdown
+    }
+
+    /// W4: execution tier of the active profile (triaje → compact-QR
+    /// summaries; ejecución → full summaries).
+    pub fn tier(&self) -> crate::model_profile::Tier {
+        self.config.profile.tier()
+    }
+
+    /// W4: attach a fitted TF-IDF closer. Its `Done` verdicts become
+    /// stop-evidence for the `EffortRouter` at hop/revision decisions
+    /// (fail-open: `Abstain` or disabled config contributes nothing).
+    pub fn set_closer(&mut self, closer: TfidfCloser, cfg: CloserConfig) {
+        self.closer = Some((closer, cfg));
+    }
+
+    /// W7-code: set the determinism seed (also propagated to the knowledge
+    /// base tie-breaks). `None` (default) = legacy exact behavior.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self.knowledge_base.with_seed(seed);
+        self
+    }
+
+    /// W5-code: enable speculative read-only prefetch on tool batches
+    /// (default OFF — sequential legacy execution).
+    pub fn with_speculative_readonly(mut self, on: bool) -> Self {
+        self.speculative = on;
+        self
+    }
+
+    /// W5-code: enable the idempotent response cache with `cap` entries
+    /// (same-process, FIFO). Serves byte-identical retries without burning
+    /// another model call.
+    pub fn with_response_cache(mut self, cap: usize) -> Self {
+        self.response_cache = Some(std::sync::Mutex::new(
+            crate::response_cache::ResponseCache::new(cap),
+        ));
+        self
+    }
+
+    /// W5-code: most likely next tool after `ctx` (trailing executed names),
+    /// per the observed n-gram table (`None` = unseen context).
+    pub fn predict_next_tool(&self, ctx: &[String]) -> Option<String> {
+        self.predictor.predict(ctx)
+    }
+
+    /// W4: closer stop-signal for the current history (`Some(true)` = the
+    /// closer predicts Done on the last assistant text with enough
+    /// confidence/margin; `None` = no closer, disabled, or abstain).
+    pub(crate) fn closer_signal(&self) -> Option<bool> {
+        let (closer, cfg) = self.closer.as_ref()?;
+        if !cfg.enabled {
+            return None;
+        }
+        let text = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .and_then(|m| m.content.as_deref())?;
+        let verdict = closer.predict(text, cfg);
+        match verdict.label {
+            CloserLabel::Done => Some(true),
+            CloserLabel::NotDone | CloserLabel::Abstain => None,
+        }
+    }
+
     /// Associated helper mirroring the free `should_fail_fast` (for `Agent::` call sites).
     pub fn should_fail_fast(streak: u8) -> bool {
         should_fail_fast(streak)
@@ -337,7 +443,43 @@ mod tests {
     use super::super::{env_lock, Agent, AgentConfig};
     use crate::model_profile::EnvRestoreGuard;
     use crate::model_profile::ModelProfile;
-    use kitty_runtime::OllamaClient;
+    use crate::router::{EXECUTION_TOOL_SUBSET, TRIAGE_TOOL_SUBSET};
+    use kitty_runtime::{MockClient, OllamaClient};
+
+    /// W8: `get_tools_for_prompt` con routing respeta el subset del tier
+    /// (enforcement a nivel agente, para cualquier categoría clasificada).
+    #[test]
+    fn get_tools_for_prompt_respects_tier_subset() {
+        for (profile, allowed) in [
+            ("tiny", TRIAGE_TOOL_SUBSET),
+            ("medium", EXECUTION_TOOL_SUBSET),
+        ] {
+            let mut agent = Agent::new(
+                MockClient::new(vec![]),
+                AgentConfig {
+                    workspace: std::path::PathBuf::from("/tmp"),
+                    ..Default::default()
+                }
+                .with_profile(profile),
+            );
+            agent.config.use_routing = true;
+            for prompt in [
+                "search the codebase for foo",
+                "run the test suite",
+                "write a new file",
+                "read foo.rs",
+                "hello there",
+            ] {
+                let tools = agent.get_tools_for_prompt(prompt);
+                assert!(
+                    tools
+                        .iter()
+                        .all(|t| allowed.contains(&t.function.name.as_str())),
+                    "{profile}/{prompt}: {tools:?} fuera del subset del tier"
+                );
+            }
+        }
+    }
 
     #[test]
     fn turn_cap_applied_per_model_in_new_inner() {

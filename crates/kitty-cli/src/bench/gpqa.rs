@@ -362,6 +362,10 @@ pub(crate) async fn run_gpqa_suite(
             passed,
             verdict: verdict.to_string(),
             latency_ms,
+            hops: None,
+            iters: None,
+            margin: None,
+            effort_off_in_bench: false,
         });
     }
 

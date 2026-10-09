@@ -117,6 +117,39 @@ pub(crate) fn p50_ms(mut latencies: Vec<f64>) -> f64 {
         (latencies[n / 2 - 1] + latencies[n / 2]) / 2.0
     }
 }
+
+/// W5 QR compact-vs-actual: veredicto A/B con Wilson 95%.
+///
+/// `full_*` = formato actual, `compact_*` = variante. Victoria SOLO si el
+/// intervalo Wilson de la variante queda estrictamente por encima del
+/// actual (no solape por arriba); cualquier otro caso ⇒ `Revert`
+/// (la variante NO se cablea; el QR queda como evidencia).
+/// Requiere k≥3 por brazo: con menos, Wilson no discrimina y se revierte.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactAbVerdict {
+    AdoptCompact,
+    Revert,
+}
+
+#[cfg(test)]
+pub(crate) fn compact_ab_verdict(
+    full_passed: usize,
+    full_total: usize,
+    compact_passed: usize,
+    compact_total: usize,
+) -> CompactAbVerdict {
+    if full_total < 3 || compact_total < 3 {
+        return CompactAbVerdict::Revert;
+    }
+    let (_, full_hi) = wilson_ci(full_passed, full_total);
+    let (compact_lo, _) = wilson_ci(compact_passed, compact_total);
+    if compact_lo > full_hi {
+        CompactAbVerdict::AdoptCompact
+    } else {
+        CompactAbVerdict::Revert
+    }
+}
 #[cfg(test)]
 mod bench_ab_tests {
     use super::super::common::resolve_exercise_timeout_secs;
@@ -333,6 +366,10 @@ mod bench_ab_tests {
                 passed,
                 verdict: verdict.into(),
                 latency_ms: 100.0,
+                hops: None,
+                iters: None,
+                margin: None,
+                effort_off_in_bench: false,
             }
         }
         // Mixed fixture: 2 pass + 1 fail + 2 error + 1 timeout.
@@ -362,5 +399,37 @@ mod bench_ab_tests {
         let empty = budget_summary(1024, &[]);
         assert_eq!(empty["errored"], serde_json::json!(0));
         assert_eq!(empty["timed_out"], serde_json::json!(0));
+    }
+
+    /// W5 QR: fixture k=3 por brazo con tasas empatadas ⇒ los Wilson se
+    /// solapan ⇒ `Revert` (la variante NO se adopta; el QR es la evidencia).
+    /// Fixture, no corrida real; decisión Revert vigente.
+    #[test]
+    fn compact_ab_tie_with_k3_reverts() {
+        use super::{compact_ab_verdict, CompactAbVerdict};
+        // 2/3 vs 2/3: idéntico ⇒ solape total ⇒ revertir (fixture, no corrida real).
+        assert_eq!(compact_ab_verdict(2, 3, 2, 3), CompactAbVerdict::Revert);
+        // Mejora aparente sin significación (3/3 vs 2/3 con k=3: los
+        // intervalos Wilson se solapan) ⇒ revertir, no maquillar.
+        assert_eq!(compact_ab_verdict(2, 3, 3, 3), CompactAbVerdict::Revert);
+    }
+
+    /// W5: k<3 por brazo no discrimina ⇒ `Revert` directo.
+    #[test]
+    fn compact_ab_under_k3_reverts() {
+        use super::{compact_ab_verdict, CompactAbVerdict};
+        assert_eq!(compact_ab_verdict(2, 2, 2, 2), CompactAbVerdict::Revert);
+        assert_eq!(compact_ab_verdict(0, 0, 0, 0), CompactAbVerdict::Revert);
+    }
+
+    /// W5 golden: victoria clara y separada (0/8 vs 8/8) ⇒ `AdoptCompact`.
+    /// Si este golden cambia, revisar el criterio Wilson antes de tocarlo.
+    #[test]
+    fn compact_ab_clear_win_golden() {
+        use super::{compact_ab_verdict, CompactAbVerdict};
+        assert_eq!(
+            compact_ab_verdict(0, 8, 8, 8),
+            CompactAbVerdict::AdoptCompact
+        );
     }
 }

@@ -177,12 +177,19 @@ pub(crate) async fn run_one_bench(
         let _ = saved;
     }
 
+    // W1B: esfuerzo real del run (siempre disponible: el loop publica
+    // contadores cada turno, también en error/timeout parcial).
+    let effort = agent.last_run_effort();
     Ok(BenchResult {
         id: ex.id.to_string(),
         lang: ex.label.to_string(),
         passed,
         verdict: verdict.to_string(),
         latency_ms,
+        hops: Some(effort.hops_used),
+        iters: Some(effort.iters_used),
+        margin: None, // sin logprobs en esta lane (W3)
+        effort_off_in_bench: effort.router_off,
     })
 }
 // ── TB2 homemade: 8 ejercicios locales (NO oficial) ────────────────

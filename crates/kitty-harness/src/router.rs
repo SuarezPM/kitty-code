@@ -9,6 +9,8 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
+use crate::agent::{clamp_autorun_hops, should_fail_fast};
+use crate::model_profile::Tier;
 use crate::tools::standard_tool_definitions;
 use kitty_runtime::ToolDefinition;
 
@@ -292,6 +294,37 @@ pub fn category_needs_tools(category: ToolCategory) -> bool {
     !tools_for_category(category).is_empty()
 }
 
+// ── W8 tier enforcement ────────────────────────────────────────────
+
+/// Tool subset per execution tier (enforcement authority for routing).
+/// Triage models (4K ctx, constrained presets) never carry search-tool
+/// definitions; execution models get the full set. Mirrors the profile
+/// `tool_subset` values so standard profiles route identically before and
+/// after (pinned by `tier_routing_matches_profile_routing`).
+pub const TRIAGE_TOOL_SUBSET: &[&str] = &["Read", "Write", "Edit", "Bash"];
+/// Full tool subset for the execution tier.
+pub const EXECUTION_TOOL_SUBSET: &[&str] = &["Read", "Write", "Edit", "Bash", "Glob", "Grep"];
+
+/// Tool names allowed for `tier`.
+#[must_use]
+pub fn tier_tool_subset(tier: Tier) -> &'static [&'static str] {
+    match tier {
+        Tier::Triage => TRIAGE_TOOL_SUBSET,
+        Tier::Execution => EXECUTION_TOOL_SUBSET,
+    }
+}
+
+/// Category tools intersected with the tier subset (W8 enforcement:
+/// category decides WHAT, tier decides HOW MUCH reaches the model).
+#[must_use]
+pub fn tools_for_category_tiered(category: ToolCategory, tier: Tier) -> Vec<ToolDefinition> {
+    let allowed = tier_tool_subset(tier);
+    tools_for_category(category)
+        .into_iter()
+        .filter(|d| allowed.contains(&d.function.name.as_str()))
+        .collect()
+}
+
 /// Stateful router that remembers the last category for affirmation guard.
 #[derive(Debug, Default)]
 pub struct ToolRouter {
@@ -314,6 +347,13 @@ impl ToolRouter {
     pub fn tools_for_prompt(&mut self, prompt: &str) -> Vec<ToolDefinition> {
         let cat = self.classify(prompt);
         tools_for_category(cat)
+    }
+
+    /// W8: classify and return tier-enforced tool definitions (category
+    /// decides WHAT, tier caps HOW MUCH).
+    pub fn tools_for_prompt_tiered(&mut self, prompt: &str, tier: Tier) -> Vec<ToolDefinition> {
+        let cat = self.classify(prompt);
+        tools_for_category_tiered(cat, tier)
     }
 
     /// Get last category (for inspection / testing).
@@ -377,6 +417,295 @@ pub fn active_tool_guidelines(active_tools: &[&str]) -> String {
 /// Free function `get_tools_for_prompt` (stateless, no affirmation guard).
 pub fn get_tools_for_prompt(prompt: &str) -> Vec<ToolDefinition> {
     ToolRouter::get_tools_for_prompt(prompt)
+}
+
+// ── W1 SDD-híbrido: `EffortRouter` ───────────────────────────────────
+// Vacuity + conflict-gate fusionados en UNA señal junto a las existentes
+// (empty-streak, invalid-streak, quality_monitor, `clamp_autorun_hops`).
+//
+// Fail-open por defecto: sin evidencia deja pasar intacto; con evidencia
+// recorta hops o pide fallback; NUNCA deniega (no existe variante Deny).
+// OFF en bench (`for_bench()` + `off_in_bench` para el manifiesto).
+// No toca `ToolRegistry::execute` ni ningún path compartido con bench.
+
+/// Env kill-switch: `KITTY_EFFORT_ROUTER=off` (o `0`) deja el router en
+/// pass-through global sin tocar código.
+pub const ENV_EFFORT_ROUTER: &str = "KITTY_EFFORT_ROUTER";
+
+/// Racha de tool-calls inválidas que dispara el schema breaker del loop
+/// (el loop usa el literal `3`; se nombra aquí para compartir el umbral
+/// sin tocar esos paths).
+pub(crate) const INVALID_STREAK_BREAKER_AT: usize = 3;
+
+/// Barra interina de vacuidad como evidencia (sin calibrar: alta a
+/// propósito; W8 la recalibra en datos kitty).
+const VACUITY_EVIDENCE_AT: f32 = 0.5;
+
+/// Margen top1-top2 bajo que corrobora otra evidencia (nunca actúa solo;
+/// el margen real llega con el spike logprobs W3).
+const LOW_MARGIN_AT: f32 = 0.1;
+
+/// Señal de esfuerzo fusionada (plan §2): vacuity × conflict-gate en una
+/// sola señal con las existentes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffortSignal {
+    /// Fracción 0..=1 de turnos recientes vacíos (se clamp en `new`).
+    pub vacuity: f32,
+    /// Margen top1-top2 si existe (`None` hasta el spike logprobs W3).
+    pub margin_top1_top2: Option<f32>,
+    /// Racha de respuestas vacías (la misma de `should_fail_fast`).
+    pub empty_streak: u8,
+    /// Racha de tool-calls inválidas (la misma del schema breaker).
+    pub invalid_streak: usize,
+    /// Eventos del quality monitor (`QualityMonitor::events().len()`).
+    pub quality_events: usize,
+    /// La verificación del workspace falló con revisiones agotadas.
+    pub verify_fail: bool,
+    /// W4: el closer TF-IDF predice Done sobre la última salida
+    /// (`Some(true)` = parar; `None` = sin closer / deshabilitado /
+    /// abstención — no aporta evidencia). Campo público aditivo: `new()`
+    /// lo deja en `None` (compat: la firma no cambia).
+    pub closer_done: Option<bool>,
+}
+
+impl EffortSignal {
+    /// Construye la señal clampando `vacuity` a 0..=1.
+    #[must_use]
+    pub fn new(
+        vacuity: f32,
+        margin_top1_top2: Option<f32>,
+        empty_streak: u8,
+        invalid_streak: usize,
+        quality_events: usize,
+        verify_fail: bool,
+    ) -> Self {
+        Self {
+            vacuity: vacuity.clamp(0.0, 1.0),
+            margin_top1_top2,
+            empty_streak,
+            invalid_streak,
+            quality_events,
+            verify_fail,
+            closer_done: None,
+        }
+    }
+
+    /// Señal vacía: cero evidencia → el router deja pasar (fail-open).
+    #[must_use]
+    pub fn idle() -> Self {
+        Self::new(0.0, None, 0, 0, 0, false)
+    }
+
+    /// Vacuidad a partir de conteos (`empty/total`; `total == 0` → 0.0).
+    #[must_use]
+    pub fn vacuity_from_counts(empty_turns: usize, total_turns: usize) -> f32 {
+        if total_turns == 0 {
+            0.0
+        } else {
+            (empty_turns as f32 / total_turns as f32).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Nº de evidencias fuertes. El margen solo corrobora (suma si ya hay
+    /// otra evidencia y es bajo); nunca es evidencia en solitario.
+    /// W4: un closer-Done suma como evidencia de parar (el trabajo parece
+    /// completo: recortar esfuerzo es la dirección correcta).
+    fn evidence_count(&self) -> usize {
+        let mut n = 0;
+        if self.closer_done == Some(true) {
+            n += 1;
+        }
+        if should_fail_fast(self.empty_streak) {
+            n += 1;
+        }
+        if self.invalid_streak >= INVALID_STREAK_BREAKER_AT {
+            n += 1;
+        }
+        if self.quality_events > 0 {
+            n += 1;
+        }
+        if self.verify_fail {
+            n += 1;
+        }
+        if self.vacuity >= VACUITY_EVIDENCE_AT {
+            n += 1;
+        }
+        if n >= 1 && self.margin_top1_top2.is_some_and(|m| m < LOW_MARGIN_AT) {
+            n += 1;
+        }
+        n
+    }
+}
+
+/// Ruta que decide el router (sin variante Deny por diseño: fail-open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortRoute {
+    /// Presupuesto intacto, sin fallback.
+    Normal,
+    /// Evidencia débil: recorta el presupuesto de hops a la mitad.
+    ReduceHops,
+    /// Evidencia compuesta: agota hops y pide estrategia fallback barata.
+    Fallback,
+}
+
+/// Decisión del router (plan §2: route + hops_budget + fallback + off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateDecision {
+    /// Ruta decidida.
+    pub route: EffortRoute,
+    /// Hops restantes autorizados (siempre vía [`clamp_autorun_hops`]).
+    pub hops_budget: usize,
+    /// Usar estrategia fallback barata en vez de más hops LLM.
+    pub fallback: bool,
+    /// Por qué el router quedó OFF (`None` = decidió de verdad).
+    pub off_reason: Option<&'static str>,
+    /// El router estuvo OFF en bench (campo de manifiesto si se activa).
+    pub off_in_bench: bool,
+}
+
+impl GateDecision {
+    /// Pass-through: ruta normal con presupuesto clampado intacto.
+    #[must_use]
+    pub fn pass_through(requested_hops: usize) -> Self {
+        Self {
+            route: EffortRoute::Normal,
+            hops_budget: clamp_autorun_hops(requested_hops),
+            fallback: false,
+            off_reason: None,
+            off_in_bench: false,
+        }
+    }
+}
+
+/// Router de esfuerzo unificado: una sola señal, fail-open, OFF en bench.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffortRouter {
+    /// `false` = pass-through siempre (con `off_reason`).
+    pub enabled: bool,
+    /// `true` = path de bench: pass-through + `off_in_bench` manifiesto.
+    pub bench_mode: bool,
+}
+
+impl EffortRouter {
+    /// Router activo (fail-open: sin evidencia deja pasar intacto).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            enabled: true,
+            bench_mode: false,
+        }
+    }
+
+    /// Router OFF para paths de bench: `decide` siempre deja pasar con el
+    /// presupuesto intacto y marca `off_in_bench` para el manifiesto.
+    #[must_use]
+    pub fn for_bench() -> Self {
+        Self {
+            enabled: false,
+            bench_mode: true,
+        }
+    }
+
+    /// Router desactivado fuera de bench (con `off_reason`, sin marca bench).
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            bench_mode: false,
+        }
+    }
+
+    fn env_off() -> bool {
+        std::env::var(ENV_EFFORT_ROUTER)
+            .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
+            .unwrap_or(false)
+    }
+
+    /// Fusiona la señal en una decisión. Sin evidencia → intacto; 1-2
+    /// evidencias → recorta hops; ≥3 → fallback. Nunca deniega.
+    #[must_use]
+    pub fn decide(&self, signal: &EffortSignal, requested_hops: usize) -> GateDecision {
+        if self.bench_mode {
+            return GateDecision {
+                off_reason: Some("effort router OFF in bench"),
+                off_in_bench: true,
+                ..GateDecision::pass_through(requested_hops)
+            };
+        }
+        if !self.enabled {
+            return GateDecision {
+                off_reason: Some("effort router disabled"),
+                ..GateDecision::pass_through(requested_hops)
+            };
+        }
+        if Self::env_off() {
+            return GateDecision {
+                off_reason: Some("KITTY_EFFORT_ROUTER=off"),
+                ..GateDecision::pass_through(requested_hops)
+            };
+        }
+        match signal.evidence_count() {
+            0 => GateDecision::pass_through(requested_hops),
+            1 | 2 => GateDecision {
+                route: EffortRoute::ReduceHops,
+                hops_budget: clamp_autorun_hops(requested_hops) / 2,
+                fallback: false,
+                off_reason: None,
+                off_in_bench: false,
+            },
+            _ => GateDecision {
+                route: EffortRoute::Fallback,
+                hops_budget: 0,
+                fallback: true,
+                off_reason: None,
+                off_in_bench: false,
+            },
+        }
+    }
+}
+
+impl Default for EffortRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// W4: lo que el gate de revisiones decide ante un fallo de verificación
+/// con revisiones restantes. Misma semántica que el presupuesto de hops
+/// (Normal/ReduceHops/Fallback) aplicada al presupuesto de revisiones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionAction {
+    /// Sin evidencia: gasta 1 revisión (legacy exacto).
+    Continue,
+    /// Evidencia débil: gasta la mitad de las restantes (mínimo 1).
+    ConsumeHalf,
+    /// Evidencia compuesta: gasta 0 (cae al manejo de agotadas).
+    Stop,
+}
+
+impl RevisionAction {
+    /// Revisiones consumidas de `left` restantes.
+    #[must_use]
+    pub fn consume(self, left: usize) -> usize {
+        match self {
+            RevisionAction::Continue => 1,
+            RevisionAction::ConsumeHalf => (left / 2).max(1).min(left),
+            RevisionAction::Stop => 0,
+        }
+    }
+}
+
+impl EffortSignal {
+    /// W4 router-donde-decide (puro, testeable): evidencia → acción de
+    /// revisión. 0 evidencias → `Continue`; 1-2 → `ConsumeHalf`; ≥3 → `Stop`.
+    #[must_use]
+    pub fn revision_action(&self) -> RevisionAction {
+        match self.evidence_count() {
+            0 => RevisionAction::Continue,
+            1 | 2 => RevisionAction::ConsumeHalf,
+            _ => RevisionAction::Stop,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -548,5 +877,212 @@ mod tests {
     fn active_tool_guidelines_unknown_tool_ignored() {
         let g = active_tool_guidelines(&["NonExistent"]);
         assert!(g.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod effort_router_tests {
+    use super::*;
+
+    #[test]
+    fn fail_open_without_evidence() {
+        let d = EffortRouter::new().decide(&EffortSignal::idle(), 4);
+        assert_eq!(d.route, EffortRoute::Normal);
+        assert_eq!(d.hops_budget, 4);
+        assert!(!d.fallback);
+        assert_eq!(d.off_reason, None);
+        assert!(!d.off_in_bench);
+    }
+
+    /// W4: closer-Done solo recorta (1 evidencia); con otra más compone.
+    #[test]
+    fn closer_done_counts_as_stop_evidence() {
+        let r = EffortRouter::new();
+        let mut sig = EffortSignal::idle();
+        sig.closer_done = Some(true);
+        let d = r.decide(&sig, 4);
+        assert_eq!(d.route, EffortRoute::ReduceHops);
+        assert_eq!(d.hops_budget, 2);
+
+        // None = sin closer: fail-open intacto.
+        let d = r.decide(&EffortSignal::idle(), 4);
+        assert_eq!(d.route, EffortRoute::Normal);
+
+        // Closer-Done + vacuous → 2 evidencias → sigue ReduceHops.
+        let mut sig = EffortSignal::idle();
+        sig.closer_done = Some(true);
+        sig.vacuity = 0.9;
+        assert_eq!(r.decide(&sig, 4).route, EffortRoute::ReduceHops);
+    }
+
+    /// W8: el subset por tier coincide con el subset por perfil en los 5
+    /// presets estándar (el tier es autoridad sin drift de comportamiento).
+    #[test]
+    fn tier_routing_matches_profile_routing() {
+        use crate::model_profile::ModelProfile;
+        for profile in [
+            ModelProfile::nano(),
+            ModelProfile::tiny(),
+            ModelProfile::small(),
+            ModelProfile::medium(),
+            ModelProfile::large(),
+        ] {
+            assert_eq!(
+                tier_tool_subset(profile.tier()),
+                profile.tool_subset,
+                "tier subset must mirror profile {}",
+                profile.name
+            );
+        }
+    }
+
+    /// W8: enforcement — triaje recorta Glob/Grep aunque la categoría los
+    /// pida; ejecución los conserva; Plan sigue vacío en ambos.
+    #[test]
+    fn tier_enforcement_caps_search_tools() {
+        use crate::model_profile::Tier;
+        let triage_search = tools_for_category_tiered(ToolCategory::Search, Tier::Triage);
+        assert!(
+            triage_search.is_empty(),
+            "triage must not carry search definitions: {:?}",
+            triage_search
+                .iter()
+                .map(|d| &d.function.name)
+                .collect::<Vec<_>>()
+        );
+        let exec_search = tools_for_category_tiered(ToolCategory::Search, Tier::Execution);
+        assert_eq!(exec_search.len(), 2);
+        assert!(tools_for_category_tiered(ToolCategory::Plan, Tier::Triage).is_empty());
+        assert!(tools_for_category_tiered(ToolCategory::Plan, Tier::Execution).is_empty());
+        // Run sigue intacto en triaje (Bash es enforcement-neutral).
+        let triage_run = tools_for_category_tiered(ToolCategory::Run, Tier::Triage);
+        assert_eq!(triage_run.len(), 1);
+    }
+
+    /// W4: el gate de revisiones mapea evidencia → acción (puro).
+    #[test]
+    fn revision_gate_maps_evidence() {
+        // Sin evidencia → Continue (gasta 1, legacy exacto).
+        assert_eq!(
+            EffortSignal::idle().revision_action(),
+            RevisionAction::Continue
+        );
+        assert_eq!(RevisionAction::Continue.consume(2), 1);
+        // 1-2 evidencias → ConsumeHalf (mitad, mínimo 1, nunca más de left).
+        let mut sig = EffortSignal::idle();
+        sig.empty_streak = 2;
+        assert_eq!(sig.revision_action(), RevisionAction::ConsumeHalf);
+        assert_eq!(RevisionAction::ConsumeHalf.consume(4), 2);
+        assert_eq!(RevisionAction::ConsumeHalf.consume(2), 1);
+        assert_eq!(RevisionAction::ConsumeHalf.consume(1), 1);
+        // ≥3 → Stop (gasta 0, cae al manejo de agotadas).
+        let sig = EffortSignal::new(0.9, None, 2, INVALID_STREAK_BREAKER_AT, 1, true);
+        assert_eq!(sig.revision_action(), RevisionAction::Stop);
+        assert_eq!(RevisionAction::Stop.consume(2), 0);
+    }
+
+    #[test]
+    fn margin_alone_never_acts() {
+        // El margen es solo corroboración: sin otra evidencia no recorta.
+        let mut sig = EffortSignal::idle();
+        sig.margin_top1_top2 = Some(0.0);
+        let d = EffortRouter::new().decide(&sig, 4);
+        assert_eq!(d.route, EffortRoute::Normal);
+        assert_eq!(d.hops_budget, 4);
+    }
+
+    #[test]
+    fn fuses_existing_signals() {
+        let r = EffortRouter::new();
+        // Cada señal existente recorta a la mitad (fail-soft, nunca deniega).
+        let mut sig = EffortSignal::idle();
+        sig.empty_streak = 2; // umbral de should_fail_fast
+        let d = r.decide(&sig, 4);
+        assert_eq!(d.route, EffortRoute::ReduceHops);
+        assert_eq!(d.hops_budget, 2);
+
+        let mut sig = EffortSignal::idle();
+        sig.invalid_streak = INVALID_STREAK_BREAKER_AT;
+        assert_eq!(r.decide(&sig, 4).route, EffortRoute::ReduceHops);
+
+        let mut sig = EffortSignal::idle();
+        sig.quality_events = 1;
+        assert_eq!(r.decide(&sig, 4).route, EffortRoute::ReduceHops);
+
+        let mut sig = EffortSignal::idle();
+        sig.verify_fail = true;
+        assert_eq!(r.decide(&sig, 4).route, EffortRoute::ReduceHops);
+
+        let mut sig = EffortSignal::idle();
+        sig.vacuity = 0.9;
+        assert_eq!(r.decide(&sig, 4).route, EffortRoute::ReduceHops);
+
+        // Evidencia compuesta (≥3) → fallback con presupuesto 0.
+        let sig = EffortSignal::new(0.9, None, 2, INVALID_STREAK_BREAKER_AT, 1, true);
+        let d = r.decide(&sig, 4);
+        assert_eq!(d.route, EffortRoute::Fallback);
+        assert!(d.fallback);
+        assert_eq!(d.hops_budget, 0);
+    }
+
+    #[test]
+    fn clamps_hops_budget() {
+        let r = EffortRouter::new();
+        let cap = clamp_autorun_hops(usize::MAX);
+        assert_eq!(r.decide(&EffortSignal::idle(), usize::MAX).hops_budget, cap);
+        let mut sig = EffortSignal::idle();
+        sig.empty_streak = 2;
+        assert_eq!(r.decide(&sig, usize::MAX).hops_budget, cap / 2);
+    }
+
+    #[test]
+    fn bench_mode_passes_through_with_evidence() {
+        // OFF en bench: evidencia máxima y el presupuesto queda intacto.
+        let r = EffortRouter::for_bench();
+        let sig = EffortSignal::new(1.0, Some(0.0), u8::MAX, usize::MAX, usize::MAX, true);
+        let d = r.decide(&sig, 4);
+        assert_eq!(d.route, EffortRoute::Normal);
+        assert_eq!(d.hops_budget, 4);
+        assert!(!d.fallback);
+        assert!(d.off_in_bench);
+        assert_eq!(d.off_reason, Some("effort router OFF in bench"));
+    }
+
+    #[test]
+    fn disabled_off_reason_without_bench_mark() {
+        let d = EffortRouter::disabled().decide(&EffortSignal::idle(), 4);
+        assert_eq!(d.route, EffortRoute::Normal);
+        assert_eq!(d.hops_budget, 4);
+        assert!(!d.off_in_bench);
+        assert_eq!(d.off_reason, Some("effort router disabled"));
+    }
+
+    #[test]
+    fn env_kill_switch_is_fail_open() {
+        // KITTY_EFFORT_ROUTER es process-global: serializar este test.
+        static ENV_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_EFFORT_ROUTER).ok();
+        std::env::set_var(ENV_EFFORT_ROUTER, "off");
+
+        let sig = EffortSignal::new(1.0, None, 9, 9, 9, true);
+        let d = EffortRouter::new().decide(&sig, 4);
+        assert_eq!(d.route, EffortRoute::Normal);
+        assert_eq!(d.hops_budget, 4);
+        assert_eq!(d.off_reason, Some("KITTY_EFFORT_ROUTER=off"));
+
+        match prev {
+            Some(v) => std::env::set_var(ENV_EFFORT_ROUTER, v),
+            None => std::env::remove_var(ENV_EFFORT_ROUTER),
+        }
+    }
+
+    #[test]
+    fn vacuity_from_counts_clamps() {
+        assert_eq!(EffortSignal::vacuity_from_counts(0, 0), 0.0);
+        assert!((EffortSignal::vacuity_from_counts(1, 2) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(EffortSignal::vacuity_from_counts(5, 2), 1.0);
+        assert_eq!(EffortSignal::new(9.9, None, 0, 0, 0, false).vacuity, 1.0);
+        assert_eq!(EffortSignal::new(-2.0, None, 0, 0, 0, false).vacuity, 0.0);
     }
 }
