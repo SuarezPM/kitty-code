@@ -177,7 +177,7 @@ rand09 = { package = "rand", version = "0.9.3" }
 # 0.4 — isaac 0.5 exige rand_core 0.10, incompatible con rand 0.9 del engine).
 # Idem reqwest.
 rand_distr = "0.6.0"
-dirs = "6.0.0"
+dirs = "7.0.0"
 # M2: thiserror = "2.0.18" — ya cubierto por la entrada Kitty-Code (compatible), no duplicado
 tokenizers = { version = "0.21.4", default-features = false }
 tokio-tungstenite = "0.28.0"
