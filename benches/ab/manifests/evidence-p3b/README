@@ -1,0 +1,10 @@
+Evidencia P3b+G3 (2026-10-07): raw logs + JSON del smoke/bench kitty-infer Ornith+Granite con el fix hibrido.
+p3b-build.log: rebuild release CPU `cargo build -p kitty-cli --features kitty-infer` (6m23s, sha db5a162b, binario viejo descartado).
+p3b-smoke-ornith.log: info Connected + smoke TIMEOUT 1501s sin turno; `hybrid sequence N has no recurrent state slot` AUSENTE.
+p3b-smoke-granite.log: info Connected + SMOKE-OK en 1243.8s; slot-error AUSENTE (primera ejecucion real del engine con slots).
+p3b-bench-granite.log + bench-tb2-granite-infer-p3b.json: `bench tb2 --limit 1` FAIL 0/1, verdict `timeout` (cap 30s vs turno CPU ~1244s).
+NOTA: el bench JSON dice `"model":"ornith:9b"` (mislabeled por el CLI); el residente real fue granite-4.0-h-micro (ver `resident ready` en p3b-bench-granite.log).
+g3-diag-ornith.log: diagnostico G3 con binario console-subscriber (RUSTFLAGS `--cfg tokio_unstable` solo-sesion, sin commit) + RUST_LOG debug, VRAM serie 1693/8192.
+VEREDICTO: tok/s~0, NO prefill-colgado — `Agent loop iteration` avanza cada ~118s sin errores con CPU ~547% y RSS ~19GB (computo saturado, 0 tokens en 11min).
+Prueba: `iteration =5 @18:08:22 -> =6 @18:10:17` y `76309 547% CPU, RSS 19023724` (grep error|hybrid|recurrent: solo el WARNING de auto-map CPU).
+SHA256SUMS verifica las 6 piezas (157KB total, sin gzip); cierre: turnos 9B en CPU inviables -> dueno `maraton-GPU` para celdas reales.

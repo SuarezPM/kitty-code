@@ -1,0 +1,76 @@
+{
+  "timestamp_utc": "20261007T033627Z",
+  "label": "p3-ornith15-granite4-ollama-l1",
+  "purpose": "P3 tanda Ollama en SERIE (VRAM 1 residente): ornith-1.5:9b local + granite4:3b pull, info backend-Ollama + mini-bench tb2 --limit 1 --no-memory out /tmp, time-box 25min/pierna",
+  "git_head_sha": "0a1fe1b",
+  "tree": "dirty pre-existente (.slim/deepwork/broche-de-oro.md + bench/official/polyglot-benchmark submodule); sin cambios de codigo en esta tanda, sin commit",
+  "matrix_real_corrida": {
+    "ornith-1.5:9b": [
+      "ollama"
+    ],
+    "granite4:3b": [
+      "ollama"
+    ]
+  },
+  "kitty_infer": "HELD para ambos (mismo fallo hibrido-recurrente, manifest-20261007T032800Z-p2); Ollama via viable confirmada aqui",
+  "env_baseline": "serie VRAM 1 modelo: ollama ps vacio + nvidia-smi antes/desps de cada pierna; KITTY_BACKEND=ollama (default); --no-memory en bench; out /tmp (no repo)",
+  "vram_mib": {
+    "pre_ornith": "553/8192, ollama ps vacio",
+    "post_ornith_stop": "553/8192, ollama ps vacio (ollama stop ornith-1.5:9b exit 0)",
+    "pre_granite": "552/8192, ollama ps vacio",
+    "post_granite_stop": "559/8192, ollama ps vacio (ollama stop granite4:3b exit 0)"
+  },
+  "legs": {
+    "ornith-1.5:9b": {
+      "model_exact": "ornith-1.5:9b (local previo, 6.6GB, e5df7dcdd8a2)",
+      "backend": "ollama",
+      "suite": "tb2",
+      "limit": 1,
+      "memory": false,
+      "out": "/tmp/bench-tb2-ornith15-ollama-l1.json",
+      "info": "kitty-cli --model ornith-1.5:9b info exit 0 — Model ornith-1.5:9b, URL http://localhost:11434, Status Connected (backend Ollama confirmado); ollama show arch qwen35 9.0B ctx 262144 Q4_K_M",
+      "bench_cmd": "timeout 1500 ./target/release/kitty-cli --model ornith-1.5:9b bench tb2 --limit 1 --no-memory --out /tmp/bench-tb2-ornith15-ollama-l1.json (exit sin pipe)",
+      "bench_exit": 0,
+      "bench_wall_s": 59,
+      "bench_timebox_s": 1500,
+      "bench_timebox_ok": true,
+      "result": "PASS 1/1 (100.0%) tb2-bash-count, latency_ms 58336.0, GATE PASSED",
+      "cell_secs": 120,
+      "cell_origin": "default actual (DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS); sin celda propia para ornith-1.5:9b en timeouts.json — log bench confirma secs=120 origin default"
+    },
+    "granite4:3b": {
+      "model_exact": "granite4:3b (nombre exacto usado; tag existe, pull OK ~2.1GB, 89962fcc7523)",
+      "pull_exit": 0,
+      "backend": "ollama",
+      "suite": "tb2",
+      "limit": 1,
+      "memory": false,
+      "out": "/tmp/bench-tb2-granite4-ollama-l1.json",
+      "info": "kitty-cli --model granite4:3b info exit 0 — Model granite4:3b, URL http://localhost:11434, Status Connected (backend Ollama confirmado); ollama show arch granite 3.4B ctx 131072 Q4_K_M",
+      "bench_cmd": "timeout 1500 ./target/release/kitty-cli --model granite4:3b bench tb2 --limit 1 --no-memory --out /tmp/bench-tb2-granite4-ollama-l1.json (exit sin pipe)",
+      "bench_exit": 0,
+      "bench_wall_s": 8,
+      "bench_timebox_s": 1500,
+      "bench_timebox_ok": true,
+      "result": "PASS 1/1 (100.0%) tb2-bash-count, latency_ms 7454.0, GATE PASSED",
+      "cell_secs": 120,
+      "cell_origin": "default actual (DEFAULT_BENCH_EXERCISE_TIMEOUT_SECS); sin celda propia para granite4:3b en timeouts.json — log bench confirma secs=120 origin default"
+    }
+  },
+  "timeouts_json": {
+    "modified": false,
+    "reason": "n=1 por celda (limit 1) insuficiente para celda estable; convencion repo max-medido x2+margen exige k>=3. Se declara default 120 para ambas celdas, sin claim. Ornith 58.3s cabe en 120; granite 7.5s cabe en 120.",
+    "cells_with_measured_wall_x2": "ninguna nueva (solo wall medido n=1 x2: ornith 59s, granite 8s — registrado aqui, no promovido a celda)"
+  },
+  "selection_rule": "first-1 exercise en orden dataset (tb2-bash-count); fijado antes de lanzar, igual en ambas piernas",
+  "harness_config": {
+    "thinking_budget": 2048,
+    "profile": "auto",
+    "hops": 0,
+    "max_iterations": 5,
+    "context_window": 16384
+  },
+  "type": "measurement-record",
+  "record_note": "type measurement-record: nacio POST-ejecucion (re-tipado honesto 2026-10-07; pre-registration solo vale pre-ejecucion) — igual que smoke infer previo (manifest-20260925T044814Z-infer-mk-smoke)",
+  "raw_logs": "volatile-missing (no persistidos; adjuntar en re-smokes)"
+}
