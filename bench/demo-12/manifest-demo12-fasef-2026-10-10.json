@@ -1,0 +1,456 @@
+{
+  "label": "demo-12-fasef-paridad-vram",
+  "timestamp_utc": "2026-10-10T15:29:37Z",
+  "suite_version": "1.0.0",
+  "modelo": "ornith:9b",
+  "modelo_digest": "sha256-af63361d2ac3ba2cb454f440842e345b926a50fe89cbdbe6a55160f32fc28e93",
+  "backend": "ollama 0.40.1 (servidor systemd: KV q8_0 + flash-attn + ctx 16384)",
+  "git_head": "c6bd16b35acab327c1b0379fbbd92ece2ab8211a (mismo que baseline Fase D/E: sin cambios de código en la lane)",
+  "k": 3,
+  "n_ejercicios": 12,
+  "lane": "única lane GPU en ejecución (1 modelo cada vez, ollama ps vacío verificado antes de cada rep, ollama stop ornith:9b después de cada rep: 6 stops)",
+  "exclusivity": "1 modelo residente durante TODA la serie; ollama ps vacío verificado antes de cada rep; ollama stop ornith:9b después de cada rep (6 stops); ninguna otra tarea con modelo en paralelo",
+  "cambio_fase_f": "KITTY_NUM_CTX=16384 exportado en las 3 reps kitty (paridad VRAM con little, que ya pedía 16384). Único cambio respecto al baseline (donde kitty iba unset→techo 32768 probe-clamped, 6.6GB parcial CPU/GPU). Sin cambios de código en harness/cli/runtime/engine. Disciplina entre-celdas idéntica al baseline (stop entre reps, no entre celdas) para atribuir el delta solo a num_ctx.",
+  "justicia": "mismo modelo ornith:9b + digest sha256-af63361d…, mismo backend ollama, mismos turnos 20 y timeouts 60s/celda, k=3 ambos, serie 1-residente con ollama stop entre TODAS las reps",
+  "gates_off": "kitty: autorun_hops=0, knowledge off, memory off (--no-memory), router pass-through (effort_off_in_bench por celda); little sin gates por diseño",
+  "versiones": {
+    "kitty": "0.1.0 (target/debug/kitty, HEAD c6bd16b, sin cambios Fase F)",
+    "little-coder": "pi RPC 0.83.0 (little-coder extensions)",
+    "ollama": "0.40.1"
+  },
+  "ficheros": {
+    "kitty": [
+      "bench/demo-12/kitty-demo12-fasef-k1.json",
+      "bench/demo-12/kitty-demo12-fasef-k2.json",
+      "bench/demo-12/kitty-demo12-fasef-k3.json"
+    ],
+    "little": [
+      "bench/demo-12/little-demo12-fasef-k1.json",
+      "bench/demo-12/little-demo12-fasef-k2.json",
+      "bench/demo-12/little-demo12-fasef-k3.json"
+    ]
+  },
+  "agent_kitty": {
+    "pass_rate": "35/36 (97.2%)",
+    "reps": [
+      12,
+      12,
+      11
+    ],
+    "p50_ms": 12784,
+    "p99_ms": 60003,
+    "rango_ms": [
+      4897,
+      60003
+    ],
+    "fails_por_ejercicio": {
+      "demo-js-fetch": "1/3"
+    }
+  },
+  "agent_little": {
+    "pass_rate": "34/36 (94.4%)",
+    "reps": [
+      12,
+      11,
+      11
+    ],
+    "p50_ms": 12594,
+    "p99_ms": 61047,
+    "rango_ms": [
+      4355,
+      61047
+    ],
+    "fails_por_ejercicio": {
+      "demo-sh-find-modified": "1/3",
+      "demo-sh-words": "1/3"
+    }
+  },
+  "comparativa": {
+    "kitty": {
+      "pass_rate": "35/36 (97.2%)",
+      "p50_ms": 12784,
+      "p99_ms": 60003,
+      "rango_ms": [
+        4897,
+        60003
+      ],
+      "reps": [
+        12,
+        12,
+        11
+      ],
+      "fails_por_ejercicio": {
+        "demo-js-fetch": "1/3"
+      }
+    },
+    "little": {
+      "pass_rate": "34/36 (94.4%)",
+      "p50_ms": 12594,
+      "p99_ms": 61047,
+      "rango_ms": [
+        4355,
+        61047
+      ],
+      "reps": [
+        12,
+        11,
+        11
+      ],
+      "fails_por_ejercicio": {
+        "demo-sh-find-modified": "1/3",
+        "demo-sh-words": "1/3"
+      }
+    },
+    "delta_p50_ms": 190,
+    "delta_pass_pp": 2.8,
+    "interpretation": "Fase F paridad VRAM (KITTY_NUM_CTX=16384): kitty 97.2% (35/36) p50 12.8s vs little 94.4% (34/36) p50 12.6s. Δp50=+190ms < umbral 5s (regla: no leer deltas <5s como señal) → EMPATE TÉCNICO en velocidad, brecha baseline (+5.3s) CERRADA (-96%). Δpass=+2.8pp = 1 ejercicio (35/36 vs 34/36), bajo el mismo umbral k=3 que declaró empate en Gate D (baseline 30/36 vs 29/36) → EMPATE en pass-rate, sin ventaja legible. Little SIN cambios ganó idénticos +13.9pp (29→34, varianza en celdas flakeables) → el +13.9pp kitty (30→35) NO es atribuible a num_ctx; lo atribuible a paridad VRAM es p50/timeouts (kitty 18.9s→12.8s −6.1s vs little 13.6s→12.6s −1.0s; timeouts kitty 6→1). HU-LATENCIA ABIERTA: (1) p50 nominal kitty > little por 190ms; (2) tb2-8 GPU nunca re-medida con paridad ctx; (3) series con gates_off (no mide router/triage/compact donde deciden); cumplido: pass-rate 97.2% ≥ baseline−5pp (83.3%−5pp=78.3%). p99 censurado en ambos (1 timeout cada lado), no métrica; ningún 0/3 en ningún lado; kitty ≥28/36 (35)."
+  },
+  "hu_latencia_estado": "ABIERTA (Fase F): (1) p50 nominal kitty 12784ms > little 12594ms (+190ms, ruido <5s, sin significancia k=3); (2) tb2-8 GPU nunca re-medida con paridad ctx (KITTY_NUM_CTX=16384 solo en demo-12); (3) series demo-12 con gates_off (autorun_hops 0, sin knowledge/memory, router pass-through: no mide HU-LATENCIA 'router/triage/compact donde deciden'). Cumplido: pass-rate 97.2% (35/36) ≥ baseline−5pp (83.3%−5pp=78.3%).",
+  "ventana_telemetria_viva": "Ventana viva, no pineada: .kitty/telemetry/current.jsonl con 2787 turnos totales (612 con wall_model_ms/guard_ms/sandbox_ms/tools_ms) entre 2026-09-01T21:26:38Z y 2026-10-10T15:19:25Z (mtime 2026-10-10 12:19:25 -0300; cierre serie Fase F 15:29:37Z). El diagnóstico citó 392 con breakdown en su ventana W0: no releer N como fijo; la ventana sigue creciendo.",
+  "desglose_wall_por_ejercicio": {
+    "demo-bash-count": {
+      "kitty_walls_ms": [
+        12672,
+        16797,
+        13324
+      ],
+      "kitty_p50_ms": 13324,
+      "kitty_pass": "3/3",
+      "kitty_iters": [
+        5,
+        7,
+        5
+      ],
+      "little_walls_ms": [
+        18775,
+        18716,
+        16537
+      ],
+      "little_p50_ms": 18716,
+      "little_pass": "3/3",
+      "little_turns": [
+        5,
+        6,
+        5
+      ],
+      "delta_p50_ms": -5392
+    },
+    "demo-dockerfile": {
+      "kitty_walls_ms": [
+        17496,
+        13914,
+        13413
+      ],
+      "kitty_p50_ms": 13914,
+      "kitty_pass": "3/3",
+      "kitty_iters": [
+        4,
+        5,
+        4
+      ],
+      "little_walls_ms": [
+        10463,
+        9008,
+        9685
+      ],
+      "little_p50_ms": 9685,
+      "little_pass": "3/3",
+      "little_turns": [
+        2,
+        2,
+        2
+      ],
+      "delta_p50_ms": 4229
+    },
+    "demo-gh-actions": {
+      "kitty_walls_ms": [
+        15395,
+        16973,
+        12609
+      ],
+      "kitty_p50_ms": 15395,
+      "kitty_pass": "3/3",
+      "kitty_iters": [
+        6,
+        6,
+        6
+      ],
+      "little_walls_ms": [
+        17105,
+        12335,
+        12072
+      ],
+      "little_p50_ms": 12335,
+      "little_pass": "3/3",
+      "little_turns": [
+        5,
+        4,
+        4
+      ],
+      "delta_p50_ms": 3060
+    },
+    "demo-js-fetch": {
+      "kitty_walls_ms": [
+        8454,
+        36816,
+        60003
+      ],
+      "kitty_p50_ms": 36816,
+      "kitty_pass": "2/3",
+      "kitty_iters": [
+        4,
+        10,
+        16
+      ],
+      "little_walls_ms": [
+        9376,
+        23046,
+        23515
+      ],
+      "little_p50_ms": 23046,
+      "little_pass": "3/3",
+      "little_turns": [
+        3,
+        3,
+        3
+      ],
+      "delta_p50_ms": 13770
+    },
+    "demo-json-config": {
+      "kitty_walls_ms": [
+        23476,
+        19664,
+        4897
+      ],
+      "kitty_p50_ms": 19664,
+      "kitty_pass": "3/3",
+      "kitty_iters": [
+        11,
+        19,
+        4
+      ],
+      "little_walls_ms": [
+        5963,
+        4558,
+        7117
+      ],
+      "little_p50_ms": 5963,
+      "little_pass": "3/3",
+      "little_turns": [
+        3,
+        2,
+        3
+      ],
+      "delta_p50_ms": 13701
+    },
+    "demo-makefile": {
+      "kitty_walls_ms": [
+        6159,
+        8785,
+        7558
+      ],
+      "kitty_p50_ms": 7558,
+      "kitty_pass": "3/3",
+      "kitty_iters": [
+        4,
+        8,
+        4
+      ],
+      "little_walls_ms": [
+        7895,
+        5972,
+        6046
+      ],
+      "little_p50_ms": 6046,
+      "little_pass": "3/3",
+      "little_turns": [
+        3,
+        2,
+        2
+      ],
+      "delta_p50_ms": 1512
+    },
+    "demo-py-csv": {
+      "kitty_walls_ms": [
+        18595,
+        6668,
+        11254
+      ],
+      "kitty_p50_ms": 11254,
+      "kitty_pass": "3/3",
+      "kitty_iters": [
+        10,
+        4,
+        4
+      ],
+      "little_walls_ms": [
+        14481,
+        13699,
+        15856
+      ],
+      "little_p50_ms": 14481,
+      "little_pass": "3/3",
+      "little_turns": [
+        5,
+        5,
+        5
+      ],
+      "delta_p50_ms": -3227
+    },
+    "demo-py-dirsize": {
+      "kitty_walls_ms": [
+        10508,
+        27387,
+        11916
+      ],
+      "kitty_p50_ms": 11916,
+      "kitty_pass": "3/3",
+      "kitty_iters": [
+        4,
+        11,
+        5
+      ],
+      "little_walls_ms": [
+        13776,
+        9202,
+        10914
+      ],
+      "little_p50_ms": 10914,
+      "little_pass": "3/3",
+      "little_turns": [
+        4,
+        2,
+        3
+      ],
+      "delta_p50_ms": 1002
+    },
+    "demo-rs-args": {
+      "kitty_walls_ms": [
+        7302,
+        12657,
+        12895
+      ],
+      "kitty_p50_ms": 12657,
+      "kitty_pass": "3/3",
+      "kitty_iters": [
+        4,
+        5,
+        5
+      ],
+      "little_walls_ms": [
+        4355,
+        7658,
+        7697
+      ],
+      "little_p50_ms": 7658,
+      "little_pass": "3/3",
+      "little_turns": [
+        2,
+        3,
+        3
+      ],
+      "delta_p50_ms": 4999
+    },
+    "demo-sh-backup": {
+      "kitty_walls_ms": [
+        11322,
+        14846,
+        23748
+      ],
+      "kitty_p50_ms": 14846,
+      "kitty_pass": "3/3",
+      "kitty_iters": [
+        5,
+        6,
+        11
+      ],
+      "little_walls_ms": [
+        12853,
+        14379,
+        15080
+      ],
+      "little_p50_ms": 14379,
+      "little_pass": "3/3",
+      "little_turns": [
+        5,
+        5,
+        6
+      ],
+      "delta_p50_ms": 467
+    },
+    "demo-sh-find-modified": {
+      "kitty_walls_ms": [
+        17481,
+        12380,
+        11324
+      ],
+      "kitty_p50_ms": 12380,
+      "kitty_pass": "3/3",
+      "kitty_iters": [
+        7,
+        6,
+        7
+      ],
+      "little_walls_ms": [
+        17971,
+        14669,
+        10284
+      ],
+      "little_p50_ms": 14669,
+      "little_pass": "2/3",
+      "little_turns": [
+        8,
+        6,
+        3
+      ],
+      "delta_p50_ms": -2289
+    },
+    "demo-sh-words": {
+      "kitty_walls_ms": [
+        6343,
+        9896,
+        29681
+      ],
+      "kitty_p50_ms": 9896,
+      "kitty_pass": "3/3",
+      "kitty_iters": [
+        5,
+        7,
+        20
+      ],
+      "little_walls_ms": [
+        21690,
+        61047,
+        21979
+      ],
+      "little_p50_ms": 21979,
+      "little_pass": "2/3",
+      "little_turns": [
+        10,
+        2,
+        9
+      ],
+      "delta_p50_ms": -12083
+    }
+  },
+  "asimetrias_declaradas": [
+    "Paridad VRAM conseguida: kitty KITTY_NUM_CTX=16384 (context.kitty_num_ctx_env=16384 en los 3 JSON) vs little 16384. La asimetría baseline (kitty 32768 probe-clamped 6.6GB parcial vs little 16384 5.5GB 100% GPU) queda eliminada por disciplina env, sin tocar runtime.",
+    "Kitty guard+sandbox activos (= producto) vs little accept-all sin gates",
+    "Kitty max_turns 20 = little max_turns 20; timeouts iguales 60s/celda, mismo modelo+digest y backend",
+    "Kitty ~7.2 turnos/ejercicio (iters medios) vs little ~4-5 turnos pero más lentos por turno (batches multi-tool); red turn-count vs turn-latency empatada",
+    "Grading idéntico un-predicado demo-12; labels kitty tb2-style file_ops heredados (sin corregir, consistencia)"
+  ],
+  "diagnostico_fase_f": {
+    "modelo_domina": "TurnEvent W0 (392 turnos recientes): wall_model p50 2905ms media 4696ms; guard media 0.00ms, sandbox media 21ms, tools media 24ms (~1% del wall). Brecha NUNCA fue guard/sandbox.",
+    "turnos_write_lentos": "Turnos Write p50 6725ms (190 out tok) vs Read 1740ms / Bash 2158ms; tokens_in p50 1364 (tools dominan el prompt turn-0 de 981 tok).",
+    "colas_largas": "Kitty baseline: json-config 17/11 iters→timeout, js-fetch 13 iters→timeout, rs-args 19 iters→timeout, py-csv 20 iters, dirsize 11 iters. Fase F con paridad: mismas colas pero rápidas (json-config 11/19 iters→PASS, words 20 iters→PASS 29s); solo js-fetch k3 (16 iters→timeout) conserva la cola.",
+    "senal_por_ejercicio": "Solo deltas ≥5s son señal. Fase F: bash-count -5.4s (kitty más rápido), js-fetch +13.8s (censurado, 1 timeout kitty), json-config +13.7s (velocidad pura pendiente, pero robustez 1/3→3/3), sh-words -12.1s (kitty más rápido y robusto). Resto ruido, incl. rs-args +4999ms (bajo el umbral por 1ms).",
+    "optimizaciones_descartadas": "speculative prefetch (0 turnos Glob/Grep en demo-12: sin señal), compact-QR (tokens_in máx 6235 < umbral 13k: compactación nunca dispara), router triaje (ornith:9b es Execution, sin modelos triaje en la serie), subsets por tier (ya activos vía profile medium 6 tools; recortar a Write quitaría Bash y rompería los 3 file_executable), prompts: tool definitions ya tersas (~450 chars), recortar Edit arriesga robustez sin señal.",
+    "conclusion": "Única optimización respaldada: paridad num_ctx (operacional, sin código). Aplicada → brecha -96%."
+  },
+  "no_commit": true,
+  "rivales_no_corridos": {
+    "opencode": "NO_CORRIDA (heredado baseline: sin provider ollama)",
+    "pi": "NO_CORRIDA (heredado baseline: sin binario)"
+  }
+}

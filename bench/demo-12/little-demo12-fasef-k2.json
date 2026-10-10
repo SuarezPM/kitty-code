@@ -1,0 +1,133 @@
+{
+  "suite": "demo-12",
+  "version": "1.0.0",
+  "agent": "little-coder (pi RPC 0.83.0)",
+  "model": "ollama/ornith:9b",
+  "rep": 2,
+  "timeout_secs": 60,
+  "max_turns": 20,
+  "results": [
+    {
+      "id": "demo-bash-count",
+      "lang": "bash",
+      "passed": true,
+      "verdict": "pass",
+      "latency_ms": 18715.750217437744,
+      "wall_ms": 18715.750217437744,
+      "turns": 6,
+      "tool_calls": 5
+    },
+    {
+      "id": "demo-py-csv",
+      "lang": "python",
+      "passed": true,
+      "verdict": "pass",
+      "latency_ms": 13699.35393333435,
+      "wall_ms": 13699.35393333435,
+      "turns": 5,
+      "tool_calls": 4
+    },
+    {
+      "id": "demo-makefile",
+      "lang": "makefile",
+      "passed": true,
+      "verdict": "pass",
+      "latency_ms": 5972.430944442749,
+      "wall_ms": 5972.430944442749,
+      "turns": 2,
+      "tool_calls": 1
+    },
+    {
+      "id": "demo-dockerfile",
+      "lang": "docker",
+      "passed": true,
+      "verdict": "pass",
+      "latency_ms": 9008.285284042358,
+      "wall_ms": 9008.285284042358,
+      "turns": 2,
+      "tool_calls": 1
+    },
+    {
+      "id": "demo-gh-actions",
+      "lang": "ci",
+      "passed": true,
+      "verdict": "pass",
+      "latency_ms": 12334.660291671753,
+      "wall_ms": 12334.660291671753,
+      "turns": 4,
+      "tool_calls": 3
+    },
+    {
+      "id": "demo-sh-find-modified",
+      "lang": "bash",
+      "passed": true,
+      "verdict": "pass",
+      "latency_ms": 14669.256925582886,
+      "wall_ms": 14669.256925582886,
+      "turns": 6,
+      "tool_calls": 5
+    },
+    {
+      "id": "demo-py-dirsize",
+      "lang": "python",
+      "passed": true,
+      "verdict": "pass",
+      "latency_ms": 9202.04210281372,
+      "wall_ms": 9202.04210281372,
+      "turns": 2,
+      "tool_calls": 1
+    },
+    {
+      "id": "demo-sh-backup",
+      "lang": "bash",
+      "passed": true,
+      "verdict": "pass",
+      "latency_ms": 14379.065990447998,
+      "wall_ms": 14379.065990447998,
+      "turns": 5,
+      "tool_calls": 4
+    },
+    {
+      "id": "demo-js-fetch",
+      "lang": "javascript",
+      "passed": true,
+      "verdict": "pass",
+      "latency_ms": 23045.974254608154,
+      "wall_ms": 23045.974254608154,
+      "turns": 3,
+      "tool_calls": 2
+    },
+    {
+      "id": "demo-rs-args",
+      "lang": "rust",
+      "passed": true,
+      "verdict": "pass",
+      "latency_ms": 7657.650947570801,
+      "wall_ms": 7657.650947570801,
+      "turns": 3,
+      "tool_calls": 2
+    },
+    {
+      "id": "demo-json-config",
+      "lang": "json",
+      "passed": true,
+      "verdict": "pass",
+      "latency_ms": 4558.197021484375,
+      "wall_ms": 4558.197021484375,
+      "turns": 2,
+      "tool_calls": 1
+    },
+    {
+      "id": "demo-sh-words",
+      "lang": "bash",
+      "passed": false,
+      "verdict": "fail",
+      "latency_ms": 61046.93388938904,
+      "wall_ms": 61046.93388938904,
+      "turns": 2,
+      "tool_calls": 2
+    }
+  ],
+  "passed": 11,
+  "total": 12
+}

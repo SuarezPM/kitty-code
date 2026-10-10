@@ -1,0 +1,275 @@
+{
+  "backend": "ollama",
+  "by_language": {
+    "ci": {
+      "attempted": 1,
+      "errored": 0,
+      "failed": 0,
+      "passed": 1
+    },
+    "docker": {
+      "attempted": 1,
+      "errored": 0,
+      "failed": 0,
+      "passed": 1
+    },
+    "file_ops": {
+      "attempted": 4,
+      "errored": 0,
+      "failed": 0,
+      "passed": 4
+    },
+    "javascript": {
+      "attempted": 1,
+      "errored": 1,
+      "failed": 0,
+      "passed": 0
+    },
+    "json": {
+      "attempted": 1,
+      "errored": 0,
+      "failed": 0,
+      "passed": 1
+    },
+    "makefile": {
+      "attempted": 1,
+      "errored": 0,
+      "failed": 0,
+      "passed": 1
+    },
+    "python": {
+      "attempted": 2,
+      "errored": 0,
+      "failed": 0,
+      "passed": 2
+    },
+    "rust": {
+      "attempted": 1,
+      "errored": 0,
+      "failed": 0,
+      "passed": 1
+    }
+  },
+  "context": {
+    "bash_timeout": 60,
+    "context_window": 16384,
+    "kitty_num_ctx_env": "unset (probe nativo con techo 32768)",
+    "ollama_server_ctx": "unset (server default; servicio fija 16384)",
+    "profile": "medium",
+    "thinking_budget": 2048
+  },
+  "details": [
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-bash-count",
+      "iters": 5,
+      "lang": "file_ops",
+      "latency_ms": 18386.0,
+      "passed": true,
+      "verdict": "pass",
+      "wall_ms": 18386.0
+    },
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-py-csv",
+      "iters": 20,
+      "lang": "python",
+      "latency_ms": 54382.0,
+      "passed": true,
+      "verdict": "pass",
+      "wall_ms": 54382.0
+    },
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-makefile",
+      "iters": 4,
+      "lang": "makefile",
+      "latency_ms": 13425.0,
+      "passed": true,
+      "verdict": "pass",
+      "wall_ms": 13425.0
+    },
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-dockerfile",
+      "iters": 4,
+      "lang": "docker",
+      "latency_ms": 22031.0,
+      "passed": true,
+      "verdict": "pass",
+      "wall_ms": 22031.0
+    },
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-gh-actions",
+      "iters": 6,
+      "lang": "ci",
+      "latency_ms": 17309.0,
+      "passed": true,
+      "verdict": "pass",
+      "wall_ms": 17309.0
+    },
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-sh-find-modified",
+      "iters": 5,
+      "lang": "file_ops",
+      "latency_ms": 13234.0,
+      "passed": true,
+      "verdict": "pass",
+      "wall_ms": 13234.0
+    },
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-py-dirsize",
+      "iters": 5,
+      "lang": "python",
+      "latency_ms": 23761.0,
+      "passed": true,
+      "verdict": "pass",
+      "wall_ms": 23761.0
+    },
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-sh-backup",
+      "iters": 5,
+      "lang": "file_ops",
+      "latency_ms": 18449.0,
+      "passed": true,
+      "verdict": "pass",
+      "wall_ms": 18449.0
+    },
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-js-fetch",
+      "iters": 13,
+      "lang": "javascript",
+      "latency_ms": 60001.0,
+      "passed": false,
+      "verdict": "timeout",
+      "wall_ms": 60001.0
+    },
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-rs-args",
+      "iters": 8,
+      "lang": "rust",
+      "latency_ms": 25743.0,
+      "passed": true,
+      "verdict": "pass",
+      "wall_ms": 25743.0
+    },
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-json-config",
+      "iters": 4,
+      "lang": "json",
+      "latency_ms": 10168.0,
+      "passed": true,
+      "verdict": "pass",
+      "wall_ms": 10168.0
+    },
+    {
+      "effort_off_in_bench": false,
+      "hops": 0,
+      "id": "demo-sh-words",
+      "iters": 13,
+      "lang": "file_ops",
+      "latency_ms": 29749.0,
+      "passed": true,
+      "verdict": "pass",
+      "wall_ms": 29749.0
+    }
+  ],
+  "exclusivity": {
+    "discipline": "1 modelo residente; `ollama stop` entre TODAS las reps, ps vacío verificado",
+    "ps_after": "1 model row(s)",
+    "ps_before": "empty",
+    "ps_empty_after": false,
+    "ps_empty_before": true
+  },
+  "fairness": {
+    "backend": "ollama",
+    "declared_asymmetries": [
+      "Kitty guard+sandbox activos (producto) vs rival accept-all sin gates (es producto, no se corrige; precedente shootout 20261007).",
+      "Declarar num_ctx de sesión de cada lado (asimetría tb2-8: kitty 32768 vs rival 16384) y KV-cache."
+    ],
+    "exclusivity": [
+      "1 modelo residente durante la serie",
+      "ollama stop entre TODAS las reps de ambos agentes (ps vacío verificado)",
+      "ninguna otra tarea con modelo en paralelo"
+    ],
+    "gates_off": {
+      "autorun_hops": 0,
+      "effort_router": "pass-through (registrar effort_off_in_bench por celda)",
+      "knowledge": false,
+      "memory": false,
+      "note": "Trampa conocida: el bench aísla latencia base sin router/knowledge/memory."
+    },
+    "grade": "evidence (12 ejercicios fijos, sin --limit; --limit Joy entra solo como smoke y lo invalida como evidencia)",
+    "k": 3,
+    "max_turns": 20,
+    "model": {
+      "digest": "FIJAR_AL_CORRER (ollama show digest, pineado por manifiesto)",
+      "id": "FIJAR_AL_CORRER",
+      "note": "Fijar el mismo modelo+digest para kitty y rival en el manifiesto de la corrida."
+    },
+    "pinned_versions": {
+      "kitty": "0.1.0",
+      "ollama": "0.40.1",
+      "rival": "FIJAR_AL_CORRER (nombre+versión pineados por manifiesto)"
+    },
+    "protocol": "Mismo modelo, backend, turnos y timeouts para ambos agentes; k>=3 reps por agente; serie exclusiva (1 modelo residente, ollama stop entre TODAS las reps, ps vacío verificado); sin tareas con modelo en paralelo.",
+    "stats": "p50/p99 sobre wall real por celda (nunca latency_ms en timeout), pass-rate con k>=3, manifiesto por corrida",
+    "timeout_secs_per_exercise": 60,
+    "verdicts": [
+      "pass",
+      "fail",
+      "error",
+      "timeout"
+    ]
+  },
+  "gates_off_actual": {
+    "autorun_hops": 0,
+    "effort_router": "pass-through (effort_off_in_bench por celda)",
+    "knowledge": false,
+    "memory": false
+  },
+  "git_head": "c6bd16b35acab327c1b0379fbbd92ece2ab8211a",
+  "k_note": "este run = 1 rep de 12; la serie exige k>=3 invocaciones con distintos --out",
+  "k_required": 3,
+  "max_turns": 20,
+  "memory": false,
+  "model": "ornith:9b",
+  "model_digest": "sha256-af63361d2ac3ba2cb454f440842e345b926a50fe89cbdbe6a55160f32fc28e93",
+  "passed": 11,
+  "pinned_versions": {
+    "kitty": "0.1.0",
+    "ollama": "0.40.1",
+    "rival": "NO_CORRIDA-en-este-run (rival se mide aparte; ver manifiesto comparativo)"
+  },
+  "rate_pct": 91.66666666666667,
+  "suite": "demo-12",
+  "timeout_secs_per_exercise": 60,
+  "timestamp_utc": "2026-10-10T14:47:40Z",
+  "total": 12,
+  "url": "http://localhost:11434",
+  "version": "1.0.0",
+  "wall_p50_ms": 20240.0,
+  "wall_p99_ms": 60001.0,
+  "wall_rango_ms": [
+    10168.0,
+    60001.0
+  ]
+}

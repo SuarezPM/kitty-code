@@ -248,6 +248,7 @@ pub enum Commands {
     Bench {
         /// Benchmark suite: polyglot (official dataset polyglot-benchmark, unit-test grading),
         /// tb2 (HOMEMADE 8 ejercicios locales, no oficial), tb2-official (OFFICIAL terminal-bench-2.1 via Harbor CLI),
+        /// demo-12 (suite fija v1.0.0 con justicia embebida: 12 ejercicios, pineos, k>=3 por serie, gates_off; ignora --exercises/--limit),
         /// gpqa, gpqa_diamond, claweval
         /// (gpqa requires --pre-registration <PATH>;
         ///  claweval requires OPENROUTER_API_KEY + claw-eval CLI;

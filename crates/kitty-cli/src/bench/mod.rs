@@ -5,6 +5,7 @@
 pub mod ab;
 pub mod claweval;
 pub mod common;
+pub mod demo12;
 pub mod gpqa;
 pub mod polyglot;
 pub mod run;
@@ -170,6 +171,19 @@ pub async fn bench_command(cli: BenchCliCtx, client: BenchClient, args: BenchArg
     // --- Polyglot unit test grading (Aider-style 225 Exercism exercises) ---
     if suite == "polyglot" {
         return polyglot::run_polyglot_bench(&cfg, &out, limit).await;
+    }
+
+    // --- demo-12 fija versionada (W8, justicia embebida; trampa --exercises) ---
+    // `--exercises` espera array pelado y `suite == "polyglot"` retorna antes;
+    // demo-12 parsea su envelope propio y NUNCA usa ese flag (se ignora con warn).
+    if suite == "demo-12" {
+        if exercises_path.is_some() {
+            warn!("demo-12 ignora --exercises (trampa conocida bench/mod.rs:171): corre la suite propia embebida v1.0.0");
+        }
+        if limit != 12 {
+            info!(limit, "demo-12 ignora --limit (siempre 12 fijos por rep)");
+        }
+        return demo12::run_demo12_bench(&cli, &cfg, &out).await;
     }
 
     println!("Kitty Code Benchmark");
