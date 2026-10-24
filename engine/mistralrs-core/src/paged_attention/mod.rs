@@ -30,7 +30,8 @@ pub use attention_backend::AttentionBackendKind;
 pub use cache_engine::{CacheConfig, CacheEngine, PagedCacheType};
 use candle_core::{DType, Device};
 pub use config::{
-    HybridPagedKvCacheConfig, KvCacheLayout, KvCacheTopology, ModelConfigLike, ModelConfigMetadata,
+    hybrid_paged_mask_from_config_json, maybe_wrap_hybrid, HybridPagedKvCacheConfig,
+    KvCacheLayout, KvCacheTopology, ModelConfigLike, ModelConfigMetadata,
 };
 pub use kv_cache_manager::KVCacheManager;
 pub use layers::PagedAttention;
@@ -75,8 +76,8 @@ pub(crate) fn block_aligned_sliding_window_start(
 #[cfg(test)]
 mod tests {
     use super::{
-        block_aligned_sliding_window_start, fit_post_load_cache_budget, MemoryGpuConfig,
-        PagedAttentionConfig, PagedCacheType,
+        assert_cache_covers_context, available_context_tokens, block_aligned_sliding_window_start,
+        fit_post_load_cache_budget, MemoryGpuConfig, PagedAttentionConfig, PagedCacheType,
     };
 
     #[test]
@@ -188,6 +189,86 @@ mod tests {
             fit_post_load_cache_budget(MemoryGpuConfig::ContextSize(131_072), 40_000, 35_000,)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn available_context_tokens_excludes_the_scheduler_spare() {
+        assert_eq!(available_context_tokens(513, 32), 512 * 32);
+        assert_eq!(available_context_tokens(1, 32), 0);
+        assert_eq!(available_context_tokens(0, 32), 0);
+    }
+
+    #[test]
+    fn cache_assert_fails_loudly_when_short() {
+        assert!(assert_cache_covers_context(513, 32, 16_384, "test-window").is_ok());
+        assert!(assert_cache_covers_context(512, 32, 16_384, "test-window").is_ok());
+        let err = assert_cache_covers_context(128, 32, 16_384, "test-window")
+            .expect_err("128 blocks cannot cover a 16K window");
+        let msg = err.to_string();
+        assert!(msg.contains("16_384") || msg.contains("16384"), "{msg}");
+        assert!(msg.contains("silently spilling"), "{msg}");
+        assert!(assert_cache_covers_context(512, 0, 16_384, "test-window").is_err());
+    }
+
+    #[test]
+    fn ornith_hybrid_context_size_covers_sixteen_k() -> anyhow::Result<()> {
+        use super::calculate_cache_config;
+        use super::config::{
+            full_attention_interval_paged_mask, HybridPagedKvCacheConfig, KvCacheLayout,
+            ModelConfigMetadata,
+        };
+        use candle_core::{DType, Device};
+
+        // Ornith-1.5-9B shape: 32 GDN-hybrid layers, every 4th paged (8/32).
+        let base = ModelConfigMetadata {
+            max_seq_len: 131_072,
+            num_layers: 32,
+            hidden_size: 4096,
+            num_kv_heads: 4,
+            num_attn_heads: 16,
+            sliding_window: None,
+            k_head_dim: 256,
+            v_head_dim: 256,
+            kv_cache_layout: KvCacheLayout::Standard,
+        };
+        let mask = full_attention_interval_paged_mask(32, 4).expect("known hybrid interval");
+        let hybrid = HybridPagedKvCacheConfig::new(base.clone(), mask);
+        let device = Device::Cpu;
+
+        let sized = calculate_cache_config(
+            MemoryGpuConfig::ContextSize(16_384),
+            super::CacheMemoryReservations::default(),
+            Some(32),
+            DType::F16,
+            PagedCacheType::Auto,
+            &hybrid,
+            &device,
+            &[None],
+            true,
+            None,
+            None,
+        )?;
+        // Demand sizing buys the window plus the scheduler spare on top.
+        assert_eq!(sized.num_gpu_blocks, 513);
+        assert_eq!(available_context_tokens(sized.num_gpu_blocks, 32), 16_384);
+        assert_cache_covers_context(sized.num_gpu_blocks, 32, 16_384, "ornith-16K")?;
+
+        // The mask is what makes 16K affordable: dense totals cost exactly 4x.
+        let dense = calculate_cache_config(
+            MemoryGpuConfig::ContextSize(16_384),
+            super::CacheMemoryReservations::default(),
+            Some(32),
+            DType::F16,
+            PagedCacheType::Auto,
+            &base,
+            &device,
+            &[None],
+            true,
+            None,
+            None,
+        )?;
+        assert_eq!(sized.num_gpu_blocks, dense.num_gpu_blocks);
         Ok(())
     }
 }
@@ -363,6 +444,44 @@ fn fit_post_load_cache_budget(
     }
 }
 
+/// Usable decode context tokens for a sized cache.
+///
+/// One block stays unallocated as the scheduler's spare, so the usable
+/// count is `(num_gpu_blocks - 1) * block_size` — the same formula the
+/// sizing log and the decode scheduler use. Record this value in run
+/// manifests (F1a) rather than the raw block count.
+pub fn available_context_tokens(num_gpu_blocks: usize, block_size: usize) -> usize {
+    num_gpu_blocks.saturating_sub(1).saturating_mul(block_size)
+}
+
+/// Fail loudly when the sized cache cannot cover the requested context.
+///
+/// Gross blocks must cover the window: demand sizing (`ContextSize`) buys
+/// the window plus the scheduler spare on top, so a shortfall here means a
+/// genuinely under-provisioned budget (typically a `Utilization`/fixed-MB
+/// fallback on a small GPU). Refuses instead of silently degrading — the
+/// historical silent path spilled layers to CPU and starved the cache.
+pub fn assert_cache_covers_context(
+    num_gpu_blocks: usize,
+    block_size: usize,
+    required_tokens: usize,
+    what: &str,
+) -> anyhow::Result<()> {
+    if block_size == 0 {
+        anyhow::bail!("PagedAttention cache assertion needs a nonzero block size ({what}).");
+    }
+    let gross = num_gpu_blocks
+        .checked_mul(block_size)
+        .ok_or_else(|| anyhow::anyhow!("PagedAttention cache size overflow ({what})."))?;
+    if gross < required_tokens {
+        let usable = available_context_tokens(num_gpu_blocks, block_size);
+        anyhow::bail!(
+            "PagedAttention KV cache covers {gross} context tokens ({usable} usable after the scheduler spare: {num_gpu_blocks} blocks x {block_size}) but {required_tokens} were requested ({what}). Refusing instead of silently spilling to CPU: lower the context (e.g. KITTY_INFER_CTX), raise the KV budget, free VRAM, or disable paged attention explicitly."
+        );
+    }
+    Ok(())
+}
+
 /// Memory values are in MBs or a percentage in [0,1]. Specify block size or the default is 32.
 ///
 /// `model_weight_size_in_bytes`: total model weight footprint. When provided, the per-device
@@ -492,7 +611,16 @@ pub fn calculate_cache_config(
             }
             MemoryGpuConfig::ContextSize(toks) => {
                 // ContextSize is demand-driven (bytes needed for N tokens), not a memory budget, so model weight does not apply here.
-                ctxt_to_blocks!(toks, dtype_size, block_size, config).div_ceil(SIZE_IN_MB)
+                // Demand one spare block on top: it stays unallocated as the
+                // scheduler's spare, so `available_context_tokens` (which
+                // excludes it) still covers the requested window (F1a).
+                ctxt_to_blocks!(
+                    toks.saturating_add(block_size),
+                    dtype_size,
+                    block_size,
+                    config
+                )
+                .div_ceil(SIZE_IN_MB)
             }
         };
         if let Some(memory) = post_load_memory {
@@ -544,7 +672,7 @@ pub fn calculate_cache_config(
     }
 
     if !silent {
-        let available_context_tokens = num_gpu_blocks.saturating_sub(1) * block_size;
+        let available_context_tokens = available_context_tokens(num_gpu_blocks, block_size);
         info!("Allocating {mem_gpu} MB for PagedAttention KV cache per GPU");
         info!("PagedAttention KV cache type is {dtype:?}");
         info!("Using PagedAttention with block size {block_size} and {num_gpu_blocks} GPU blocks: available context length is {available_context_tokens} tokens");

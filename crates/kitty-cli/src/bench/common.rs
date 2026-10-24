@@ -41,6 +41,14 @@ pub(crate) struct BenchResult {
     /// W1: el `EffortRouter` estuvo OFF en bench (se omite si es false).
     #[serde(skip_serializing_if = "is_false")]
     pub(crate) effort_off_in_bench: bool,
+    /// F1b: razón terminal del agent loop (siempre presente: el driver
+    /// ejecuta el loop; nunca "pending").
+    pub(crate) terminal_reason: String,
+    /// F1b: llamadas a tools inválidas acumuladas en el run.
+    pub(crate) invalid_tool_calls: usize,
+    /// F1a: ventana de contexto usable para la celda (del engine en
+    /// kitty-infer vía `run_context`, del harness en ollama).
+    pub(crate) available_context_tokens: usize,
 }
 
 /// Predicado serde para omitir `effort_off_in_bench` cuando es false
@@ -64,11 +72,15 @@ mod effort_manifest_mirror_tests {
             iters: None,
             margin: None,
             effort_off_in_bench: false,
+            terminal_reason: "text".to_string(),
+            invalid_tool_calls: 0,
+            available_context_tokens: 16384,
         }
     }
 
     /// Espejo byte-identidad: sin esfuerzo las claves nuevas se omiten, el
-    /// manifiesto conserva el formato viejo exacto.
+    /// manifiesto conserva el formato viejo exacto (salvo los ejes F1b,
+    /// que siempre van: terminal/invalid/disponible nunca son pending).
     #[test]
     fn empty_effort_omits_new_keys_old_format_intact() {
         let v = serde_json::to_value(empty_result()).unwrap();
@@ -86,8 +98,13 @@ mod effort_manifest_mirror_tests {
                 "passed": true,
                 "verdict": "pass",
                 "latency_ms": 1.0,
+                "terminal_reason": "text",
+                "invalid_tool_calls": 0,
+                "available_context_tokens": 16384,
             })
         );
+        // Nunca "pending": el loop siempre produce una razón terminal real.
+        assert_ne!(v["terminal_reason"], serde_json::json!("pending"));
     }
 
     /// Con esfuerzo real las claves aparecen con sus valores.
@@ -393,6 +410,19 @@ impl ChatClient for BenchClient {
             Self::Ollama(c) => ChatClient::health_check(c),
             #[cfg(feature = "kitty-infer")]
             Self::Infer(c) => ChatClient::health_check(c),
+        }
+    }
+}
+
+impl BenchClient {
+    /// Real engine run context for the kitty-infer arm (F1a/F1b): mem_mode,
+    /// decision_reason y available_context_tokens del load real. `None` en
+    /// ollama (sin engine) o antes del primer load.
+    pub(crate) fn infer_run_context(&self) -> Option<kitty_runtime::KittyInferRunContext> {
+        match self {
+            Self::Ollama(_) => None,
+            #[cfg(feature = "kitty-infer")]
+            Self::Infer(c) => c.run_context(),
         }
     }
 }
@@ -813,6 +843,9 @@ mod language_breakdown_tests {
             iters: None,
             margin: None,
             effort_off_in_bench: false,
+            terminal_reason: verdict.to_string(),
+            invalid_tool_calls: 0,
+            available_context_tokens: 16384,
         }
     }
 

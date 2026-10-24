@@ -356,6 +356,8 @@ pub(crate) async fn run_gpqa_suite(
             let _ = saved;
         }
 
+        // F1b: gpqa no ejecuta el tool-loop del agent (respuesta directa),
+        // así que los ejes van como "n/a" honestos, nunca "pending".
         results.push(BenchResult {
             id: q.id.clone(),
             lang: "gpqa".to_string(),
@@ -366,6 +368,9 @@ pub(crate) async fn run_gpqa_suite(
             iters: None,
             margin: None,
             effort_off_in_bench: false,
+            terminal_reason: "n/a".to_string(),
+            invalid_tool_calls: 0,
+            available_context_tokens: cfg.context_window,
         });
     }
 

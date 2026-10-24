@@ -8,13 +8,17 @@ impl Agent {
     /// Process a single LLM response within the agent loop.
     ///
     /// Handles tool execution, quality checks, and message ordering.
-    /// Returns Ok(true) when a final text response was produced, Ok(false) to
-    /// continue the loop (tool calls were processed).
+    /// F2a E1: returns `Ok(Some(Terminal))` for a pure-text terminal
+    /// candidate (no tool calls, non-empty, no done-guard nudge) — the caller
+    /// breaks the loop and runs the single `finalize_terminal` (verify +
+    /// save post-verify). `Ok(None)` means continue the loop (tool calls
+    /// processed, nudge injected, or empty retry). The done-guard/nudge case
+    /// is explicitly excluded from the terminal predicate.
     pub(super) async fn process_response(
         &mut self,
         user_prompt: &str,
         response: ChatResponse,
-    ) -> Result<()> {
+    ) -> Result<Option<super::Terminal>> {
         // Check for tool calls — any tool call resets the empty streak
         // (progress was made, handoff §6).
         if let Some(tool_calls) = &response.message.tool_calls {
@@ -142,8 +146,13 @@ impl Agent {
                                 tool_call_id: None,
                             })
                             .await;
-                            self.save_episode(user_prompt, &text, true).await;
-                            return Ok(());
+                            // Turn-level correction, NOT run-terminal: the loop
+                            // continues, so no `Terminal` is returned and no
+                            // episode is saved here. Single save site: the
+                            // run-terminal saves go ONLY through
+                            // `finalize_terminal` post-verify (E1).
+                            let _ = user_prompt;
+                            return Ok(None);
                         }
                         QualityViolation::EmptyResponse => {
                             // Handled in the no-tool-calls branch below
@@ -151,7 +160,7 @@ impl Agent {
                     }
                 }
 
-                return Ok(()); // Next iteration for tool results
+                return Ok(None); // Next iteration for tool results
             }
         }
 
@@ -183,15 +192,19 @@ impl Agent {
                     streak = self.empty_response_streak,
                     "Empty response streak cap reached (2), failing fast"
                 );
-                self.save_episode(user_prompt, "no response (empty after 2 retries)", false)
-                    .await;
-                return Ok(());
+                // F2a E1: no pre-verify save here — the caller converts this
+                // into a `Terminal{EmptyFailFast}` consumed ONLY by
+                // `finalize_terminal` (verify + save post-verify).
+                return Ok(Some(super::Terminal::new(
+                    "no response (empty after 2 retries)".to_string(),
+                    super::TerminalReason::EmptyFailFast,
+                )));
             }
             warn!(
                 streak = self.empty_response_streak,
                 "Empty response detected, continuing loop for retry"
             );
-            return Ok(());
+            return Ok(None);
         }
         // Non-empty text resets the streak
         self.empty_response_streak = 0;
@@ -203,7 +216,7 @@ impl Agent {
                 warn!(diagnostic = %diag, "Malformed tool call in text response");
                 self.push_message(Message::user(diag)).await;
             }
-            return Ok(());
+            return Ok(None);
         }
         if !parsed.is_empty() {
             // There are tool calls in the text, process them
@@ -214,19 +227,24 @@ impl Agent {
                 self.execute_and_push_tool_result(tc, None, prefetched.remove(&idx))
                     .await?;
             }
-            return Ok(()); // Process tool results next iteration
+            return Ok(None); // Process tool results next iteration
         }
 
-        // Pure text response — we're done
-        // (Assistant message already pushed above before the empty check)
+        // Pure text response — terminal candidate (assistant message already
+        // pushed above before the empty check). F2a E1: the done-guard/nudge
+        // case is EXCLUDED from the terminal predicate (loop continues).
         if let Some(nudge) = self.check_done_guard(&text) {
             self.push_message(Message::user(nudge)).await;
-            return Ok(());
+            return Ok(None);
         }
-        // Save successful episode to memory
-        self.save_episode(user_prompt, &text, true).await;
-
-        Ok(())
+        // F2a E1: NO pre-verify save here (Oracle: response.rs:226-227 movido).
+        // The caller breaks the loop and runs the single `finalize_terminal`
+        // (verify + save_episode post-verify).
+        let _ = user_prompt;
+        Ok(Some(super::Terminal::new(
+            text,
+            super::TerminalReason::Text,
+        )))
     }
 
     /// Execute one tool call and push its result message (shared by the
@@ -280,12 +298,14 @@ impl Agent {
             }
             Err(e) => {
                 // F4.3: increment invalid streak on NotFound/InvalidArgs.
+                // F2a E2: cumulative counter for the A/B gate (never reset).
                 if matches!(
                     e,
                     crate::tools::ToolError::NotFound(_)
                         | crate::tools::ToolError::InvalidArgs { .. }
                 ) {
                     self.invalid_streak += 1;
+                    self.invalid_tool_calls += 1;
                 }
                 warn!(error = %e, name = tc.name, streak = self.invalid_streak, "Tool execution failed");
                 crate::tools::ToolResult {
@@ -724,14 +744,20 @@ impl Agent {
             .context("Retry LLM call without thinking failed")
     }
 
-    /// E3 dynamic max-output cap + F2 per-model sampling/thinking:
-    /// request only as much output as still fits the context window
+    /// E3 dynamic max-output cap + F2 per-model sampling/thinking + F2a E2 floor.
+    /// Request only as much output as still fits the context window
     /// (`context_limit − estimated_input − 1024`, floor 256), never more than
     /// the profile's `num_predict`; sampling parameters and the thinking
     /// override come from the resolved per-model tuning. Input estimated
     /// conservatively at chars/4 via
     /// [`kitty_runtime::client::estimate_input_tokens`]. The session-fixed
     /// `num_ctx` is injected by [`kitty_runtime::OllamaClient`] itself.
+    ///
+    /// F2a E2 (wired tras E1 verificado en este lane): Ornith floor
+    /// `num_predict`/thinking `>= 4096` (no 2K: trunca thinking/JSON y genera
+    /// mas turnos). El floor aplica al valor configurado (tuning), no al cap
+    /// dinamico por contexto (que sigue mandando cuando la ventana esta llena).
+    /// Kill-switch: `KITTY_ORNITH_FLOOR_4K=off` restaura el tuning sin floor.
     pub(super) fn request_options(
         &self,
         messages: &[Message],
@@ -741,20 +767,65 @@ impl Agent {
             self.config.context_window,
             est,
         ));
-        let num_predict = i32::try_from(dynamic.min(i64::from(self.config.tuning.num_predict)))
+        let (num_predict_cfg, thinking) = Self::ornith_floor_4k(
+            &self.config.model,
+            self.config.tuning.num_predict,
+            self.config.tuning.thinking,
+        );
+        let num_predict = i32::try_from(dynamic.min(i64::from(num_predict_cfg)))
             .unwrap_or(kitty_runtime::client::MIN_OUTPUT_TOKENS);
         kitty_runtime::client::RequestOptions {
             num_predict: Some(num_predict),
             temperature: Some(self.config.tuning.temperature),
             top_p: self.config.tuning.top_p,
             top_k: self.config.tuning.top_k.map(|k| k as i32),
-            think: if self.config.tuning.thinking == ThinkingMode::Off {
+            think: if thinking == ThinkingMode::Off {
                 Some(false)
             } else {
                 None
             },
             ..Default::default()
         }
+    }
+
+    /// F2a E2 floor puro: Ornith (`model` contiene "ornith",
+    /// case-insensitive) exige `num_predict >= 4096` y
+    /// `ThinkingMode::Budget(n >= 4096)` (On/Off intactos). `off` explicito
+    /// via `KITTY_ORNITH_FLOOR_4K=off` desactiva el floor (flag sin cablear).
+    /// No-Ornith: tuning intacto. Puro salvo el env leido aqui.
+    pub(crate) fn ornith_floor_4k(
+        model: &str,
+        num_predict: u32,
+        thinking: ThinkingMode,
+    ) -> (u32, ThinkingMode) {
+        Self::ornith_floor_4k_raw(
+            model,
+            num_predict,
+            thinking,
+            std::env::var("KITTY_ORNITH_FLOOR_4K").ok().as_deref(),
+        )
+    }
+
+    /// Nucleo puro del floor (testeable sin env).
+    pub(crate) fn ornith_floor_4k_raw(
+        model: &str,
+        num_predict: u32,
+        thinking: ThinkingMode,
+        raw: Option<&str>,
+    ) -> (u32, ThinkingMode) {
+        if raw.map(str::trim) == Some("off") {
+            return (num_predict, thinking);
+        }
+        if !model.to_ascii_lowercase().contains("ornith") {
+            return (num_predict, thinking);
+        }
+        const FLOOR: u32 = 4096;
+        let num_predict = num_predict.max(FLOOR);
+        let thinking = match thinking {
+            ThinkingMode::Budget(n) if n < FLOOR => ThinkingMode::Budget(FLOOR),
+            other => other,
+        };
+        (num_predict, thinking)
     }
 
     /// Make an LLM call with bounded retry for transient errors (F3.3).
@@ -769,13 +840,21 @@ impl Agent {
         let tools = Some(self.tools.clone());
         let options = Some(self.request_options(&messages));
 
-        // W5-code: idempotent cache — a byte-identical retry (overflow
-        // retry, thinking retry, transport retry) is served without burning
-        // another model call. Disabled by default (`None` = legacy path).
-        let cache_key = self
-            .response_cache
-            .as_ref()
-            .map(|_| crate::response_cache::cache_key(model, &messages, &tools, &options));
+        // W5-code + F2a E3: idempotent cache — a byte-identical retry
+        // (overflow retry, thinking retry, transport retry) is served without
+        // burning another model call. Disabled by default (`None` = legacy
+        // path; bench default OFF, opt-in via `KITTY_RESPONSE_CACHE`).
+        // E3 threshold: prefixes below 64 tok never touch the cache.
+        let cacheable = crate::response_cache::should_cache_tokens(
+            kitty_runtime::client::estimate_input_tokens(&messages),
+        );
+        let cache_key = if cacheable {
+            self.response_cache.as_ref().map(|_| {
+                crate::response_cache::cache_key(model, &messages, &tools, &options)
+            })
+        } else {
+            None
+        };
         if let (Some(cache), Some(key)) = (self.response_cache.as_ref(), &cache_key) {
             if let Ok(mut guard) = cache.lock() {
                 if let Some(hit) = guard.get(key) {

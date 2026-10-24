@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::SegmentKind;
+
 /// A structured compaction summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionSummary {
@@ -285,6 +287,35 @@ pub fn extract_file_operations(results: &[String]) -> (Vec<String>, Vec<String>)
     (read_files, modified_files)
 }
 
+/// F2b P0-a: classify a conversation message into a [`SegmentKind`].
+///
+/// Role-driven; `system` is refined by block markers so the protected
+/// preflight is never confused with the evictable `[Memory]` /
+/// `[Context Summary]` blocks. Pure hook for P1 `evict_to_budget`
+/// (which trims non-protected kinds first, protected never).
+pub fn segment_kind_for_message(role: &str, content: &str) -> SegmentKind {
+    match role {
+        "user" => SegmentKind::UserTurn,
+        "tool" => SegmentKind::ToolResult,
+        "assistant" => SegmentKind::Assistant,
+        _ => {
+            if content.contains("[Memory]") {
+                SegmentKind::Memory
+            } else if content.contains("[Context Summary]") {
+                SegmentKind::Summary
+            } else {
+                SegmentKind::SystemPreflight
+            }
+        }
+    }
+}
+
+/// F2b P0-a: whether a message belongs to a protected segment
+/// (UserTurn / SystemPreflight — intocables en compactación/evicción).
+pub fn is_protected_message(role: &str, content: &str) -> bool {
+    segment_kind_for_message(role, content).protected()
+}
+
 fn extract_path(text: &str) -> Option<String> {
     // Look for common path patterns — file extensions common in coding projects
     const EXTENSIONS: &[&str] = &[
@@ -487,5 +518,46 @@ mod tests {
         let qr = s.format_qr(&[]);
         assert!(qr.contains("## Open Queries"));
         assert!(qr.contains("(none)"));
+    }
+
+    /// F2b P0-a: el mapeo rol→segmento protege UserTurn y preflight system,
+    /// y distingue los bloques evictables ([Memory], [Context Summary]).
+    #[test]
+    fn segment_mapping_keeps_userturn_and_preflight_protected() {
+        use super::{is_protected_message, segment_kind_for_message};
+        use crate::context::SegmentKind;
+        // Protegidos.
+        assert_eq!(
+            segment_kind_for_message("user", "fix the bug"),
+            SegmentKind::UserTurn
+        );
+        assert!(is_protected_message("user", "fix the bug"));
+        assert_eq!(
+            segment_kind_for_message("system", "Workspace detected: rust."),
+            SegmentKind::SystemPreflight
+        );
+        assert!(is_protected_message("system", "Workspace detected: rust."));
+        // Evictables.
+        assert_eq!(
+            segment_kind_for_message("tool", "Read src/main.rs"),
+            SegmentKind::ToolResult
+        );
+        assert_eq!(
+            segment_kind_for_message("assistant", "done"),
+            SegmentKind::Assistant
+        );
+        assert_eq!(
+            segment_kind_for_message("system", "lead\n[Memory]\n## Episodes\n- x\n[End Memory]"),
+            SegmentKind::Memory
+        );
+        assert_eq!(
+            segment_kind_for_message("system", "[Context Summary]\n## Goal\nx"),
+            SegmentKind::Summary
+        );
+        assert!(!is_protected_message("tool", "Read src/main.rs"));
+        assert!(!is_protected_message(
+            "system",
+            "lead\n[Memory]\n## Episodes\n- x\n[End Memory]"
+        ));
     }
 }

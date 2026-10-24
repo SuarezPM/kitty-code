@@ -35,7 +35,8 @@ use crate::{
     layers::{self, CausalMasker, GemmaRmsNorm, Mlp, Qwen3VLRotaryEmbedding, Sdpa, YarnRopeConfig},
     layers_masker::{CausalMaskConfig, PastKvLenCache},
     paged_attention::{
-        load_fp8_attention_scales, AttentionImplementation, ModelConfigMetadata, PagedAttention,
+        load_fp8_attention_scales, AttentionImplementation, HybridPagedKvCacheConfig,
+        ModelConfigLike, ModelConfigMetadata, PagedAttention,
     },
     pipeline::{
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
@@ -2819,6 +2820,22 @@ impl NormalModel for Qwen3_5TextModel {
 
     fn config(&self) -> &ModelConfigMetadata {
         &self.cfg
+    }
+
+    fn model_config(&self) -> Arc<dyn ModelConfigLike + Send + Sync> {
+        let mask: Vec<bool> = self
+            .layer_types
+            .iter()
+            .map(|lt| matches!(lt, LayerType::FullAttention))
+            .collect();
+        if mask.len() == self.cfg.num_layers
+            && mask.contains(&true)
+            && mask.contains(&false)
+        {
+            Arc::new(HybridPagedKvCacheConfig::new(self.cfg.clone(), mask))
+        } else {
+            Arc::new(self.cfg.clone())
+        }
     }
 
     fn supports_packed_prefill(&self) -> bool {

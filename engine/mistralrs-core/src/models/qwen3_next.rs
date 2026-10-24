@@ -31,7 +31,10 @@ use crate::{
     },
     layers_masker::PastKvLenCache,
     moe::{MoEExperts, MoEExpertsConfig},
-    paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
+    paged_attention::{
+        AttentionImplementation, HybridPagedKvCacheConfig, ModelConfigLike, ModelConfigMetadata,
+        PagedAttention,
+    },
     pipeline::{
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
         EitherCache, ForwardMaskCache, IsqModel, KvCache, ModelForwardContext,
@@ -1217,6 +1220,22 @@ impl NormalModel for Model {
     }
     fn config(&self) -> &ModelConfigMetadata {
         &self.cfg
+    }
+
+    fn model_config(&self) -> Arc<dyn ModelConfigLike + Send + Sync> {
+        let mask: Vec<bool> = self
+            .layer_types
+            .iter()
+            .map(|lt| matches!(lt, LayerType::FullAttention))
+            .collect();
+        if mask.len() == self.cfg.num_layers
+            && mask.contains(&true)
+            && mask.contains(&false)
+        {
+            Arc::new(HybridPagedKvCacheConfig::new(self.cfg.clone(), mask))
+        } else {
+            Arc::new(self.cfg.clone())
+        }
     }
 
     fn supports_packed_prefill(&self) -> bool {

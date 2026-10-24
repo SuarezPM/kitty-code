@@ -39,6 +39,82 @@ mod setup;
 pub use crate::config::ENV_TRUNCATION_DIR;
 pub use config::{AgentConfig, AgentEvent, RunOverrides};
 pub(crate) use output::{effective_output_cap, truncate_tool_output, TRUNCATION_MAX_BYTES};
+/// F2a E1: terminal reason — why the agent loop stopped producing tool
+/// calls and produced its final text. Mandatory in bench manifests
+/// (`terminal_reason`); `iters_used` stays LLM turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalReason {
+    /// Pure text response with no tool calls and no done-guard nudge.
+    Text,
+    /// Exhaustion path: forced final answer after iterations ran out.
+    ForceResponse,
+    /// Consecutive-empty fail-fast abort.
+    EmptyFailFast,
+    /// Doom-loop abort recovered to the turn checkpoint.
+    DoomLoopAbort,
+    /// ToolLoop corrective forced text (turn-level, loop continues).
+    ToolLoopCorrection,
+    /// Verification passed on the terminal text.
+    VerifyPassed,
+    /// Verification failed (revisions exhausted or hop spent).
+    VerifyFailed,
+    /// Verification skipped (no edits / loop disabled / no command).
+    VerifySkipped,
+}
+
+impl TerminalReason {
+    /// Stable wire label for manifests/fingerprints.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::ForceResponse => "force_response",
+            Self::EmptyFailFast => "empty_fail_fast",
+            Self::DoomLoopAbort => "doom_loop_abort",
+            Self::ToolLoopCorrection => "tool_loop_correction",
+            Self::VerifyPassed => "verify_passed",
+            Self::VerifyFailed => "verify_failed",
+            Self::VerifySkipped => "verify_skipped",
+        }
+    }
+}
+
+impl std::fmt::Display for TerminalReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// F2a E1: terminal text + reason. Produced by `process_response` for pure
+/// text (done-guard/nudge excluded) and by the exhaustion/fail-fast paths;
+/// consumed ONLY by the single `finalize_terminal` (verify + save post-verify).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Terminal {
+    /// Final answer text.
+    pub text: String,
+    /// Why the loop terminated.
+    pub reason: TerminalReason,
+}
+
+impl Terminal {
+    /// Build a terminal value.
+    #[must_use]
+    pub fn new(text: String, reason: TerminalReason) -> Self {
+        Self { text, reason }
+    }
+}
+
+/// F2a E1 predicate: a pure-text response is terminal UNLESS the done-guard
+/// fires (pending contract + done-claim ⇒ corrective nudge, loop continues).
+/// `has_nudge` = `check_done_guard(text).is_some()`. Pure, no IO.
+#[must_use]
+pub fn is_terminal_text(text: &str, has_nudge: bool) -> bool {
+    if has_nudge {
+        return false;
+    }
+    !text.trim().is_empty()
+}
+
 pub use policy::clamp_autorun_hops;
 #[cfg(test)]
 pub(crate) use policy::QWEN_STANCE_OVERLAY;
@@ -215,10 +291,14 @@ mod tests {
         // G2-FIX3 good case: post-construction mutation of tuning.thinking —
         // exactly what the CLI/bench A/B thinking axis does — reaches the LIVE
         // tracker through run()'s lazy seeding. Script: max_iterations=1 so
-        // the bounded loop consumes one response and exhaustion's forced
-        // extraction consumes the second.
+        // the bounded loop consumes one TOOL response (non-terminal) and
+        // exhaustion's forced extraction consumes the terminal text.
+        // F2a E1: pure text is terminal, so the intermediate must be a tool.
         let mut agent = Agent::new(
-            MockClient::new(vec![dummy_response("ok"), dummy_response("final")]),
+            MockClient::new(vec![
+                tool_call_response("Glob", serde_json::json!({"pattern": "*.md"})),
+                dummy_response("final"),
+            ]),
             AgentConfig::default(),
         );
         agent.config.max_iterations = 1;
@@ -230,7 +310,10 @@ mod tests {
         // Control: On maps to NO cap — reasoning-trained models are never
         // force-capped into a thinking-off retry.
         let mut agent = Agent::new(
-            MockClient::new(vec![dummy_response("ok"), dummy_response("final")]),
+            MockClient::new(vec![
+                tool_call_response("Glob", serde_json::json!({"pattern": "*.rs"})),
+                dummy_response("final"),
+            ]),
             AgentConfig::default(),
         );
         agent.config.max_iterations = 1;
@@ -566,12 +649,14 @@ mod tests {
         let file_path = tmp.path().join("step.txt");
         std::fs::write(&file_path, "x").unwrap();
 
+        // F2a E1: intermediate text would terminate, so both loop turns are
+        // tools (non-terminal); exhaustion forces the terminal text.
         let mock = MockClient::new(vec![
             tool_call_response(
                 "Read",
                 serde_json::json!({"path": file_path.to_string_lossy()}),
             ),
-            dummy_response("working on it"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.md"})),
             dummy_response("final answer"),
         ]);
         let cfg = AgentConfig {
@@ -666,17 +751,25 @@ mod tests {
 
         // Per pass: max_iterations(2) tool-loop calls + 1 forced response.
         // Pass 1 edits a file; passes 2-3 are the two revision cycles.
+        // F2a E1: intermediate text would terminate, so loop turns are tools;
+        // forced texts drive verify/revisions.
         let mut responses = vec![
             tool_call_response(
                 "Write",
                 serde_json::json!({"path": notes.to_string_lossy(), "content": "v1"}),
             ),
-            dummy_response("editing"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.md"})),
             dummy_response("done v1"),
         ];
         for round in 2..=3 {
-            responses.push(dummy_response(&format!("fix attempt {round}")));
-            responses.push(dummy_response("still fixing"));
+            responses.push(tool_call_response(
+                "Glob",
+                serde_json::json!({"pattern": format!("*.{round}.md")}),
+            ));
+            responses.push(tool_call_response(
+                "Grep",
+                serde_json::json!({"pattern": format!("fix{round}"), "path": "."}),
+            ));
             responses.push(dummy_response(&format!("done v{round}")));
         }
 
@@ -718,12 +811,13 @@ mod tests {
         let ws = makefile_workspace(dir.path(), 0); // `make test` succeeds
         let notes = ws.join("notes.txt");
 
+        // F2a E1: intermediate text would terminate; use tools in the loop.
         let responses = vec![
             tool_call_response(
                 "Write",
                 serde_json::json!({"path": notes.to_string_lossy(), "content": "v1"}),
             ),
-            dummy_response("editing"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.md"})),
             dummy_response("done v1"),
         ];
         let mut agent = Agent::new(
@@ -763,12 +857,13 @@ mod tests {
         let ws = makefile_workspace(dir.path(), 1); // would fail — but loop is off
         let notes = ws.join("notes.txt");
 
+        // F2a E1: intermediate text would terminate; use tools in the loop.
         let responses = vec![
             tool_call_response(
                 "Write",
                 serde_json::json!({"path": notes.to_string_lossy(), "content": "v1"}),
             ),
-            dummy_response("editing"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.md"})),
             dummy_response("done v1"),
         ];
         let mut agent = Agent::new(
@@ -807,9 +902,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = makefile_workspace(dir.path(), 1); // fails, but agent edited nothing
 
+        // F2a E1: pure text would terminate on the first turn; read-only
+        // tools (no file mods) exhaust the loop so verify stays Skipped.
         let responses = vec![
-            dummy_response("just chatting"),
-            dummy_response("still talking"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.md"})),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.rs"})),
             dummy_response("done"),
         ];
         let mut agent = Agent::new(
@@ -847,7 +944,11 @@ mod tests {
     async fn autorun_hops_zero_keeps_legacy_single_cycle() {
         // hops=0 must be byte-identical legacy: first exhaustion goes straight
         // to force_response — no continuation prompt anywhere in history.
-        let responses = vec![dummy_response("cycle1"), dummy_response("forced final")];
+        // F2a E1: text would terminate, so the loop turn is a tool.
+        let responses = vec![
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.md"})),
+            dummy_response("forced final"),
+        ];
         let mut agent = Agent::new(MockClient::new(responses), AgentConfig::default());
         agent.config.max_iterations = 1;
         let out = agent.run("hi").await.unwrap();
@@ -866,13 +967,12 @@ mod tests {
     #[tokio::test]
     async fn autorun_hop_consumed_on_exhaustion_completes_later_cycle() {
         // max_iterations=1 so each scripted response exhausts one cycle.
-        // hops=2: cycles 1-2 exhaust and consume a hop each (NO forced
-        // response); cycle 3 exhausts with hops==0 → force_response consumes
-        // the 4th scripted reply.
+        // F2a E1: text terminates, so cycles 1-2 are tools (exhaust → hop);
+        // cycle 3 is the natural terminal text (no forced response).
+        // hops=2: 2 CONTINUE + 1 terminal, MAX_STEPS once on the last cycle.
         let responses = vec![
-            dummy_response("cycle1"),
-            dummy_response("cycle2"),
-            dummy_response("cycle3"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.a.md"})),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.b.md"})),
             dummy_response("final answer"),
         ];
         let mut agent = Agent::new(
@@ -914,12 +1014,13 @@ mod tests {
         let ws = makefile_workspace(dir.path(), 1); // always failing tests
         let notes = ws.join("notes.txt");
 
-        // hops=1, max_iterations=2. Fixed-machine trace:
-        //   c1: Write + "editing" -> exhaust -> HOP spent, CONTINUE pushed.
-        //   c2: fix2/fixing2 -> exhaust (hops==0) -> forced "done v2" -> verify
+        // hops=1, max_iterations=2. Fixed-machine trace (F2a E1: loop turns
+        // are tools — text would terminate instead of exhausting):
+        //   c1: Write + Glob -> exhaust -> HOP spent, CONTINUE pushed.
+        //   c2: tools -> exhaust (hops==0) -> forced "done v2" -> verify
         //       FAILED -> REVISION #1 fed back.
-        //   c3: fix3/fixing3 -> forced "done v3" -> FAILED -> REVISION #2.
-        //   c4: fix4/fixing4 -> forced "done v4" -> FAILED, revisions
+        //   c3: tools -> forced "done v3" -> FAILED -> REVISION #2.
+        //   c4: tools -> forced "done v4" -> FAILED, revisions
         //       exhausted, hops==0 -> return as-is.
         // Verification failures spend REVISIONS (feedback pushes), never
         // hops: exactly ONE CONTINUE despite two verify-Failed re-entries.
@@ -928,11 +1029,17 @@ mod tests {
                 "Write",
                 serde_json::json!({"path": notes.to_string_lossy(), "content": "v1"}),
             ),
-            dummy_response("editing"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.c1.md"})),
         ];
         for round in 2..=4 {
-            responses.push(dummy_response(&format!("fix attempt {round}")));
-            responses.push(dummy_response(&format!("still fixing {round}")));
+            responses.push(tool_call_response(
+                "Glob",
+                serde_json::json!({"pattern": format!("*.c{round}a.md")}),
+            ));
+            responses.push(tool_call_response(
+                "Grep",
+                serde_json::json!({"pattern": format!("fix{round}"), "path": "."}),
+            ));
             responses.push(dummy_response(&format!("done v{round}")));
         }
 
@@ -1154,11 +1261,15 @@ mod tests {
     /// emits TWO content-only responses in a row made the THIRD request end
     /// with `[assistant, assistant]` — Ollama rejects it with
     /// "Cannot have 2 or more assistant messages at the end of the list."
+    /// F2a E1: pure text is terminal, so two consecutive prose turns can only
+    /// coexist via the done-guard exclusion (pending contract + done-claim ⇒
+    /// nudge, loop continues). The wire invariant (≤1 trailing assistant)
+    /// still holds for all three requests.
     #[tokio::test]
     async fn two_prose_responses_never_send_double_trailing_assistant() {
         let capturing = CapturingClient::new(vec![
-            dummy_response("alpha"),
-            dummy_response("beta"),
+            dummy_response("All done alpha"),
+            dummy_response("All done beta"),
             dummy_response("forced final"),
         ]);
         let all_calls = capturing.all_calls.clone();
@@ -1168,6 +1279,11 @@ mod tests {
         };
         let mut agent = Agent::new(capturing, cfg);
         agent.config.max_iterations = 2;
+        // Pending contract: done-claims trigger the nudge (excluded from the
+        // terminal predicate), so both prose turns continue the loop.
+        let mut contract = crate::contract::Contract::new("test-guard");
+        contract.add_assertion(crate::contract::AssertionCheck::FileExists("a.rs".into()));
+        agent.set_contract(contract);
 
         let out = agent.run("goal").await.unwrap();
         assert_eq!(out, "forced final");
@@ -1197,7 +1313,7 @@ mod tests {
             .rev()
             .find(|m| m.role == "assistant")
             .expect("history must still contain an assistant message");
-        assert_eq!(last_assistant.content.as_deref(), Some("beta"));
+        assert_eq!(last_assistant.content.as_deref(), Some("All done beta"));
     }
 
     /// G5 sanitizer, direct table: merge case (tool_calls concatenated),

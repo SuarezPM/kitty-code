@@ -29,8 +29,8 @@ pub use kitty_infer::unavailable_error;
 #[cfg(feature = "kitty-infer")]
 pub use kitty_infer::KittyInferClient;
 pub use kitty_infer::{
-    backend_selected, KittyInferConfig, BACKEND_KITTY_INFER, ENV_BACKEND, ENV_CTX,
-    ENV_F32_PREFIXES, ENV_MODEL, ENV_TOKENIZER_DIR,
+    backend_selected, KittyInferConfig, KittyInferRunContext, BACKEND_KITTY_INFER, ENV_BACKEND,
+    ENV_CTX, ENV_F32_PREFIXES, ENV_MODEL, ENV_TOKENIZER_DIR,
 };
 #[cfg(feature = "llama")]
 pub use llama::LlamaCppClient;

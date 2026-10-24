@@ -179,7 +179,20 @@ pub(crate) async fn run_one_bench(
 
     // W1B: esfuerzo real del run (siempre disponible: el loop publica
     // contadores cada turno, también en error/timeout parcial).
+    // F1b: ejes reales del loop, nunca "pending": terminal_reason del
+    // agent, invalid_tool_calls acumulado, y available_context_tokens del
+    // engine (kitty-infer vía run_context) o del harness (ollama).
     let effort = agent.last_run_effort();
+    let terminal_reason = agent
+        .last_terminal_reason()
+        .map(|r| r.as_str().to_string())
+        .unwrap_or_else(|| verdict.to_string());
+    let invalid_tool_calls = agent.invalid_tool_calls();
+    let available_context_tokens = cfg
+        .client
+        .infer_run_context()
+        .map(|c| c.available_context_tokens)
+        .unwrap_or_else(|| agent.available_context_tokens());
     Ok(BenchResult {
         id: ex.id.to_string(),
         lang: ex.label.to_string(),
@@ -190,6 +203,9 @@ pub(crate) async fn run_one_bench(
         iters: Some(effort.iters_used),
         margin: None, // sin logprobs en esta lane (W3)
         effort_off_in_bench: effort.router_off,
+        terminal_reason,
+        invalid_tool_calls,
+        available_context_tokens,
     })
 }
 // ── TB2 homemade: 8 ejercicios locales (NO oficial) ────────────────

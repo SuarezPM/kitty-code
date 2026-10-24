@@ -289,6 +289,38 @@ pub(crate) fn wall_for_verdict(verdict: &str, reported_ms: f64, wall_ms: f64) ->
     }
 }
 
+/// Agregado F1b: razón terminal modal (más frecuente) sobre los 12
+/// ejercicios; `n/a` si vacío (nunca `pending`). Puro y testeado.
+pub(crate) fn aggregate_terminal_reason(results: &[BenchResult]) -> String {
+    if results.is_empty() {
+        return "n/a".to_string();
+    }
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for r in results {
+        *counts.entry(r.terminal_reason.as_str()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(k, _)| k.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+/// Agregado F1b: suma de llamadas inválidas sobre los ejercicios. Puro.
+pub(crate) fn aggregate_invalid_tool_calls(results: &[BenchResult]) -> u64 {
+    results.iter().map(|r| r.invalid_tool_calls as u64).sum()
+}
+
+/// Agregado F1a: ventana mínima disponible (cuello de botella de la
+/// celda); `fallback` cuando vacío. Puro.
+pub(crate) fn aggregate_available_context_tokens(results: &[BenchResult], fallback: u32) -> u32 {
+    results
+        .iter()
+        .map(|r| r.available_context_tokens as u32)
+        .min()
+        .unwrap_or(fallback)
+}
+
 /// Versión kitty pineada (Cargo, en tiempo de compilación).
 pub(crate) fn kitty_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -443,7 +475,20 @@ pub(crate) async fn run_demo12_bench(
 
     // Runmark Capa 0 (Lane B): fingerprint de celda + rechazo de rerun ANTES
     // del primer LLM. scored/offline: memory=off, systemone=off, seed fijo.
+    // F1b: fairness.backend == ollama (validado abajo). kitty-infer NO
+    // corre bajo este manifiesto — usar `demo-12-infer` (arm/manifiesto
+    // NUEVO). Rechazo duro con exit de integridad (stderr, sin stdout).
+    if cli.backend == "kitty-infer" {
+        eprintln!(
+            "integridad: demo-12 declara fairness.backend=ollama; kitty-infer corre en arm/manifiesto NUEVO `demo-12-infer`, nunca bajo este manifiesto"
+        );
+        std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+    }
     // `rep` = 0 siempre (1 rep/invocación, k=1; hueco k=2 futuro, ppc k=1).
+    // F1b: backend_features + available_context_tokens en el fingerprint;
+    // terminal_reason/invalid_tool_calls pre-run como `n/a`/0 (el
+    // manifiesto post-run vuelca el agregado por ejercicio en `details`;
+    // el per-exercise vive en run.rs/common.rs, fuera de este lane).
     let runmark = crate::bench::runmark::Runmark {
         model: cfg.model.clone(),
         digest: model_digest(&cfg.model),
@@ -462,6 +507,14 @@ pub(crate) async fn run_demo12_bench(
         memory: false,
         systemone: crate::bench::common::bench_systemone_label(),
         toolset: crate::bench::common::bench_toolset_label(),
+        backend_features:
+            crate::bench::runmark::BackendFeatures::for_bench(
+                cli.backend,
+                kitty_harness::response_cache::response_cache_enabled(),
+            ),
+        available_context_tokens: cfg.context_window as u32,
+        terminal_reason: "n/a".to_string(),
+        invalid_tool_calls: 0,
     };
     // Ledger SQLite (única fuente de verdad): pre-chequeo + `begin` que
     // reserva la celda ANTES del primer LLM y rechaza el duplicado
@@ -683,9 +736,21 @@ pub(crate) async fn run_demo12_bench(
                 "hops": r.hops,
                 "iters": r.iters,
                 "effort_off_in_bench": r.effort_off_in_bench,
+                "terminal_reason": r.terminal_reason,
+                "invalid_tool_calls": r.invalid_tool_calls,
+                "available_context_tokens": r.available_context_tokens,
             })
         })
         .collect();
+    // F1a/F1b agregados reales (nunca `pending`): modal/suma/mínimo sobre
+    // los 12 + mem_mode/decision_reason del engine (infer) o n/a (ollama).
+    let agg_terminal = aggregate_terminal_reason(&results);
+    let agg_invalid = aggregate_invalid_tool_calls(&results);
+    let agg_available = aggregate_available_context_tokens(&results, cfg.context_window as u32);
+    let (mem_mode, decision_reason) = match cfg.client.infer_run_context() {
+        Some(c) => (c.mem_mode.to_string(), c.decision_reason.to_string()),
+        None => ("n/a (ollama)".to_string(), "n/a (ollama)".to_string()),
+    };
     let ledger_db_str = ledger_path.display().to_string();
     let fingerprint_str = runmark.fingerprint();
     let git_head_str = runmark.git_head.clone();
@@ -729,6 +794,12 @@ pub(crate) async fn run_demo12_bench(
             "ollama_server_ctx": std::env::var("OLLAMA_CONTEXT_LENGTH").unwrap_or("unset (server default; servicio fija 16384)".to_string()),
             "kitty_num_ctx_env": std::env::var(kitty_runtime::client::ENV_NUM_CTX).unwrap_or("unset (probe nativo con techo 32768)".to_string()),
         },
+        "backend_features": runmark.backend_features.canonical_json(),
+        "available_context_tokens": agg_available,
+        "terminal_reason": agg_terminal,
+        "invalid_tool_calls": agg_invalid,
+        "mem_mode": mem_mode,
+        "decision_reason": decision_reason,
         "git_head": git_head_str,
         "git_dirty": runmark.dirty,
         "run_id": run_id,
@@ -764,12 +835,322 @@ pub(crate) async fn run_demo12_bench(
     std::process::exit(exit_code)
 }
 
+/// F1b: arm/manifiesto NUEVO para kitty-infer.
+///
+/// `demo-12` declara `fairness.backend=ollama` y lo valida (rechaza
+/// kitty-infer con exit 3). Este arm corre los mismos 12 ejercicios bajo un
+/// manifiesto propio con `suite=demo-12-infer`, `backend=kitty-infer` y
+/// `arm=kitty-infer`: nunca bajo el manifiesto ollama. Firma paralela a
+/// `run_demo12_bench` para que `bench/mod.rs` la cablee sin tocar este fichero.
+pub(crate) const DEMO12_INFER_SUITE: &str = "demo-12-infer";
+pub(crate) const DEMO12_INFER_ARM: &str = "kitty-infer";
+
+/// Ejercicios demo-12 sin validar el backend del envelope (el arm infer usa
+/// los mismos 12 ejercicios con fairness propia kitty-infer).
+pub(crate) fn load_demo12_exercises_for_infer() -> Result<Vec<JsonExercise>> {
+    let suite: Demo12Suite = serde_json::from_str(EMBEDDED_DEMO12_JSON)
+        .context("demo-12-infer: envelope embebido no parsea")?;
+    if suite.suite != "demo-12" {
+        anyhow::bail!("demo-12-infer: suite base debe ser 'demo-12'");
+    }
+    if suite.version != DEMO12_VERSION {
+        anyhow::bail!("demo-12-infer: version base debe ser {:?}", DEMO12_VERSION);
+    }
+    if suite.exercises.len() != DEMO12_N_EXERCISES {
+        anyhow::bail!("demo-12-infer: 12 ejercicios fijos");
+    }
+    Ok(suite.exercises)
+}
+
+pub(crate) async fn run_demo12_infer_bench(
+    cli: &BenchCliCtx,
+    cfg: &BenchConfig,
+    out: &PathBuf,
+) -> Result<()> {
+    // Arm infer exige backend kitty-infer (usar demo-12 para ollama).
+    if cli.backend != "kitty-infer" {
+        eprintln!(
+            "integridad: demo-12-infer exige backend kitty-infer (got {:?}); usar demo-12 para ollama",
+            cli.backend
+        );
+        std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+    }
+    let exercises = load_demo12_exercises_for_infer()?;
+    let items = demo12_to_bench_items(&exercises)?;
+    // Fairness propia del arm (misma base, backend kitty-infer).
+    let mut fairness_json: serde_json::Value =
+        serde_json::from_str(EMBEDDED_DEMO12_JSON)
+            .context("demo-12-infer fairness copy")
+            .map(|v: serde_json::Value| {
+                v.get("fairness").cloned().unwrap_or(serde_json::Value::Null)
+            })?;
+    if let Some(obj) = fairness_json.as_object_mut() {
+        obj.insert(
+            "backend".to_string(),
+            serde_json::json!("kitty-infer"),
+        );
+        obj.insert(
+            "note".to_string(),
+            serde_json::json!("arm NUEVO kitty-infer: mismos 12 ejercicios, manifiesto propio; nunca bajo fairness.backend=ollama"),
+        );
+    }
+
+    let runmark = crate::bench::runmark::Runmark {
+        model: cfg.model.clone(),
+        digest: model_digest(&cfg.model),
+        backend: "kitty-infer".to_string(),
+        profile: cfg.profile.name.to_string(),
+        ctx: cfg.context_window as u32,
+        max_iter: DEMO12_MAX_TURNS,
+        hops: 0,
+        suite: DEMO12_INFER_SUITE.to_string(),
+        dataset_sha: crate::bench::runmark::sha_of_str(EMBEDDED_DEMO12_JSON),
+        timeout_cell: DEMO12_TIMEOUT_SECS,
+        seed: 42,
+        rep: 0,
+        git_head: git_head(),
+        dirty: git_dirty(),
+        memory: false,
+        systemone: crate::bench::common::bench_systemone_label(),
+        toolset: crate::bench::common::bench_toolset_label(),
+        backend_features:
+            crate::bench::runmark::BackendFeatures::for_bench(
+                "kitty-infer",
+                kitty_harness::response_cache::response_cache_enabled(),
+            ),
+        available_context_tokens: cfg
+            .client
+            .infer_run_context()
+            .map(|c| c.available_context_tokens as u32)
+            .unwrap_or(cfg.context_window as u32),
+        terminal_reason: "n/a".to_string(),
+        invalid_tool_calls: 0,
+    };
+    if let Err(e) = crate::bench::runmark::check_rerun_rejected(out, &runmark.fingerprint()) {
+        eprintln!("integridad: {e:#}");
+        std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+    }
+    if kitty_harness::guard::is_run_leaked() {
+        eprintln!("integridad: run marcado con leak (tripwire): demo-12-infer no corre");
+        std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+    }
+    let ledger_path = crate::bench::ledger::ledger_db_path(out);
+    let ledger = match crate::bench::ledger::Ledger::open(&ledger_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("integridad: no se pudo abrir el ledger {}: {e:#}", ledger_path.display());
+            std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+        }
+    };
+    let run_id = match ledger.begin(&crate::bench::ledger::LedgerStamp {
+        fingerprint: runmark.fingerprint(),
+        suite: DEMO12_INFER_SUITE.to_string(),
+        arm: DEMO12_INFER_ARM.to_string(),
+        rep: runmark.rep as i64,
+        git_head: runmark.git_head.clone(),
+        dirty: runmark.dirty,
+        started_at: utc_timestamp(),
+    }) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("integridad: {e:#}");
+            std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+        }
+    };
+
+    let mut demo_cfg = cfg.clone();
+    demo_cfg.max_iterations = DEMO12_MAX_TURNS;
+    demo_cfg.autorun_hops = 0;
+    demo_cfg.exercise_timeout_secs = DEMO12_TIMEOUT_SECS;
+    demo_cfg.use_memory = false;
+    demo_cfg.enable_knowledge = false;
+
+    println!("Kitty Code demo-12-infer (arm NUEVO kitty-infer)");
+    println!("  Suite: {DEMO12_INFER_SUITE} v{DEMO12_VERSION} (12 fijos, 1 rep/invocación, serie k>=3)");
+    println!("  Model: {}", cfg.model);
+    println!("  Backend: kitty-infer (arm propio; nunca bajo manifiesto ollama)");
+    println!("  Max turns: {DEMO12_MAX_TURNS}  Timeout: {DEMO12_TIMEOUT_SECS}s/celda");
+    println!();
+
+    let mut store: Option<kitty_memory::EpisodeStore> = None;
+    let mut results: Vec<BenchResult> = Vec::with_capacity(DEMO12_N_EXERCISES);
+    for (i, ex) in items.iter().enumerate() {
+        print!("[{:2}/{:2}] ", i + 1, DEMO12_N_EXERCISES);
+        let wall_start = Instant::now();
+        let r = run_one_bench(ex, &demo_cfg, &mut store).await?;
+        let wall_ms = wall_start.elapsed().as_millis() as f64;
+        let latency_ms = wall_for_verdict(&r.verdict, r.latency_ms, wall_ms);
+        results.push(BenchResult { latency_ms, ..r });
+    }
+
+    let passed = results.iter().filter(|r| r.passed).count();
+    let total = results.len();
+    let rate = if total > 0 { 100.0 * passed as f64 / total as f64 } else { 0.0 };
+    let walls: Vec<f64> = results.iter().map(|r| r.latency_ms).collect();
+    let p50 = p50_wall(walls.clone());
+    let p99 = p99_wall(walls.clone());
+    let timed_out = results.iter().filter(|r| r.verdict == "timeout").count();
+    let (_p99_check, p99_censored) =
+        kitty_harness::comparison::p99_ms_censored(walls.clone(), timed_out);
+    let rango = if walls.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (
+            walls.iter().cloned().fold(f64::INFINITY, f64::min),
+            walls.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+    let by_lang = tally_by_language(&results);
+
+    println!();
+    println!("RESULTS (demo-12-infer evidencia, 1 rep)");
+    println!("Passed: {passed}/{total} ({rate:.1}%)");
+    println!("  wall p50={p50:.0}ms p99={p99:.0}ms rango=[{:.0},{:.0}]ms{}",
+        rango.0, rango.1, if p99_censored { " (p99 censored: hubo timeouts)" } else { "" });
+
+    if kitty_harness::guard::is_run_leaked() {
+        let _ = ledger.mark_leaked(&run_id);
+        let _ = ledger.finish(&run_id, &utc_timestamp(), crate::bench::runmark::EXIT_INTEGRITY);
+        eprintln!("integridad: run marcado con leak durante probes (tripwire): sin resume");
+        std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+    }
+    let ledger_clean = ledger.is_clean(&run_id).unwrap_or(false);
+    let signal = kitty_harness::comparison::decide_signal(passed, total, passed, total, ledger_clean, 1);
+    let exit_code = match &signal {
+        kitty_harness::comparison::Signal::Signal => crate::bench::runmark::EXIT_PASS,
+        kitty_harness::comparison::Signal::NoSignal(_) => crate::bench::runmark::EXIT_INCONCLUSIVE,
+    };
+
+    let by_language_json: std::collections::BTreeMap<String, serde_json::Value> = by_lang
+        .iter()
+        .map(|(lang, t)| {
+            (
+                lang.clone(),
+                serde_json::json!({
+                    "attempted": t.attempted,
+                    "passed": t.passed,
+                    "failed": t.failed,
+                    "errored": t.errored,
+                }),
+            )
+        })
+        .collect();
+    let details_json: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "lang": r.lang,
+                "passed": r.passed,
+                "verdict": r.verdict,
+                "latency_ms": r.latency_ms,
+                "wall_ms": r.latency_ms,
+                "hops": r.hops,
+                "iters": r.iters,
+                "effort_off_in_bench": r.effort_off_in_bench,
+                "terminal_reason": r.terminal_reason,
+                "invalid_tool_calls": r.invalid_tool_calls,
+                "available_context_tokens": r.available_context_tokens,
+            })
+        })
+        .collect();
+    // F1a/F1b agregados reales del arm infer (nunca `pending`): modal/suma/
+    // mínimo + mem_mode/decision_reason del engine vía run_context.
+    let agg_terminal = aggregate_terminal_reason(&results);
+    let agg_invalid = aggregate_invalid_tool_calls(&results);
+    let agg_available =
+        aggregate_available_context_tokens(&results, cfg.context_window as u32);
+    let infer_ctx = cfg.client.infer_run_context();
+    let (mem_mode, decision_reason) = match &infer_ctx {
+        Some(c) => (c.mem_mode.to_string(), c.decision_reason.to_string()),
+        None => (
+            "utilization-fallback".to_string(),
+            "automatic-mapping".to_string(),
+        ),
+    };
+    let agg_available = infer_ctx
+        .map(|c| c.available_context_tokens as u32)
+        .unwrap_or(agg_available);
+    let output = serde_json::json!({
+        "suite": DEMO12_INFER_SUITE,
+        "arm": DEMO12_INFER_ARM,
+        "version": DEMO12_VERSION,
+        "fairness": fairness_json,
+        "model": cfg.model,
+        "model_digest": runmark.digest.clone(),
+        "backend": "kitty-infer",
+        "url": cli.url,
+        "max_turns": DEMO12_MAX_TURNS,
+        "timeout_secs_per_exercise": DEMO12_TIMEOUT_SECS,
+        "signal": signal.to_string(),
+        "exit_code": exit_code,
+        "gates_off_actual": {
+            "autorun_hops": 0,
+            "knowledge": false,
+            "memory": false,
+            "effort_router": "pass-through (effort_off_in_bench por celda)",
+        },
+        "backend_features": runmark.backend_features.canonical_json(),
+        "available_context_tokens": agg_available,
+        "terminal_reason": agg_terminal,
+        "invalid_tool_calls": agg_invalid,
+        "mem_mode": mem_mode,
+        "decision_reason": decision_reason,
+        "git_head": runmark.git_head.clone(),
+        "git_dirty": runmark.dirty,
+        "run_id": run_id,
+        "ledger_db": ledger_path.display().to_string(),
+        "runmark_fingerprint": runmark.fingerprint(),
+        "timestamp_utc": utc_timestamp(),
+        "total": total,
+        "passed": passed,
+        "rate_pct": rate,
+        "wall_p50_ms": p50,
+        "wall_p99_ms": p99,
+        "wall_p99_censored": p99_censored,
+        "wall_rango_ms": [rango.0, rango.1],
+        "memory": false,
+        "by_language": by_language_json,
+        "details": details_json,
+    });
+    std::fs::write(out, serde_json::to_string_pretty(&output)?)?;
+    println!("Results saved to {}", out.display());
+    crate::bench::runmark::write_sidecar_atomic(out, &runmark)?;
+    if let Err(e) = ledger.finish(&run_id, &utc_timestamp(), exit_code) {
+        warn!("ledger finish falló (best-effort): {e:#}");
+    }
+    println!(
+        "Runmark saved to {} (fingerprint {})",
+        crate::bench::runmark::sidecar_path(out).display(),
+        runmark.fingerprint()
+    );
+    println!("demo-12-infer {signal} (exit {exit_code})");
+    std::process::exit(exit_code)
+}
+
 #[cfg(test)]
 mod demo12_tests {
     use super::{
-        demo12_to_bench_items, load_demo12_suite, p50_wall, p99_wall, validate_demo12_suite,
-        wall_for_verdict, DEMO12_N_EXERCISES, DEMO12_VERSION,
+        demo12_to_bench_items, load_demo12_exercises_for_infer, load_demo12_suite, p50_wall,
+        p99_wall, validate_demo12_suite, wall_for_verdict, DEMO12_INFER_ARM,
+        DEMO12_INFER_SUITE, DEMO12_N_EXERCISES, DEMO12_VERSION,
     };
+
+    #[test]
+    fn infer_arm_has_own_suite_and_manifest_not_ollama() {
+        // Arm NUEVO: suite y arm propios, mismos 12 ejercicios, fairness
+        // parcheada a kitty-infer (nunca backend ollama bajo ese manifiesto).
+        assert_eq!(DEMO12_INFER_SUITE, "demo-12-infer");
+        assert_eq!(DEMO12_INFER_ARM, "kitty-infer");
+        assert_ne!(DEMO12_INFER_SUITE, "demo-12");
+        let exercises = load_demo12_exercises_for_infer().unwrap();
+        assert_eq!(exercises.len(), DEMO12_N_EXERCISES);
+        let items = demo12_to_bench_items(&exercises).unwrap();
+        assert_eq!(items.len(), DEMO12_N_EXERCISES);
+        // El envelope base sigue declarando ollama (el arm infer lo parchea).
+        let suite = load_demo12_suite().unwrap();
+        assert_eq!(suite.fairness.backend, "ollama");
+    }
 
     #[test]
     fn embedded_envelope_validates() {
@@ -855,6 +1236,47 @@ mod demo12_tests {
 
     // === Fix begin/leak: el tripwire pre-LLM va ANTES de `begin` (ppc.rs:279)
     // y el intra-run cierra con mark_leaked+finish antes del exit 3 ===
+
+    #[test]
+    fn aggregates_are_real_never_pending() {
+        use super::{aggregate_available_context_tokens, aggregate_invalid_tool_calls,
+            aggregate_terminal_reason};
+        use crate::bench::common::BenchResult;
+
+        fn mk(terminal: &str, invalid: usize, avail: usize) -> BenchResult {
+            BenchResult {
+                id: "x".to_string(),
+                lang: "python".to_string(),
+                passed: true,
+                verdict: "pass".to_string(),
+                latency_ms: 1.0,
+                hops: None,
+                iters: None,
+                margin: None,
+                effort_off_in_bench: false,
+                terminal_reason: terminal.to_string(),
+                invalid_tool_calls: invalid,
+                available_context_tokens: avail,
+            }
+        }
+        let results = vec![
+            mk("text", 1, 16384),
+            mk("text", 0, 16384),
+            mk("force_response", 2, 8192),
+        ];
+        // Modal, suma, mínimo — nunca `pending`.
+        assert_eq!(aggregate_terminal_reason(&results), "text");
+        assert_eq!(aggregate_invalid_tool_calls(&results), 3);
+        assert_eq!(
+            aggregate_available_context_tokens(&results, 16384),
+            8192
+        );
+        assert_ne!(aggregate_terminal_reason(&results), "pending");
+        // Vacío honesto: n/a, 0, fallback (el driver no corrió).
+        assert_eq!(aggregate_terminal_reason(&[]), "n/a");
+        assert_eq!(aggregate_invalid_tool_calls(&[]), 0);
+        assert_eq!(aggregate_available_context_tokens(&[], 16384), 16384);
+    }
 
     #[test]
     fn leaked_run_cerrado_no_pasa_is_clean() {

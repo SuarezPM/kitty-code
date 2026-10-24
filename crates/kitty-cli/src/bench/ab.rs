@@ -380,6 +380,9 @@ mod bench_ab_tests {
                 iters: None,
                 margin: None,
                 effort_off_in_bench: false,
+                terminal_reason: verdict.to_string(),
+                invalid_tool_calls: 0,
+                available_context_tokens: 16384,
             }
         }
         // Mixed fixture: 2 pass + 1 fail + 2 error + 1 timeout.

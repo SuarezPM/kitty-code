@@ -50,6 +50,12 @@ pub struct Agent {
     pub(crate) contract: Option<Contract>,
     /// Consecutive invalid tool calls (NotFound, InvalidArgs) — breaker mechanism (F4.3).
     pub(crate) invalid_streak: usize,
+    /// F2a E2: cumulative invalid tool calls in this agent (NotFound +
+    /// InvalidArgs, never reset per run). Measured for the A/B gate.
+    pub(crate) invalid_tool_calls: usize,
+    /// F2a E1: reason of the last terminal produced by `finalize_terminal`
+    /// (`None` until the first run terminates).
+    pub(crate) last_terminal_reason: Option<super::TerminalReason>,
     /// W1B: hops consumidos en el último `run` (para `BenchResult.hops`).
     pub(crate) last_run_hops_used: usize,
     /// W1B: iteraciones consumidas en el último `run` (`BenchResult.iters`).
@@ -231,6 +237,8 @@ impl Agent {
             router: ToolRouter::new(),
             contract: None,
             invalid_streak: 0,
+            invalid_tool_calls: 0,
+            last_terminal_reason: None,
             last_run_hops_used: 0,
             last_run_iters_used: 0,
             last_run_router_off: false,
@@ -238,7 +246,12 @@ impl Agent {
             closer: None,
             seed: None,
             speculative: false,
-            response_cache: None,
+            // F2a E3: opt-in via `KITTY_RESPONSE_CACHE`, default OFF
+            // everywhere (bench incluido). `with_response_cache(_from_env)`
+            // puede elevarlo después; aquí nunca default silencioso.
+            response_cache: crate::response_cache::response_cache_cap().map(|cap| {
+                std::sync::Mutex::new(crate::response_cache::ResponseCache::new(cap))
+            }),
             predictor: crate::pld::NgramPredictor::new(),
         }
     }
@@ -380,6 +393,40 @@ impl Agent {
             crate::response_cache::ResponseCache::new(cap),
         ));
         self
+    }
+
+    /// F2a E3: opt-in from env (`KITTY_RESPONSE_CACHE`, default OFF). Returns
+    /// `self` unchanged when the env flag is absent/invalid; otherwise enables
+    /// the cache with the requested cap. Bench paths stay OFF unless the env
+    /// explicitly opts in (never silent default).
+    pub fn with_response_cache_from_env(mut self) -> Self {
+        if let Some(cap) = crate::response_cache::response_cache_cap() {
+            self.response_cache = Some(std::sync::Mutex::new(
+                crate::response_cache::ResponseCache::new(cap),
+            ));
+        }
+        self
+    }
+
+    /// F2a E2: cumulative invalid tool calls (NotFound + InvalidArgs).
+    pub fn invalid_tool_calls(&self) -> usize {
+        self.invalid_tool_calls
+    }
+
+    /// F2a E1: reason of the last terminal (`None` before the first run).
+    pub fn last_terminal_reason(&self) -> Option<super::TerminalReason> {
+        self.last_terminal_reason
+    }
+
+    /// Available context tokens for the current budget (remaining window).
+    /// Feeds the `available_context_tokens` runmark axis.
+    pub fn available_context_tokens(&self) -> usize {
+        self.budget.remaining()
+    }
+
+    /// Whether the idempotent response cache is enabled on this agent.
+    pub fn response_cache_enabled(&self) -> bool {
+        self.response_cache.is_some()
     }
 
     /// W5-code: most likely next tool after `ctx` (trailing executed names),

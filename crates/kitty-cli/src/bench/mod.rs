@@ -7,6 +7,7 @@ pub mod claweval;
 pub mod common;
 pub mod demo12;
 pub mod gpqa;
+pub mod inferperf;
 pub mod ledger;
 pub mod polyglot;
 pub mod ppc;
@@ -194,6 +195,8 @@ pub async fn bench_command(cli: BenchCliCtx, client: BenchClient, args: BenchArg
     // --- demo-12 fija versionada (W8, justicia embebida; trampa --exercises) ---
     // `--exercises` espera array pelado y `suite == "polyglot"` retorna antes;
     // demo-12 parsea su envelope propio y NUNCA usa ese flag (se ignora con warn).
+    // F2a E5: demo-12 exige backend ollama (rechaza kitty-infer con exit 3);
+    // demo-12-infer es el arm/manifiesto NUEVO para kitty-infer.
     if suite == "demo-12" {
         if exercises_path.is_some() {
             warn!("demo-12 ignora --exercises (trampa conocida bench/mod.rs:171): corre la suite propia embebida v1.0.0");
@@ -202,6 +205,23 @@ pub async fn bench_command(cli: BenchCliCtx, client: BenchClient, args: BenchArg
             info!(limit, "demo-12 ignora --limit (siempre 12 fijos por rep)");
         }
         return demo12::run_demo12_bench(&cli, &cfg, &out).await;
+    }
+    if suite == "demo-12-infer" {
+        if exercises_path.is_some() {
+            warn!("demo-12-infer ignora --exercises: corre los 12 propios embebidos");
+        }
+        if limit != 12 {
+            info!(limit, "demo-12-infer ignora --limit (siempre 12 fijos por rep)");
+        }
+        return demo12::run_demo12_infer_bench(&cli, &cfg, &out).await;
+    }
+
+    // --- inferperf steady-state tok/s (F1b, Lane D provee; Lane B cablea) ---
+    // Firma exacta que provee Lane D:
+    // `inferperf::run_inferperf_suite(&cli, &cfg, &out) -> Result<()>`.
+    // Una celda por invocación y backend (append-only JSONL al mismo `--out`).
+    if suite == "inferperf" {
+        return inferperf::run_inferperf_suite(&cli, &cfg, &out).await;
     }
 
     println!("Kitty Code Benchmark");

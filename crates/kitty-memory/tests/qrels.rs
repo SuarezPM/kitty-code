@@ -5,11 +5,12 @@
 //! 30 episodes / 12 queries, one relevant doc each. Queries paraphrase their
 //! target sharing rare tokens; distractors share only common words.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use kitty_memory::{
-    ndcg_at_k, normalize_embedding, recall_at_k, reciprocal_rank, EpisodeStore, RecallMode,
-    RrfParams, ScoringWeights, ENV_HYBRID_RECALL, MODEL_DIM,
+    episode_tier, fuse_rankings_weighted, fuse_rankings_weighted_tiered, ndcg_at_k,
+    normalize_embedding, recall_at_k, reciprocal_rank, EpisodeStore, FuseChannel, RecallMode,
+    RrfParams, ScoringWeights, TierWeights, ENV_HYBRID_RECALL, MODEL_DIM,
 };
 
 /// Deterministic PRNG (splitmix64) for synthetic dense vectors — same
@@ -282,7 +283,10 @@ fn qrels_jaccard_at3_holdout_disjoint() {
             .collect();
         let rj = recall_at_k(&jaccard, &rel, K);
         let rh = recall_at_k(&hybrid, &rel, K);
-        println!("holdout q={query:?} target={} jaccard@3={rj:.3} hybrid@3={rh:.3}", TARGETS[target].0);
+        println!(
+            "holdout q={query:?} target={} jaccard@3={rj:.3} hybrid@3={rh:.3}",
+            TARGETS[target].0
+        );
         // Sin fill: el brazo que no puntúa devuelve vacío en vez de
         // recientes — aquí ambas queries tienen overlap, así que ambos
         // deben recuperar al relevante dentro del top-3.
@@ -305,7 +309,11 @@ fn qrels_jaccard_at3_holdout_disjoint() {
         }
     }
     let n = holdout.len() as f32;
-    println!("HOLDOUT recall@3 jaccard={:.3} hybrid={:.3} (n={n})", sum_j / n, sum_h / n);
+    println!(
+        "HOLDOUT recall@3 jaccard={:.3} hybrid={:.3} (n={n})",
+        sum_j / n,
+        sum_h / n
+    );
     // Piso del holdout (corpus saturado): ambos ≥ 0.5. Sin exigencia de
     // victoria del híbrido — documentar, no ganar.
     assert!(
@@ -317,6 +325,247 @@ fn qrels_jaccard_at3_holdout_disjoint() {
         sum_h / n >= 0.5,
         "hybrid@3 holdout bajo el piso: {:.3}",
         sum_h / n
+    );
+}
+
+/// F2b P0-b — corpus DURO: overlap léxico roto a propósito.
+///
+/// 8 targets × query sin NINGÚN token en común (paráfrasis por sinónimos),
+/// cada query con 3 trampas léxicas (distractores que comparten 1-2 tokens
+/// de la query con sentido ajeno). El brazo léxico no solo falla: apunta a
+/// las trampas. El brazo denso (sintético, correlación solo query↔target
+/// como en `build_store`) debe seguir decidiendo. Los targets van
+/// `importance = 0.9` (tier 0) y las trampas `0.0` (tier 2): la hipótesis
+/// bajo test es que el ajuste por tier rompe empates a favor de lo
+/// verificado/destacado sin colapsar cuando no aporta.
+///
+/// Gate: NO-regresión tiered ≥ untiered (un empate pasa: si no gana, se
+/// reporta, no se fuerza). Dureza pineada: BM25 top-1 ≠ target en TODAS
+/// las queries (si alguna pasa, el corpus dejó de ser duro y el test debe
+/// fallar para recalibración, no para verde fácil).
+const HARD_TARGETS: &[(&str, &str, &str)] = &[
+    (
+        "automobile velocity calibration",
+        "garage/dyno.rs",
+        "car speed tune",
+    ),
+    (
+        "canine obedience training",
+        "pets/school.rs",
+        "dog tricks class",
+    ),
+    (
+        "feline hydration fountain",
+        "pets/water.rs",
+        "cat drink bowl",
+    ),
+    (
+        "residence illumination retrofit",
+        "home/lights.rs",
+        "house lamp upgrade",
+    ),
+    (
+        "bicycle drivetrain maintenance",
+        "shop/bike.rs",
+        "pedal chain repair",
+    ),
+    (
+        "photographic exposure triangle",
+        "photo/manual.rs",
+        "camera light settings",
+    ),
+    (
+        "culinary fermentation chamber",
+        "kitchen/crock.rs",
+        "cooking pickle vat",
+    ),
+    (
+        "aquatic filtration cycle",
+        "tank/filter.rs",
+        "fish pond cleaning",
+    ),
+];
+
+const HARD_TRAPS: &[&[&str]] = &[
+    &[
+        "car wash schedule notes",
+        "guitar tune practice log",
+        "speed running plan",
+    ],
+    &[
+        "dog food recipe list",
+        "magic tricks tutorial",
+        "night class timetable",
+    ],
+    &[
+        "cat meme gallery dump",
+        "sports drink review",
+        "soup bowl collection",
+    ],
+    &[
+        "house loan rate sheet",
+        "street lamp outage map",
+        "software upgrade notes",
+    ],
+    &[
+        "pedal steel guitar tabs",
+        "supply chain logistics",
+        "phone repair shop rates",
+    ],
+    &[
+        "camera bag review thread",
+        "light bulb wattage chart",
+        "settings menu redesign",
+    ],
+    &[
+        "cooking show episode recap",
+        "pickle recipe brine ratio",
+        "army vat dyeing manual",
+    ],
+    &[
+        "fish taco recipe card",
+        "pond hockey league rules",
+        "office cleaning rota",
+    ],
+];
+
+fn build_hard_store() -> (EpisodeStore, tempfile::TempDir, Vec<String>, Vec<Vec<f32>>) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = EpisodeStore::open(tmp.path().join("hard.db").to_str().unwrap()).unwrap();
+    let now = 1_800_000_000_i64;
+    let mut rng = SplitMix64::new(0xf2b0_2026);
+    let mut query_embs = Vec::new();
+    let mut ids = Vec::new();
+    for (i, (goal, file, _)) in HARD_TARGETS.iter().enumerate() {
+        let mut ep =
+            kitty_memory::Episode::new((*goal).into(), vec![(*file).into()], None, "done".into());
+        ep.timestamp = now - (i as i64 + 1) * 2 * 86_400;
+        ep.id = kitty_memory::Episode::compute_id(&ep.goal, ep.timestamp);
+        ep.importance = 0.9; // tier 0: destacado por el operador
+        ids.push(ep.id.clone());
+        let q = rand_unit_vec(&mut rng);
+        let r = rand_unit_vec(&mut rng);
+        let mut t: Vec<f32> = q.iter().zip(r.iter()).map(|(a, b)| a + 0.3 * b).collect();
+        normalize_embedding(&mut t);
+        query_embs.push(q);
+        store.save_with_embedding(&ep, &t).unwrap();
+    }
+    for (j, traps) in HARD_TRAPS.iter().enumerate() {
+        for (k, goal) in traps.iter().enumerate() {
+            let mut ep = kitty_memory::Episode::new(
+                (*goal).into(),
+                vec!["trap".into()],
+                None,
+                "done".into(),
+            );
+            ep.timestamp = now - (j as i64 + 1) * 86_400 - k as i64 * 3600;
+            ep.id = kitty_memory::Episode::compute_id(&ep.goal, ep.timestamp);
+            // importance 0.0 ⇒ tier 2 (rutina).
+            let d = rand_unit_vec(&mut rng);
+            store.save_with_embedding(&ep, &d).unwrap();
+        }
+    }
+    (store, tmp, ids, query_embs)
+}
+
+/// Ordena un mapa fusionado a ranking determinista (score desc, id asc).
+fn rank_fused(fused: &HashMap<String, f32>) -> Vec<String> {
+    let mut v: Vec<(&String, &f32)> = fused.iter().collect();
+    v.sort_by(|a, b| {
+        b.1.partial_cmp(a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+    v.into_iter().map(|(id, _)| id.clone()).collect()
+}
+
+#[test]
+fn tiered_vs_untiered_no_regression_on_hard_corpus() {
+    const K: usize = 3;
+    let (store, _tmp, ids, query_embs) = build_hard_store();
+    // Tiers por episodio: targets tier 0, trampas tier 2.
+    let all = store.recall_recent(100).unwrap();
+    let doc_tiers: HashMap<String, u8> = all
+        .iter()
+        .map(|ep| (ep.id.clone(), episode_tier(ep.importance, ep.settled)))
+        .collect();
+    for (i, (_, _, _)) in HARD_TARGETS.iter().enumerate() {
+        assert_eq!(
+            doc_tiers[&ids[i]], 0,
+            "el target {i} debe ser tier 0 (importance 0.9)"
+        );
+    }
+    let params = RrfParams {
+        n: 50,
+        ..RrfParams::default()
+    };
+    let tier_w = TierWeights::default();
+    let (mut sum_r_u, mut sum_r_t, mut sum_n_u, mut sum_n_t) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
+    for (qi, (_, _, query)) in HARD_TARGETS.iter().enumerate() {
+        let rel: HashSet<String> = [ids[qi].clone()].into_iter().collect();
+        let lex: Vec<String> = store
+            .recall_bm25(query, 10)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let dense: Vec<String> = store
+            .recall_by_embedding(&query_embs[qi], 10)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        // DUREZA: el léxico apunta a trampas, nunca al target top-1.
+        assert!(
+            lex.first().is_some_and(|top| *top != ids[qi]),
+            "corpus blando en q{qi} {query:?}: BM25 top-1 es el target"
+        );
+        assert!(
+            !lex.contains(&ids[qi]),
+            "corpus blando en q{qi} {query:?}: el target aparece en el ranking léxico"
+        );
+        // Canal denso vivo: top-1 es el target.
+        assert!(
+            dense.first().is_some_and(|top| *top == ids[qi]),
+            "canal denso roto en q{qi} {query:?}: top-1 no es el target"
+        );
+        let rankings = vec![(FuseChannel::Lexical, lex), (FuseChannel::Dense, dense)];
+        let untiered = rank_fused(&fuse_rankings_weighted(&rankings, &params));
+        let tiered = rank_fused(&fuse_rankings_weighted_tiered(
+            &rankings, &params, &tier_w, &doc_tiers,
+        ));
+        let ru = recall_at_k(&untiered, &rel, K);
+        let rt = recall_at_k(&tiered, &rel, K);
+        let nu = ndcg_at_k(&untiered, &rel, K);
+        let nt = ndcg_at_k(&tiered, &rel, K);
+        println!(
+            "hard q{qi} {query:?}: untiered_rank={:?} tiered_rank={:?} r@{K} {ru:.3}→{rt:.3} ndcg@{K} {nu:.3}→{nt:.3}",
+            untiered.iter().position(|id| *id == ids[qi]),
+            tiered.iter().position(|id| *id == ids[qi]),
+        );
+        sum_r_u += ru;
+        sum_r_t += rt;
+        sum_n_u += nu;
+        sum_n_t += nt;
+    }
+    let n = HARD_TARGETS.len() as f32;
+    let (mr_u, mr_t, mn_u, mn_t) = (sum_r_u / n, sum_r_t / n, sum_n_u / n, sum_n_t / n);
+    println!("HARD untiered recall@{K}={mr_u:.3} ndcg@{K}={mn_u:.3}");
+    println!("HARD tiered   recall@{K}={mr_t:.3} ndcg@{K}={mn_t:.3}");
+    // Pisos: ningún brazo colapsa en el corpus duro.
+    assert!(mr_u >= 0.5, "untiered colapsa en duro: {mr_u:.3}");
+    assert!(mr_t >= 0.5, "tiered colapsa en duro: {mr_t:.3}");
+    // Gate no-regresión: el empate pasa (si no gana, se reporta arriba).
+    if mr_t < mr_u || mn_t < mn_u {
+        println!("NOTE: tiered no gana en duro (recall {mr_u:.3}→{mr_t:.3}, ndcg {mn_u:.3}→{mn_t:.3}): reportado, no forzado");
+    }
+    assert!(
+        mr_t + 1e-6 >= mr_u,
+        "tiered regresa recall@{K}: {mr_t:.3} < {mr_u:.3}"
+    );
+    assert!(
+        mn_t + 1e-6 >= mn_u,
+        "tiered regresa ndcg@{K}: {mn_t:.3} < {mn_u:.3}"
     );
 }
 

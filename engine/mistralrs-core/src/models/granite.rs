@@ -23,7 +23,10 @@ use crate::{
     },
     layers::{embedding_with_legacy_tied_uqff, CausalMasker, RmsNorm, RotaryEmbedding, Sdpa},
     layers_masker::PastKvLenCache,
-    paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
+    paged_attention::{
+        AttentionImplementation, HybridPagedKvCacheConfig, ModelConfigLike, ModelConfigMetadata,
+        PagedAttention,
+    },
     pipeline::{
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
         EitherCache, ForwardMaskCache, IsqModel, KvCache, ModelForwardContext,
@@ -2412,6 +2415,21 @@ impl NormalModel for GraniteMoeHybrid {
     }
     fn config(&self) -> &ModelConfigMetadata {
         &self.cfg
+    }
+    fn model_config(&self) -> Arc<dyn ModelConfigLike + Send + Sync> {
+        let mask: Vec<bool> = self
+            .layer_types
+            .iter()
+            .map(|lt| matches!(lt, GraniteLayerType::Attention))
+            .collect();
+        if mask.len() == self.cfg.num_layers
+            && mask.contains(&true)
+            && mask.contains(&false)
+        {
+            Arc::new(HybridPagedKvCacheConfig::new(self.cfg.clone(), mask))
+        } else {
+            Arc::new(self.cfg.clone())
+        }
     }
     fn supports_packed_prefill(&self) -> bool {
         true

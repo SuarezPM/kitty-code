@@ -35,7 +35,7 @@ use std::future::Future;
 #[cfg(feature = "kitty-infer")]
 use std::pin::Pin;
 #[cfg(feature = "kitty-infer")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "kitty-infer")]
 use mistralrs::{
@@ -51,16 +51,47 @@ pub const BACKEND_KITTY_INFER: &str = "kitty-infer";
 pub const ENV_MODEL: &str = "KITTY_INFER_MODEL";
 /// Sidecar dir holding `<...>/MiniCPM5-2B/tokenizer.json`.
 pub const ENV_TOKENIZER_DIR: &str = "KITTY_INFER_TOKENIZER_DIR";
-/// Context length override (default 4096 — honest for 8GB consumer GPUs).
+/// Context length override (default 16384 — full 16K window, F1a).
 pub const ENV_CTX: &str = "KITTY_INFER_CTX";
 /// Extra comma-separated F32 filename prefixes.
 pub const ENV_F32_PREFIXES: &str = "KITTY_INFER_F32_PREFIXES";
-/// GPU layer count override (e.g. `12` keeps 12 layers on cuda[0], spilling
-/// the rest to CPU). Unset = automatic mapping. Needed for >8GB models
-/// (K2 9.5GB) where auto packs too tight to survive prefill transients.
+/// Manual GPU-layer spill knob (PROHIBITED by policy, P0-4).
+///
+/// The name stays so a set variable warns loudly and is IGNORED: automatic
+/// mapping owns placement (byte precheck + auto map spill whole layers by
+/// measured VRAM; a hand-picked count rots across quants and ctx). Unset
+/// (or empty) = automatic mapping, the only supported mode.
 pub const ENV_GPU_LAYERS: &str = "KITTY_INFER_GPU_LAYERS";
+/// Flag that truly silences the engine subscriber during the inferperf
+/// window (F1b): `KITTY_INFERPERF_ENGINE_LOG=off` (plus legacy
+/// `KITTY_ENGINE_LOG=off`). Read in `ensure_loaded` BEFORE the first
+/// `build()`: when off, the builder skips `.with_logging()` so
+/// `initialize_logging()` never runs and the window stays quiet. Same
+/// names as `bench::inferperf::{ENGINE_LOG_ENV, ENGINE_LOG_LEGACY_ENV}`
+/// (duplicated here to avoid a cli→runtime dep; keep them in sync).
+pub const ENV_ENGINE_LOG_OFF: &str = "KITTY_INFERPERF_ENGINE_LOG";
+/// Legacy alias honored the same way (see [`ENV_ENGINE_LOG_OFF`]).
+pub const ENV_ENGINE_LOG_OFF_LEGACY: &str = "KITTY_ENGINE_LOG";
 
-const DEFAULT_CTX: usize = 4096;
+/// True when the operator requested engine silence for the measurement
+/// window (either flag set to `off`, case-insensitive). Pure core is
+/// unit-testable without touching the process env.
+fn engine_logging_off_requested() -> bool {
+    engine_logging_off_requested_raw(
+        std::env::var(ENV_ENGINE_LOG_OFF).ok().as_deref(),
+        std::env::var(ENV_ENGINE_LOG_OFF_LEGACY).ok().as_deref(),
+    )
+}
+
+/// Pure core of [`engine_logging_off_requested`] (testable without env).
+fn engine_logging_off_requested_raw(main: Option<&str>, legacy: Option<&str>) -> bool {
+    [main, legacy].iter().any(|v| {
+        v.map(|s| s.trim().eq_ignore_ascii_case("off"))
+            .unwrap_or(false)
+    })
+}
+
+const DEFAULT_CTX: usize = 16384;
 
 /// Returns true when the operator selected the embedded backend. Pure and
 /// unit-testable (env read stays at the call site).
@@ -69,56 +100,86 @@ pub fn backend_selected(raw: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// Parse the GPU-layer spill override. `None` = unset/invalid = automatic
-/// mapping. Pure and unit-testable.
+/// Parse the GPU-layer spill knob for the prohibition warning. `None` =
+/// unset/invalid. The value is NEVER honored (P0-4) — parsing only feeds
+/// the "ignored" message. Pure and unit-testable.
 fn parse_gpu_layers(raw: Option<&str>) -> Option<usize> {
     raw?.trim().parse::<usize>().ok().filter(|v| *v > 0)
 }
 
-/// Validate a spill count against the model's own layer total. `n > total`
-/// is always nonsense (asking for more GPU layers than exist) and bails.
-/// Unknown total allows through: the absolute refuses it replaced couldn't
-/// see per-model size either, and the byte pre-check stays fail-closed
-/// below. Pure and unit-testable.
-fn validate_gpu_layers(n: usize, total: Option<usize>) -> Result<()> {
-    if let Some(t) = total {
-        if n > t {
-            return Err(RuntimeError::InvalidArgument(format!(
-                "KITTY_INFER_GPU_LAYERS={n} exceeds the model's {t} layers — \
-                 check the value (internal knob documented ≤12)"
-            )));
-        }
+/// P0-4: manual GPU-layer spill is prohibited — automatic mapping owns
+/// placement (the byte precheck + auto map already spill whole layers by
+/// measured VRAM, while a hand-picked count rots across quants and ctx).
+/// Returns the loud warning when the variable is set (any value, parseable
+/// or not); `None` means automatic mapping with nothing to report.
+/// Pure and unit-testable.
+fn manual_layers_warning(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    if raw.trim().is_empty() {
+        return None;
     }
-    Ok(())
+    let parsed = parse_gpu_layers(Some(raw));
+    Some(format!(
+        "{ENV_GPU_LAYERS}={raw:?} is set (parsed layers: {parsed:?}) but manual GPU-layer spill is prohibited — ignoring it and using automatic mapping; unset {ENV_GPU_LAYERS} to silence this warning"
+    ))
 }
 
-/// Layered GPU-byte estimate mirroring `vram_precheck` shape with spill:
-/// `file × (n/total) × fraction + kv(ctx)`. Unknown total (or no spill)
-/// falls back to the legacy full-file shape. Pure and unit-testable.
-fn spill_estimate_bytes(
-    file_len: u64,
-    layers: Option<usize>,
-    total: Option<usize>,
-    fraction: f32,
-    ctx_len: usize,
-) -> u64 {
-    let share = match (layers, total) {
-        (Some(n), Some(t)) if t > 0 => n.min(t) as f64 / t as f64,
-        _ => 1.0,
-    };
-    let model = file_len as f64 * share * fraction.clamp(0.0, 1.0) as f64;
-    let kv = ctx_len as u64 * 256 * 1024;
-    model as u64 + kv
+/// Sizing policy (F1a): demand-driven `ContextSize` when the GGUF arch is
+/// recognized (exact under the engine's hybrid paged-KV mask: Ornith 8/32
+/// pays a quarter of the dense KV, so the full 16K window fits 8GB);
+/// `Utilization` ONLY as fallback when the header/arch is unrecognized —
+/// never as the primary mode (it prices layers the mask leaves unpaged).
+/// Pure and unit-testable; the feature-gated twin below applies it.
+fn mem_mode_for_arch(arch: Option<&str>) -> &'static str {
+    match arch {
+        Some(a) if is_supported_gguf_arch(a) => "context-size",
+        _ => "utilization-fallback",
+    }
 }
 
-/// Headroom under which a spill estimate warns. Measured: spill-20's
-/// estimate sat ~1% under free yet OOMed on prefill transients/graphs, so
-/// "under free" alone is not safe on 8GB — warn above 90%.
-const SPILL_WARN_HEADROOM: f64 = 0.90;
+/// Load policy reason recorded in the run context (plumbed to the
+/// manifest): automatic mapping, or a manual override that was caught and
+/// ignored (P0-4). Pure and unit-testable.
+fn load_decision_reason(gpu_layers_ignored: bool) -> &'static str {
+    if gpu_layers_ignored {
+        "manual-override-ignored:automatic-mapping"
+    } else {
+        "automatic-mapping"
+    }
+}
 
-/// Read the GGUF's own `block_count` for its declared architecture from the
-/// file header (no model load). Returns `None` on any parse miss — callers
-/// treat unknown as unvalidated, never as zero. Pure file IO, no new deps.
+/// Apply the F1a sizing policy: `ContextSize` on a recognized arch,
+/// `Utilization` fallback otherwise (same rule as [`mem_mode_for_arch`]).
+#[cfg(feature = "kitty-infer")]
+fn mem_gpu_for_arch(arch: Option<&str>, ctx_len: usize) -> mistralrs::MemoryGpuConfig {
+    match mem_mode_for_arch(arch) {
+        "context-size" => mistralrs::MemoryGpuConfig::ContextSize(ctx_len),
+        _ => mistralrs::MemoryGpuConfig::Utilization(0.85),
+    }
+}
+
+/// Fresh (uncached) free-VRAM read for the load precheck (P0-2).
+///
+/// `health::snapshot()` is cached 1s and can predate the evict-before-load;
+/// a direct `MemoryUsage::query` on the CUDA device bypasses that cache.
+/// `None` on CPU boxes (no GPU: no precheck — the engine sizes the cache
+/// itself) or when the query fails (fail-open: the authoritative sizing in
+/// `calculate_cache_config` — sync + trim + fresh query — is the
+/// fail-closed gate; this early probe must never fail a load by itself).
+#[cfg(feature = "kitty-infer")]
+fn fresh_free_bytes() -> Option<u64> {
+    let device = mistralrs::Device::cuda_if_available(0).ok()?;
+    if device.is_cpu() {
+        return None;
+    }
+    mistralrs::core::MemoryUsage
+        .query(&device)
+        .ok()
+        .and_then(|m| u64::try_from(m.available()).ok())
+}
+
+/// Raw GGUF header readers (no model load). Each returns `None` on any
+/// parse miss — callers treat unknown as unvalidated, never as zero.
 fn gguf_read_u32(f: &mut std::fs::File) -> Option<u32> {
     use std::io::Read;
     let mut b = [0u8; 4];
@@ -196,6 +257,57 @@ fn gguf_block_count(path: &std::path::Path) -> Option<usize> {
         return None;
     }
     usize::try_from(count).ok().filter(|v| *v > 0)
+}
+
+/// Read `{arch}.full_attention_interval` (u32) from the GGUF header for
+/// hybrid GDN families (qwen35/qwen3next: every Nth layer is full
+/// attention, the rest linear). `None` = absent/unreadable. Pure file IO.
+fn gguf_full_attention_interval(path: &std::path::Path, arch: &str) -> Option<usize> {
+    use std::io::Read;
+    let want = format!("{arch}.full_attention_interval");
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).ok()?;
+    if &magic != b"GGUF" {
+        return None;
+    }
+    gguf_read_u32(&mut f)?; // version
+    let tensor_count = gguf_read_u64(&mut f)?;
+    let kv_count = gguf_read_u64(&mut f)?;
+    if tensor_count > 1_000_000 || kv_count > 1_000_000 {
+        return None;
+    }
+    for _ in 0..kv_count {
+        let key = gguf_read_str(&mut f)?;
+        let ty = gguf_read_u32(&mut f)?;
+        if key == want && ty == 4 {
+            let v = gguf_read_u32(&mut f)?;
+            return usize::try_from(v).ok().filter(|v| *v > 0);
+        }
+        skip_gguf_value(&mut f, ty)?;
+    }
+    None
+}
+
+/// Hybrid paged-KV share `(paged, total)` for the precheck window (F1a).
+///
+/// Supported GDN-hybrid archs page only their full-attention layers
+/// (Ornith/qwen35 8/32), so the coarse byte gate prices that share instead
+/// of the dense 256 KiB/token; every other arch (dense, unreadable header,
+/// missing interval) prices dense (`None` = share 1, fail-closed).
+/// Pure header IO, no model load.
+fn gguf_paged_share(path: &std::path::Path) -> Option<(usize, usize)> {
+    const HYBRID_INTERVAL_ARCHS: &[&str] = &["qwen3next", "qwen35", "qwen35moe"];
+    let total = gguf_block_count(path)?;
+    let arch = gguf_architecture(path)?;
+    if !HYBRID_INTERVAL_ARCHS.contains(&arch.as_str()) {
+        return None;
+    }
+    let interval = gguf_full_attention_interval(path, &arch)?;
+    if interval > total {
+        return None;
+    }
+    Some((total / interval, total))
 }
 
 /// GGUF architectures the embedded engine can serve. Mirror of
@@ -541,6 +653,28 @@ impl KittyInferConfig {
 // Pure mapping helpers (feature-independent, unit-tested without a model)
 // ---------------------------------------------------------------------------
 
+/// Run context recorded for every successful load and plumbed to the
+/// manifest (F1a): what was demanded (`ctx_len`), how the KV was sized
+/// (`mem_mode`: `context-size` on a recognized arch, `utilization-fallback`
+/// otherwise), which arch the header named, the placement policy that
+/// decided it (`decision_reason`: `automatic-mapping`, or the P0-4
+/// `manual-override-ignored` marker), and the usable decode window
+/// (`available_context_tokens`: demand-sized, so it equals `ctx_len` on
+/// the `context-size` path where the engine guarantees the window;
+/// on the fallback path it stays the demand, honestly marked by
+/// `mem_mode`). Feature-independent so bench manifests can read it
+/// without loading a model.
+#[derive(Debug, Clone)]
+pub struct KittyInferRunContext {
+    pub model_path: String,
+    pub ctx_len: usize,
+    pub gguf_arch: Option<String>,
+    pub mem_mode: &'static str,
+    pub decision_reason: &'static str,
+    pub gpu_layers_ignored: bool,
+    pub available_context_tokens: usize,
+}
+
 /// Map a kitty role string to a mistralrs role. Tool results never reach
 /// this classifier: `to_request` intercepts `role == "tool"` first and
 /// threads [`Message::tool_call_id`] through `add_tool_message` (fallback
@@ -587,12 +721,16 @@ fn loaded_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, A
 #[derive(Clone)]
 pub struct KittyInferClient {
     config: KittyInferConfig,
+    run_context: Arc<Mutex<Option<KittyInferRunContext>>>,
 }
 
 #[cfg(feature = "kitty-infer")]
 impl KittyInferClient {
     pub fn new(config: KittyInferConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            run_context: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn from_env() -> Result<Self> {
@@ -601,6 +739,13 @@ impl KittyInferClient {
 
     pub fn config(&self) -> &KittyInferConfig {
         &self.config
+    }
+
+    /// Run context of the last successful load (F1a manifest plumbing):
+    /// demanded ctx, sizing mode, recognized arch, and the placement
+    /// policy that decided it. `None` before the first load.
+    pub fn run_context(&self) -> Option<KittyInferRunContext> {
+        self.run_context.lock().ok().and_then(|g| g.clone())
     }
 
     fn spec_id(&self) -> Option<String> {
@@ -626,6 +771,15 @@ impl KittyInferClient {
     /// come from `global_registry`; the `gpu_fraction` attempt scales the
     /// context (the KV lever this client controls), and `vram_precheck`
     /// fails fast with byte counts before touching the engine.
+    ///
+    /// Policy (F1a): placement is always automatic (P0-4 prohibits the
+    /// manual spill knob — a set `KITTY_INFER_GPU_LAYERS` warns loudly and
+    /// is ignored); KV sizing is `ContextSize(ctx)` on a recognized GGUF
+    /// arch (exact under the engine's hybrid mask) with `Utilization` only
+    /// as fallback for unrecognized headers. The hybrid paged share scales
+    /// the coarse precheck window (dense 256 KiB/token would 4x-price a
+    /// GDN hybrid); the engine's `calculate_cache_config` stays the
+    /// authoritative, mask-exact gate.
     async fn ensure_loaded(&self) -> Result<Arc<Model>> {
         let cfg = self.config.clone();
         let file_name = cfg
@@ -645,19 +799,20 @@ impl KittyInferClient {
             ki::resolve_tokenizer_json(&cfg.model_path, cfg.tokenizer_sidecar_dir.as_deref())
                 .map_err(Self::friendly)?;
         let file_len = ki::file_bytes(&cfg.model_path).map_err(Self::friendly)?;
-        // Spill validation is relative to the model's own layer total
-        // (read from the GGUF header, no load): n > total always bails.
-        // Unknown total allows through (documented: legacy had no per-model
-        // view either) with the byte pre-check below staying fail-closed.
-        // Internal knob documented ≤12 (measured 8GB envelope).
-        let gpu_layers = parse_gpu_layers(std::env::var(ENV_GPU_LAYERS).ok().as_deref());
-        let total_layers = gpu_layers
-            .is_some()
-            .then(|| gguf_block_count(&cfg.model_path))
-            .flatten();
-        if let Some(n) = gpu_layers {
-            validate_gpu_layers(n, total_layers)?;
-        }
+        // P0-4: manual spill is prohibited — detect, warn loudly, ignore.
+        let gpu_layers_ignored =
+            manual_layers_warning(std::env::var(ENV_GPU_LAYERS).ok().as_deref())
+                .inspect(|msg| {
+                    eprintln!("{msg}");
+                    tracing::warn!("{msg}");
+                })
+                .is_some();
+        let decision_reason = load_decision_reason(gpu_layers_ignored);
+        // F1a inputs, read once from the header (no model load): the arch
+        // picks the sizing mode, the paged share scales the precheck window.
+        let arch = gguf_architecture(&cfg.model_path);
+        let mem_mode = mem_mode_for_arch(arch.as_deref());
+        let paged_share = gguf_paged_share(&cfg.model_path);
         let spec = ki::ModelSpec::auto(&format!("local:{}", cfg.model_path.display()))
             .map_err(Self::friendly)?;
         let spec_id = spec.id.clone();
@@ -677,69 +832,49 @@ impl KittyInferClient {
                 let parent = parent.clone();
                 let tok_json = tok_json.clone();
                 let spec_id = spec_id.clone();
-                let gpu_layers = gpu_layers;
-                let total_layers = total_layers;
+                let arch = arch.clone();
+                let paged_share = paged_share;
                 async move {
                     // Attempt ctx scales with the retry fraction (1.0 → ~0.66):
                     // KV cache is the OOM lever this client owns.
                     let ctx = ((cfg.ctx_len as f32 * fraction) as usize).max(512);
-                    let free = ki::health::snapshot()
-                        .devices
-                        .first()
-                        .map(|d| d.total_bytes.saturating_sub(d.used_bytes));
-                    // Layered estimate: with spill only n/total of the file
-                    // sits on GPU. Warn above headroom (not fail — the
-                    // scaled pre-check below stays fail-closed with bytes).
-                    if let (Some(n), Some(t)) = (gpu_layers, total_layers) {
-                        let est = spill_estimate_bytes(file_len, Some(n), Some(t), fraction, ctx);
-                        if let Some(free_bytes) = free {
-                            if est as f64 > free_bytes as f64 * SPILL_WARN_HEADROOM {
-                                tracing::warn!(
-                                    estimate_bytes = est,
-                                    free_bytes,
-                                    gpu_layers = n,
-                                    total_layers = t,
-                                    "spill estimate within headroom of free VRAM; \
-                                     prefill transients may still OOM — failure will be loud"
-                                );
-                            }
+                    // P0-2: fresh post-evict read (the 1s snapshot cache can
+                    // predate the evict); fail-open, never fail-closed here.
+                    let free = fresh_free_bytes();
+                    // Dense-equivalent window for the coarse byte gate:
+                    // hybrids page only a share of their layers.
+                    let eff_ctx = match paged_share {
+                        Some((paged, total)) if total > 0 => {
+                            ((ctx as u64 * paged as u64) / total as u64).max(1) as usize
                         }
-                    }
-                    // Scale the precheck input so a spill passes on its real
-                    // GPU share instead of the full file (spill-20 passed the
-                    // legacy check and OOMed late — the HOLD this fixes).
-                    let eff_file = match (gpu_layers, total_layers) {
-                        (Some(n), Some(t)) if t > 0 => {
-                            ((file_len as f64 * n.min(t) as f64 / t as f64) as u64).max(1)
-                        }
-                        _ => file_len,
+                        _ => ctx,
                     };
-                    ki::vram_precheck(eff_file, free, fraction, ctx)
+                    ki::vram_precheck(file_len, free, fraction, eff_ctx)
                         .map_err(|e| anyhow::anyhow!("{e:#}"))?;
-                    let mut builder = GgufModelBuilder::new(parent, vec![file_name])
-                        .with_logging()
+                    let mem_gpu = mem_gpu_for_arch(arch.as_deref(), ctx);
+                    // F1b: engine silence is real — skip `.with_logging()`
+                    // when the inferperf window asked for off (read here,
+                    // before the first `build()`; the `OnceLock` subscriber
+                    // can only be initialized once per process, so the guard
+                    // must cover the cold load, which it does: the window
+                    // owns warmup+ventana and the load happens inside it).
+                    let mut builder = GgufModelBuilder::new(parent, vec![file_name]);
+                    if !engine_logging_off_requested() {
+                        builder = builder.with_logging();
+                    }
+                    builder = builder
                         .with_max_model_len(ctx)
                         .with_dtype(dtype.clone())
-                        // Paged KV capacity must follow the attempt ctx: the
-                        // builder default pins ContextSize(4096) = 128 blocks,
-                        // which starves agent prompts (measured K2 panic).
+                        // Paged KV capacity follows the attempt ctx: demand
+                        // sizing on the hybrid mask (F1a), Utilization only
+                        // when the arch is unrecognized.
                         .with_paged_attn(
                             PagedAttentionMetaBuilder::default()
-                                .with_gpu_memory(mistralrs::MemoryGpuConfig::ContextSize(ctx))
+                                .with_gpu_memory(mem_gpu)
                                 .build()?,
                         );
-                    // Pre-validated above (relative clamp); the spill itself is
-                    // honored verbatim here so load matches what passed checks.
-                    if let Some(n) = gpu_layers {
-                        builder = builder.with_device_mapping(mistralrs::DeviceMapSetting::Map(
-                            mistralrs::DeviceMapMetadata::from_num_device_layers(vec![
-                                mistralrs::DeviceLayerMapMetadata {
-                                    ordinal: 0,
-                                    layers: n,
-                                },
-                            ]),
-                        ));
-                    }
+                    // No manual device mapping (P0-4): automatic mapping owns
+                    // placement, matching what the precheck priced.
                     if let Some(tj) = tok_json {
                         builder = builder.with_tokenizer_json(tj.to_string_lossy().into_owned());
                     }
@@ -756,11 +891,31 @@ impl KittyInferClient {
             })
             .await
             .map_err(Self::friendly)?;
+        // F1a: usable window equals the demand on the `context-size`
+        // path (the engine sizes `ContextSize(ctx)` to cover it, see
+        // `available_context_tokens` in the engine); on the fallback path
+        // it stays the demand, honestly marked by `mem_mode`.
+        let available_context_tokens = cfg.ctx_len;
+        let run_ctx = KittyInferRunContext {
+            model_path: cfg.model_path.to_string_lossy().into_owned(),
+            ctx_len: cfg.ctx_len,
+            gguf_arch: arch.clone(),
+            mem_mode,
+            decision_reason,
+            gpu_layers_ignored,
+            available_context_tokens,
+        };
+        // Best-effort observability: a poisoned slot must never fail the load.
+        if let Ok(mut slot) = self.run_context.lock() {
+            *slot = Some(run_ctx.clone());
+        }
         tracing::info!(
             model = %resident.spec.id,
             gpu_fraction = resident.gpu_fraction,
             ctx = cfg.ctx_len,
-            gpu_layers = ?gpu_layers,
+            arch = arch.as_deref().unwrap_or("unknown"),
+            mem_mode = run_ctx.mem_mode,
+            decision_reason = run_ctx.decision_reason,
             thinking = thinking_enabled(std::env::var(ENV_NO_THINK).ok().as_deref()),
             "kitty-infer resident ready"
         );
@@ -1051,6 +1206,22 @@ mod mapping_tests {
     use super::map_role;
 
     #[test]
+    fn engine_logging_off_is_real_flag_not_placeholder() {
+        use super::engine_logging_off_requested_raw;
+        // Off en cualquiera de los dos flags (case-insensitive, con espacios).
+        assert!(engine_logging_off_requested_raw(Some("off"), None));
+        assert!(engine_logging_off_requested_raw(None, Some("OFF")));
+        assert!(engine_logging_off_requested_raw(Some(" off "), None));
+        // Cualquier otro valor (incl. unset) = logging on honesto.
+        assert!(!engine_logging_off_requested_raw(None, None));
+        assert!(!engine_logging_off_requested_raw(Some("debug"), None));
+        assert!(!engine_logging_off_requested_raw(Some(""), None));
+        assert!(!engine_logging_off_requested_raw(Some("on"), Some("on")));
+        // Solo un flag en off basta.
+        assert!(engine_logging_off_requested_raw(Some("on"), Some("off")));
+    }
+
+    #[test]
     fn gpu_layers_parse() {
         use super::parse_gpu_layers;
         assert_eq!(parse_gpu_layers(None), None);
@@ -1061,34 +1232,75 @@ mod mapping_tests {
     }
 
     #[test]
-    fn spill_validation_is_relative() {
-        use super::validate_gpu_layers;
-        assert!(validate_gpu_layers(24, Some(28)).is_ok());
-        assert!(validate_gpu_layers(28, Some(28)).is_ok());
-        assert!(validate_gpu_layers(37, Some(36)).is_err());
-        // Unknown total: allowed (documented), byte pre-check stays fail-closed.
-        assert!(validate_gpu_layers(99, None).is_ok());
+    fn manual_spill_is_prohibited_and_ignored() {
+        use super::{load_decision_reason, manual_layers_warning, ENV_GPU_LAYERS};
+        assert_eq!(manual_layers_warning(None), None);
+        assert_eq!(manual_layers_warning(Some("")), None);
+        assert_eq!(manual_layers_warning(Some("   ")), None);
+        // Set (parseable or not) → loud warn + ignore, never honor.
+        for raw in ["12", "nope", "0"] {
+            let msg = manual_layers_warning(Some(raw)).expect("must warn when set");
+            assert!(msg.contains(ENV_GPU_LAYERS), "{msg}");
+            assert!(msg.contains("prohibited"), "{msg}");
+            assert!(msg.contains("ignoring"), "{msg}");
+        }
+        assert_eq!(load_decision_reason(false), "automatic-mapping");
+        assert_eq!(
+            load_decision_reason(true),
+            "manual-override-ignored:automatic-mapping"
+        );
     }
 
     #[test]
-    fn spill_estimate_scales_and_fails_fast() {
-        use super::spill_estimate_bytes;
-        // f32 fraction widens exactly like the implementation does.
-        let frac = 0.9f32.clamp(0.0, 1.0) as f64;
-        let kv = 7372u64 * 256 * 1024;
-        // K2 spill-20 shape: 10GB file, 20/36 layers.
-        let est = spill_estimate_bytes(10_000_000_000, Some(20), Some(36), 0.9, 7372);
-        assert_eq!(est, (10_000_000_000f64 * (20.0 / 36.0) * frac) as u64 + kv);
-        assert!(est < 10_000_000_000);
-        // No spill info: legacy full-file shape.
-        let full = spill_estimate_bytes(10_000_000_000, None, None, 0.9, 7372);
-        assert_eq!(full, (10_000_000_000f64 * frac) as u64 + kv);
-        assert!(est < full);
+    fn mem_mode_selects_context_size_on_known_arch() {
+        use super::mem_mode_for_arch;
+        assert_eq!(mem_mode_for_arch(Some("qwen35")), "context-size");
+        assert_eq!(mem_mode_for_arch(Some("llama")), "context-size");
+        assert_eq!(mem_mode_for_arch(Some("granitehybrid")), "context-size");
+        // Unrecognized or unreadable headers fall back — never primary.
+        assert_eq!(mem_mode_for_arch(Some("falcon")), "utilization-fallback");
+        assert_eq!(mem_mode_for_arch(None), "utilization-fallback");
+    }
+
+    #[cfg(feature = "kitty-infer")]
+    #[test]
+    fn mem_gpu_for_arch_matches_mode() {
+        use super::mem_gpu_for_arch;
+        assert!(matches!(
+            mem_gpu_for_arch(Some("qwen35"), 16_384),
+            mistralrs::MemoryGpuConfig::ContextSize(16_384)
+        ));
+        assert!(matches!(
+            mem_gpu_for_arch(Some("falcon"), 16_384),
+            mistralrs::MemoryGpuConfig::Utilization(_)
+        ));
+        assert!(matches!(
+            mem_gpu_for_arch(None, 16_384),
+            mistralrs::MemoryGpuConfig::Utilization(_)
+        ));
     }
 
     #[test]
-    fn gguf_block_count_reads_header() {
-        use super::gguf_block_count;
+    fn run_context_carries_manifest_fields() {
+        use super::KittyInferRunContext;
+        let ctx = KittyInferRunContext {
+            model_path: "/models/ornith.gguf".to_string(),
+            ctx_len: 16_384,
+            gguf_arch: Some("qwen35".to_string()),
+            mem_mode: "context-size",
+            decision_reason: "automatic-mapping",
+            gpu_layers_ignored: false,
+            available_context_tokens: 16_384,
+        };
+        assert_eq!(ctx.ctx_len, 16_384);
+        assert_eq!(ctx.gguf_arch.as_deref(), Some("qwen35"));
+        assert!(!ctx.gpu_layers_ignored);
+        assert_eq!(ctx.available_context_tokens, 16_384);
+    }
+
+    #[test]
+    fn hybrid_interval_and_share_from_header() {
+        use super::{gguf_full_attention_interval, gguf_paged_share};
         fn u32le(v: u32, out: &mut Vec<u8>) {
             out.extend_from_slice(&v.to_le_bytes());
         }
@@ -1108,41 +1320,40 @@ mod mapping_tests {
             u32le(4, out);
             out.extend_from_slice(&val.to_le_bytes());
         }
+        // Ornith/qwen35 shape: 32 blocks, every 4th paged → share 8/32.
         let mut blob = vec![];
         blob.extend_from_slice(b"GGUF");
         u32le(3, &mut blob);
         u64le(0, &mut blob); // tensor_count
-        u64le(2, &mut blob); // kv_count
-        kv_str(&mut blob, "general.architecture", "k2-horizon");
-        kv_u32(&mut blob, "k2-horizon.block_count", 36);
+        u64le(3, &mut blob); // kv_count
+        kv_str(&mut blob, "general.architecture", "qwen35");
+        kv_u32(&mut blob, "qwen35.block_count", 32);
+        kv_u32(&mut blob, "qwen35.full_attention_interval", 4);
         let dir = std::env::temp_dir();
-        let path = dir.join("kitty-infer-test-header.gguf");
+        let path = dir.join("kitty-infer-test-share.gguf");
         std::fs::write(&path, &blob).unwrap();
-        assert_eq!(gguf_block_count(&path), Some(36));
-        // Truncated / wrong magic / wrong arch: None, never zero/panic.
-        std::fs::write(&path, &blob[..10]).unwrap();
-        assert_eq!(gguf_block_count(&path), None);
+        assert_eq!(gguf_full_attention_interval(&path, "qwen35"), Some(4));
+        assert_eq!(gguf_paged_share(&path), Some((8, 32)));
+        // Wrong arch key for the interval: no share (never a partial mask).
+        assert_eq!(gguf_full_attention_interval(&path, "llama"), None);
+        std::fs::remove_file(&path).unwrap();
+
+        // Dense arch with no interval key: dense share (None = price full).
+        let mut dense = vec![];
+        dense.extend_from_slice(b"GGUF");
+        u32le(3, &mut dense);
+        u64le(0, &mut dense);
+        u64le(2, &mut dense);
+        kv_str(&mut dense, "general.architecture", "llama");
+        kv_u32(&mut dense, "llama.block_count", 32);
+        std::fs::write(&path, &dense).unwrap();
+        assert_eq!(gguf_full_attention_interval(&path, "llama"), None);
+        assert_eq!(gguf_paged_share(&path), None);
+        // Truncated / wrong magic: None, never zero/panic.
+        std::fs::write(&path, &dense[..10]).unwrap();
+        assert_eq!(gguf_paged_share(&path), None);
         std::fs::write(&path, b"NOPE").unwrap();
-        assert_eq!(gguf_block_count(&path), None);
-        let mut blob2 = vec![];
-        blob2.extend_from_slice(b"GGUF");
-        u32le(3, &mut blob2);
-        u64le(0, &mut blob2);
-        u64le(2, &mut blob2);
-        kv_str(&mut blob2, "general.architecture", "llama");
-        kv_u32(&mut blob2, "k2-horizon.block_count", 36);
-        std::fs::write(&path, &blob2).unwrap();
-        assert_eq!(gguf_block_count(&path), None);
-        // Order-independent: block_count before the architecture key.
-        let mut blob3 = vec![];
-        blob3.extend_from_slice(b"GGUF");
-        u32le(3, &mut blob3);
-        u64le(0, &mut blob3);
-        u64le(2, &mut blob3);
-        kv_u32(&mut blob3, "qwen3.block_count", 36);
-        kv_str(&mut blob3, "general.architecture", "qwen3");
-        std::fs::write(&path, &blob3).unwrap();
-        assert_eq!(gguf_block_count(&path), Some(36));
+        assert_eq!(gguf_full_attention_interval(&path, "qwen35"), None);
         std::fs::remove_file(&path).unwrap();
     }
 

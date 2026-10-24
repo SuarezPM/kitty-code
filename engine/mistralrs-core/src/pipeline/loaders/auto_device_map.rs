@@ -1,8 +1,10 @@
 use std::fmt::{self, Display};
 
 use crate::paged_attention::{
-    calculate_cache_config, device_memory_cap, CacheMemoryReservations, MemoryGpuConfig,
-    ModelConfigLike, DEFAULT_PAGED_ATTENTION_BLOCK_SIZE,
+    assert_cache_covers_context, available_context_tokens, calculate_cache_config,
+    device_memory_cap, hybrid_paged_mask_from_config_json, CacheMemoryReservations,
+    HybridPagedKvCacheConfig, MemoryGpuConfig, ModelConfigLike, ModelConfigMetadata,
+    DEFAULT_PAGED_ATTENTION_BLOCK_SIZE,
 };
 use crate::utils::debug::DeviceRepr;
 use crate::{DeviceLayerMapMetadata, DeviceMapMetadata, MemoryUsage, PagedAttentionConfig};
@@ -260,6 +262,55 @@ fn count_fitting_layers(sizes: &[usize], kv: &[usize], mut used: usize, cap: usi
     count
 }
 
+/// `sliding_window` carried by the GGUF-synthesized JSON, if any. Read from
+/// the config (not the loader) so the hybrid rebuild below cannot drop a
+/// window the loader reported.
+fn config_sliding_window(config_json: &str) -> Option<usize> {
+    serde_json::from_str::<serde_json::Value>(config_json)
+        .ok()?
+        .get("sliding_window")?
+        .as_u64()
+        .and_then(|v| usize::try_from(v).ok())
+}
+
+/// Wrap the loader config with the hybrid paged-KV mask when the
+/// GGUF-synthesized JSON names per-layer kinds (F1a: Ornith/qwen35 8/32 via
+/// `full_attention_interval`, granite `mamba`, LFM2 `conv`).
+///
+/// Only wraps on a genuinely hybrid mask — length matches, every tag known,
+/// at least one paged and one pageless layer. Anything else (dense models,
+/// sliding-window `layer_types`, unrecognized archs) returns the original
+/// config untouched, so windowing/layout metadata can never be lost in a
+/// rebuild and `Utilization` stays the only fallback for unknown archs.
+fn apply_hybrid_paged_mask(
+    model_cfg: Box<dyn ModelConfigLike>,
+    config_json: &str,
+) -> Box<dyn ModelConfigLike> {
+    let num_layers = model_cfg.num_layers();
+    let mask = match hybrid_paged_mask_from_config_json(num_layers, config_json) {
+        Some(mask) => mask,
+        None => return model_cfg,
+    };
+    if mask.len() != num_layers || !mask.contains(&true) || !mask.contains(&false) {
+        return model_cfg;
+    }
+    let base = ModelConfigMetadata {
+        max_seq_len: model_cfg.max_seq_len(),
+        num_layers,
+        hidden_size: model_cfg.hidden_size(),
+        num_kv_heads: model_cfg.num_kv_heads(),
+        num_attn_heads: model_cfg.num_attn_heads(),
+        sliding_window: config_sliding_window(config_json),
+        k_head_dim: model_cfg.k_head_dim(),
+        v_head_dim: model_cfg.v_head_dim(),
+        kv_cache_layout: model_cfg.kv_cache_layout(),
+    };
+    let hybrid = HybridPagedKvCacheConfig::new(base, mask);
+    let paged = hybrid.paged_layer_count();
+    info!("Hybrid paged-KV mask: {paged}/{num_layers} layers keep a paged cache; sizing off {paged}, not {num_layers}.");
+    Box::new(hybrid)
+}
+
 /// Audible reason for the final split. Pure and unit-tested.
 fn decision_reason(
     gpu_layers: usize,
@@ -358,7 +409,10 @@ pub fn get_device_layers(
     };
 
     let model_cfg = loader.model_config(config)?;
+    // F1a: paged-KV indices from the GGUF arch (Ornith 8/32, not 32/32).
+    let model_cfg = apply_hybrid_paged_mask(model_cfg, config);
     let has_paged_attn = paged_attn_config.is_some();
+    let mut estimate_available_tokens: Option<usize> = None;
     let base_device_memory_reservation_bytes = paged_attn_config
         .as_ref()
         .map_or(0, |config| config.base_device_memory_reservation_bytes);
@@ -446,6 +500,20 @@ pub fn get_device_layers(
                 Some(total_model_size_in_bytes),
                 Some(max_seq_len * max_batch_size),
             )?;
+            // F1a: the estimate must cover the mapping window — fail loudly
+            // instead of silently degrading (the old path spilled to CPU).
+            // `Utilization` fallbacks run the same assert.
+            let required_window = max_seq_len.saturating_mul(max_batch_size);
+            assert_cache_covers_context(
+                cache.num_gpu_blocks,
+                cache.block_size,
+                required_window,
+                "auto device-map estimate",
+            )?;
+            estimate_available_tokens = Some(available_context_tokens(
+                cache.num_gpu_blocks,
+                cache.block_size,
+            ));
             let key_shape = calculate_key_block_shape(&*model_cfg, dtype, cache.block_size);
             let key_sz =
                 cache.num_gpu_blocks * key_shape.0 * key_shape.1 * key_shape.2 * key_shape.3;
@@ -578,10 +646,8 @@ pub fn get_device_layers(
             // Same arithmetic as the historical fill loop, via the single
             // `count_fitting_layers` implementation (unit-tested below).
             let tail = layer_sizes_in_bytes.len();
-            let next_sizes: Vec<usize> =
-                layer_sizes_in_bytes.iter().rev().copied().collect();
-            let next_kv: Vec<usize> =
-                (0..tail).map(|i| kv_bytes_for_layer(layer + i)).collect();
+            let next_sizes: Vec<usize> = layer_sizes_in_bytes.iter().rev().copied().collect();
+            let next_kv: Vec<usize> = (0..tail).map(|i| kv_bytes_for_layer(layer + i)).collect();
             let count = count_fitting_layers(&next_sizes, &next_kv, used, cap);
             if count > 0 {
                 for _ in 0..count {
@@ -654,7 +720,8 @@ pub fn get_device_layers(
         .map(|(a, d)| format!("{}:free={}MiB", d.device_pretty_repr(), b_to_mb!(*a)))
         .join(", ");
     let summary = format!(
-        "[mistralrs-auto-map] decision: gpu_layers={gpu_layers} cpu_layers={cpu_layers} total={num_layers} reason={reason} preference={preference:?} [{free_detail}]"
+        "[mistralrs-auto-map] decision: gpu_layers={gpu_layers} cpu_layers={cpu_layers} total={num_layers} reason={reason} preference={preference:?} kv_tokens={} [{free_detail}]",
+        estimate_available_tokens.map_or("none".to_string(), |t| t.to_string())
     );
     eprintln!("{summary}");
     info!("{summary}");
@@ -732,7 +799,8 @@ mod tests {
     }
 
     #[test]
-    fn post_load_utilization_is_not_frozen_to_the_inventory_estimate() {        let requested = MemoryGpuConfig::Utilization(0.85);
+    fn post_load_utilization_is_not_frozen_to_the_inventory_estimate() {
+        let requested = MemoryGpuConfig::Utilization(0.85);
         assert!(matches!(
             post_load_memory_config(requested, MemoryGpuConfig::MbAmount(45_000), true),
             MemoryGpuConfig::Utilization(value) if value == 0.85
@@ -800,7 +868,10 @@ mod tests {
         // Exact fit counts (the boundary is `> cap`, not `>=`).
         assert_eq!(count_fitting_layers(&[100, 100], &[10, 10], 50, 270), 2);
         // Scarce VRAM spill is prefix-deterministic: always the FIRST n.
-        assert_eq!(count_fitting_layers(&[60, 60, 60, 60], &[5, 5, 5, 5], 0, 130), 2);
+        assert_eq!(
+            count_fitting_layers(&[60, 60, 60, 60], &[5, 5, 5, 5], 0, 130),
+            2
+        );
     }
 
     #[test]
@@ -963,5 +1034,80 @@ mod tests {
         } else {
             assert_eq!(gpu, 4);
         }
+    }
+
+    fn hybrid_test_metadata(num_layers: usize) -> ModelConfigMetadata {
+        ModelConfigMetadata {
+            max_seq_len: 8192,
+            num_layers,
+            hidden_size: 1024,
+            num_kv_heads: 4,
+            num_attn_heads: 16,
+            sliding_window: None,
+            k_head_dim: 64,
+            v_head_dim: 64,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
+        }
+    }
+
+    #[test]
+    fn hybrid_mask_wraps_only_genuinely_hybrid_configs() {
+        use super::apply_hybrid_paged_mask;
+
+        // Ornith shape: 32 layers, qwen35 interval 4 → 8 paged.
+        let ornith =
+            serde_json::json!({"num_hidden_layers": 32, "full_attention_interval": 4}).to_string();
+        let wrapped = apply_hybrid_paged_mask(Box::new(hybrid_test_metadata(32)), &ornith);
+        assert!(!wrapped.layer_has_paged_kv_cache(0));
+        assert!(wrapped.layer_has_paged_kv_cache(3));
+        assert_eq!(
+            wrapped.total_kv_cache_elements_per_token(),
+            8 * wrapped.kv_cache_elements_per_token()
+        );
+
+        // Granite shape via explicit layer_types: mamba layers pay nothing.
+        let granite = serde_json::json!({
+            "num_hidden_layers": 4,
+            "layer_types": ["attention", "mamba", "mamba", "attention"],
+        })
+        .to_string();
+        let wrapped = apply_hybrid_paged_mask(Box::new(hybrid_test_metadata(4)), &granite);
+        assert_eq!(
+            wrapped.total_kv_cache_elements_per_token(),
+            2 * wrapped.kv_cache_elements_per_token()
+        );
+
+        // Dense JSON keeps the original totals: no wrap, no behavior change.
+        let dense = serde_json::json!({"num_hidden_layers": 4}).to_string();
+        let kept = apply_hybrid_paged_mask(Box::new(hybrid_test_metadata(4)), &dense);
+        assert_eq!(
+            kept.total_kv_cache_elements_per_token(),
+            4 * kept.kv_cache_elements_per_token()
+        );
+
+        // Sliding-window layer_types are all paged → untouched.
+        let sliding = serde_json::json!({
+            "num_hidden_layers": 4,
+            "layer_types": ["full_attention", "sliding_attention", "full_attention", "sliding_attention"],
+        })
+        .to_string();
+        let kept = apply_hybrid_paged_mask(Box::new(hybrid_test_metadata(4)), &sliding);
+        assert!(kept.layer_has_paged_kv_cache(1));
+        assert_eq!(
+            kept.total_kv_cache_elements_per_token(),
+            4 * kept.kv_cache_elements_per_token()
+        );
+
+        // Length mismatch → untouched (never a partial mask).
+        let bad = serde_json::json!({
+            "num_hidden_layers": 4,
+            "layer_types": ["attention"],
+        })
+        .to_string();
+        let kept = apply_hybrid_paged_mask(Box::new(hybrid_test_metadata(4)), &bad);
+        assert_eq!(
+            kept.total_kv_cache_elements_per_token(),
+            4 * kept.kv_cache_elements_per_token()
+        );
     }
 }

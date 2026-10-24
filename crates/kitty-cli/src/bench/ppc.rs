@@ -310,6 +310,19 @@ async fn run_ppc_inner(cli: &BenchCliCtx, cfg: &BenchConfig, out: &PathBuf) -> R
         memory: false,
         systemone: systemone_dump.clone(),
         toolset: bench_toolset_label(),
+        // F1b (Lane B): nuevos ejes en el fingerprint (build fix mecánico;
+        // la lógica PPC la sigue poseyendo Lane D).
+        backend_features: super::runmark::BackendFeatures::for_bench(
+            cli.backend,
+            kitty_harness::response_cache::response_cache_enabled(),
+        ),
+        available_context_tokens: cfg
+            .client
+            .infer_run_context()
+            .map(|c| c.available_context_tokens as u32)
+            .unwrap_or(cfg.context_window as u32),
+        terminal_reason: "n/a".to_string(),
+        invalid_tool_calls: 0,
     };
     let fingerprint = runmark.fingerprint();
     // Pre-chequeo rerun ANTES del primer LLM (delega al ledger) + `begin`
@@ -343,6 +356,12 @@ async fn run_ppc_inner(cli: &BenchCliCtx, cfg: &BenchConfig, out: &PathBuf) -> R
     let mut per_candidate: Vec<(String, Vec<ProbeScore>)> = Vec::with_capacity(candidates.len());
     let mut latencies: Vec<f64> = Vec::with_capacity(candidates.len() * n);
     let mut timed_out: usize = 0;
+    // F1a/F1b agregados reales (nunca `pending`): suma/modal/mínimo sobre
+    // todos los runs (candidatos × tareas).
+    let mut agg_invalid: u64 = 0;
+    let mut term_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut agg_available: Option<u32> = None;
     let mut no_store: Option<kitty_memory::EpisodeStore> = None;
     for (cand, cand_cfg) in &candidates {
         let mut scores = Vec::with_capacity(n);
@@ -352,6 +371,12 @@ async fn run_ppc_inner(cli: &BenchCliCtx, cfg: &BenchConfig, out: &PathBuf) -> R
             }
             let r = run_one_bench(ex, cand_cfg, &mut no_store).await?;
             calls += 1;
+            agg_invalid += r.invalid_tool_calls as u64;
+            *term_counts.entry(r.terminal_reason.clone()).or_default() += 1;
+            agg_available = Some(match agg_available {
+                Some(cur) => cur.min(r.available_context_tokens as u32),
+                None => r.available_context_tokens as u32,
+            });
             let s = score_of(&r);
             latencies.push(s.latency_ms);
             if s.timed_out {
@@ -450,6 +475,16 @@ async fn run_ppc_inner(cli: &BenchCliCtx, cfg: &BenchConfig, out: &PathBuf) -> R
     .await
     .context("lessons store task failed")??;
 
+    let agg_terminal = term_counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(k, _)| k)
+        .unwrap_or_else(|| "n/a".to_string());
+    let agg_available = agg_available.unwrap_or(cfg.context_window as u32);
+    let (mem_mode, decision_reason) = match cfg.client.infer_run_context() {
+        Some(c) => (c.mem_mode.to_string(), c.decision_reason.to_string()),
+        None => ("n/a (ollama)".to_string(), "n/a (ollama)".to_string()),
+    };
     let report = serde_json::json!({
         "suite": "ppc",
         "model": cfg.model,
@@ -468,6 +503,11 @@ async fn run_ppc_inner(cli: &BenchCliCtx, cfg: &BenchConfig, out: &PathBuf) -> R
         "exit_code": exit_code,
         "p99_ms": p99_ms,
         "p99_censored": p99_censored,
+        "available_context_tokens": agg_available,
+        "terminal_reason": agg_terminal,
+        "invalid_tool_calls": agg_invalid,
+        "mem_mode": mem_mode,
+        "decision_reason": decision_reason,
         "run_id": run_id,
         "runmark_fingerprint": fingerprint,
         "systemone_status_dump": systemone_dump,
@@ -560,6 +600,9 @@ mod tests {
             iters: None,
             margin: None,
             effort_off_in_bench: false,
+            terminal_reason: verdict.to_string(),
+            invalid_tool_calls: 0,
+            available_context_tokens: 16384,
         };
         let p = score_of(&mk(true, "pass"));
         assert!(p.passed && !p.timed_out);

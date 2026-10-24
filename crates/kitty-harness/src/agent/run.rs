@@ -99,6 +99,11 @@ impl Agent {
         let mut total_turns: usize = 0;
         let mut vacuous_turns: usize = 0;
         let mut hops_spent: usize = 0;
+        // F2a E1: natural terminal from `process_response` (Text /
+        // EmptyFailFast / DoomLoopAbort). When set, the inner loops break to
+        // the single `finalize_terminal` (verify + save post-verify) instead
+        // of the exhaustion path.
+        let mut natural_terminal: Option<super::Terminal> = None;
         'verify: loop {
             // Fixed state machine (f8 AD1): the inner for restarts on hop
             // consumption; force_response + Verification run ONLY on real
@@ -127,9 +132,18 @@ impl Agent {
 
                     if self.budget.should_halt() {
                         warn!("Context halting: compaction exhausted");
-                        return self
+                        let text = self
                             .force_response(
                                 "Context limit reached. Please start a new conversation.",
+                            )
+                            .await?;
+                        return self
+                            .finalize_terminal(
+                                user_prompt,
+                                super::Terminal::new(
+                                    text,
+                                    super::TerminalReason::ForceResponse,
+                                ),
                             )
                             .await;
                     }
@@ -190,8 +204,8 @@ impl Agent {
                             // Note: empty_response_streak is NOT reset here; thinking retry counts toward streak.
                             let retry_response = self.llm_call_no_thinking().await?;
                             // W7-code: same doom-loop recovery as the main
-                            // path (terminal `Some` returns the recovered
-                            // text; `None` falls through to the checks below).
+                            // path (terminal `Some` breaks to finalize;
+                            // `None` falls through to the checks below).
                             if let Some(recovered) = self
                                 .process_response_recoverable(
                                     user_prompt,
@@ -200,12 +214,20 @@ impl Agent {
                                 )
                                 .await?
                             {
-                                return Ok(recovered);
+                                return self.finalize_terminal(user_prompt, recovered).await;
                             }
                             // Fail-fast after retry as well (handoff §6). Warn with streak always.
                             if should_fail_fast(self.empty_response_streak) {
                                 warn!(streak = self.empty_response_streak, "Empty response streak cap reached (2) after thinking retry, failing fast");
-                                return Ok("no response (empty after 2 retries)".to_string());
+                                return self
+                                    .finalize_terminal(
+                                        user_prompt,
+                                        super::Terminal::new(
+                                            "no response (empty after 2 retries)".to_string(),
+                                            super::TerminalReason::EmptyFailFast,
+                                        ),
+                                    )
+                                    .await;
                             }
                             // Don't reset thinking budget — we already retried once
                             continue;
@@ -261,13 +283,16 @@ impl Agent {
                     // never leak into the next event.
                     self.registry.reset_turn_timing();
                     let tools_start = std::time::Instant::now();
-                    // W7-code: a doom-loop abort recovers to `checkpoint`
-                    // with a terminal text instead of failing the run.
-                    if let Some(recovered) = self
+                    // F2a E1: a natural terminal (Text / EmptyFailFast) or a
+                    // doom-loop abort breaks to `finalize_terminal` (verify +
+                    // save post-verify) — the loop no longer runs to
+                    // `max_iterations` on text.
+                    if let Some(terminal) = self
                         .process_response_recoverable(user_prompt, response, checkpoint)
                         .await?
                     {
-                        return Ok(recovered);
+                        natural_terminal = Some(terminal);
+                        break;
                     }
                     let tools_ms = tools_start.elapsed().as_millis() as u64;
                     let (guard_ms, sandbox_ms) = self.registry.take_turn_timing();
@@ -281,13 +306,17 @@ impl Agent {
 
                     // Fail-fast: 2 consecutive empty responses → terminate quickly
                     // instead of looping until max_iterations/timeout (handoff §6).
+                    // F2a E1: via `finalize_terminal` (verify + save post-verify).
                     if should_fail_fast(self.empty_response_streak) {
                         warn!(
                             streak = self.empty_response_streak,
                             "Empty response streak cap reached (2), failing fast"
                         );
-                        // Episode already saved as failure in process_response.
-                        return Ok("no response (empty after 2 retries)".to_string());
+                        natural_terminal = Some(super::Terminal::new(
+                            "no response (empty after 2 retries)".to_string(),
+                            super::TerminalReason::EmptyFailFast,
+                        ));
+                        break;
                     }
 
                     // F3.4: write telemetry for this turn (after process_response)
@@ -342,6 +371,12 @@ impl Agent {
                     self.thinking_budget.reset_turn();
                     // F2.4: Do NOT clear the quality monitor window — it persists
                     // across turns to detect cross-turn tool loops.
+                }
+
+                // F2a E1: natural terminal — skip hops/exhaustion, go to
+                // `finalize_terminal` (verify + save post-verify).
+                if natural_terminal.is_some() {
+                    break 'autorun;
                 }
 
                 // Iteration budget exhausted WITHOUT a natural terminal return.
@@ -410,14 +445,22 @@ impl Agent {
                 break 'autorun;
             }
 
-            // Exhausted iterations with no hops left — force a final response.
-            warn!(
-                iterations = self.config.max_iterations,
-                "Agent loop exhausted iterations"
-            );
-            let text = self
-                .force_response("Please provide your final answer now.")
-                .await?;
+            // F2a E1: single terminal value — natural (Text / EmptyFailFast /
+            // DoomLoopAbort) or exhaustion-forced. Verification + save happen
+            // ONLY below (post-verify); no pre-verify save anywhere.
+            let terminal = if let Some(t) = natural_terminal.take() {
+                t
+            } else {
+                // Exhausted iterations with no hops left — force a final response.
+                warn!(
+                    iterations = self.config.max_iterations,
+                    "Agent loop exhausted iterations"
+                );
+                let text = self
+                    .force_response("Please provide your final answer now.")
+                    .await?;
+                super::Terminal::new(text, super::TerminalReason::ForceResponse)
+            };
 
             // Verification gate: only meaningful when the agent actually
             // touched files — otherwise failures are pre-existing and not
@@ -476,8 +519,8 @@ impl Agent {
                     // Revision budget exhausted (or gate disabled mid-flight):
                     // consume ONE autorun hop iff any remain — a full fresh
                     // cycle retries with the LATEST failure output fed back;
-                    // no save here (intermediate). Otherwise return the work
-                    // as-is, recorded as a failure (terminal).
+                    // no save here (intermediate). Otherwise the work ends
+                    // as-is, saved post-verify as a failure (terminal).
                     if autorun_hop_retries_after_revisions_exhausted(
                         hops_remaining,
                         revision_cycles,
@@ -493,18 +536,19 @@ impl Agent {
                         .await;
                         continue 'verify;
                     }
-                    self.save_episode(user_prompt, &text, false).await;
-                    return Ok(text);
+                    return self.finish_post_verify(user_prompt, terminal, false).await;
                 }
                 Verification::Passed => {
-                    self.save_episode(user_prompt, &text, true).await;
-                    return Ok(text);
+                    return self.finish_post_verify(user_prompt, terminal, true).await;
                 }
                 Verification::Skipped => {
-                    // No test command / loop disabled / nothing modified —
-                    // historical behavior: exhausted iterations count as fail.
-                    self.save_episode(user_prompt, &text, false).await;
-                    return Ok(text);
+                    // Post-verify save: natural Text without edits ⇒ chat
+                    // success (true); exhaustion-forced without edits keeps
+                    // the historical fail (false).
+                    let success = terminal.reason == super::TerminalReason::Text;
+                    return self
+                        .finish_post_verify(user_prompt, terminal, success)
+                        .await;
                 }
             }
         }
@@ -538,32 +582,93 @@ impl Agent {
         }
     }
 
+    /// F2a E1: single finalizer — runs verification then saves the episode
+    /// post-verify (never pre-verify). `terminal` carries the loop reason
+    /// (`Text` / `ForceResponse` / `EmptyFailFast` / `DoomLoopAbort`);
+    /// `success` derives from the verification verdict in the caller
+    /// (Passed ⇒ true; natural `Text` + Skipped ⇒ true for chat-without-edits;
+    /// otherwise false). Records `last_terminal_reason` (mandatory manifest
+    /// axis) and returns the final text. See `finish_post_verify` for the
+    /// shared post-verify save (single save site).
+    async fn finalize_terminal(
+        &mut self,
+        user_prompt: &str,
+        terminal: super::Terminal,
+    ) -> Result<String> {
+        let verification = if self.registry.file_modifications() == 0 {
+            debug!("verification skipped: no file modifications this session");
+            Verification::Skipped
+        } else {
+            self.verify_workspace().await
+        };
+        let success = match &verification {
+            Verification::Passed => true,
+            Verification::Skipped => terminal.reason == super::TerminalReason::Text,
+            Verification::Failed(_) => false,
+        };
+        let verify_label = match &verification {
+            Verification::Passed => super::TerminalReason::VerifyPassed,
+            Verification::Failed(_) => super::TerminalReason::VerifyFailed,
+            Verification::Skipped => super::TerminalReason::VerifySkipped,
+        };
+        debug!(
+            terminal_reason = %terminal.reason,
+            verify = %verify_label,
+            success,
+            "finalize: verify then save post-verify"
+        );
+        self.finish_post_verify(user_prompt, terminal, success).await
+    }
+
+    /// F2a E1: single post-verify save site. Records `last_terminal_reason`
+    /// (loop reason, mandatory bench axis), saves the episode post-verdict,
+    /// and returns the terminal text. m06: `Result` (anyhow en app), sin unwrap.
+    async fn finish_post_verify(
+        &mut self,
+        user_prompt: &str,
+        terminal: super::Terminal,
+        success: bool,
+    ) -> Result<String> {
+        self.last_terminal_reason = Some(terminal.reason);
+        let text = terminal.text.clone();
+        self.save_episode(user_prompt, &text, success).await;
+        Ok(text)
+    }
+
     /// W7-code: `process_response` with doom-loop recovery (HU-PODER:
     /// colapso = abandono/error-no-recuperado). On a doom-loop abort
     /// (streak at `DOOM_LOOP_FAIL_AT`), rewinds messages to the turn
-    /// `checkpoint`, records the episode as failed, and returns the
-    /// recovered terminal text (`Some`). `None` = turn processed normally,
-    /// continue the loop. Any other error propagates untouched (legacy).
+    /// `checkpoint` and returns a `Terminal{DoomLoopAbort}` for the single
+    /// `finalize_terminal` (verify + save post-verify). `Ok(None)` = turn
+    /// processed normally (tool calls, nudge, or empty retry). A natural
+    /// `Text`/`EmptyFailFast` terminal from `process_response` is propagated
+    /// as-is (caller breaks to finalize). Any other error propagates
+    /// untouched (legacy).
     async fn process_response_recoverable(
         &mut self,
         user_prompt: &str,
         response: ChatResponse,
         checkpoint: usize,
-    ) -> Result<Option<String>> {
-        if let Err(e) = self.process_response(user_prompt, response).await {
-            if self.doom_loop.streak >= DOOM_LOOP_FAIL_AT {
-                warn!(
-                    streak = self.doom_loop.streak,
-                    "Doom loop abort — recovering to turn checkpoint"
-                );
-                self.messages.truncate(checkpoint);
-                let text = "Stopped: the same tool was repeated with identical arguments. Recovered with partial progress — please continue with smaller steps.";
-                self.save_episode(user_prompt, text, false).await;
-                return Ok(Some(text.to_string()));
+    ) -> Result<Option<super::Terminal>> {
+        match self.process_response(user_prompt, response).await {
+            Ok(term) => Ok(term),
+            Err(e) => {
+                if self.doom_loop.streak >= DOOM_LOOP_FAIL_AT {
+                    warn!(
+                        streak = self.doom_loop.streak,
+                        "Doom loop abort — recovering to turn checkpoint"
+                    );
+                    self.messages.truncate(checkpoint);
+                    let text = "Stopped: the same tool was repeated with identical arguments. Recovered with partial progress — please continue with smaller steps.";
+                    // F2a E1: no pre-verify save — finalize owns the save.
+                    return Ok(Some(super::Terminal::new(
+                        text.to_string(),
+                        super::TerminalReason::DoomLoopAbort,
+                    )));
+                }
+                Err(e)
             }
-            return Err(e);
         }
-        Ok(None)
     }
 
     /// W4: shared router construction for hop AND revision decisions.
@@ -828,11 +933,12 @@ mod run_effort_tests {
         let _g = env_lock();
         let _e = EnvRestoreGuard::remove(ENV_VERIFY_LOOP);
         // Sin evidencia el router deja pasar: 2 hops gastados como el legacy.
+        // F2a E1: el texto es terminal, así que los dos primeros ciclos son
+        // tools (agotan) y el tercero es el terminal natural (sin forced).
         let responses = vec![
-            dummy_response("cycle1"),
-            dummy_response("cycle2"),
-            dummy_response("cycle3"),
-            dummy_response("forced final"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.a.md"})),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.b.md"})),
+            dummy_response("terminal"),
         ];
         let mut agent = Agent::new(
             MockClient::new(responses),
@@ -843,7 +949,7 @@ mod run_effort_tests {
         );
         agent.config.max_iterations = 1;
         let out = agent.run("hi").await.unwrap();
-        assert_eq!(out, "forced final");
+        assert_eq!(out, "terminal");
         assert_eq!(continues(&agent), 2);
         assert_eq!(
             agent.last_run_effort(),
@@ -861,10 +967,11 @@ mod run_effort_tests {
         let _g = env_lock();
         let _e = EnvRestoreGuard::remove(ENV_VERIFY_LOOP);
         // Vacuidad 0.5 por ciclo → ReduceHops: 2→1→0, un solo CONTINUE.
+        // F2a E1: el turno no-vacuo es tool (el texto terminaría).
         let responses = vec![
-            dummy_response("work"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.a.md"})),
             empty_response(),
-            dummy_response("work"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.b.md"})),
             empty_response(),
             dummy_response("forced final"),
         ];
@@ -988,16 +1095,32 @@ mod run_effort_tests {
         }
     }
 
-    /// W5-code: la caché idempotente sirve un retry idéntico sin quemar
-    /// otra llamada al modelo (la cola del Mock solo trae una respuesta: el
-    /// segundo `llm_call` idéntico SOLO puede salir de la caché).
+    /// W5-code + F2a E3: la caché idempotente sirve un retry idéntico sin
+    /// quemar otra llamada al modelo (la cola del Mock solo trae una
+    /// respuesta: el segundo `llm_call` idéntico SOLO puede salir de la
+    /// caché). E3: el prefijo debe superar el umbral de 64 tok — con historial
+    /// minúsculo la caché se puentea (miss sin insert).
     #[tokio::test]
     async fn w5_response_cache_serves_identical_retry() {
-        let agent = Agent::new(
+        // Prefijo minúsculo: puenteado (ni hit ni store).
+        let tiny = Agent::new(
             MockClient::new(vec![dummy_response("cached")]),
             AgentConfig::default(),
         )
         .with_response_cache(8);
+        let first = tiny.llm_call().await.unwrap();
+        assert_eq!(first.message.content.as_deref(), Some("cached"));
+        assert!(tiny.response_cache.as_ref().unwrap().lock().unwrap().is_empty());
+
+        // Prefijo ≥64 tok: get/insert activos (1 miss + 1 hit).
+        let mut agent = Agent::new(
+            MockClient::new(vec![dummy_response("cached")]),
+            AgentConfig::default(),
+        )
+        .with_response_cache(8);
+        agent
+            .push_message(kitty_runtime::Message::user("x".repeat(400)))
+            .await;
         let first = agent.llm_call().await.unwrap();
         assert_eq!(first.message.content.as_deref(), Some("cached"));
         let second = agent.llm_call().await.unwrap();
@@ -1033,6 +1156,8 @@ mod run_effort_tests {
 
     /// W5-code: el batch especulativo ejecuta Glob+Grep concurrentes y
     /// conserva orden y resultados idénticos al path secuencial.
+    /// F2a E1: el segundo turno es vacío (no-terminal) para agotar sin
+    /// terminar; el forced aporta el terminal.
     #[tokio::test]
     async fn w5_speculative_batch_keeps_order_and_results() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1048,7 +1173,7 @@ mod run_effort_tests {
             let mut agent = Agent::new(
                 MockClient::new(vec![
                     batch.clone(),
-                    dummy_response("d"),
+                    empty_response(),
                     dummy_response("f"),
                 ]),
                 AgentConfig {
@@ -1087,8 +1212,9 @@ mod run_effort_tests {
             "Glob",
             serde_json::json!({"pattern": format!("{dir}/*.txt")}),
         );
+        // F2a E1: segundo turno vacío (no-terminal) para agotar sin terminar.
         let mut agent = Agent::new(
-            MockClient::new(vec![batch, dummy_response("d"), dummy_response("f")]),
+            MockClient::new(vec![batch, empty_response(), dummy_response("f")]),
             AgentConfig {
                 workspace: tmp.path().to_path_buf(),
                 ..Default::default()
@@ -1194,12 +1320,13 @@ mod run_effort_tests {
         let _e = EnvRestoreGuard::set(ENV_VERIFY_LOOP, "off"); // marca bench
                                                                // Misma evidencia que recorta en interactivo: en bench se gastan
                                                                // los 2 hops igual que el legacy (3 ciclos + forced).
+        // F2a E1: turnos no-vacuos como tools (el texto terminaría).
         let responses = vec![
-            dummy_response("work"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.a.md"})),
             empty_response(),
-            dummy_response("work"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.b.md"})),
             empty_response(),
-            dummy_response("work"),
+            tool_call_response("Glob", serde_json::json!({"pattern": "*.c.md"})),
             empty_response(),
             dummy_response("forced final"),
         ];
@@ -1560,6 +1687,181 @@ mod memory_block_tests {
             !agent.messages().iter().any(|m| m.role == "user"
                 && m.content.as_deref().is_some_and(|c| c.contains("[Memory]"))),
             "sin role=user tras compactar"
+        );
+    }
+}
+
+#[cfg(test)]
+mod f2a_terminal_tests {
+    //! F2a E1/E2/E3 — evidencia Oracle sin LLM/GPU en vivo (mocks).
+    //!
+    //! - terminal cierra post-verify con episodio guardado post-veredicto
+    //! - done-guard excluido del predicado terminal
+    //! - umbral 64 tok de la response cache
+    //! - floor Ornith ≥4096 + medición de invalid_tool_calls
+
+    use super::super::{
+        dummy_response, is_terminal_text, tool_call_response, Agent, AgentConfig,
+        TerminalReason,
+    };
+    use crate::model_profile::{EnvRestoreGuard, ThinkingMode};
+    use kitty_runtime::MockClient;
+
+    #[test]
+    fn terminal_predicate_excludes_done_guard_nudge() {
+        assert!(is_terminal_text("final answer", false));
+        assert!(!is_terminal_text("final answer", true));
+        assert!(!is_terminal_text("   ", false));
+        assert!(!is_terminal_text("", false));
+        assert_eq!(TerminalReason::Text.as_str(), "text");
+        assert_eq!(TerminalReason::ForceResponse.as_str(), "force_response");
+        assert_eq!(TerminalReason::EmptyFailFast.as_str(), "empty_fail_fast");
+        assert_eq!(TerminalReason::DoomLoopAbort.as_str(), "doom_loop_abort");
+    }
+
+    #[test]
+    fn ornith_floor_4k_no_2k() {
+        // Ornith: floor 4096 en num_predict y thinking Budget.
+        let (np, th) = Agent::ornith_floor_4k_raw(
+            "ornith:9b",
+            2048,
+            ThinkingMode::Budget(2048),
+            None,
+        );
+        assert_eq!(np, 4096, "num_predict 2K → 4K");
+        assert_eq!(th, ThinkingMode::Budget(4096), "thinking 2K → 4K");
+        // Ya sobre el floor: intacto.
+        let (np, th) = Agent::ornith_floor_4k_raw(
+            "ornith:9b",
+            8192,
+            ThinkingMode::Budget(8192),
+            None,
+        );
+        assert_eq!(np, 8192);
+        assert_eq!(th, ThinkingMode::Budget(8192));
+        // On/Off intactos (On nunca se capa).
+        let (_, th) =
+            Agent::ornith_floor_4k_raw("ornith:9b", 8192, ThinkingMode::On, None);
+        assert_eq!(th, ThinkingMode::On);
+        let (_, th) =
+            Agent::ornith_floor_4k_raw("ornith:9b", 100, ThinkingMode::Off, None);
+        assert_eq!(th, ThinkingMode::Off);
+        // No-Ornith: intacto aunque sea 2K.
+        let (np, th) = Agent::ornith_floor_4k_raw(
+            "qwen3:8b",
+            2048,
+            ThinkingMode::Budget(2048),
+            None,
+        );
+        assert_eq!((np, th), (2048, ThinkingMode::Budget(2048)));
+        // Kill-switch off: floor desactivado (flag sin cablear).
+        let (np, th) = Agent::ornith_floor_4k_raw(
+            "ornith:9b",
+            2048,
+            ThinkingMode::Budget(2048),
+            Some("off"),
+        );
+        assert_eq!((np, th), (2048, ThinkingMode::Budget(2048)));
+    }
+
+    #[tokio::test]
+    async fn terminal_closes_post_verify_with_episode_post_verdict() {
+        // Makefile que pasa: verify Passed ⇒ episodio success=true post-verify,
+        // terminal_reason Text obligatorio, iters = turnos LLM.
+        let dir = tempfile::tempdir().unwrap();
+        super::super::makefile_workspace(dir.path(), 0);
+        let notes = dir.path().join("notes.txt");
+        let responses = vec![
+            tool_call_response(
+                "Write",
+                serde_json::json!({"path": notes.to_string_lossy(), "content": "v1"}),
+            ),
+            dummy_response("terminal answer"),
+        ];
+        let db = tempfile::tempdir().unwrap();
+        let db_path = db.path().join("episodes.db");
+        let mut agent = Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                workspace: dir.path().to_path_buf(),
+                memory_db_path: Some(db_path.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+        );
+        // max 2: iter0 Write (tool), iter1 texto natural Text (terminal).
+        agent.config.max_iterations = 2;
+        let out = agent.run("persist me").await.unwrap();
+        assert_eq!(out, "terminal answer");
+        assert_eq!(agent.last_terminal_reason(), Some(TerminalReason::Text));
+        assert_eq!(agent.last_run_effort().iters_used, 2);
+        let store =
+            kitty_memory::EpisodeStore::open(&db_path.to_string_lossy()).unwrap();
+        assert_eq!(store.count().unwrap(), 1, "un episodio post-verify");
+        let eps = store.recall_similar("persist me", 5).unwrap();
+        assert!(!eps.is_empty());
+        assert_eq!(eps[0].test_verdict.as_deref(), Some("pass"));
+        assert_eq!(eps[0].outcome, "terminal answer");
+    }
+
+    #[tokio::test]
+    async fn done_guard_nudge_is_not_terminal() {
+        // Contrato pendiente + done-claim ⇒ nudge (no terminal): el loop
+        // continúa hasta agotar y el forced cierra con ForceResponse.
+        let mut agent = Agent::new(
+            MockClient::new(vec![
+                dummy_response("All done"),
+                dummy_response("forced final"),
+            ]),
+            AgentConfig {
+                workspace: std::path::PathBuf::from("/tmp"),
+                ..Default::default()
+            },
+        );
+        agent.config.max_iterations = 1;
+        let mut contract = crate::contract::Contract::new("test-guard");
+        contract.add_assertion(crate::contract::AssertionCheck::FileExists("a.rs".into()));
+        agent.set_contract(contract);
+        let out = agent.run("goal").await.unwrap();
+        assert_eq!(out, "forced final");
+        assert_eq!(
+            agent.last_terminal_reason(),
+            Some(TerminalReason::ForceResponse)
+        );
+        assert!(agent.messages().iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains("[CONTRACT-GUARD]"))));
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_calls_are_measured() {
+        // Tool real con args inválidos ⇒ InvalidArgs en execute ⇒ contador E2.
+        // (Las alucinadas las filtra el quality monitor antes de ejecutar.)
+        let mut agent = Agent::new(MockClient::new(vec![]), AgentConfig::default());
+        assert_eq!(agent.invalid_tool_calls(), 0);
+        let resp =
+            tool_call_response("Read", serde_json::json!({"wrong_key": "x"}));
+        agent.process_response("p", resp).await.unwrap();
+        assert!(
+            agent.invalid_tool_calls() >= 1,
+            "Read con args inválidos debe contar como invalid"
+        );
+    }
+
+    #[test]
+    fn response_cache_threshold_64_tok() {
+        assert!(!crate::response_cache::should_cache_tokens(0));
+        assert!(!crate::response_cache::should_cache_tokens(63));
+        assert!(crate::response_cache::should_cache_tokens(64));
+        assert_eq!(crate::response_cache::MIN_CACHE_TOKENS, 64);
+        // Env opt-in por defecto OFF (bench).
+        let _g = crate::model_profile::test_env_lock();
+        let _e = EnvRestoreGuard::remove(crate::response_cache::ENV_RESPONSE_CACHE);
+        assert!(!crate::response_cache::response_cache_enabled());
+        assert_eq!(crate::response_cache::response_cache_cap_raw(None), None);
+        assert_eq!(
+            crate::response_cache::response_cache_cap_raw(Some("1")),
+            Some(crate::response_cache::DEFAULT_RESPONSE_CACHE_CAP)
         );
     }
 }

@@ -50,8 +50,71 @@ pub const EXIT_INCONCLUSIVE: i32 = 2;
 /// sidecar corrupto.
 pub const EXIT_INTEGRITY: i32 = 3;
 
+/// F2a E4 / F1b: features del backend declaradas por celda (`kv_fp8`,
+/// `response_cache`, `kv_retention`, `paged_mem_config`). Misma forma que
+/// `inferperf::InferperfFeatures` (Lane D) para que la comparación de líneas
+/// sea auditable: booleanos para flags, strings para políticas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendFeatures {
+    /// KV-cache cuantizado a FP8 en el servidor (Oilamma `OLLAMA_KV_CACHE_TYPE`).
+    pub kv_fp8: bool,
+    /// Response cache idempotente del harness (E3, opt-in).
+    pub response_cache: bool,
+    /// Retención KV entre runs (E4/F2c: `off` hasta pasar el test de aislamiento).
+    pub kv_retention: String,
+    /// Config de memoria paginada del backend embebido (kitty-infer) o `n/a`.
+    pub paged_mem_config: String,
+}
+
+impl BackendFeatures {
+    /// Todo apagado (base honesta hasta que F1a pruebe lo contrario).
+    pub fn declared_off() -> Self {
+        Self {
+            kv_fp8: false,
+            response_cache: false,
+            kv_retention: "off".to_string(),
+            paged_mem_config: "n/a".to_string(),
+        }
+    }
+
+    /// Defaults declarados por backend (el bench corre con gates off).
+    /// `response_cache` se resuelve por separado (opt-in env); aquí solo la
+    /// forma por backend.
+    pub fn for_backend(backend: &str) -> Self {
+        match backend {
+            "kitty-infer" => Self {
+                paged_mem_config: "paged (engine default; ver manifiesto F1a)".to_string(),
+                ..Self::declared_off()
+            },
+            _ => Self {
+                paged_mem_config: "n/a (ollama)".to_string(),
+                ..Self::declared_off()
+            },
+        }
+    }
+
+    /// Con el flag de response cache ya resuelto (env/opt-in).
+    pub fn for_bench(backend: &str, response_cache: bool) -> Self {
+        let mut f = Self::for_backend(backend);
+        f.response_cache = response_cache;
+        f
+    }
+
+    /// JSON canónico (claves ordenadas por BTreeMap del llamador).
+    pub fn canonical_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kv_fp8": self.kv_fp8,
+            "kv_retention": self.kv_retention,
+            "paged_mem_config": self.paged_mem_config,
+            "response_cache": self.response_cache,
+        })
+    }
+}
+
 /// Fingerprint de celda bench (todos los ejes que cambian el resultado,
 /// incluido `rep`: cambiar de rep cambia el fingerprint).
+/// F2a E4: suma `backend_features` + `available_context_tokens` +
+/// `terminal_reason` + `invalid_tool_calls` al canónico.
 #[derive(Debug, Clone)]
 pub struct Runmark {
     pub model: String,
@@ -73,19 +136,40 @@ pub struct Runmark {
     pub memory: bool,
     pub systemone: String,
     pub toolset: String,
+    /// F2a E4: features del backend (cambian el resultado).
+    pub backend_features: BackendFeatures,
+    /// F2a E4 / F1a: tokens de contexto disponibles para la celda.
+    pub available_context_tokens: u32,
+    /// F1b: razón terminal de la celda (`n/a` pre-run; el manifiesto
+    /// post-run vuelca el agregado por ejercicio en `details`).
+    pub terminal_reason: String,
+    /// F2a E2: llamadas a tools inválidas acumuladas en la celda.
+    pub invalid_tool_calls: u64,
 }
 
 impl Runmark {
     /// JSON canónico con claves ordenadas (BTreeMap ⇒ orden alfabético).
     pub fn canonical_json(&self) -> serde_json::Value {
         let mut m = BTreeMap::new();
+        m.insert(
+            "available_context_tokens".to_string(),
+            serde_json::json!(self.available_context_tokens),
+        );
         m.insert("backend".to_string(), serde_json::json!(self.backend));
+        m.insert(
+            "backend_features".to_string(),
+            self.backend_features.canonical_json(),
+        );
         m.insert("ctx".to_string(), serde_json::json!(self.ctx));
         m.insert("dataset_sha".to_string(), serde_json::json!(self.dataset_sha));
         m.insert("digest".to_string(), serde_json::json!(self.digest));
         m.insert("dirty".to_string(), serde_json::json!(self.dirty));
         m.insert("git_head".to_string(), serde_json::json!(self.git_head));
         m.insert("hops".to_string(), serde_json::json!(self.hops));
+        m.insert(
+            "invalid_tool_calls".to_string(),
+            serde_json::json!(self.invalid_tool_calls),
+        );
         m.insert("max_iter".to_string(), serde_json::json!(self.max_iter));
         m.insert("memory".to_string(), serde_json::json!(self.memory));
         m.insert("model".to_string(), serde_json::json!(self.model));
@@ -94,6 +178,10 @@ impl Runmark {
         m.insert("seed".to_string(), serde_json::json!(self.seed));
         m.insert("suite".to_string(), serde_json::json!(self.suite));
         m.insert("systemone".to_string(), serde_json::json!(self.systemone));
+        m.insert(
+            "terminal_reason".to_string(),
+            serde_json::json!(self.terminal_reason),
+        );
         m.insert(
             "timeout_cell".to_string(),
             serde_json::json!(self.timeout_cell),
@@ -269,6 +357,10 @@ mod runmark_tests {
             memory: false,
             systemone: "off".into(),
             toolset: "Read,Edit,Write,Bash,Glob,Grep".into(),
+            backend_features: BackendFeatures::for_bench("ollama", false),
+            available_context_tokens: 16384,
+            terminal_reason: "n/a".into(),
+            invalid_tool_calls: 0,
         }
     }
 
@@ -284,9 +376,10 @@ mod runmark_tests {
         assert_eq!(
             keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             vec![
-                "backend", "ctx", "dataset_sha", "digest", "dirty", "git_head", "hops",
+                "available_context_tokens", "backend", "backend_features", "ctx",
+                "dataset_sha", "digest", "dirty", "git_head", "hops", "invalid_tool_calls",
                 "max_iter", "memory", "model", "profile", "rep", "seed", "suite", "systemone",
-                "timeout_cell", "toolset"
+                "terminal_reason", "timeout_cell", "toolset"
             ]
         );
         // Estable: dos serializaciones idénticas.
@@ -307,6 +400,56 @@ mod runmark_tests {
         let mut r = sample();
         r.memory = true;
         assert_ne!(r.fingerprint(), base);
+    }
+
+    #[test]
+    fn fingerprint_changes_with_backend_features() {
+        // F2a E4: cada eje nuevo cambia el hash (evidencia Oracle).
+        let base = sample().fingerprint();
+        let mut r = sample();
+        r.backend_features.response_cache = true;
+        assert_ne!(r.fingerprint(), base, "response_cache debe cambiar el hash");
+        let mut r = sample();
+        r.backend_features.kv_fp8 = true;
+        assert_ne!(r.fingerprint(), base, "kv_fp8 debe cambiar el hash");
+        let mut r = sample();
+        r.backend_features.kv_retention = "session".to_string();
+        assert_ne!(r.fingerprint(), base, "kv_retention debe cambiar el hash");
+        let mut r = sample();
+        r.backend_features.paged_mem_config = "paged".to_string();
+        assert_ne!(
+            r.fingerprint(),
+            base,
+            "paged_mem_config debe cambiar el hash"
+        );
+        let mut r = sample();
+        r.available_context_tokens = 8192;
+        assert_ne!(
+            r.fingerprint(),
+            base,
+            "available_context_tokens debe cambiar el hash"
+        );
+        let mut r = sample();
+        r.terminal_reason = "text".to_string();
+        assert_ne!(
+            r.fingerprint(),
+            base,
+            "terminal_reason debe cambiar el hash"
+        );
+        let mut r = sample();
+        r.invalid_tool_calls = 3;
+        assert_ne!(
+            r.fingerprint(),
+            base,
+            "invalid_tool_calls debe cambiar el hash"
+        );
+        // Forma canónica de backend_features (misma que inferperf Lane D).
+        let v = sample().canonical_json();
+        let bf = v.get("backend_features").expect("backend_features canónico");
+        assert_eq!(bf.get("kv_fp8"), Some(&serde_json::json!(false)));
+        assert_eq!(bf.get("response_cache"), Some(&serde_json::json!(false)));
+        assert_eq!(bf.get("kv_retention"), Some(&serde_json::json!("off")));
+        assert!(bf.get("paged_mem_config").is_some());
     }
 
     #[test]

@@ -15,6 +15,73 @@ pub enum ContextError {
     InsufficientCompaction { freed: usize, needed: usize },
 }
 
+/// F2b P0-a: conversation segment kinds for per-segment budgets.
+///
+/// `SystemPreflight` (bootstrap/system prompt) and `UserTurn` are PROTECTED
+/// (intocables): eviction/compaction must never trim them, and the emergency
+/// scale does not apply. All other kinds share a fair slice of the window
+/// with a floor of [`MIN_SEGMENT_TOKENS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SegmentKind {
+    /// Bootstrap/system preflight message (protected).
+    SystemPreflight,
+    /// User turn (protected).
+    UserTurn,
+    /// Assistant message.
+    Assistant,
+    /// Tool result.
+    ToolResult,
+    /// `[Memory]` block (lessons + gated episodes).
+    Memory,
+    /// Knowledge-base injection.
+    Knowledge,
+    /// `[Context Summary]` block from compaction.
+    Summary,
+}
+
+impl SegmentKind {
+    /// Number of variants (sizes the per-segment accounting array).
+    pub const COUNT: usize = 7;
+
+    /// All variants in index order (for tests/diagnostics).
+    pub fn all() -> [SegmentKind; SegmentKind::COUNT] {
+        use SegmentKind::*;
+        [
+            SystemPreflight,
+            UserTurn,
+            Assistant,
+            ToolResult,
+            Memory,
+            Knowledge,
+            Summary,
+        ]
+    }
+
+    /// Array index for this variant.
+    fn index(self) -> usize {
+        match self {
+            SegmentKind::SystemPreflight => 0,
+            SegmentKind::UserTurn => 1,
+            SegmentKind::Assistant => 2,
+            SegmentKind::ToolResult => 3,
+            SegmentKind::Memory => 4,
+            SegmentKind::Knowledge => 5,
+            SegmentKind::Summary => 6,
+        }
+    }
+
+    /// Protected kinds are never trimmed and skip emergency scaling.
+    pub fn protected(self) -> bool {
+        matches!(self, SegmentKind::SystemPreflight | SegmentKind::UserTurn)
+    }
+}
+
+/// F2b P0-a: minimum per-segment budget floor (tokens).
+pub const MIN_SEGMENT_TOKENS: usize = 512;
+
+/// F2b P0-a: emergency scale applied to NON-protected segment caps.
+pub const EMERGENCY_SCALE: f32 = 0.8;
+
 /// Lightweight snapshot saved before compaction for continuity.
 #[derive(Debug, Clone, Default)]
 pub struct CompactionSnapshot {
@@ -37,6 +104,9 @@ pub struct ContextBudget {
     compact_threshold: f32,
     /// Lightweight snapshot saved before compaction for continuity.
     snapshot: Option<CompactionSnapshot>,
+    /// F2b P0-a: cumulative tokens consumed per [`SegmentKind`]
+    /// (observability; eviction attribution is P1 `evict_to_budget`).
+    segment_used: [usize; SegmentKind::COUNT],
 }
 
 impl ContextBudget {
@@ -85,6 +155,7 @@ impl ContextBudget {
             max_consecutive_compactions: 3,
             compact_threshold: threshold.clamp(0.1, 0.95),
             snapshot: None,
+            segment_used: [0; SegmentKind::COUNT],
         }
     }
 
@@ -149,6 +220,45 @@ impl ContextBudget {
         self.used_tokens = self.used_tokens.saturating_add(tokens).min(self.max_tokens);
     }
 
+    /// F2b P0-a: segment-aware consumption. Global accounting is identical
+    /// to [`Self::consume`]; the per-kind counter is cumulative telemetry.
+    /// Intended accounting point for `push_message(kind, …)`: callers pass
+    /// the `count_tokens` real-token count (never `chars/4` here) — the
+    /// estimate fallback already happened inside `count_tokens`.
+    /// Wiring `push_message` to this is post-lane (agent/* untouched here).
+    pub fn consume_as(&mut self, kind: SegmentKind, tokens: usize) {
+        self.consume(tokens);
+        let slot = &mut self.segment_used[kind.index()];
+        *slot = slot.saturating_add(tokens);
+    }
+
+    /// Cumulative tokens consumed by one segment (telemetry, not a cap).
+    pub fn segment_used(&self, kind: SegmentKind) -> usize {
+        self.segment_used[kind.index()]
+    }
+
+    /// F2b P0-a budget table: protected kinds are intocables (whole window,
+    /// no effective cap); every other kind gets a fair quarter slice floored
+    /// at [`MIN_SEGMENT_TOKENS`] (clamped to the window on tiny budgets).
+    pub fn segment_cap(&self, kind: SegmentKind) -> usize {
+        if kind.protected() {
+            return self.max_tokens;
+        }
+        let floor = MIN_SEGMENT_TOKENS.min(self.max_tokens);
+        (self.max_tokens / 4).clamp(floor, self.max_tokens)
+    }
+
+    /// Emergency budget: protected kinds bypass scaling (intocables);
+    /// the rest are cut to `cap × [`EMERGENCY_SCALE`]` (a recorte, so it may
+    /// dip below the 512 floor by design).
+    pub fn emergency_cap(&self, kind: SegmentKind) -> usize {
+        let cap = self.segment_cap(kind);
+        if kind.protected() {
+            return cap;
+        }
+        ((cap as f32 * EMERGENCY_SCALE) as usize).max(1)
+    }
+
     /// Record that compaction happened. Returns whether we can continue.
     ///
     /// `freed` is the number of tokens freed by compaction.
@@ -168,6 +278,7 @@ impl ContextBudget {
     pub fn reset(&mut self) {
         self.used_tokens = 0;
         self.consecutive_compactions = 0;
+        self.segment_used = [0; SegmentKind::COUNT];
     }
 
     /// Save a snapshot before compaction.
@@ -299,6 +410,73 @@ mod tests {
                 "derive({profile}, {ctx}) = {got}, expected {expected}"
             );
         }
+    }
+
+    /// F2b P0-a: per-segment accounting accumulates without changing the
+    /// global total (same saturation semantics as `consume`).
+    #[test]
+    fn consume_as_tracks_segments_and_global() {
+        use SegmentKind::*;
+        let mut budget = ContextBudget::new(1000);
+        budget.consume_as(UserTurn, 200);
+        budget.consume_as(ToolResult, 300);
+        budget.consume_as(UserTurn, 100);
+        assert_eq!(budget.used(), 600);
+        assert_eq!(budget.segment_used(UserTurn), 300);
+        assert_eq!(budget.segment_used(ToolResult), 300);
+        assert_eq!(budget.segment_used(Assistant), 0);
+        // Saturation still caps the global total.
+        budget.consume_as(ToolResult, 900);
+        assert_eq!(budget.used(), 1000);
+        // Reset clears both.
+        budget.reset();
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.segment_used(UserTurn), 0);
+    }
+
+    /// F2b P0-a: UserTurn y SystemPreflight intocables — protected, cap ==
+    /// ventana completa y la emergencia NO los recorta.
+    #[test]
+    fn protected_kinds_userturn_and_preflight_intact() {
+        use SegmentKind::*;
+        let budget = ContextBudget::new(16384);
+        for kind in [SystemPreflight, UserTurn] {
+            assert!(kind.protected(), "{kind:?} debe ser protegido");
+            assert_eq!(budget.segment_cap(kind), 16384);
+            assert_eq!(budget.emergency_cap(kind), 16384);
+        }
+        for kind in [Assistant, ToolResult, Memory, Knowledge, Summary] {
+            assert!(!kind.protected(), "{kind:?} no debe ser protegido");
+            assert!(budget.segment_cap(kind) < budget.max());
+            assert!(budget.emergency_cap(kind) < budget.segment_cap(kind));
+        }
+    }
+
+    /// F2b P0-a: tabla de presupuestos — cuarto justo con suelo de 512 tok.
+    #[test]
+    fn segment_table_fair_quarter_with_512_floor() {
+        use SegmentKind::*;
+        let budget = ContextBudget::new(16384);
+        assert_eq!(budget.segment_cap(ToolResult), 4096);
+        assert!(budget.segment_cap(ToolResult) >= MIN_SEGMENT_TOKENS);
+        // Ventana enana: el suelo se sujeta a la ventana, nunca la supera.
+        let tiny = ContextBudget::new(100);
+        assert_eq!(tiny.segment_cap(ToolResult), 100);
+        assert_eq!(tiny.segment_cap(UserTurn), 100);
+    }
+
+    /// F2b P0-a: emergencia ×0.8 exacta en no-protegidos.
+    #[test]
+    fn emergency_cap_is_point_eight_on_unprotected() {
+        use SegmentKind::*;
+        let budget = ContextBudget::new(16384);
+        let cap = budget.segment_cap(ToolResult);
+        assert_eq!(cap, 4096);
+        assert_eq!(
+            budget.emergency_cap(ToolResult),
+            (4096.0 * EMERGENCY_SCALE) as usize
+        );
+        assert_eq!(budget.emergency_cap(ToolResult), 3276);
     }
 
     /// Derivation is INACTIVE (returns the profile value unchanged) whenever

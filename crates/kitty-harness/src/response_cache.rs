@@ -33,6 +33,55 @@ pub fn cache_key(
     hex::encode(hasher.finalize().as_bytes())
 }
 
+/// Env opt-in for the idempotent response cache (`KITTY_RESPONSE_CACHE`).
+/// Values `1`/`on`/`true` (case-insensitive, trimmed) enable with the default
+/// cap; `off`/`0`/empty/unset keep it disabled. A plain positive integer is a
+/// custom cap (e.g. `32`). Default OFF everywhere, including bench.
+pub const ENV_RESPONSE_CACHE: &str = "KITTY_RESPONSE_CACHE";
+/// Default cap when the env flag enables without an explicit size.
+pub const DEFAULT_RESPONSE_CACHE_CAP: usize = 8;
+/// Minimum estimated input tokens for a request to be cacheable (E3).
+/// Prefixes below this are too small to be worth reusing (prompt-shape noise
+/// dominates); they bypass get/insert entirely.
+pub const MIN_CACHE_TOKENS: usize = 64;
+
+/// Pure core behind [`response_cache_enabled`]: parse the raw env value into
+/// an optional cap (`None` = disabled). Unit-testable without process env.
+#[must_use]
+pub fn response_cache_cap_raw(raw: Option<&str>) -> Option<usize> {
+    let s = raw.map(str::trim).unwrap_or_default();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    if lower == "1" || lower == "on" || lower == "true" {
+        return Some(DEFAULT_RESPONSE_CACHE_CAP);
+    }
+    if lower == "0" || lower == "off" || lower == "false" {
+        return None;
+    }
+    s.parse::<usize>().ok().filter(|v| *v > 0)
+}
+
+/// Whether the response cache is opted-in via env (default OFF).
+#[must_use]
+pub fn response_cache_enabled() -> bool {
+    response_cache_cap_raw(std::env::var(ENV_RESPONSE_CACHE).ok().as_deref()).is_some()
+}
+
+/// Cap requested via env (`None` = disabled / default OFF).
+#[must_use]
+pub fn response_cache_cap() -> Option<usize> {
+    response_cache_cap_raw(std::env::var(ENV_RESPONSE_CACHE).ok().as_deref())
+}
+
+/// Whether `estimated_input_tokens` clears the E3 64-tok threshold.
+/// Pure: no env, no IO.
+#[must_use]
+pub fn should_cache_tokens(estimated_input_tokens: usize) -> bool {
+    estimated_input_tokens >= MIN_CACHE_TOKENS
+}
+
 /// Bounded FIFO cache of whole responses by request key.
 #[derive(Debug, Default)]
 pub struct ResponseCache {
@@ -158,5 +207,29 @@ mod tests {
         let key = cache_key("m", &[Message::user("hi")], &None, &None);
         c.insert(key.clone(), test_response("r"));
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn env_opt_in_parses_cap_and_defaults_off() {
+        assert_eq!(response_cache_cap_raw(None), None);
+        assert_eq!(response_cache_cap_raw(Some("")), None);
+        assert_eq!(response_cache_cap_raw(Some("off")), None);
+        assert_eq!(response_cache_cap_raw(Some("0")), None);
+        assert_eq!(
+            response_cache_cap_raw(Some("1")),
+            Some(DEFAULT_RESPONSE_CACHE_CAP)
+        );
+        assert_eq!(response_cache_cap_raw(Some("on")), Some(DEFAULT_RESPONSE_CACHE_CAP));
+        assert_eq!(response_cache_cap_raw(Some("32")), Some(32));
+        assert_eq!(response_cache_cap_raw(Some("garbage")), None);
+    }
+
+    #[test]
+    fn cache_threshold_64_tok() {
+        assert!(!should_cache_tokens(0));
+        assert!(!should_cache_tokens(63));
+        assert!(should_cache_tokens(64));
+        assert!(should_cache_tokens(4096));
+        assert_eq!(MIN_CACHE_TOKENS, 64);
     }
 }

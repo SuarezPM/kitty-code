@@ -266,7 +266,8 @@ impl LessonStore {
             item.expires_at = item.created_at.saturating_add(LESSON_DEFAULT_TTL_SECS);
         }
         if item.id.is_empty() {
-            item.id = MemoryItem::compute_id(&item.cue, &item.lesson, &item.run_id, item.created_at);
+            item.id =
+                MemoryItem::compute_id(&item.cue, &item.lesson, &item.run_id, item.created_at);
         }
         item.hash = MemoryItem::compute_hash(&item.cue, &item.lesson, &item.evidence, &item.run_id);
         self.conn.execute(
@@ -320,7 +321,11 @@ impl LessonStore {
         scored.sort_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then(b.1.confidence.partial_cmp(&a.1.confidence).unwrap_or(std::cmp::Ordering::Equal))
+                .then(
+                    b.1.confidence
+                        .partial_cmp(&a.1.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
                 .then(b.1.created_at.cmp(&a.1.created_at))
         });
         Ok(scored.into_iter().take(limit).map(|(_, it)| it).collect())
@@ -349,9 +354,9 @@ impl LessonStore {
     }
 
     pub fn get(&self, id: &str) -> Result<Option<MemoryItem>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {SELECT_COLS} FROM memory_items WHERE id = ?1"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SELECT_COLS} FROM memory_items WHERE id = ?1"
+        ))?;
         let opt = stmt
             .query_row(rusqlite::params![id], row_to_item)
             .optional()?;
@@ -390,7 +395,9 @@ mod tests {
         let store = LessonStore::open_in_memory().unwrap();
         let prov = RunProvenance::clean("run-limpio-1");
         for bad in ["", "   "] {
-            let err = store.save(item("postgres index bloat autovacuum", bad), &prov).unwrap_err();
+            let err = store
+                .save(item("postgres index bloat autovacuum", bad), &prov)
+                .unwrap_err();
             assert!(
                 matches!(err, LessonError::MissingEvidenceRef),
                 "sin evidence_ref debe rechazar, fue: {err}"
@@ -415,17 +422,28 @@ mod tests {
         let mut li = item("postgres index bloat autovacuum", "ppc:run-leak:x");
         li.run_id = "run-leak".to_string();
         let err = store.save(li, &leaked).unwrap_err();
-        assert!(matches!(err, LessonError::DirtyRun(_)), "leak debe rechazar: {err}");
+        assert!(
+            matches!(err, LessonError::DirtyRun(_)),
+            "leak debe rechazar: {err}"
+        );
 
         let mut di = item("postgres index bloat autovacuum", "ppc:run-dirty:x");
         di.run_id = "run-dirty".to_string();
         let err = store.save(di, &dirty).unwrap_err();
-        assert!(matches!(err, LessonError::DirtyRun(_)), "ledger sucio debe rechazar: {err}");
+        assert!(
+            matches!(err, LessonError::DirtyRun(_)),
+            "ledger sucio debe rechazar: {err}"
+        );
 
         // run_id que no coincide con la proveniencia también se rechaza.
         let clean = RunProvenance::clean("run-otro");
-        let err = store.save(item("postgres index bloat autovacuum", "ppc:run:x"), &clean).unwrap_err();
-        assert!(matches!(err, LessonError::DirtyRun(_)), "mismatch debe rechazar: {err}");
+        let err = store
+            .save(item("postgres index bloat autovacuum", "ppc:run:x"), &clean)
+            .unwrap_err();
+        assert!(
+            matches!(err, LessonError::DirtyRun(_)),
+            "mismatch debe rechazar: {err}"
+        );
 
         assert_eq!(store.count().unwrap(), 0);
     }
@@ -435,7 +453,13 @@ mod tests {
         let store = LessonStore::open_in_memory().unwrap();
         let prov = RunProvenance::clean("run-limpio-1");
         let id = store
-            .save(item("postgres index bloat autovacuum", "ppc:run-limpio-1:baseline"), &prov)
+            .save(
+                item(
+                    "postgres index bloat autovacuum",
+                    "ppc:run-limpio-1:baseline",
+                ),
+                &prov,
+            )
             .unwrap();
         assert!(!id.is_empty());
         let got = store.get(&id).unwrap().expect("debe existir");
@@ -447,14 +471,21 @@ mod tests {
     fn recall_sin_match_vacio_sin_fill_recent() {
         let store = LessonStore::open_in_memory().unwrap();
         let prov = RunProvenance::clean("run-limpio-1");
-        store.save(item("postgres index bloat autovacuum", "ppc:r:a"), &prov).unwrap();
         store
-            .save(item("postgres index bloat autovacuum tuning", "ppc:r:b"), &prov)
+            .save(item("postgres index bloat autovacuum", "ppc:r:a"), &prov)
+            .unwrap();
+        store
+            .save(
+                item("postgres index bloat autovacuum tuning", "ppc:r:b"),
+                &prov,
+            )
             .unwrap();
         assert_eq!(store.count().unwrap(), 2);
         // Nada en común con los cues guardados ⇒ vacío (el episódico aquí
         // devolvería recientes; lessons lo tiene prohibido).
-        let out = store.recall("bake sourdough bread at home", 5, NOW).unwrap();
+        let out = store
+            .recall("bake sourdough bread at home", 5, NOW)
+            .unwrap();
         assert!(out.is_empty(), "sin match debe ser vacío, fue: {out:?}");
     }
 
@@ -463,7 +494,9 @@ mod tests {
     fn recall_50_goals_no_relacionados_cero_inyecciones() {
         let store = LessonStore::open_in_memory().unwrap();
         let prov = RunProvenance::clean("run-limpio-1");
-        store.save(item("postgres index bloat autovacuum", "ppc:r:a"), &prov).unwrap();
+        store
+            .save(item("postgres index bloat autovacuum", "ppc:r:a"), &prov)
+            .unwrap();
         const GOALS: [&str; 50] = [
             "bake sourdough bread at home",
             "grow tomatoes on balcony",
@@ -519,7 +552,10 @@ mod tests {
         assert_eq!(GOALS.len(), 50);
         for g in GOALS {
             let out = store.recall(g, 5, NOW).unwrap();
-            assert!(out.is_empty(), "goal '{g}' no-relacionado debe dar 0 inyecciones, fue: {out:?}");
+            assert!(
+                out.is_empty(),
+                "goal '{g}' no-relacionado debe dar 0 inyecciones, fue: {out:?}"
+            );
         }
     }
 
@@ -527,7 +563,9 @@ mod tests {
     fn recall_match_devuelve_ordenado_y_respeta_limite() {
         let store = LessonStore::open_in_memory().unwrap();
         let prov = RunProvenance::clean("run-limpio-1");
-        store.save(item("postgres index bloat autovacuum", "ppc:r:a"), &prov).unwrap();
+        store
+            .save(item("postgres index bloat autovacuum", "ppc:r:a"), &prov)
+            .unwrap();
         let out = store.recall("autovacuum bloat postgres", 5, NOW).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].evidence_ref, "ppc:r:a");
@@ -537,19 +575,30 @@ mod tests {
     fn supersede_y_ttl_ocultan_en_recall() {
         let store = LessonStore::open_in_memory().unwrap();
         let prov = RunProvenance::clean("run-limpio-1");
-        let id = store.save(item("postgres index bloat autovacuum", "ppc:r:a"), &prov).unwrap();
-        assert_eq!(store.recall("postgres autovacuum", 5, NOW).unwrap().len(), 1);
+        let id = store
+            .save(item("postgres index bloat autovacuum", "ppc:r:a"), &prov)
+            .unwrap();
+        assert_eq!(
+            store.recall("postgres autovacuum", 5, NOW).unwrap().len(),
+            1
+        );
         store.supersede(&id, "nueva").unwrap();
-        assert!(store.recall("postgres autovacuum", 5, NOW).unwrap().is_empty());
+        assert!(store
+            .recall("postgres autovacuum", 5, NOW)
+            .unwrap()
+            .is_empty());
 
         let mut exp = item("postgres index bloat autovacuum", "ppc:r:b");
         exp.run_id = "run-limpio-1".to_string();
         exp.expires_at = NOW - 1; // ya caducada
-        // id distinto para no colisionar con la anterior
+                                  // id distinto para no colisionar con la anterior
         exp.created_at = NOW + 1;
         let id2 = store.save(exp, &prov).unwrap();
         assert_ne!(id, id2);
-        assert!(store.recall("postgres autovacuum", 5, NOW).unwrap().is_empty());
+        assert!(store
+            .recall("postgres autovacuum", 5, NOW)
+            .unwrap()
+            .is_empty());
         assert_eq!(store.forget_expired(NOW).unwrap(), 1);
     }
 }

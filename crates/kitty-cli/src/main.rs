@@ -1120,6 +1120,8 @@ mod run_flags_tests {
         assert_eq!(crate::journal::ensure_run_journal_env(), journal);
 
         let path_str = target.to_str().unwrap().to_string();
+        // F2a E1: el texto es terminal, así que el tercer turno es tool
+        // (agota) y el forced aporta el terminal.
         let mock = MockClient::new(vec![
             tool_resp("Read", serde_json::json!({"path": path_str})),
             tool_resp(
@@ -1130,7 +1132,7 @@ mod run_flags_tests {
                     "new_string": "AFTER",
                 }),
             ),
-            text_resp("halfway"),
+            tool_resp("Glob", serde_json::json!({"pattern": "*.md"})),
             text_resp("final answer"),
         ]);
         let mut agent = Agent::new(

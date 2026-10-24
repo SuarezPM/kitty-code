@@ -738,10 +738,19 @@ pub type ChannelRankings = Vec<(FuseChannel, Vec<(String, f32)>)>;
 /// multi-GB model download plus a sparse-vector storage schema, neither
 /// available offline — the weight plumbing below already admits it when a
 /// third channel lands (no fusion rewrite then).
+///
+/// F2b P0-b: `Tier` is the episode-tier channel (operator-settled /
+/// starred episodes outrank routine ones pre-fusion). It rides the same
+/// RRF summands as the other channels; the per-document boost lives in
+/// [`tier_adjust`] and the tiered entry point is
+/// [`fuse_rankings_weighted_tiered`]. The legacy [`fuse_rankings_weighted`]
+/// path is unchanged for Lexical/Dense-only inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FuseChannel {
     Lexical,
     Dense,
+    /// F2b P0-b: episode-tier channel (tiered ranking input).
+    Tier,
 }
 
 /// Fusion knobs (plan `RrfParams{k=60, alpha, N=100}`).
@@ -766,11 +775,24 @@ impl Default for RrfParams {
     }
 }
 
+/// F2b P0-b: default weight of the [`FuseChannel::Tier`] channel.
+/// Shared with [`TierWeights::default`] so the legacy and tiered fusion
+/// paths agree on the Tier channel mass.
+pub const TIER_CHANNEL_DEFAULT_WEIGHT: f32 = 0.25;
+
 fn channel_weight(channel: FuseChannel, alpha: f32) -> f32 {
     let a = alpha.clamp(0.0, 1.0);
     match channel {
         FuseChannel::Lexical => 1.0 - a,
         FuseChannel::Dense => a,
+        FuseChannel::Tier => TIER_CHANNEL_DEFAULT_WEIGHT,
+    }
+}
+
+fn channel_weight_with_tier(channel: FuseChannel, alpha: f32, tier: &TierWeights) -> f32 {
+    match channel {
+        FuseChannel::Tier => tier.channel.max(0.0),
+        _ => channel_weight(channel, alpha),
     }
 }
 
@@ -790,6 +812,83 @@ pub fn fuse_rankings_weighted(
         for (rank, id) in ranking.iter().enumerate() {
             let score = w / (params.k + rank as f32 + 1.0);
             *fused.entry(id.clone()).or_insert(0.0) += score;
+        }
+    }
+    fused
+}
+
+// ---------------------------------------------------------------------------
+// F2b P0-b: tier_adjust pre-fusión (canal Tier).
+// ---------------------------------------------------------------------------
+
+/// Episode tier for pre-fusion adjustment: 0 = verified/starred
+/// (settled vigente o importance alta), 1 = intermedio, 2 = rutina.
+/// Pure y offline (el caller pasa los campos; sin reloj dentro).
+pub fn episode_tier(importance: f32, settled: bool) -> u8 {
+    if settled || importance >= 0.7 {
+        0
+    } else if importance >= 0.3 {
+        1
+    } else {
+        2
+    }
+}
+
+/// Knobs del ajuste por tier pre-fusión.
+/// - `channel`: peso del canal [`FuseChannel::Tier`] en la fusión.
+/// - `boost`: escala del boost multiplicativo por documento
+///   (`tier_adjust`): tier 0 ×(1+boost), tier 1 ×(1+boost/2), tier 2 ×1.
+///   `0.0` desactiva el ajuste (la fusión tiered iguala a la legacy).
+#[derive(Debug, Clone, Copy)]
+pub struct TierWeights {
+    pub channel: f32,
+    pub boost: f32,
+}
+
+impl Default for TierWeights {
+    fn default() -> Self {
+        Self {
+            channel: TIER_CHANNEL_DEFAULT_WEIGHT,
+            boost: TIER_CHANNEL_DEFAULT_WEIGHT,
+        }
+    }
+}
+
+/// Multiplicative pre-fusion boost for one RRF summand: top tier scales by
+/// `1+boost`, mid tier by `1+boost/2`, routine tier is untouched.
+/// Negative boosts clamp to 0 (never penaliza por debajo del base).
+pub fn tier_adjust(base: f32, tier: u8, weights: &TierWeights) -> f32 {
+    let boost = weights.boost.max(0.0);
+    let factor = match tier {
+        0 => 1.0,
+        1 => 0.5,
+        _ => 0.0,
+    };
+    base * (1.0 + boost * factor)
+}
+
+/// Tiered fusion: same channel-weighted RRF summands as
+/// [`fuse_rankings_weighted`], but each summand is scaled pre-fusion by
+/// [`tier_adjust`] from `doc_tiers` (missing ids ⇒ tier 2, sin boost).
+/// With `TierWeights { channel: 0.25, boost: 0.0 }` and no Tier channel
+/// the output equals [`fuse_rankings_weighted`] exactly.
+pub fn fuse_rankings_weighted_tiered(
+    rankings: &[(FuseChannel, Vec<String>)],
+    params: &RrfParams,
+    tier_weights: &TierWeights,
+    doc_tiers: &std::collections::HashMap<String, u8>,
+) -> std::collections::HashMap<String, f32> {
+    let mut fused: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for (channel, ranking) in rankings {
+        let w = channel_weight_with_tier(*channel, params.alpha, tier_weights);
+        if w <= 0.0 {
+            continue;
+        }
+        for (rank, id) in ranking.iter().enumerate() {
+            let base = w / (params.k + rank as f32 + 1.0);
+            let tier = doc_tiers.get(id).copied().unwrap_or(2);
+            let adj = tier_adjust(base, tier, tier_weights);
+            *fused.entry(id.clone()).or_insert(0.0) += adj;
         }
     }
     fused
@@ -1751,6 +1850,98 @@ mod tests {
         assert!(!dense_only.contains_key("lex"));
     }
 
+    // ── F2b P0-b: tier_adjust pre-fusión ──────────────────────────────────
+
+    #[test]
+    fn episode_tier_buckets_settled_and_importance() {
+        assert_eq!(episode_tier(0.0, true), 0, "settled ⇒ top");
+        assert_eq!(episode_tier(0.9, false), 0);
+        assert_eq!(episode_tier(0.7, false), 0);
+        assert_eq!(episode_tier(0.5, false), 1);
+        assert_eq!(episode_tier(0.3, false), 1);
+        assert_eq!(episode_tier(0.29, false), 2);
+        assert_eq!(episode_tier(0.0, false), 2);
+    }
+
+    #[test]
+    fn tier_adjust_boosts_top_only() {
+        let w = TierWeights {
+            channel: 0.25,
+            boost: 0.4,
+        };
+        assert!((tier_adjust(1.0, 0, &w) - 1.4).abs() < 1e-6);
+        assert!((tier_adjust(1.0, 1, &w) - 1.2).abs() < 1e-6);
+        assert!((tier_adjust(1.0, 2, &w) - 1.0).abs() < 1e-6);
+        assert!((tier_adjust(1.0, 9, &w) - 1.0).abs() < 1e-6);
+        // Boost negativo o cero ⇒ sin ajuste (nunca penaliza).
+        let off = TierWeights {
+            channel: 0.0,
+            boost: 0.0,
+        };
+        assert!((tier_adjust(2.0, 0, &off) - 2.0).abs() < 1e-6);
+        let neg = TierWeights {
+            channel: 0.25,
+            boost: -1.0,
+        };
+        assert!((tier_adjust(2.0, 0, &neg) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tiered_fusion_matches_legacy_when_boost_off_and_no_tier_channel() {
+        let rankings = vec![
+            (FuseChannel::Lexical, vec!["a".into(), "b".into()]),
+            (FuseChannel::Dense, vec!["b".into(), "a".into()]),
+        ];
+        let params = RrfParams::default();
+        let legacy = fuse_rankings_weighted(&rankings, &params);
+        let off = TierWeights {
+            channel: 0.0,
+            boost: 0.0,
+        };
+        let tiered = fuse_rankings_weighted_tiered(&rankings, &params, &off, &Default::default());
+        for id in ["a", "b"] {
+            assert!(
+                (legacy[id] - tiered[id]).abs() < 1e-6,
+                "{id}: {} vs {}",
+                legacy[id],
+                tiered[id]
+            );
+        }
+    }
+
+    #[test]
+    fn tiered_fusion_breaks_ties_toward_top_tier() {
+        // Mismo ranking en ambos canales: empate legacy entre a y b.
+        // Con a en tier 0 y b en rutina, el tiered debe ordenar a primero.
+        let rankings = vec![
+            (FuseChannel::Lexical, vec!["a".into(), "b".into()]),
+            (FuseChannel::Dense, vec!["a".into(), "b".into()]),
+        ];
+        let params = RrfParams::default();
+        let tiers: std::collections::HashMap<String, u8> =
+            [("a".to_string(), 0_u8), ("b".to_string(), 2_u8)]
+                .into_iter()
+                .collect();
+        let tiered =
+            fuse_rankings_weighted_tiered(&rankings, &params, &TierWeights::default(), &tiers);
+        assert!(
+            tiered["a"] > tiered["b"],
+            "top tier debe desempatar: a={} b={}",
+            tiered["a"],
+            tiered["b"]
+        );
+    }
+
+    #[test]
+    fn tier_channel_rides_fusion_with_default_weight() {
+        // El canal Tier participa en la fusión legacy con el peso default.
+        let rankings = vec![(FuseChannel::Tier, vec!["t".into(), "u".into()])];
+        let fused = fuse_rankings_weighted(&rankings, &RrfParams::default());
+        let w = TIER_CHANNEL_DEFAULT_WEIGHT;
+        assert!((fused["t"] - w / (RRF_K + 1.0)).abs() < 1e-6);
+        assert!(fused["t"] > fused["u"]);
+    }
+
     // ── T6.2: 3-factor scoring ────────────────────────────────────────────
 
     #[test]
@@ -2098,7 +2289,12 @@ mod tests {
         assert_eq!(a[0].timestamp, 200);
         assert_eq!(a[0].goal, "bash script");
         assert_eq!(a[1].goal, "bash script");
-        assert!(a[0].id < a[1].id, "empate total ⇒ id asc: {:?} vs {:?}", a[0].id, a[1].id);
+        assert!(
+            a[0].id < a[1].id,
+            "empate total ⇒ id asc: {:?} vs {:?}",
+            a[0].id,
+            a[1].id
+        );
         // limit respeta el top sin rellenar.
         let top1 = store
             .recall_gated("bash script", None, 1, RecallMode::Jaccard, 300)

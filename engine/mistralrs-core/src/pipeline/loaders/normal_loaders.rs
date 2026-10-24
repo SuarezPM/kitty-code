@@ -13,7 +13,9 @@ use crate::{
     amoe::AnyMoeBaseModelMixin,
     device_map::DeviceMapper,
     lora::{LoraConfig, Ordering},
-    paged_attention::{AttentionImplementation, ModelConfigLike, ModelConfigMetadata},
+    paged_attention::{
+        maybe_wrap_hybrid, AttentionImplementation, ModelConfigLike, ModelConfigMetadata,
+    },
     pipeline::{
         isq::IsqModelLoader, text_models_inputs_processor::FlashParams, EitherCache, IsqModel,
         ModelForwardContext,
@@ -5674,7 +5676,7 @@ impl DeviceMappedModelLoader for GraniteMoeHybridLoader {
     fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
         let cfg: crate::models::granite::Config = serde_json::from_str(config)?;
 
-        let cfg = ModelConfigMetadata {
+        let base = ModelConfigMetadata {
             max_seq_len: cfg.max_position_embeddings,
             num_layers: cfg.num_hidden_layers,
             hidden_size: cfg.hidden_size,
@@ -5686,7 +5688,7 @@ impl DeviceMappedModelLoader for GraniteMoeHybridLoader {
             kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
-        Ok(Box::new(cfg))
+        Ok(maybe_wrap_hybrid(base, config))
     }
 }
 
@@ -6145,7 +6147,7 @@ impl DeviceMappedModelLoader for Qwen3NextLoader {
     fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
         let cfg: crate::models::qwen3_next::Config = serde_json::from_str(config)?;
 
-        let cfg = ModelConfigMetadata {
+        let base = ModelConfigMetadata {
             max_seq_len: cfg.max_position_embeddings,
             num_layers: cfg.num_hidden_layers,
             hidden_size: cfg.hidden_size,
@@ -6157,7 +6159,7 @@ impl DeviceMappedModelLoader for Qwen3NextLoader {
             kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
-        Ok(Box::new(cfg))
+        Ok(maybe_wrap_hybrid(base, config))
     }
 }
 
@@ -6366,7 +6368,7 @@ impl DeviceMappedModelLoader for Qwen3_5TextLoader {
 
     fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
         let cfg = parse_qwen35_text_config(config)?;
-        Ok(Box::new(ModelConfigMetadata {
+        let base = ModelConfigMetadata {
             max_seq_len: cfg.max_position_embeddings,
             num_layers: cfg.num_hidden_layers,
             hidden_size: cfg.hidden_size,
@@ -6376,7 +6378,8 @@ impl DeviceMappedModelLoader for Qwen3_5TextLoader {
             k_head_dim: cfg.head_dim,
             v_head_dim: cfg.head_dim,
             kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
-        }))
+        };
+        Ok(maybe_wrap_hybrid(base, config))
     }
 }
 
@@ -6604,7 +6607,7 @@ impl DeviceMappedModelLoader for Lfm2Loader {
     fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
         let cfg: crate::models::lfm2::Config = serde_json::from_str(config)?;
         let head_dim = cfg.head_dim();
-        let cfg = ModelConfigMetadata {
+        let base = ModelConfigMetadata {
             max_seq_len: cfg.max_position_embeddings,
             num_layers: cfg.num_hidden_layers,
             hidden_size: cfg.hidden_size,
@@ -6616,7 +6619,7 @@ impl DeviceMappedModelLoader for Lfm2Loader {
             kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
-        Ok(Box::new(cfg))
+        Ok(maybe_wrap_hybrid(base, config))
     }
 }
 
