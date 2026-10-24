@@ -128,6 +128,17 @@ fn uuidish() -> String {
     format!("{:x}{:x}", nanos, std::process::id())
 }
 
+/// Lock serializa los tests que mutan `HOME` (cargo corre hilos en
+/// paralelo; sin lock los tests de `session` que fijan HOME y los de
+/// `tui.rs` que persisten sesión vía `finalize_turn` se pisan ⇒ flaky).
+/// Compartido con `tui::tests` (mismo binario): ambos lados deben tomar
+/// este lock, nunca uno local.
+#[cfg(test)]
+pub(crate) fn test_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,9 +147,8 @@ mod tests {
     fn with_tmp_home<F: FnOnce(&str)>(f: F) {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().to_str().unwrap().to_string();
-        // Env var global: serializamos con un lock por proceso de test.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap();
+        // Env var global: serializamos con el lock compartido con tui::tests.
+        let _g = test_home_env_lock();
         let prev = std::env::var("HOME").ok();
         std::env::set_var("HOME", &home);
         // Aíslo el directorio de sesiones para que un test no vea archivos

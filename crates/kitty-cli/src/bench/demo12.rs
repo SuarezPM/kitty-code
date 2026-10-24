@@ -470,6 +470,13 @@ pub(crate) async fn run_demo12_bench(
         eprintln!("integridad: {e:#}");
         std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
     }
+    // B1: tripwire pre-LLM ANTES de `begin` (como ppc.rs:279): si el run ya
+    // viene marcado con leak, integridad sin reservar fila — una fila con
+    // finished_at NULL y dirty/leaked=0 pasaría `is_clean` (residual gate).
+    if kitty_harness::guard::is_run_leaked() {
+        eprintln!("integridad: run marcado con leak (tripwire): demo-12 no corre");
+        std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+    }
     let ledger_path = crate::bench::ledger::ledger_db_path(out);
     let ledger = match crate::bench::ledger::Ledger::open(&ledger_path) {
         Ok(l) => l,
@@ -493,11 +500,6 @@ pub(crate) async fn run_demo12_bench(
             std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
         }
     };
-    // B1: tripwire pre-LLM — si el run ya viene marcado con leak, integridad.
-    if kitty_harness::guard::is_run_leaked() {
-        eprintln!("integridad: run marcado con leak (tripwire): demo-12 no corre");
-        std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
-    }
 
     // Justicia forzada (warn si el invocador pidió otra cosa).
     if cli.backend != "ollama" {
@@ -849,5 +851,57 @@ mod demo12_tests {
         // Con k=3 y separación real sí habría señal (control Wilson).
         let sig3 = kitty_harness::comparison::decide_signal(0, 8, 8, 8, true, 3);
         assert!(sig3.is_signal());
+    }
+
+    // === Fix begin/leak: el tripwire pre-LLM va ANTES de `begin` (ppc.rs:279)
+    // y el intra-run cierra con mark_leaked+finish antes del exit 3 ===
+
+    #[test]
+    fn leaked_run_cerrado_no_pasa_is_clean() {
+        // Contrato que el fix exige: un run con leak queda CERRADO
+        // (finished_at NOT NULL, exit 3) e `is_clean` es false — nunca una
+        // fila residual con finished_at NULL y dirty/leaked=0.
+        let tmp = tempfile::tempdir().expect("tmp ledger demo12");
+        let db = tmp.path().join("leak.ledger.db");
+        let l = crate::bench::ledger::Ledger::open(&db).expect("open ledger");
+        let id = l
+            .begin(&crate::bench::ledger::LedgerStamp {
+                fingerprint: "fp-demo12-leak-fix".to_string(),
+                suite: "demo-12".to_string(),
+                arm: "default".to_string(),
+                rep: 0,
+                git_head: "test".to_string(),
+                dirty: false,
+                started_at: "2026-10-24T00:00:00Z".to_string(),
+            })
+            .expect("begin reserva la celda");
+        // Camino tripwire intra-run (mark + finish antes del exit 3).
+        l.mark_leaked(&id).expect("mark_leaked");
+        l.finish(
+            &id,
+            "2026-10-24T00:01:00Z",
+            crate::bench::runmark::EXIT_INTEGRITY,
+        )
+        .expect("finish cierra la fila");
+        assert!(
+            !l.is_clean(&id).expect("is_clean debe responder"),
+            "run con leak ⇒ is_clean false (gate cerrado)"
+        );
+        drop(l);
+        // Fila cerrada en disco: finished_at NOT NULL + exit 3.
+        let conn = rusqlite::Connection::open(&db).expect("reopen ledger");
+        let (fin, code): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT finished_at, exit_code FROM runs WHERE run_id = ?1",
+                rusqlite::params![id],
+                |row| Ok((row.get(0).unwrap_or(None), row.get(1).unwrap_or(None))),
+            )
+            .expect("fila presente");
+        assert!(fin.is_some(), "fila cerrada: finished_at NOT NULL");
+        assert_eq!(
+            code,
+            Some(crate::bench::runmark::EXIT_INTEGRITY as i64),
+            "exit de integridad (3)"
+        );
     }
 }

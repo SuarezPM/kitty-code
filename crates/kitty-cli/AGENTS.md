@@ -12,7 +12,7 @@ Binary crate: Clap dispatch + bench harness + MCP stdio + optional TUI. No agent
 | Bench helpers | `src/main.rs:867,983,1000` | `bench_exit_code` gate 50% + baseline delta, `wilson_ci` z 1.96, `p50_ms` median, `parse_thinking_budgets`, `build_ab_plan` |
 | Bench items | `src/main.rs:643,816` | `exercises()` 15 polyglot + `tb2_exercises()` 8; `json_to_bench_item` + `load_json_exercises` for `--exercises` JSON |
 | MCP server | `src/mcp.rs:17,178` | `McpServer` stdio JSON-RPC line delimited; 6 tools via `ToolRegistry::execute` (Guard enforced); `handle_request` for tests |
-| TUI | `src/tui.rs:150` | `run_tui` feature `tui` only; ratatui 0.29 + crossterm 0.28; `StatusInfo` ctx pct + duration; q/Esc quit |
+| TUI | `src/tui.rs:150` | `run_tui` feature `tui` only; ratatui 0.30 + crossterm 0.29; `StatusInfo` ctx pct + duration; q/Esc quit |
 
 ## CONVENTIONS
 - Bench harness lives here, not in `kitty-harness`. Keeps harness lib pure.

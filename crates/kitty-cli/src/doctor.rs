@@ -36,6 +36,13 @@ pub struct DoctorReport {
     pub ram_total_gb: Option<f64>,
     /// GPU VRAM in GiB (first `nvidia-smi` line, `None` without NVIDIA GPU).
     pub gpu_vram_gb: Option<f64>,
+    /// `ollama ps` runs CPU-only with resident models (`None` when `ps`
+    /// failed or no model is resident — nothing to judge).
+    pub ollama_cpu_only: Option<bool>,
+    /// `ollama ps` summary (`"empty"`, `"N model row(s)"`, `"ollama ps failed"`).
+    pub ollama_ps_summary: String,
+    /// Profile recommended from measured VRAM (`recommend_profile_by_vram`).
+    pub perfil_recomendado: String,
     /// Free disk in GiB at the current directory (`None` when `df` fails).
     pub disk_free_gb: Option<f64>,
     /// Recommended backend: `"ollama"` (or the `kitty-infer` env override).
@@ -113,6 +120,50 @@ pub fn parse_df_avail_gb(output: &str) -> Option<f64> {
     Some(kb / 1024.0 / 1024.0)
 }
 
+/// Is Ollama running CPU-only? Parses `ollama ps` output (table with a
+/// `PROCESSOR` column like `100% GPU`, `100% CPU` or `86% CPU/14% GPU`).
+/// - Header-only / empty ⇒ `None` (no resident model, nothing to judge).
+/// - Any row mentioning GPU ⇒ `Some(false)` (offload active).
+/// - Rows only CPU ⇒ `Some(true)`.
+#[must_use]
+pub fn parse_ollama_ps_cpu_only(output: &str) -> Option<bool> {
+    let mut rows: u32 = 0;
+    let mut gpu_seen = false;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Header (`NAME … PROCESSOR …`); data rows never carry that word.
+        if trimmed.to_ascii_uppercase().contains("PROCESSOR") {
+            continue;
+        }
+        rows += 1;
+        if trimmed.to_ascii_uppercase().contains("GPU") {
+            gpu_seen = true;
+        }
+    }
+    if rows == 0 {
+        None
+    } else {
+        Some(!gpu_seen)
+    }
+}
+
+/// Profile recommended from measured VRAM. Conservative thresholds aligned
+/// with the w6-vram series (9B peaks ≈6.5 GiB on 8 GiB; medium needs ≥8 GiB).
+/// `None` (no NVIDIA GPU) ⇒ `tiny` (CPU-friendly ≤4B models).
+#[must_use]
+pub fn recommend_profile_by_vram(vram_gb: Option<f64>) -> &'static str {
+    match vram_gb {
+        None => "tiny",
+        Some(v) if v < 6.0 => "tiny",
+        Some(v) if v < 8.0 => "small",
+        Some(v) if v < 20.0 => "medium",
+        _ => "large",
+    }
+}
+
 /// Pure action builder — unit-tested without network or subprocesses.
 #[must_use]
 pub fn build_actions(
@@ -121,6 +172,8 @@ pub fn build_actions(
     model_present: bool,
     ram_total_gb: Option<f64>,
     disk_free_gb: Option<f64>,
+    gpu_vram_gb: Option<f64>,
+    ollama_cpu_only: Option<bool>,
 ) -> Vec<String> {
     let mut acciones = Vec::new();
     if !ollama_reachable {
@@ -147,6 +200,23 @@ pub fn build_actions(
                 "Disco libre {free:.1} GiB (< 10 GiB): un Q4_K_M 8-9B ocupa ~6 GiB; libera espacio antes del pull."
             ));
         }
+    }
+    if ollama_cpu_only == Some(true) {
+        acciones.push(
+            "Ollama corre CPU-only (`ollama ps` sin GPU): espera latencias altas; usa `--profile tiny` y modelos ≤4B, o revisa el offload a GPU."
+                .to_string(),
+        );
+    }
+    let perfil = recommend_profile_by_vram(gpu_vram_gb);
+    match gpu_vram_gb {
+        None => acciones.push(
+            "Sin VRAM detectable (sin nvidia-smi): si no hay GPU, usa `--profile tiny` y modelos ≤4B."
+                .to_string(),
+        ),
+        Some(v) if perfil == "tiny" || perfil == "small" => acciones.push(format!(
+            "VRAM {v:.1} GiB: usa `--profile {perfil}` y modelos acordes (9B ≈6.5 GiB pico)."
+        )),
+        Some(_) => {}
     }
     if acciones.is_empty() {
         acciones.push("Todo listo: Ollama responde y el modelo está presente.".to_string());
@@ -183,6 +253,30 @@ fn read_disk_free_gb() -> Option<f64> {
     parse_df_avail_gb(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// `ollama ps` best-effort: (`cpu_only`, summary). Nunca falla el doctor:
+/// fallo o `ps` vacío degradan a (`None`, resumen honesto).
+fn read_ollama_ps() -> (Option<bool>, String) {
+    let Ok(out) = std::process::Command::new("ollama").arg("ps").output() else {
+        return (None, "ollama ps failed".to_string());
+    };
+    if !out.status.success() {
+        return (None, "ollama ps failed".to_string());
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let cpu_only = parse_ollama_ps_cpu_only(&text);
+    let rows = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.to_ascii_uppercase().contains("PROCESSOR"))
+        .count();
+    let summary = if rows == 0 {
+        "empty".to_string()
+    } else {
+        format!("{rows} model row(s)")
+    };
+    (cpu_only, summary)
+}
+
 /// Run the full probe. Network/subprocess failures degrade to `false`/`None`
 /// fields — this function never returns `Err` for a missing server or GPU.
 pub async fn run_doctor(url: &str, model: &str) -> DoctorReport {
@@ -204,6 +298,8 @@ pub async fn run_doctor(url: &str, model: &str) -> DoctorReport {
     let ram_total_gb = read_host_ram_gb();
     let gpu_vram_gb = read_gpu_vram_gb();
     let disk_free_gb = read_disk_free_gb();
+    let (ollama_cpu_only, ollama_ps_summary) = read_ollama_ps();
+    let perfil_recomendado = recommend_profile_by_vram(gpu_vram_gb).to_string();
     let backend_recomendado = recommend_backend(ollama_reachable);
     let acciones = build_actions(
         ollama_reachable,
@@ -211,6 +307,8 @@ pub async fn run_doctor(url: &str, model: &str) -> DoctorReport {
         model_present,
         ram_total_gb,
         disk_free_gb,
+        gpu_vram_gb,
+        ollama_cpu_only,
     );
 
     DoctorReport {
@@ -223,6 +321,9 @@ pub async fn run_doctor(url: &str, model: &str) -> DoctorReport {
         ram_total_gb,
         disk_free_gb,
         gpu_vram_gb,
+        ollama_cpu_only,
+        ollama_ps_summary,
+        perfil_recomendado,
         backend_recomendado,
         acciones,
     }
@@ -272,6 +373,16 @@ pub fn format_human(r: &DoctorReport) -> String {
         Some(d) => out.push_str(&format!("Disco libre: {d:.1} GiB\n")),
         None => out.push_str("Disco libre: desconocido\n"),
     }
+    let ps_nota = match r.ollama_cpu_only {
+        Some(true) => " (CPU-only, sin GPU)",
+        Some(false) => " (con GPU)",
+        None => "",
+    };
+    out.push_str(&format!("Ollama ps: {}{ps_nota}\n", r.ollama_ps_summary));
+    out.push_str(&format!(
+        "Perfil recomendado (por VRAM): --profile {}\n",
+        r.perfil_recomendado
+    ));
     out.push_str(&format!("Backend recomendado: {}\n", r.backend_recomendado));
     out.push_str("Acciones:\n");
     for (i, a) in r.acciones.iter().enumerate() {
@@ -327,7 +438,15 @@ mod tests {
 
     #[test]
     fn missing_model_proposes_exact_pull() {
-        let acciones = build_actions(true, "ornith:9b", false, Some(16.0), Some(50.0));
+        let acciones = build_actions(
+            true,
+            "ornith:9b",
+            false,
+            Some(16.0),
+            Some(50.0),
+            Some(16.0),
+            Some(false),
+        );
         assert!(
             acciones.iter().any(|a| a.contains("ollama pull ornith:9b")),
             "got {acciones:?}"
@@ -336,7 +455,7 @@ mod tests {
 
     #[test]
     fn unreachable_ollama_asks_to_serve_first() {
-        let acciones = build_actions(false, "ornith:9b", false, None, None);
+        let acciones = build_actions(false, "ornith:9b", false, None, None, None, None);
         assert!(
             acciones.iter().any(|a| a.contains("ollama serve")),
             "got {acciones:?}"
@@ -350,16 +469,140 @@ mod tests {
 
     #[test]
     fn all_good_reports_ready() {
-        let acciones = build_actions(true, "ornith:9b", true, Some(16.0), Some(50.0));
+        // VRAM de sobra (medium) + ps con GPU: sin avisos nuevos.
+        let acciones = build_actions(
+            true,
+            "ornith:9b",
+            true,
+            Some(16.0),
+            Some(50.0),
+            Some(16.0),
+            Some(false),
+        );
         assert_eq!(acciones.len(), 1);
         assert!(acciones[0].contains("Todo listo"));
     }
 
     #[test]
     fn low_ram_warns_tiny_profile() {
-        let acciones = build_actions(true, "qwen3:4b", true, Some(4.0), Some(50.0));
+        let acciones = build_actions(
+            true,
+            "qwen3:4b",
+            true,
+            Some(4.0),
+            Some(50.0),
+            Some(16.0),
+            Some(false),
+        );
         assert!(
             acciones.iter().any(|a| a.contains("--profile tiny")),
+            "got {acciones:?}"
+        );
+    }
+
+    #[test]
+    fn ollama_ps_cpu_only_parsing() {
+        assert_eq!(parse_ollama_ps_cpu_only(""), None);
+        assert_eq!(
+            parse_ollama_ps_cpu_only("NAME\tID\tSIZE\tPROCESSOR\tCONTEXT\tUNTIL\n"),
+            None,
+            "solo header ⇒ sin residentes"
+        );
+        assert_eq!(
+            parse_ollama_ps_cpu_only(
+                "NAME\tID\tSIZE\tPROCESSOR\tCONTEXT\tUNTIL\nornith:9b\te5df7dc\t5.5 GB\t100% CPU\t16384\t5 minutes from now\n"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            parse_ollama_ps_cpu_only(
+                "NAME ID SIZE PROCESSOR CONTEXT UNTIL\nornith:9b e5df7dc 5.5 GB 100% GPU 16384 5m\n"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            parse_ollama_ps_cpu_only(
+                "NAME ID SIZE PROCESSOR CONTEXT UNTIL\nornith:9b e5df7dc 5.5 GB 86% CPU/14% GPU 16384 5m\n"
+            ),
+            Some(false),
+            "offload parcial cuenta como GPU"
+        );
+        assert_eq!(
+            parse_ollama_ps_cpu_only(
+                "NAME ID SIZE PROCESSOR CONTEXT UNTIL\na x 1 GB 100% CPU 4096 1m\nb y 2 GB 100% GPU 4096 1m\n"
+            ),
+            Some(false),
+            "una fila con GPU basta"
+        );
+    }
+
+    #[test]
+    fn vram_profile_thresholds() {
+        assert_eq!(recommend_profile_by_vram(None), "tiny");
+        assert_eq!(recommend_profile_by_vram(Some(4.0)), "tiny");
+        assert_eq!(recommend_profile_by_vram(Some(6.0)), "small");
+        assert_eq!(recommend_profile_by_vram(Some(7.9)), "small");
+        assert_eq!(recommend_profile_by_vram(Some(8.0)), "medium");
+        assert_eq!(recommend_profile_by_vram(Some(16.0)), "medium");
+        assert_eq!(recommend_profile_by_vram(Some(24.0)), "large");
+    }
+
+    #[test]
+    fn cpu_only_warns_tiny_and_offload() {
+        let acciones = build_actions(
+            true,
+            "ornith:9b",
+            true,
+            Some(16.0),
+            Some(50.0),
+            Some(8.0),
+            Some(true),
+        );
+        assert!(
+            acciones
+                .iter()
+                .any(|a| a.contains("CPU-only") && a.contains("--profile tiny")),
+            "got {acciones:?}"
+        );
+    }
+
+    #[test]
+    fn low_vram_recommends_matching_profile() {
+        let tiny = build_actions(
+            true,
+            "m",
+            true,
+            Some(16.0),
+            Some(50.0),
+            Some(5.0),
+            Some(false),
+        );
+        assert!(
+            tiny.iter().any(|a| a.contains("--profile tiny")),
+            "got {tiny:?}"
+        );
+        let small = build_actions(
+            true,
+            "m",
+            true,
+            Some(16.0),
+            Some(50.0),
+            Some(7.0),
+            Some(false),
+        );
+        assert!(
+            small.iter().any(|a| a.contains("--profile small")),
+            "got {small:?}"
+        );
+    }
+
+    #[test]
+    fn missing_vram_suggests_tiny() {
+        let acciones = build_actions(true, "m", true, Some(16.0), Some(50.0), None, None);
+        assert!(
+            acciones
+                .iter()
+                .any(|a| a.contains("Sin VRAM") && a.contains("--profile tiny")),
             "got {acciones:?}"
         );
     }

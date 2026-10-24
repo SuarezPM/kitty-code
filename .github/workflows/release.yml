@@ -1,5 +1,35 @@
 name: Release
 
+# Pass 3 Lane C — verificación local vs tag-only (2026-10-24):
+#
+# VERIFICABLE EN LOCAL sin push ni OIDC (verify local, no release E2E):
+#   - `cargo build --locked --release -p kitty-cli --features tui` → dist/kittycode
+#   - `(cd dist && sha256sum kittycode > kittycode.sha256)` + `sha256sum -c`
+#   - `cargo cyclonedx --all-features --format json` (SBOM en seco; el workflow
+#     usa cargo-cyclonedx 0.5.9 pinned) + check de que dist/*.cdx.json existe
+#   - staging de assets (cp/ln). Todo lo anterior corre sin secretos.
+#
+# SOLO corre con push de tag `v*` (+ OIDC GitHub → Sigstore):
+#   - `actions/attest-build-provenance` (necesita attestations: write + OIDC;
+#     en local `gh attestation` no tiene nada que verificar sin release).
+#   - `sigstore/cosign-installer` + `cosign sign-blob --yes` keyless (necesita
+#     OIDC contra Rekor/Fulcio; fuera de Actions falla sin token efímero).
+#   - `gh release create` (necesita GITHUB_TOKEN con contents: write sobre un
+#     tag real; en local es dry-run como máximo con `gh release create --dry-run`
+#     o no se ejecuta).
+#   Conclusión: el E2E de release (attest/cosign/SLSA + publicación) NO es
+#   reproducible en local ni en contenedor limpio; lo local cubre build+sha+SBOM.
+#
+# NOTA-REPO-PRIVADO: repo privado + sin tag pusheado ⇒ no hay release pública;
+#   `curl|sh` (install.sh paso 1) es imposible hoy. Desbloqueo: 1) hacer público
+#   el repo, 2) pushear tag v*, 3) este workflow publica assets, 4) curl|sh funciona.
+#
+# FIX 2026-10-24 (Lane C): el staging usaba `cp target/**/*.cdx.json` pero
+#   cargo-cyclonedx 0.5.9 escribe junto a cada Cargo.toml (crates/*, engine/*),
+#   0 matches bajo target/ ⇒ el guard "SBOM missing" mataba el job en el primer
+#   tag push. Se cambió a `find crates engine -name '*.cdx.json' -exec cp`;
+#   staging completo (build+sha+11 SBOM) re-verificado en local (ver STAGING OK).
+
 on:
   push:
     tags: ["v*"]
@@ -43,8 +73,12 @@ jobs:
           (cd dist && sha256sum kittycode > kittycode.sha256)
           ln -sf kittycode dist/kitty
           ln -sf kittycode dist/kitty-cli
-          shopt -s globstar nullglob
-          cp target/**/*.cdx.json dist/
+          # cargo-cyclonedx 0.5.9 escribe los *.cdx.json junto a cada Cargo.toml
+          # (crates/*/*.cdx.json, engine/*/*.cdx.json), NO bajo target/ —
+          # verificado en local 2026-10-24. Se recogen con find para que el
+          # guard de abajo los vea (el glob anterior `target/**/*.cdx.json`
+          # no copiaba nada y el job moría en "SBOM missing").
+          find crates engine -name '*.cdx.json' -exec cp {} dist/ \;
           compgen -G "dist/*.cdx.json" > /dev/null || { echo "SBOM missing"; exit 1; }
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0

@@ -1,8 +1,14 @@
 # Kitty Code
 
 A **local coding agent** written in Rust, designed to run small models (e.g.
-`ornith:9b`, Q4_K_M, ~5.6 GB) on consumer GPUs (tested on an RTX 2060 Super 8 GB)
-via the [Ollama](https://ollama.com) HTTP API.
+`ornith:9b`, Q4_K_M, ≈5.6 GB en disco según `bench/gpu-ventana-2026-10-09/manifest-tb2-justicia.json`
+(`modelo: ornith:9b … 5.6GB Q4_K_M`); residente medido 6.2 GB en serie CPU
+(`bench/gpu-ventana-2026-10-09/manifest-w6-vram.json`,
+`matriz[6].size_residente`) y 5.5 GB ps / 5.1 GiB runner en serie GPU 1-celda
+(`bench/gpu-ventana-2026-10-09/manifest-w6-vram-gpu.json`, `matriz[3]`;
+ver `docs/SUPPORTED-MODELS-8GB.md`)) on consumer GPUs (tested on an RTX 2060
+Super 8 GB — `hardware.gpu: NVIDIA GeForce RTX 2060 SUPER 8192 MiB` en ambas
+series W6) via the [Ollama](https://ollama.com) HTTP API.
 
 The value is not the model — it is the **harness**: the tool-call loop, safety
 guards, hashline-based file edits, quality monitor, context budget, knowledge
@@ -15,6 +21,16 @@ injection, and episodic memory wrapped around a small local LLM.
 kittycode doctor                    # 2. diagnostica Ollama/modelo/VRAM/disco; si falta el modelo propone el `ollama pull <id>` exacto
 kittycode run "escribe hola mundo"  # 3. primer run (añade `--plan` para dry-run sin edits)
 ```
+
+> **Estado install (2026-10-24, repo privado sin tag):** el `curl|sh`
+> público es imposible hoy — no hay releases que descargar y
+> `cargo install --git` pide credenciales. Desde un checkout local usa el
+> modo sin red:
+> `./install.sh --from-source --source-dir "$PWD"` (o
+> `KITTY_INSTALL_SOURCE="$PWD" ./install.sh --from-source`).
+> Desbloqueo: 1) hacer público el repo → 2) pushear tag `v*` → 3) CI
+> `release.yml` publica binario+sha256+SBOM+attest/cosign → 4) `curl|sh`
+> funciona. Detalle de flags en `./install.sh --help`.
 
 Sin subcomando, `kittycode` abre la TUI interactiva (feature `tui`, por
 defecto). Requisitos: Linux x86_64, [Ollama](https://ollama.com) sirviendo en
@@ -48,7 +64,13 @@ defecto). Requisitos: Linux x86_64, [Ollama](https://ollama.com) sirviendo en
 ```bash
 cargo build --release -p kitty-cli
 ollama pull ornith:9b
-./target/release/kittycode run "Write a Rust function that reverses a string"
+./target/release/kitty run "Write a Rust function that reverses a string"
+# `kitty`, `kitty-cli` y `kittycode` son el mismo binario (mismo
+# `crates/kitty-cli/src/main.rs`, tres `[[bin]]` en `crates/kitty-cli/Cargo.toml`);
+# `install.sh` lo publica como `kittycode` (+ symlinks `kitty`/`kitty-cli`).
+# Artefacto verificado en esta sesión: `./target/release/kitty` (`kitty 0.1.0`).
+# `cargo build --release -p kitty-cli` compila los tres bins a la vez
+# (el propio `release.yml` depende de eso); `install.sh` instala `kittycode`.
 ```
 
 Bare `kittycode` (sin subcomando) abre la TUI interactiva. Otros comandos:

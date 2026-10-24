@@ -832,6 +832,22 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
+    /// HOME temporal + lock compartido con `session::tests` (ver
+    /// `session::test_home_env_lock`): `finalize_turn` persiste la sesión
+    /// en HOME y los tests de sesión mutan HOME en paralelo ⇒ sin lock y
+    /// sin HOME aislado, flaky + contaminación de `~/.kitty` real.
+    fn with_tmp_home<F: FnOnce()>(f: F) {
+        let tmp = tempfile::tempdir().expect("tmp HOME para test TUI");
+        let _lock = session::test_home_env_lock();
+        let prev = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+        f();
+        match prev {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     fn rows_of(backend: &TestBackend) -> Vec<String> {
         let buf = backend.buffer();
         let w = buf.area.width as usize;
@@ -901,31 +917,37 @@ mod tests {
 
     #[test]
     fn streaming_then_done_finalizes_turn() {
-        let mut app = App::new("m", 100);
-        app.handle_tui_event(TuiEvent::Token("hola ".into()));
-        app.handle_tui_event(TuiEvent::Token("mundo".into()));
-        assert_eq!(app.streaming, "hola mundo");
-        app.handle_tui_event(TuiEvent::Done("ignorado".into()));
-        assert_eq!(app.messages.last().unwrap().content, "hola mundo");
-        assert!(app.streaming.is_empty());
-        assert!(!app.is_running);
-        // la sesión persistida refleja el turno
-        assert_eq!(app.session.entries.last().unwrap().content, "hola mundo");
+        with_tmp_home(|| {
+            let mut app = App::new("m", 100);
+            app.handle_tui_event(TuiEvent::Token("hola ".into()));
+            app.handle_tui_event(TuiEvent::Token("mundo".into()));
+            assert_eq!(app.streaming, "hola mundo");
+            app.handle_tui_event(TuiEvent::Done("ignorado".into()));
+            assert_eq!(app.messages.last().unwrap().content, "hola mundo");
+            assert!(app.streaming.is_empty());
+            assert!(!app.is_running);
+            // la sesión persistida refleja el turno
+            assert_eq!(app.session.entries.last().unwrap().content, "hola mundo");
+        });
     }
 
     #[test]
     fn done_without_streaming_uses_text() {
-        let mut app = App::new("m", 100);
-        app.handle_tui_event(TuiEvent::Done("respuesta directa".into()));
-        assert_eq!(app.messages.last().unwrap().content, "respuesta directa");
+        with_tmp_home(|| {
+            let mut app = App::new("m", 100);
+            app.handle_tui_event(TuiEvent::Done("respuesta directa".into()));
+            assert_eq!(app.messages.last().unwrap().content, "respuesta directa");
+        });
     }
 
     #[test]
     fn error_event_finalizes_with_error_text() {
-        let mut app = App::new("m", 100);
-        app.handle_tui_event(TuiEvent::Error("boom".into()));
-        assert!(app.messages.last().unwrap().content.contains("boom"));
-        assert!(!app.is_running);
+        with_tmp_home(|| {
+            let mut app = App::new("m", 100);
+            app.handle_tui_event(TuiEvent::Error("boom".into()));
+            assert!(app.messages.last().unwrap().content.contains("boom"));
+            assert!(!app.is_running);
+        });
     }
 
     #[test]
@@ -949,14 +971,16 @@ mod tests {
 
     #[test]
     fn reset_clears_messages_and_streaming() {
-        let mut app = App::new("m", 100);
-        app.input = "a".into();
-        app.take_input();
-        app.handle_tui_event(TuiEvent::Done("r".into()));
-        app.reset();
-        assert!(app.messages.is_empty());
-        assert!(app.streaming.is_empty());
-        assert_eq!(app.scroll_offset, 0);
+        with_tmp_home(|| {
+            let mut app = App::new("m", 100);
+            app.input = "a".into();
+            app.take_input();
+            app.handle_tui_event(TuiEvent::Done("r".into()));
+            app.reset();
+            assert!(app.messages.is_empty());
+            assert!(app.streaming.is_empty());
+            assert_eq!(app.scroll_offset, 0);
+        });
     }
 
     #[test]

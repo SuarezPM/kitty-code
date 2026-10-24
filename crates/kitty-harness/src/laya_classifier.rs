@@ -366,6 +366,25 @@ mod tests {
     }
 
     #[test]
+    fn fitted_stays_held_until_real_calibration() {
+        // W8 sigue 0/200: sin tráfico propio medido no hay calibración
+        // real. Aunque `fit` devuelva `Fitted` sobre datos sintéticos, el
+        // gate de este lane lo mantiene HELD (fail-open): `from_fit`
+        // ignora el payload `CalibratedLaya` por diseño y devuelve el
+        // no-op held Noul ("laya", "laya-held"). Fija el comportamiento
+        // decidido: Fitted NO habilita gating hasta la calibración real.
+        let samples = calibrated_set(400);
+        let outcome = fit(&samples);
+        assert!(is_fitted(&outcome));
+        let s = crate::systemone::LayaSystemOne::from_fit(outcome);
+        let d = s.decide(&crate::systemone::DecisionRequest::new("task complete"));
+        assert_eq!(d.decision, crate::systemone::Decision::Noul);
+        assert!(d.abstained);
+        assert_eq!(d.source, "laya");
+        assert_eq!(d.model_id, "laya-held");
+    }
+
+    #[test]
     fn scale_identity_at_t1_and_clamped() {
         assert!((scale_confidence(0.7, 1.0) - 0.7).abs() < 1e-5);
         assert!((0.0..=1.0).contains(&scale_confidence(0.0, 2.0)));
