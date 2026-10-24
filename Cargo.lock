@@ -3551,6 +3551,7 @@ name = "kitty-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "console-subscriber",
  "crossterm",

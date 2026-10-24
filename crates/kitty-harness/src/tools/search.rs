@@ -9,6 +9,9 @@ impl ToolRegistry {
         &self,
         args: &serde_json::Value,
     ) -> Result<ToolResult, ToolError> {
+        if let Some(reason) = crate::guard::bench_policy_check("Glob", args) {
+            return Err(ToolError::BenchDenied(reason));
+        }
         let pattern = args
             .get("pattern")
             .and_then(|v| v.as_str())
@@ -43,6 +46,9 @@ impl ToolRegistry {
         &self,
         args: &serde_json::Value,
     ) -> Result<ToolResult, ToolError> {
+        if let Some(reason) = crate::guard::bench_policy_check("Grep", args) {
+            return Err(ToolError::BenchDenied(reason));
+        }
         let pattern = args
             .get("pattern")
             .and_then(|v| v.as_str())

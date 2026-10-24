@@ -29,6 +29,11 @@ impl ToolRegistry {
         &self,
         args: &serde_json::Value,
     ) -> Result<ToolResult, ToolError> {
+        // BenchPolicy primero (cat bench/... denegado aunque Guard lo
+        // consideraría SAFE_OUTPUT Allow).
+        if let Some(reason) = crate::guard::bench_policy_check("Bash", args) {
+            return Err(ToolError::BenchDenied(reason));
+        }
         let command = args
             .get("command")
             .and_then(|v| v.as_str())

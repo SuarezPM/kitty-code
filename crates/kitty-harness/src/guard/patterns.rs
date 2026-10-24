@@ -69,6 +69,13 @@ pub(crate) const NON_DESTRUCTIVE_TARGETS: &[&str] = &[
     "/dev/urandom",
 ];
 
+/// Bench leak guard (Capa 0, Lane B): path components that must never be
+/// readable via agent tools during a scored/offline bench. Matched as exact
+/// path segments after lexical canonicalization (`bench` != `benchmark`).
+/// Pre-dispatch deny covers Read/Grep/Glob/Bash (incl. `cat` in
+/// `SAFE_OUTPUT_COMMANDS`, which must NOT bypass this policy).
+pub(crate) const BENCH_DENY_COMPONENTS: &[&str] = &["bench", "benches"];
+
 /// Chain operators that split a shell command chain into independent commands.
 pub(crate) const CHAIN_OPERATORS: &[&str] = &["&&", "||", ";", "|", "\n"];
 

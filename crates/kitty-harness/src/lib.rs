@@ -33,6 +33,11 @@ pub mod sandbox;
 pub mod seed;
 pub mod skills;
 pub mod speculative;
+pub mod systemone;
+pub use systemone::{
+    Decision, DecisionRequest, OffSystemOne, ScoredDecision, SystemOne, TfidfSystemOne,
+    systemone_status,
+};
 pub mod telemetry;
 pub mod tfidf_closer;
 pub mod thinking_budget;
@@ -42,7 +47,7 @@ pub mod version;
 pub use agent::{Agent, AgentEvent};
 pub use bootstrap::{Bootstrap, BootstrapResult};
 pub use context::ContextBudget;
-pub use guard::{detect_write_targets, is_write_via_redirect, Guard, GuardVerdict};
+pub use guard::{bench_policy_check, detect_write_targets, is_bench_path, is_write_via_redirect, Guard, GuardVerdict};
 pub use knowledge::{KnowledgeBase, KnowledgeConfig};
 pub use model_profile::{ModelProfile, ModelTuning, ThinkingMode, Tier};
 pub use plugin::{HelloPlugin, Plugin, PluginError, PluginRegistry, TwoToolPlugin};

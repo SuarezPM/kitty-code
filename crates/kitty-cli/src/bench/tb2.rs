@@ -178,7 +178,11 @@ pub(crate) async fn run_tb2_official(
                 println!("GATE FAILED: {:.1}% < {:.0}%", rate, gate);
             }
 
-            let exit_code = if rate < gate { 1 } else { 0 };
+            let exit_code = if rate >= gate {
+                super::runmark::EXIT_GATE_FAIL
+            } else {
+                super::runmark::EXIT_PASS
+            };
             std::process::exit(exit_code);
         }
         Err(e) => {

@@ -5,6 +5,7 @@
 pub mod embedding;
 pub mod episodic;
 pub mod error;
+pub mod lessons;
 
 pub use embedding::{
     default_cache_dir, normalize_embedding, EmbeddingStore, MODEL_DIM, MODEL_FILE, MODEL_ID,
@@ -17,3 +18,7 @@ pub use episodic::{
     RECENCY_HALF_LIFE_SECS, RRF_K,
 };
 pub use error::MemoryError;
+pub use lessons::{
+    LessonError, LessonStore, MemoryItem, RunProvenance, LESSON_DEFAULT_TTL_SECS,
+    MAX_LESSON_RECALL,
+};

@@ -8,15 +8,15 @@
 #   1. Tries the signed release binary for this platform (curl -f, sha256
 #      verified fail-closed).
 #   2. Falls back to a source build (`cargo install --locked --git ...`).
-#   3. Installs `kitty` into $KITTY_INSTALL_DIR (default ~/.local/bin) plus a
-#      transitional `kitty-cli` symlink, then prints the 3-command quickstart.
+#   3. Installs `kittycode` into $KITTY_INSTALL_DIR (default ~/.local/bin) plus
+#      compat `kitty` / `kitty-cli` symlinks, then prints the 3-command quickstart.
 #
 # Phase scope: Linux x86_64 only (mac/win explicitly out until CI ships them).
 # Every step checks its exit code and aborts with an actionable message.
 set -euo pipefail
 
 REPO="${KITTY_REPO:-SuarezPM/kitty-code}"
-BIN="kitty"
+BIN="kittycode"
 VERSION="${KITTY_VERSION:-latest}"
 INSTALL_DIR="${KITTY_INSTALL_DIR:-$HOME/.local/bin}"
 FROM_SOURCE=0
@@ -125,10 +125,12 @@ else
     fi
 fi
 
-# ── 2. Compat symlink (bench/harbor scripts still call `kitty-cli`) ────
-if [ ! -e "$INSTALL_DIR/kitty-cli" ]; then
-    ln -s "$BIN" "$INSTALL_DIR/kitty-cli" || die "symlink failed"
-fi
+# ── 2. Compat symlinks (bench/harbor scripts still call `kitty`/`kitty-cli`) ────
+for alias in kitty kitty-cli; do
+    if [ ! -e "$INSTALL_DIR/$alias" ]; then
+        ln -s "$BIN" "$INSTALL_DIR/$alias" || die "symlink $alias failed"
+    fi
+done
 
 # ── 3. Verify ──────────────────────────────────────────────────────────
 if ! "$INSTALL_DIR/$BIN" --version >/dev/null 2>&1; then

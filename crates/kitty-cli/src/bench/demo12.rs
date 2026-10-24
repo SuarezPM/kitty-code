@@ -368,6 +368,19 @@ pub(crate) fn git_head() -> String {
     }
 }
 
+/// Dirty git best-effort (`git status --porcelain` vacío = limpio).
+pub(crate) fn git_dirty() -> bool {
+    match std::process::Command::new("git")
+        .arg("status")
+        .arg("--porcelain")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+    {
+        Ok(out) => !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        Err(_) => true,
+    }
+}
+
 /// Timestamp UTC best-effort (`date -u`; nunca falla el bench).
 pub(crate) fn utc_timestamp() -> String {
     match std::process::Command::new("date")
@@ -427,6 +440,36 @@ pub(crate) async fn run_demo12_bench(
     // bench se invocó con --exercises + demo-12, el mod ya advirtió. Aquí solo
     // corremos la suite propia embebida.
     let items = demo12_to_bench_items(&suite.exercises)?;
+
+    // Runmark Capa 0 (Lane B): fingerprint de celda + rechazo de rerun ANTES
+    // del primer LLM. scored/offline: memory=off, systemone=off, seed fijo.
+    let runmark = crate::bench::runmark::Runmark {
+        model: cfg.model.clone(),
+        digest: model_digest(&cfg.model),
+        backend: cli.backend.to_string(),
+        profile: cfg.profile.name.to_string(),
+        ctx: cfg.context_window as u32,
+        max_iter: DEMO12_MAX_TURNS,
+        hops: 0,
+        suite: "demo-12".to_string(),
+        dataset_sha: crate::bench::runmark::sha_of_str(EMBEDDED_DEMO12_JSON),
+        timeout_cell: DEMO12_TIMEOUT_SECS,
+        seed: 42,
+        git_head: git_head(),
+        dirty: git_dirty(),
+        memory: false,
+        systemone: crate::bench::common::bench_systemone_label(),
+        toolset: crate::bench::common::bench_toolset_label(),
+    };
+    if let Err(e) = crate::bench::runmark::check_rerun_rejected(out, &runmark.fingerprint()) {
+        eprintln!("integridad: {e:#}");
+        std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+    }
+    // B1: tripwire pre-LLM — si el run ya viene marcado con leak, integridad.
+    if kitty_harness::guard::is_run_leaked() {
+        eprintln!("integridad: run marcado con leak (tripwire): demo-12 no corre");
+        std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+    }
 
     // Justicia forzada (warn si el invocador pidió otra cosa).
     if cli.backend != "ollama" {
@@ -512,6 +555,11 @@ pub(crate) async fn run_demo12_bench(
     let walls: Vec<f64> = results.iter().map(|r| r.latency_ms).collect();
     let p50 = p50_wall(walls.clone());
     let p99 = p99_wall(walls.clone());
+    // F2: p99 censored — con timeouts la cola está truncada (cap, no wall).
+    let timed_out = results.iter().filter(|r| r.verdict == "timeout").count();
+    let (_p99_check, p99_censored) =
+        kitty_harness::comparison::p99_ms_censored(walls.clone(), timed_out);
+    debug_assert!((_p99_check - p99).abs() < 1e-9, "p99 local == comparison");
     let rango = if walls.is_empty() {
         (0.0, 0.0)
     } else {
@@ -538,12 +586,34 @@ pub(crate) async fn run_demo12_bench(
         );
     }
     println!(
-        "  wall p50={p50:.0}ms p99={p99:.0}ms rango=[{:.0},{:.0}]ms",
-        rango.0, rango.1
+        "  wall p50={p50:.0}ms p99={p99:.0}ms rango=[{:.0},{:.0}]ms{}",
+        rango.0, rango.1,
+        if p99_censored { " (p99 censored: hubo timeouts)" } else { "" }
     );
     println!("  ollama ps después: {ps_summary_after} (hacer `ollama stop` entre reps)");
 
-    let digest = model_digest(&cfg.model);
+    // B1: tripwire intra-run — deny durante los probes ⇒ integridad (exit 3).
+    if kitty_harness::guard::is_run_leaked() {
+        eprintln!("integridad: run marcado con leak durante probes (tripwire): sin resume");
+        std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+    }
+    // B2: SIGNAL/NO-SIGNAL también en demo-12 (hoy solo PPC lo llamaba).
+    // 1 rep/invocación (k=1) ⇒ siempre NoSignal + exit 2 (inconcluso, nunca
+    // publicable): la serie k>=3 decide fuera de este proceso.
+    let ledger_clean = !runmark.dirty;
+    let signal = kitty_harness::comparison::decide_signal(passed, total, passed, total, ledger_clean, 1);
+    let exit_code = match &signal {
+        kitty_harness::comparison::Signal::Signal => crate::bench::runmark::EXIT_PASS,
+        kitty_harness::comparison::Signal::NoSignal(_) => {
+            crate::bench::runmark::EXIT_INCONCLUSIVE
+        }
+    };
+    debug_assert!(
+        matches!(signal, kitty_harness::comparison::Signal::NoSignal(_)),
+        "demo12 1 rep siempre NoSignal (k=1)"
+    );
+
+    let digest = runmark.digest.clone();
     if digest == "unknown" {
         warn!("no se pudo pinejar el digest del modelo (ollama show falló)");
     }
@@ -564,6 +634,8 @@ pub(crate) async fn run_demo12_bench(
         "timeout_secs_per_exercise": DEMO12_TIMEOUT_SECS,
         "k_required": suite.fairness.k,
         "k_note": "este run = 1 rep de 12; la serie exige k>=3 invocaciones con distintos --out",
+        "signal": signal.to_string(),
+        "exit_code": exit_code,
         "gates_off_actual": {
             "autorun_hops": 0,
             "knowledge": false,
@@ -585,13 +657,16 @@ pub(crate) async fn run_demo12_bench(
             "ollama_server_ctx": std::env::var("OLLAMA_CONTEXT_LENGTH").unwrap_or("unset (server default; servicio fija 16384)".to_string()),
             "kitty_num_ctx_env": std::env::var(kitty_runtime::client::ENV_NUM_CTX).unwrap_or("unset (probe nativo con techo 32768)".to_string()),
         },
-        "git_head": git_head(),
+        "git_head": runmark.git_head,
+        "git_dirty": runmark.dirty,
+        "runmark_fingerprint": runmark.fingerprint(),
         "timestamp_utc": utc_timestamp(),
         "total": total,
         "passed": passed,
         "rate_pct": rate,
         "wall_p50_ms": p50,
         "wall_p99_ms": p99,
+        "wall_p99_censored": p99_censored,
         "wall_rango_ms": [rango.0, rango.1],
         "memory": false,
         "by_language": by_lang.iter().map(|(lang, t)| (lang.clone(), serde_json::json!({
@@ -614,7 +689,16 @@ pub(crate) async fn run_demo12_bench(
     });
     std::fs::write(out, serde_json::to_string_pretty(&output)?)?;
     println!("Results saved to {}", out.display());
-    Ok(())
+    // Sidecar runmark tmp+fsync+rename (después del manifiesto principal).
+    crate::bench::runmark::write_sidecar_atomic(out, &runmark)?;
+    println!(
+        "Runmark saved to {} (fingerprint {})",
+        crate::bench::runmark::sidecar_path(out).display(),
+        runmark.fingerprint()
+    );
+    // B2: 1 rep ⇒ exit 2 (inconcluso), no Ok 0. La serie k>=3 decide fuera.
+    println!("demo-12 {signal} (exit {exit_code})");
+    std::process::exit(exit_code)
 }
 
 #[cfg(test)]
@@ -683,5 +767,26 @@ mod demo12_tests {
         let mut suite = load_demo12_suite().unwrap();
         suite.version = "9.9.9".to_string();
         assert!(validate_demo12_suite(&suite).is_err());
+    }
+
+    // === B2: 1 rep ⇒ exit 2 (inconcluso), no Ok 0 ===
+
+    #[test]
+    fn single_rep_siempre_exit_2_inconcluso() {
+        // Una invocación demo-12 = 1 rep (k=1<3): Wilson no discrimina aunque
+        // sea 12/12. El runner debe reportar NoSignal + exit 2, nunca 0.
+        let signal = kitty_harness::comparison::decide_signal(12, 12, 12, 12, true, 1);
+        assert!(
+            matches!(signal, kitty_harness::comparison::Signal::NoSignal(_)),
+            "1 rep ⇒ NoSignal, fue {signal}"
+        );
+        assert_eq!(
+            crate::bench::runmark::EXIT_INCONCLUSIVE,
+            2,
+            "exit 2 = inconcluso (contrato unificado B2)"
+        );
+        // Con k=3 y separación real sí habría señal (control Wilson).
+        let sig3 = kitty_harness::comparison::decide_signal(0, 8, 8, 8, true, 3);
+        assert!(sig3.is_signal());
     }
 }

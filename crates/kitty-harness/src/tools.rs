@@ -82,6 +82,9 @@ pub enum ToolError {
 
     #[error("Grep error: {0}")]
     Grep(String),
+
+    #[error("BenchPolicy denied: {0}")]
+    BenchDenied(String),
 }
 
 /// Result of executing a tool.
@@ -276,6 +279,13 @@ impl ToolRegistry {
 
     /// Execute a parsed tool call.
     pub async fn execute(&mut self, tc: &ParsedToolCall) -> Result<ToolResult, ToolError> {
+        // BenchPolicy pre-dispatch (Capa 0, Lane B): deny Read/Grep/Glob/Bash
+        // sobre bench/** y benches/** canonicalizados ANTES de cualquier IO.
+        // Corre antes que normalize/repair y antes que Guard, de modo que
+        // `cat bench/...` (SAFE_OUTPUT) tampoco salta la política.
+        if let Some(reason) = crate::guard::bench_policy_check(&tc.name, &tc.arguments) {
+            return Err(ToolError::BenchDenied(reason));
+        }
         let call = match Self::prepare_call(tc) {
             Ok(call) => call,
             Err(early) => return Ok(early),
@@ -613,5 +623,32 @@ mod tests {
         let _e = crate::model_profile::EnvRestoreGuard::remove(crate::journal::ENV_JOURNAL);
         let registry = ToolRegistry::new();
         assert_eq!(registry.journal_path(), None);
+    }
+
+    /// Capa 0 F1 (Lane B): pre-dispatch deniega bench/** en `execute`
+    /// (Read/Grep/Glob/Bash incl. `cat`), 0 lecturas, error `BenchDenied`.
+    #[tokio::test]
+    async fn bench_policy_predispatch_denies_without_io() {
+        let mut registry = ToolRegistry::new();
+        let cases = vec![
+            ("Read", serde_json::json!({"path": "bench/demo-12/demo-12.json"})),
+            ("Grep", serde_json::json!({"pattern": "x", "path": "bench"})),
+            ("Glob", serde_json::json!({"pattern": "bench/**/*.json"})),
+            ("Bash", serde_json::json!({"command": "cat bench/demo-12/demo-12.json"})),
+            ("Bash", serde_json::json!({"command": "cat benches/baseline.json"})),
+        ];
+        for (name, args) in cases {
+            let err = registry
+                .execute(&ParsedToolCall { name: name.to_string(), arguments: args, id: None })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ToolError::BenchDenied(_)),
+                "{name} bench debe denegarse con BenchDenied, got {err:?}"
+            );
+        }
+        // 0 lecturas: ninguna denegación registra el fichero como leído.
+        assert!(registry.read_files.is_empty());
+        assert_eq!(registry.file_modifications(), 0);
     }
 }

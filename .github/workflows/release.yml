@@ -39,16 +39,17 @@ jobs:
       - name: Stage release assets
         run: |
           mkdir -p dist
-          cp target/release/kitty dist/kitty
-          cp target/release/kitty-cli dist/kitty-cli
-          (cd dist && sha256sum kitty > kitty.sha256)
+          cp target/release/kittycode dist/kittycode
+          (cd dist && sha256sum kittycode > kittycode.sha256)
+          ln -sf kittycode dist/kitty
+          ln -sf kittycode dist/kitty-cli
           shopt -s globstar nullglob
           cp target/**/*.cdx.json dist/
           compgen -G "dist/*.cdx.json" > /dev/null || { echo "SBOM missing"; exit 1; }
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-path: "dist/*"
+          subject-path: "dist/kittycode, dist/kittycode.sha256"
       - name: Install cosign (keyless, no secrets)
         uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
         with:
@@ -58,9 +59,11 @@ jobs:
       - name: Sign release assets (keyless, Rekor bundle)
         run: |
           shopt -s nullglob
-          test -f dist/kitty || { echo "binary missing"; exit 1; }
-          test -f dist/kitty-cli || { echo "binary missing"; exit 1; }
-          for asset in dist/*; do
+          test -f dist/kittycode || { echo "binary missing"; exit 1; }
+          test -f dist/kittycode.sha256 || { echo "sha256 missing"; exit 1; }
+          for asset in dist/kittycode dist/kittycode.sha256 dist/*.cdx.json; do
+            test -f "$asset" || continue
+            test -L "$asset" && continue
             cosign sign-blob --yes \
               --bundle "${asset}.bundle" \
               --output-signature "${asset}.sig" \
@@ -69,4 +72,4 @@ jobs:
       - name: Publish GitHub release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" --generate-notes dist/*
+        run: gh release create "${{ github.ref_name }}" --generate-notes dist/kittycode dist/kittycode.sha256 dist/*.cdx.json dist/*.bundle dist/*.sig

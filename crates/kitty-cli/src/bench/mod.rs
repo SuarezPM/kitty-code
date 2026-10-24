@@ -8,7 +8,9 @@ pub mod common;
 pub mod demo12;
 pub mod gpqa;
 pub mod polyglot;
+pub mod ppc;
 pub mod run;
+pub mod runmark;
 pub mod tb2;
 
 pub(crate) use ab::{budget_summary, build_ab_plan, parse_thinking_budgets};
@@ -145,6 +147,21 @@ pub async fn bench_command(cli: BenchCliCtx, client: BenchClient, args: BenchArg
         enable_knowledge: cli.knowledge,
         knowledge_dir: PathBuf::from(cli.knowledge_dir.clone()),
     };
+
+    // --- PPC offline (Harness² k=1, Lane D dueña; Lane B cablea) ---
+    // scored/offline: memory=off + DB aislada (nunca default_db_path).
+    // B3: default `--limit` global es 15 (para polyglot/tb2), pero PPC cap
+    // `≤3` (PPC_MAX_LIMIT): sin `--limit` explícito el default rompería el
+    // cap. Si suite==ppc y limit==15 (default clap), se usa 3 (máximo PPC).
+    if suite == "ppc" {
+        let mut ppc_cfg = cfg.clone();
+        ppc_cfg.use_memory = false;
+        if limit == 15 {
+            info!(limit, "ppc usa --limit 3 por defecto (cap Oracle ≤3; global 15 rompería el cap)");
+            ppc_cfg.limit = ppc::PPC_MAX_LIMIT;
+        }
+        return ppc::run_ppc_suite(&cli, &ppc_cfg, &out).await;
+    }
 
     // --- GPQA Diamond local approximation (F1: offline-first, gated, pre-registro explícito G1) ---
     if suite == "gpqa" || suite == "gpqa_diamond" {
@@ -294,16 +311,51 @@ pub async fn bench_command(cli: BenchCliCtx, client: BenchClient, args: BenchArg
             "latency_ms": r.latency_ms,
         })).collect::<Vec<_>>(),
     });
-    std::fs::write(&out, serde_json::to_string_pretty(&output)?)?;
-    println!("Results saved to {}", out.display());
-    // bench-reproducibility: exit-code 0=pass/improved, 1=gate failed, 2=noise (no significant change)
-    let baseline_rate: Option<f64> = std::fs::read_to_string(
+    // B2: SIGNAL/NO-SIGNAL también en el report de comparación genérico
+    // (hoy solo PPC lo llamaba). Single-rep (k=1) ⇒ siempre NoSignal
+    // (inconcluso, nunca publicable); se vuelca como `signal` sin cambiar el
+    // exit por gate (el exit unificado lo decide `bench_exit_code`).
+    let baseline_doc: Option<serde_json::Value> = std::fs::read_to_string(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benches/baseline.json"),
     )
     .ok()
-    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-    .and_then(|v| v.get("rate_pct").and_then(|r| r.as_f64()));
-    let exit_code = bench_exit_code(rate, gate, baseline_rate);
+    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok());
+    let baseline_rate: Option<f64> =
+        baseline_doc.as_ref().and_then(|v| v.get("rate_pct").and_then(|r| r.as_f64()));
+    let signal_str = {
+        let b_total = baseline_doc
+            .as_ref()
+            .and_then(|v| v.get("total").and_then(|t| t.as_u64()))
+            .unwrap_or(0) as usize;
+        let b_passed = baseline_rate
+            .map(|r| ((r / 100.0) * b_total as f64).round() as usize)
+            .unwrap_or(0);
+        // Ledger best-effort: sin runmark aquí, se asume limpio; reps=1
+        // (una invocación = 1 rep) ⇒ NoSignal k<3 salvo que el caller
+        // documente serie k>=3 fuera de este proceso.
+        let sig = kitty_harness::comparison::decide_signal(
+            b_passed,
+            b_total,
+            passed,
+            total,
+            true,
+            1,
+        );
+        sig.to_string()
+    };
+    let mut output = output;
+    output["signal"] = serde_json::json!(signal_str);
+    std::fs::write(&out, serde_json::to_string_pretty(&output)?)?;
+    println!("Results saved to {}", out.display());
+    println!("Comparison signal: {signal_str} (single-rep k=1 ⇒ inconcluso salvo serie k>=3)");
+    // Exit unificado B2 (misma tabla runmark): 0 pass / 1 gate-fail /
+    // 2 inconcluso (1 rep o noise) / 3 integridad. Mapeo B2: NoSignal por
+    // k<3 (single-rep, reps=1) ⇒ 2 aunque el gate pase (nunca publicable).
+    let exit_code = if signal_str.contains("k<3") {
+        runmark::EXIT_INCONCLUSIVE
+    } else {
+        bench_exit_code(rate, gate, baseline_rate)
+    };
     std::process::exit(exit_code);
 }
 

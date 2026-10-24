@@ -18,6 +18,7 @@ tracing-subscriber.workspace = true
 console-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+blake3.workspace = true
 tempfile = "3"
 rand = "0.10"
 # W3 probe params derivan JsonSchema: el derive de rmcp exige `schemars` en
@@ -32,16 +33,23 @@ version = "3.5.1"
 default-features = false
 features = ["client", "server", "transport-child-process", "transport-io", "macros", "schemars"]
 
-# W1: binario `kitty` (plan SDD-ESTADO-ARTE §3 W-INSTALAR). Se mantiene el
-# autobin `kitty-cli` por compatibilidad (harbor adapter, benches/*.sh y
-# release.yml referencian `target/release/kitty-cli`); ambos compilan desde
-# el mismo src/main.rs.
+# SDD-KITTY-HARNESS2-SYSTEMONE §0: UN binario `kittycode` con TUI por
+# defecto. `kitty` y `kitty-cli` se mantienen como alias de compatibilidad
+# (mismo src/main.rs) hasta que harbor adapter / benches / scripts migren.
+[[bin]]
+name = "kittycode"
+path = "src/main.rs"
+
 [[bin]]
 name = "kitty"
 path = "src/main.rs"
 
+[[bin]]
+name = "kitty-cli"
+path = "src/main.rs"
+
 [features]
-default = []
+default = ["tui"]
 tui = ["ratatui", "crossterm"]
 # Embedded kitty-infer GGUF backend: `cargo check --features kitty-infer`
 # (CPU-only here; CUDA builds are the kitty-infer lane).

@@ -428,6 +428,22 @@ pub(crate) async fn build_bench_agent(client: BenchClient, config: AgentConfig) 
         .await
         .context("agent construction task failed")
 }
+
+// ── Bench scored/offline (Capa 0/2, Lane B) ──────────────────────────
+// scored/offline = memory=off + DB aislada (nunca `default_db_path`).
+// Sin `fill_recent` para lecciones: el recall bench usa `recall_similar`
+// (sin relleno) o nada; `recall_hybrid*` con fill_recent está vetado en
+// bench porque inventa lecciones sin overlap.
+
+/// Etiqueta del toolset expuesto al agente en bench (runmark `toolset`).
+pub(crate) fn bench_toolset_label() -> String {
+    "Read,Edit,Write,Bash,Glob,Grep".to_string()
+}
+
+/// Bench fuerza System-One OFF con campo manifiesto (`systemone="off"`).
+pub(crate) fn bench_systemone_label() -> String {
+    "off".to_string()
+}
 /// Default per-exercise bench wall-clock cap (seconds). Calibration showed
 /// real 9B-model tasks on split-GPU hardware routinely exceed this; raise
 /// via `--timeout-secs` or `KITTY_BENCH_TIMEOUT_SECS`.
@@ -621,21 +637,26 @@ pub(crate) fn list_files(dir: &str) -> Vec<String> {
     files
 }
 
-/// Pure helper for bench exit-code (P1b reproducibility spec).
-/// 0 = pass/improved, 1 = gate failed or baseline regression, 2 = noise (|delta|<2).
+/// Exit unificado B2 (misma tabla que `runmark::EXIT_*`):
+/// 0 pass / 1 gate-fail / 2 inconcluso (1 rep o noise, nunca publicable) /
+/// 3 integridad. 2 era "noise" (|delta|<2): se renombra a inconcluso — el
+/// noise sin significación NO es pass, es evidencia insuficiente (igual que
+/// 1 rep sin k>=3). Usa las consts runmark (sin doble sentido del 2).
 pub(crate) fn bench_exit_code(rate: f64, gate: f64, baseline: Option<f64>) -> i32 {
+    use super::runmark::{EXIT_GATE_FAIL, EXIT_INCONCLUSIVE, EXIT_PASS};
     if rate < gate {
-        1
+        EXIT_GATE_FAIL
     } else if let Some(b) = baseline {
         if rate < b {
-            1
+            EXIT_GATE_FAIL
         } else if (rate - b).abs() < 2.0 {
-            2
+            // Noise ⇒ inconcluso (B2): sin separación no hay señal publicable.
+            EXIT_INCONCLUSIVE
         } else {
-            0
+            EXIT_PASS
         }
     } else {
-        0
+        EXIT_PASS
     }
 }
 pub(crate) fn is_small_model(profile: &str, model: &str) -> bool {

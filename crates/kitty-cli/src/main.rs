@@ -163,12 +163,12 @@ async fn resolve_session_num_ctx(client: &OllamaClient, model: &str) -> NumCtxRe
 }
 
 #[derive(Parser)]
-#[command(name = "kitty")]
+#[command(name = "kittycode")]
 #[command(about = "Local coding agent for ornith:9B on consumer GPUs")]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 
     /// Ollama API URL
     #[arg(long, default_value = "http://localhost:11434")]
@@ -249,13 +249,15 @@ pub enum Commands {
         /// Benchmark suite: polyglot (official dataset polyglot-benchmark, unit-test grading),
         /// tb2 (HOMEMADE 8 ejercicios locales, no oficial), tb2-official (OFFICIAL terminal-bench-2.1 via Harbor CLI),
         /// demo-12 (suite fija v1.0.0 con justicia embebida: 12 ejercicios, pineos, k>=3 por serie, gates_off; ignora --exercises/--limit),
+        /// ppc (Harness² offline k=1, --limit ≤3, scored/offline, exit 0/1/2/3),
         /// gpqa, gpqa_diamond, claweval
         /// (gpqa requires --pre-registration <PATH>;
         ///  claweval requires OPENROUTER_API_KEY + claw-eval CLI;
-        ///  tb2-official requires harbor CLI + Docker)
+        ///  tb2-official requires harbor CLI + Docker;
+        ///  ppc requires --limit ≤3, default 3 cuando --limit es el global 15)
         #[arg(default_value = "polyglot")]
         suite: String,
-        /// Number of exercises to run
+        /// Number of exercises to run (ppc: ≤3, default 3 si se deja el global 15)
         #[arg(short, long, default_value = "15")]
         limit: usize,
         /// Autorun continuation hops for every exercise (default 0 = off).
@@ -440,11 +442,13 @@ async fn main() -> Result<()> {
     // (KITTY_INFER_CTX, default 4096).
     // W3 plan mode (`run --plan`) is an offline dry-run: it prints and exits
     // before any client/probe work, so it never touches the network.
-    let plan_dry_run = matches!(&cli.command, Commands::Run { plan: true, .. });
+    let plan_dry_run = matches!(&cli.command, Some(Commands::Run { plan: true, .. }));
     let ctx_resolution = if !plan_dry_run
         && matches!(
             cli.command,
-            Commands::Run { .. } | Commands::Bench { .. } | Commands::BenchAb { .. }
+            Some(Commands::Run { .. })
+                | Some(Commands::Bench { .. })
+                | Some(Commands::BenchAb { .. })
         ) {
         match ollama_client.as_ref() {
             Some(oc) => {
@@ -508,13 +512,29 @@ async fn main() -> Result<()> {
     let bench_backend: &'static str = if use_infer { "kitty-infer" } else { "ollama" };
 
     match cli.command {
-        Commands::Run {
+        // SDD §0: bare `kittycode` sin subcomando abre la TUI con la ventana
+        // de contexto del CLI (sin red para abrir: el worker solo conecta al
+        // enviar el primer turno o pedir /api/tags desde el picker).
+        None => {
+            #[cfg(feature = "tui")]
+            {
+                tui::run_tui(&cli.model, &cli.url, cli.context_window)?;
+                Ok(())
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                Err(anyhow::anyhow!(
+                    "no subcommand given: rebuild with `--features tui` for the interactive TUI (or run `kittycode --help`)"
+                ))
+            }
+        }
+        Some(Commands::Run {
             prompt,
             no_memory,
             logprobs_probe,
             plan,
             seed,
-        } => {
+        }) => {
             let prompt = prompt.join(" ");
             // W3 plan mode: dry-run summary, NEVER the agent loop.
             if plan {
@@ -683,7 +703,7 @@ async fn main() -> Result<()> {
             println!("Completed in {:.1?}", elapsed);
             Ok(())
         }
-        Commands::Bench {
+        Some(Commands::Bench {
             suite,
             limit,
             hops,
@@ -695,7 +715,7 @@ async fn main() -> Result<()> {
             claweval_trials,
             claweval_parallel,
             claweval_sandbox,
-        } => {
+        }) => {
             let cli_ctx = bench::BenchCliCtx {
                 url: cli.url.clone(),
                 model: cli.model.clone(),
@@ -727,7 +747,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Commands::Info => {
+        Some(Commands::Info) => {
             println!("Kitty Code v{}", env!("CARGO_PKG_VERSION"));
             println!("Local coding agent for ornith:9B on consumer GPUs");
             println!();
@@ -756,12 +776,12 @@ async fn main() -> Result<()> {
                 .collect();
             println!("Tools: {}", tool_names.join(", "));
             println!("Edit:  Hashline (primary) + search-replace (fallback)");
-            println!("Bench: polyglot (code), tb2 (terminal), tb2-official (terminal-bench-2.1 via Harbor), gpqa (reasoning, gated, requires --pre-registration and --limit 198), claweval (agent eval, requires claw-eval CLI + OPENROUTER_API_KEY)");
+            println!("Bench: polyglot (code), tb2 (terminal), tb2-official (terminal-bench-2.1 via Harbor), demo-12 (fija v1.0.0 k>=3), ppc (Harness² offline k=1 --limit ≤3), gpqa (reasoning, gated, requires --pre-registration and --limit 198), claweval (agent eval, requires claw-eval CLI + OPENROUTER_API_KEY)");
             Ok(())
         }
-        Commands::Update { json } => update::run_update(json).await,
-        Commands::Mcp { plan } => mcp::run(plan).await,
-        Commands::Doctor { json } => {
+        Some(Commands::Update { json }) => update::run_update(json).await,
+        Some(Commands::Mcp { plan }) => mcp::run(plan).await,
+        Some(Commands::Doctor { json }) => {
             // W1: probe Ollama (/api/tags + /api/show via OllamaClient) + host.
             let report = doctor::run_doctor(&cli.url, &cli.model).await;
             if json {
@@ -771,7 +791,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Skills { dir } => {
+        Some(Commands::Skills { dir }) => {
             // W3: discover SKILL.md files, render the prompt XML block.
             let roots = if dir.is_empty() {
                 skills::default_skill_dirs()
@@ -791,7 +811,7 @@ async fn main() -> Result<()> {
             print!("{}", skills::format_skills_xml(&found));
             Ok(())
         }
-        Commands::Undo { journal } => {
+        Some(Commands::Undo { journal }) => {
             // W3: revert the most recent journaled edit.
             let path = journal.unwrap_or_else(journal::default_journal_path);
             match journal::undo_last(&path)? {
@@ -806,12 +826,12 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::McpClient {
+        Some(Commands::McpClient {
             command,
             call,
             args_json,
             args,
-        } => {
+        }) => {
             // W3: list tools from an external MCP server child process.
             let names = mcp_client::list_tools_via_child(&command, &args).await?;
             println!("tools: {} found", names.len());
@@ -826,8 +846,8 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::ProbeMcpServer => mcp_client::serve_probe_stdio().await,
-        Commands::BenchAb {
+        Some(Commands::ProbeMcpServer) => mcp_client::serve_probe_stdio().await,
+        Some(Commands::BenchAb {
             thinking,
             limit,
             hops,
@@ -836,7 +856,7 @@ async fn main() -> Result<()> {
             suite,
             out,
             interleave,
-        } => {
+        }) => {
             let cli_ctx = bench::BenchCliCtx {
                 url: cli.url.clone(),
                 model: cli.model.clone(),
@@ -866,9 +886,8 @@ async fn main() -> Result<()> {
             .await
         }
         #[cfg(feature = "tui")]
-        Commands::Tui => {
-            let context_window = AgentConfig::default().context_window;
-            tui::run_tui(&cli.model, &cli.url, context_window)?;
+        Some(Commands::Tui) => {
+            tui::run_tui(&cli.model, &cli.url, cli.context_window)?;
             Ok(())
         }
     }
@@ -962,30 +981,76 @@ mod run_flags_tests {
     #[test]
     fn run_seed_flag_parses_and_defaults_to_none() {
         // C2: `--seed` is a `Run`-only flag (bench keeps its seed-42 shuffle).
-        let cli = Cli::try_parse_from(["kitty", "run", "hello"]).unwrap();
+        let cli = Cli::try_parse_from(["kittycode", "run", "hello"]).unwrap();
         match cli.command {
-            Commands::Run { seed, plan, .. } => {
+            Some(Commands::Run { seed, plan, .. }) => {
                 assert_eq!(seed, None);
                 assert!(!plan);
             }
             _ => panic!("expected run"),
         }
-        let cli = Cli::try_parse_from(["kitty", "run", "--seed", "42", "hello"]).unwrap();
+        let cli = Cli::try_parse_from(["kittycode", "run", "--seed", "42", "hello"]).unwrap();
         match cli.command {
-            Commands::Run { seed, .. } => assert_eq!(seed, Some(42)),
+            Some(Commands::Run { seed, .. }) => assert_eq!(seed, Some(42)),
             _ => panic!("expected run"),
         }
     }
 
     #[test]
     fn run_plan_and_seed_combine() {
-        let cli = Cli::try_parse_from(["kitty", "run", "--plan", "--seed", "7", "hi"]).unwrap();
+        let cli = Cli::try_parse_from(["kittycode", "run", "--plan", "--seed", "7", "hi"]).unwrap();
         match cli.command {
-            Commands::Run { plan, seed, .. } => {
+            Some(Commands::Run { plan, seed, .. }) => {
                 assert!(plan);
                 assert_eq!(seed, Some(7));
             }
             _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn bare_no_subcommand_parses_to_none_with_cli_context_window() {
+        // SDD §0: bare `kittycode` abre la TUI (command == None) con la
+        // ventana del CLI, no AgentConfig::default().
+        let cli = Cli::try_parse_from(["kittycode"]).unwrap();
+        assert!(cli.command.is_none(), "bare must parse to None");
+        assert_eq!(cli.context_window, 16384);
+        let cli = Cli::try_parse_from(["kittycode", "--context-window", "8192"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.context_window, 8192);
+    }
+
+    // === B3: `kittycode bench ppc` parsea + default --limit ≤3 ===
+
+    #[test]
+    fn bench_ppc_invocacion_parsea_y_default_limit_3() {
+        // B3: `kittycode bench ppc` debe parsear (suite ppc en help) y el
+        // default global 15 no debe romper el cap PPC (≤3): bench/mod.rs lo
+        // recorta a 3 cuando limit==15.
+        let cli = Cli::try_parse_from(["kittycode", "bench", "ppc"]).expect("parse bench ppc");
+        match cli.command {
+            Some(Commands::Bench { suite, limit, .. }) => {
+                assert_eq!(suite, "ppc", "suite debe ser ppc");
+                assert_eq!(limit, 15, "default clap global sigue 15 (el recorte a 3 lo hace bench/mod.rs)");
+                // El recorte efectivo: 15 (default) ⇒ 3 (cap PPC).
+                let effective = if suite == "ppc" && limit == 15 {
+                    crate::bench::ppc::PPC_MAX_LIMIT
+                } else {
+                    limit
+                };
+                assert_eq!(effective, 3, "default ppc efectivo ≤3");
+                assert!(crate::bench::ppc::validate_limit(effective, 15).is_ok());
+            }
+            _ => panic!("expected Bench ppc"),
+        }
+        // Explícito --limit 2 pasa; --limit 4 rechaza (cap Oracle).
+        let cli =
+            Cli::try_parse_from(["kittycode", "bench", "ppc", "--limit", "2"]).expect("parse ppc limit 2");
+        match cli.command {
+            Some(Commands::Bench { suite, limit, .. }) => {
+                assert_eq!((suite.as_str(), limit), ("ppc", 2));
+            }
+            _ => panic!("expected Bench ppc limit 2"),
         }
     }
 

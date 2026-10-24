@@ -29,6 +29,11 @@ impl ToolRegistry {
         &mut self,
         args: &serde_json::Value,
     ) -> Result<ToolResult, ToolError> {
+        // BenchPolicy pre-dispatch (defensa en profundidad: también cubre
+        // llamadas directas que saltan `ToolRegistry::execute`).
+        if let Some(reason) = crate::guard::bench_policy_check("Read", args) {
+            return Err(ToolError::BenchDenied(reason));
+        }
         let path =
             args.get("path")
                 .and_then(|v| v.as_str())

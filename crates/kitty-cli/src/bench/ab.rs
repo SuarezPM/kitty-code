@@ -64,6 +64,10 @@ pub(crate) fn build_ab_plan(
 /// harness-limit outcomes, a different failure class). The README gate
 /// applies to `errored`; consumers apply their own timeout policy. All
 /// pre-existing fields are preserved untouched for backward compatibility.
+///
+/// F2 (Lane B): `p99_ms` + `p99_censored` — con `timed_out>0` la cola está
+/// truncada y el cuantil se marca censored (ver
+/// `kitty_harness::comparison::p99_ms_censored`).
 pub(crate) fn budget_summary(budget: usize, results: &[BenchResult]) -> serde_json::Value {
     let passed = results.iter().filter(|r| r.passed).count();
     let total = results.len();
@@ -76,6 +80,10 @@ pub(crate) fn budget_summary(budget: usize, results: &[BenchResult]) -> serde_js
     let p50 = p50_ms(results.iter().map(|r| r.latency_ms).collect());
     let errored = results.iter().filter(|r| r.verdict == "error").count();
     let timed_out = results.iter().filter(|r| r.verdict == "timeout").count();
+    let (p99, p99_censored) = kitty_harness::comparison::p99_ms_censored(
+        results.iter().map(|r| r.latency_ms).collect(),
+        timed_out,
+    );
     serde_json::json!({
         "budget": budget,
         "passed": passed,
@@ -83,6 +91,8 @@ pub(crate) fn budget_summary(budget: usize, results: &[BenchResult]) -> serde_js
         "rate": rate,
         "wilson_ci": [lo, hi],
         "p50_ms": p50,
+        "p99_ms": p99,
+        "p99_censored": p99_censored,
         "errored": errored,
         "timed_out": timed_out,
     })
@@ -163,7 +173,7 @@ mod bench_ab_tests {
     #[test]
     fn test_bench_ab_parses() {
         let cli = Cli::try_parse_from([
-            "kitty",
+            "kittycode",
             "bench-ab",
             "--thinking",
             "1024,2048,4096",
@@ -172,9 +182,9 @@ mod bench_ab_tests {
         ])
         .expect("parse bench-ab");
         match cli.command {
-            Commands::BenchAb {
+            Some(Commands::BenchAb {
                 thinking, limit, ..
-            } => {
+            }) => {
                 assert_eq!(limit, 50);
                 let budgets = parse_thinking_budgets(&thinking).expect("parse budgets");
                 assert_eq!(budgets, vec![1024, 2048, 4096]);
@@ -304,23 +314,23 @@ mod bench_ab_tests {
     #[test]
     fn test_bench_hops_flag_propagation() {
         // Explicit --hops 3 propagates.
-        let cli = Cli::try_parse_from(["kitty", "bench-ab", "--hops", "3"])
+        let cli = Cli::try_parse_from(["kittycode", "bench-ab", "--hops", "3"])
             .expect("parse bench-ab --hops 3");
         match cli.command {
-            Commands::BenchAb { hops, .. } => assert_eq!(hops, 3),
+            Some(Commands::BenchAb { hops, .. }) => assert_eq!(hops, 3),
             _ => panic!("expected BenchAb"),
         }
         // Absent flag defaults to 0 (byte-identical legacy behavior).
-        let cli = Cli::try_parse_from(["kitty", "bench-ab"]).expect("parse bench-ab default");
+        let cli = Cli::try_parse_from(["kittycode", "bench-ab"]).expect("parse bench-ab default");
         match cli.command {
-            Commands::BenchAb { hops, .. } => assert_eq!(hops, 0),
+            Some(Commands::BenchAb { hops, .. }) => assert_eq!(hops, 0),
             _ => panic!("expected BenchAb"),
         }
         // Same on the Bench subcommand.
         let cli =
-            Cli::try_parse_from(["kitty", "bench", "--hops", "2"]).expect("parse bench --hops 2");
+            Cli::try_parse_from(["kittycode", "bench", "--hops", "2"]).expect("parse bench --hops 2");
         match cli.command {
-            Commands::Bench { hops, .. } => assert_eq!(hops, 2),
+            Some(Commands::Bench { hops, .. }) => assert_eq!(hops, 2),
             _ => panic!("expected Bench"),
         }
     }

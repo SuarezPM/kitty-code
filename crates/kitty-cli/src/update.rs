@@ -369,14 +369,14 @@ mod tests {
 
     #[test]
     fn update_subcommand_parses_with_and_without_json() {
-        let cli = crate::Cli::try_parse_from(["kitty", "update"]).unwrap();
+        let cli = crate::Cli::try_parse_from(["kittycode", "update"]).unwrap();
         match cli.command {
-            crate::Commands::Update { json } => assert!(!json),
+            Some(crate::Commands::Update { json }) => assert!(!json),
             _ => panic!("expected update"),
         }
-        let cli = crate::Cli::try_parse_from(["kitty", "update", "--json"]).unwrap();
+        let cli = crate::Cli::try_parse_from(["kittycode", "update", "--json"]).unwrap();
         match cli.command {
-            crate::Commands::Update { json } => assert!(json),
+            Some(crate::Commands::Update { json }) => assert!(json),
             _ => panic!("expected update --json"),
         }
     }

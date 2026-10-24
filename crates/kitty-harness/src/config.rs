@@ -45,6 +45,8 @@ pub const ENV_WORKSPACE_ROOT: &str = "KITTY_WORKSPACE_ROOT";
 pub use kitty_runtime::client::{ENV_NO_THINK, ENV_NUM_CTX};
 /// Per-model turn-cap override spec (`exact=value[,family=value…]`).
 pub const ENV_MODEL_TURN_CAPS: &str = "KITTY_MODEL_TURN_CAPS";
+/// System-One selector (`off` | `tfidf`). Default `off`; bench forces `off`.
+pub const ENV_SYSTEMONE: &str = "KITTY_SYSTEMONE";
 
 // ── Sandbox opt-out ─────────────────────────────────────────────────
 
@@ -124,6 +126,35 @@ pub fn truncation_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from(".kitty/truncation"))
 }
 
+// ── System-One (Capa 1, Lane C) ───────────────────────────────────────
+
+/// Pure core: `KITTY_SYSTEMONE=tfidf` selects the TF-IDF baseline; any
+/// other value (including `None`) means `off`.
+pub fn systemone_mode_raw(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some("tfidf") => "tfidf",
+        _ => "off",
+    }
+}
+
+/// Pure core: bench always forces `off` (gates never score in bench).
+pub fn systemone_mode_with(raw: Option<&str>, bench: bool) -> &'static str {
+    if bench {
+        "off"
+    } else {
+        systemone_mode_raw(raw)
+    }
+}
+
+/// Effective System-One mode: `off` | `tfidf`. Bench (`KITTY_BENCH_MODE=1`)
+/// always forces `off`.
+pub fn systemone_mode() -> &'static str {
+    systemone_mode_with(
+        std::env::var(ENV_SYSTEMONE).ok().as_deref(),
+        bench_mode(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +179,18 @@ mod tests {
         assert!(edit_check_raw(Some("1")));
         assert!(!lint_gate_raw(None));
         assert!(lint_gate_raw(Some("1")));
+    }
+
+    #[test]
+    fn systemone_defaults_off_and_bench_forces_off() {
+        assert_eq!(systemone_mode_raw(None), "off");
+        assert_eq!(systemone_mode_raw(Some("off")), "off");
+        assert_eq!(systemone_mode_raw(Some("tfidf")), "tfidf");
+        assert_eq!(systemone_mode_raw(Some("laya")), "off");
+        // Bench siempre off, aunque el flag pida tfidf.
+        assert_eq!(systemone_mode_with(Some("tfidf"), true), "off");
+        assert_eq!(systemone_mode_with(Some("tfidf"), false), "tfidf");
+        assert_eq!(systemone_mode_with(None, true), "off");
+        assert_eq!(systemone_mode_with(None, false), "off");
     }
 }

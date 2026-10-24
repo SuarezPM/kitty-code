@@ -45,6 +45,15 @@ impl Default for CloserConfig {
     }
 }
 
+impl CloserConfig {
+    /// Baseline default (Lane C): idéntico a [`Default`] — OFF en bench.
+    /// Existe para nombrar el baseline sin cambiar su semántica.
+    #[must_use]
+    pub fn baseline() -> Self {
+        Self::default()
+    }
+}
+
 fn tokenize(s: &str) -> Vec<String> {
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
