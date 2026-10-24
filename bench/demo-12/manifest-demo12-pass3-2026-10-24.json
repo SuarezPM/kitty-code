@@ -1,0 +1,279 @@
+{
+ "serie": "pass3-hu-latencia-paridad-ctx",
+ "prereg": "bench/demo-12/manifest-prereg-pass3-2026-10-24.json",
+ "prereg_sha16": "01dd690ec6dfa3b3",
+ "kitty": {
+  "passed": 35,
+  "total": 36,
+  "p50_ms": 13264.5,
+  "per_rep": [
+   12,
+   11,
+   12
+  ]
+ },
+ "little": {
+  "passed": 32,
+  "total": 36,
+  "p50_ms": 10457.68129825592,
+  "per_rep": [
+   10,
+   11,
+   11
+  ]
+ },
+ "delta_pass_pp": 8.3,
+ "delta_p50_ms": 2806.8,
+ "desglose_por_ejercicio": {
+  "demo-bash-count": {
+   "kitty_walls": [
+    13340.0,
+    14127.0,
+    14299.0
+   ],
+   "kitty_pass": 3,
+   "little_walls": [
+    45685.87136268616,
+    15838.284730911255,
+    19487.12682723999
+   ],
+   "little_pass": 2,
+   "kitty_p50": 14127.0,
+   "little_p50": 19487.12682723999,
+   "delta_p50_ms": -5360.12682723999
+  },
+  "demo-py-csv": {
+   "kitty_walls": [
+    19050.0,
+    9778.0,
+    12076.0
+   ],
+   "kitty_pass": 3,
+   "little_walls": [
+    16179.074048995972,
+    9653.5062789917,
+    9189.928531646729
+   ],
+   "little_pass": 3,
+   "kitty_p50": 12076.0,
+   "little_p50": 9653.5062789917,
+   "delta_p50_ms": 2422.493721008301
+  },
+  "demo-makefile": {
+   "kitty_walls": [
+    7107.0,
+    8256.0,
+    6794.0
+   ],
+   "kitty_pass": 3,
+   "little_walls": [
+    6113.042116165161,
+    6393.789291381836,
+    5979.45237159729
+   ],
+   "little_pass": 3,
+   "kitty_p50": 7107.0,
+   "little_p50": 6113.042116165161,
+   "delta_p50_ms": 993.9578838348389
+  },
+  "demo-dockerfile": {
+   "kitty_walls": [
+    26540.0,
+    16976.0,
+    12282.0
+   ],
+   "kitty_pass": 3,
+   "little_walls": [
+    10290.040254592896,
+    8973.052501678467,
+    10445.052862167358
+   ],
+   "little_pass": 3,
+   "kitty_p50": 16976.0,
+   "little_p50": 10290.040254592896,
+   "delta_p50_ms": 6685.9597454071045
+  },
+  "demo-gh-actions": {
+   "kitty_walls": [
+    13853.0,
+    13082.0,
+    16800.0
+   ],
+   "kitty_pass": 3,
+   "little_walls": [
+    14051.202774047852,
+    11978.504180908203,
+    14460.483312606812
+   ],
+   "little_pass": 3,
+   "kitty_p50": 13853.0,
+   "little_p50": 14051.202774047852,
+   "delta_p50_ms": -198.20277404785156
+  },
+  "demo-sh-find-modified": {
+   "kitty_walls": [
+    9175.0,
+    10471.0,
+    15569.0
+   ],
+   "kitty_pass": 3,
+   "little_walls": [
+    20887.186527252197,
+    16277.44174003601,
+    25820.64461708069
+   ],
+   "little_pass": 1,
+   "kitty_p50": 10471.0,
+   "little_p50": 20887.186527252197,
+   "delta_p50_ms": -10416.186527252197
+  },
+  "demo-py-dirsize": {
+   "kitty_walls": [
+    13189.0,
+    10618.0,
+    14841.0
+   ],
+   "kitty_pass": 3,
+   "little_walls": [
+    9694.988250732422,
+    5934.958457946777,
+    10470.309734344482
+   ],
+   "little_pass": 3,
+   "kitty_p50": 13189.0,
+   "little_p50": 9694.988250732422,
+   "delta_p50_ms": 3494.011749267578
+  },
+  "demo-sh-backup": {
+   "kitty_walls": [
+    13519.0,
+    34612.0,
+    25888.0
+   ],
+   "kitty_pass": 3,
+   "little_walls": [
+    21846.41122817993,
+    15866.67275428772,
+    14510.879278182983
+   ],
+   "little_pass": 3,
+   "kitty_p50": 25888.0,
+   "little_p50": 15866.67275428772,
+   "delta_p50_ms": 10021.32724571228
+  },
+  "demo-js-fetch": {
+   "kitty_walls": [
+    18096.0,
+    9922.0,
+    11774.0
+   ],
+   "kitty_pass": 3,
+   "little_walls": [
+    18413.92207145691,
+    23616.251230239868,
+    8282.219409942627
+   ],
+   "little_pass": 3,
+   "kitty_p50": 11774.0,
+   "little_p50": 18413.92207145691,
+   "delta_p50_ms": -6639.922071456909
+  },
+  "demo-rs-args": {
+   "kitty_walls": [
+    10971.0,
+    51874.0,
+    7369.0
+   ],
+   "kitty_pass": 2,
+   "little_walls": [
+    4790.240287780762,
+    4442.633628845215,
+    4312.91937828064
+   ],
+   "little_pass": 3,
+   "kitty_p50": 10971.0,
+   "little_p50": 4442.633628845215,
+   "delta_p50_ms": 6528.366371154785
+  },
+  "demo-json-config": {
+   "kitty_walls": [
+    8321.0,
+    6705.0,
+    25723.0
+   ],
+   "kitty_pass": 3,
+   "little_walls": [
+    5314.0153884887695,
+    7996.154308319092,
+    8168.58172416687
+   ],
+   "little_pass": 3,
+   "kitty_p50": 8321.0,
+   "little_p50": 7996.154308319092,
+   "delta_p50_ms": 324.8456916809082
+  },
+  "demo-sh-words": {
+   "kitty_walls": [
+    5752.0,
+    15625.0,
+    17990.0
+   ],
+   "kitty_pass": 3,
+   "little_walls": [
+    35163.33508491516,
+    37942.65341758728,
+    9937.611103057861
+   ],
+   "little_pass": 2,
+   "kitty_p50": 15625.0,
+   "little_p50": 35163.33508491516,
+   "delta_p50_ms": -19538.33508491516
+  }
+ },
+ "veredicto": "EMPATE TECNICO en velocidad (delta p50 2.8s < umbral 5s = ruido); kitty +3 ejercicios en pass-rate sobre celdas flakeables (sin ningun 0/3 en ningun lado). HU-LATENCIA ABIERTA: p50 nominal kitty > little.",
+ "gates_off": true,
+ "k": 3,
+ "num_ctx": 16384,
+ "model": "ornith:9b",
+ "backend": "ollama",
+ "ollama": "0.40.6",
+ "pi_rpc": "0.83.0",
+ "heads": "73a1542 (worktree detached)",
+ "git_dirty": false,
+ "ledger_nota": "Ledger SQLite integrado en el binario medido (73a1542): 1 fila runs por rep (UUID, fingerprint a6b2e3b3a02e3b61e086c476402fe217a721b8dade72d4c73949a88a36e88c01, git_head 73a1542, dirty 0, leaked 0, exit 2). Fuente de verdad: runmark sidecar + JSON.",
+ "delta_pass_pp_scope": "8.33 sobre 36 trials; descriptivo. En las 4 celdas flakeables (12 trials/brazo): 11/12 vs 8/12 = +25pp, n=12, McNemar no significativo. Paridad, no victoria.",
+ "deviations": {
+  "cooldowns_obs_s": {
+   "K1-L1": 52,
+   "L1-K2": 49,
+   "K2-L2": 62,
+   "L2-K3": 47,
+   "K3-L3": 47
+  },
+  "ctx_por_brazo": {
+   "kitty": "options.num_ctx=16384 por request (env KITTY_NUM_CTX, verificado en log: source=env) + ps CONTEXT 16384 archivado",
+   "little": "ps CONTEXT 16384 archivado (pi RPC 0.83.0 lo negocia; sin reiniciar servidor)"
+  },
+  "fingerprint_identico_3_reps": "rep hardcodeado a 0 en runmark+ledger; sin colision porque cada rep tiene su ledger (<out>.ledger.db)",
+  "little_sin_runmark": true,
+  "model_digest": "sha256-af63361d2ac3ba2cb454f440842e345b926a50fe89cbdbe6a55160f32fc28e93",
+  "ps_after_1_row": "esperado: el stop externo ocurre despues del JSON; no es violacion",
+  "seed_runmark_42": "registrado sin aplicar (Ollama defaults); declarado, no afirmado",
+  "suite_sha256": "172796a9fbc8ffb70fe9f8c4a565d3df9149ff18bd1e555a05aa75f8d6d83deb",
+  "suite_version": "demo-12 v1.0.0",
+  "warmup": "parcial 6-7 ejercicios (demo-12 ignora --limit); ps 100pct GPU ctx 16384 archivado por brazo + logs warmup-log-*.log",
+  "ollama_server_ctx_nota": "unset (server default; servicio fija 16384)"
+ },
+ "warmup_evidencia": [
+  "bench/demo-12/warmup-ps-kitty-2026-10-24.txt",
+  "bench/demo-12/warmup-ps-little-2026-10-24.txt"
+ ],
+ "ledger_dbs": {
+  "nota": "DBs verificadas en serie (1 fila runs c/u, dirty 0, leaked 0, exit 2); no commiteadas (*.db en .gitignore); hashes:",
+  "sha256": [
+   "f1359088970a57ae8a7cdb2d34d8770855ccc38a8174f2ddcfc0648be4f14591  bench/demo-12/kitty-demo12-p3-k1.json.ledger.db",
+   "3f0b58dd6c7b94a6a46e3f772d835b5cbc0d30c735ec92e8dd6c266c52fcd6ea  bench/demo-12/kitty-demo12-p3-k2.json.ledger.db",
+   "53abef9fc81de57341c8ebad4e59701254232f5f005aa2e89365d7fd6182cffa  bench/demo-12/kitty-demo12-p3-k3.json.ledger.db"
+  ]
+ }
+}

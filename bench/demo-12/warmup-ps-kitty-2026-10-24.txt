@@ -1,0 +1,2 @@
+NAME         ID              SIZE      PROCESSOR    CONTEXT    RUNNER      UNTIL              
+ornith:9b    a75697c14589    5.5 GB    100% GPU     16384      llamacpp    4 minutes from now    

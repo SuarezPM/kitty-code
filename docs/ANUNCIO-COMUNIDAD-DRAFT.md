@@ -36,14 +36,13 @@ kitty run "..."
 kitty bench demo-12 --k 3 -o manifiesto.json
 ```
 
-## Resultados (parity-only, k≥3 con letra pequeña; serie en curso como [MEDIR-PASS3])
+## Resultados (parity-only, k≥3 con letra pequeña; serie Pass 3 medida)
 
-> Los tres titulares citan manifiestos k=3 existentes (HEAD distintos del
-> HEAD actual 3bf6b04: tb2-gpu = 5d8090d, demo12-fasef = c6bd16b).
-> La serie Pass 3 en curso (`bench/demo-12/manifest-prereg-pass3-2026-10-24.json`,
-> HEAD 73a1542, outs en `/tmp/kitty-serie-pass3/`) los re-mide con paridad
-> num_ctx 16384; sus celdas figuran como [MEDIR-PASS3] y las rellenará el
-> orchestrator con task_revive. Nada de abajo es victoria.
+> Los tres titulares citan manifiestos k=3 existentes (tb2-gpu = 5d8090d,
+> demo12-fasef = c6bd16b, demo12-pass3 = 73a1542). Doc actual: tag v0.2.0.
+> La serie Pass 3 ya corrió
+> (`bench/demo-12/manifest-demo12-pass3-2026-10-24.json`, HEAD 73a1542,
+> 6 celdas K1/L1/K2/L2/K3/L3 con paridad num_ctx 16384).
 
 - **Titular 1 — tb2-8 casera 24/24 vs 18/24 (k=3):** kitty 24/24 (100.0%)
   vs little-coder 18/24 (75.0%), mismo modelo `ornith:9b`, misma GPU real,
@@ -74,9 +73,14 @@ kitty bench demo-12 --k 3 -o manifiesto.json
   abierta** (gates_off en bench, p50/p99 brutos no cumplen `≤ little`);
   el +13.9pp de ambos brazos vs baseline es varianza en celdas flakeables,
   no atribuible a num_ctx (little sin cambios ganó lo mismo).
-  Re-medición en curso: [MEDIR-PASS3: serie Pass 3 k=3 interleaved
-  K1/L1/K2/L2/K3/L3, `manifest-prereg-pass3-2026-10-24.json`].
-- **Titular 3 — cero ceros en dos series k=3 con sandbox on:** ningún
+   Re-medición Pass 3 (HEAD 73a1542, paridad ctx 16384, k=3 interleaved):
+   demo-12 35/36 vs 32/36, Δp50 +2807ms (< 5s = ruido).
+   Fuente: `bench/demo-12/manifest-demo12-pass3-2026-10-24.json`
+   (`kitty.passed=35`, `little.passed=32`, `delta_p50_ms=2806.8`,
+   `desglose_por_ejercicio`, sin ningún 0/3 en ningún lado;
+   kitty reps 12/12/11, little reps 10/11/11). HU-LATENCIA sigue
+   ABIERTA (p50 nominal kitty > little); tb2-8 no entra en Pass 3.]
+- **Titular 3 — cero ceros en tres series k=3 con sandbox on:** ningún
   ejercicio 0/3 en comparativo (30/36 vs 29/36) ni en fasef (35/36 vs 34/36).
   Fuentes: `bench/demo-12/manifest-demo12-comparativo.json`
   (`comparativa.kitty.fails_por_ejercicio` sin entradas 0/3;
@@ -88,8 +92,11 @@ kitty bench demo-12 --k 3 -o manifiesto.json
   Letra pequeña: robustez observada en suites **caseras** (demo-12 v1.0.0,
   12 ejercicios fijos), no en benchmark oficial; con sandbox+guard activos
   en el brazo kitty (= producto); k=3 no autoriza p99 ni claims de
-  producción. Re-medición en curso: [MEDIR-PASS3: cero-ceros Pass 3
-  pendiente de los 6 ficheros `/tmp/kitty-serie-pass3/*.json`].
+   producción. Pass 3: cero ceros confirmado (kitty 12/12, 11/12,
+   12/12; little 10/12, 11/12, 11/12; fails kitty {demo-rs-args:1/3},
+   little {demo-bash-count:1/3, demo-sh-find-modified:2/3,
+   demo-sh-words:1/3}).
+   Fuente: `bench/demo-12/manifest-demo12-pass3-2026-10-24.json`.
 - **Reserva (serie 1-celda, nunca k≥3):** `ornith:9b` Q4 cabe en 8GB:
   pico-delta 5391 MiB (peak 6466 MiB), 33/33 capas GPU (+545.62 MiB
   CPU-mapped), runner 5.1 GiB / ps 5.5 GB, sin OOM.
@@ -101,15 +108,15 @@ kitty bench demo-12 --k 3 -o manifiesto.json
   exceder ligeramente el residente; `qwen38-27b` sin celda GPU (no cabe).
 - VRAM por modelo Q4 + KV-quant: verificado en
   `docs/SUPPORTED-MODELS-8GB.md` (CPU `manifest-w6-vram.json` + GPU
-  1-celda `manifest-w6-vram-gpu.json`, columna GPU citada como serie).
-  Serie Pass 3 en curso: [MEDIR-PASS3: warmup 100% GPU + `ollama ps`
-  CONTEXT por brazo, `warmup_gate` del prereg].
+   1-celda `manifest-w6-vram-gpu.json`, columna GPU citada como serie).
+   Pass 3: warmup 100% GPU + CONTEXT 16384 en ambos brazos
+   (`ollama ps`: 5.5 GB, llamacpp, ctx 16384; little vía pi RPC 0.83.0
+   también negocia 16384 sin reiniciar el servidor).
 
 ## Qué falta / honest scope
 
-- Serie GPU k≥3 (la serie GPU 1-celda ya existe en
-  `bench/gpu-ventana-2026-10-09/manifest-w6-vram-gpu.json`; falta la
-  repetición k≥3 para cerrar HU-LATENCIA).
+- HU-LATENCIA abierta: Pass 3 k=3 no la cierra (p50 nominal kitty >
+  little: 13.3s vs 10.5s); falta una serie que cumpla p50/p99 ≤ little.
 - Plataformas fuera de ubuntu x86_64 hasta CI por objetivo.
 - Auditoría externa, desktop/IDE, i18n: fuera de alcance declarado.
 
