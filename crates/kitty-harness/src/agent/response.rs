@@ -378,6 +378,176 @@ impl Agent {
         self.bootstrap_done = true;
     }
 
+    // -----------------------------------------------------------------------
+    // Pass 2 Lane B — bloque [Memory] Oracle (system líder único).
+    //
+    // Invariantes:
+    // - System líder único: el bloque vive en UN mensaje `role=system` (el
+    //   líder, índice 0: preflight o summary tras compactación). Nunca `user`.
+    // - Secciones `## Lessons` (lecciones con gate) + `## Episodes` (gated
+    //   recall, sin fill). Sección vacía ⇒ se omite; ambas vacías ⇒ sin bloque.
+    // - Reemplazo en sitio, nunca push: `upsert_memory_block` sustituye solo
+    //   el bloque y conserva el prefijo líder (workspace/summary).
+    // - Orden determinista: el recall ya ordena (score desc, timestamp desc,
+    //   id asc); el bloque renderiza en ese orden.
+    // - Presupuesto por `push_message` (mismo punto contable: count+consume),
+    //   truncando a ítems COMPLETOS (nunca a media línea).
+    // - Tras compactación se reconstruye sobre el nuevo líder system.
+    // -----------------------------------------------------------------------
+
+    /// Recall de lecciones con gate (solo runs limpios admiten lecciones;
+    /// el gate vive en `LessonStore::save`). Sin match ⇒ vacío (sin fill).
+    /// Best-effort: cualquier error SQLite ⇒ vacío, nunca falla el run.
+    /// m06: sin `unwrap` en prod — `spawn_blocking` + `unwrap_or_default`.
+    pub(super) async fn recall_memory_lessons(
+        &self,
+        goal: &str,
+    ) -> Vec<kitty_memory::MemoryItem> {
+        let Some(path) = self.config.memory_db_path.clone() else {
+            return Vec::new();
+        };
+        let goal = goal.to_string();
+        let now = epoch_now_secs();
+        tokio::task::spawn_blocking(move || -> Vec<kitty_memory::MemoryItem> {
+            let Ok(store) = kitty_memory::LessonStore::open(&path) else {
+                return Vec::new();
+            };
+            store
+                .recall(&goal, MEMORY_MAX_LESSONS, now)
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Recall episódico gated (firma Oracle): sin `fill_recent` ni fallback;
+    /// vacío si `score <= 0`. El modo lo decide el selector default-off
+    /// (`KITTY_HYBRID_RECALL=1` o feature `hybrid-recall`); sin selector la
+    /// llamada con `Hybrid` degrada a Jaccard dentro de `recall_gated`.
+    /// m06: sin `unwrap` en prod — el store se devuelve siempre al agente.
+    pub(super) async fn recall_memory_episodes(
+        &mut self,
+        goal: &str,
+    ) -> Vec<kitty_memory::Episode> {
+        let mode = if kitty_memory::hybrid_recall_enabled() {
+            kitty_memory::RecallMode::Hybrid
+        } else {
+            kitty_memory::RecallMode::Jaccard
+        };
+        // Sin embeddings cableados en el harness (save_episode no los
+        // persiste): el canal denso queda vacío y el híbrido gated equivale
+        // al léxico gated — igualmente sin fill.
+        let query_embedding: Option<Vec<f32>> = None;
+        let Some(store) = self.memory_store.take() else {
+            return Vec::new();
+        };
+        let goal = goal.to_string();
+        let now = epoch_now_secs();
+        let (store, result) = tokio::task::spawn_blocking(move || {
+            let result = store.recall_gated(
+                &goal,
+                query_embedding.as_deref(),
+                MEMORY_MAX_EPISODES,
+                mode,
+                now,
+            );
+            (Some(store), result)
+        })
+        .await
+        .unwrap_or((None, Ok(Vec::new())));
+        if let Some(store) = store {
+            self.memory_store = Some(store);
+        }
+        result.unwrap_or_default()
+    }
+
+    /// Inyecta el bloque [Memory] único (lecciones + episodios) en el líder
+    /// system. Vacío ⇒ omite (sin mensaje). Presupuesto: trunca a ítems
+    /// completos hasta caber en el restante; si ni un ítem cabe, omite.
+    pub(super) async fn inject_memory_block(&mut self, goal: &str) {
+        let lessons = self.recall_memory_lessons(goal).await;
+        let episodes = self.recall_memory_episodes(goal).await;
+        if lessons.is_empty() && episodes.is_empty() {
+            return;
+        }
+        let mut lesson_lines: Vec<String> = lessons
+            .iter()
+            .take(MEMORY_MAX_LESSONS)
+            .map(format_lesson_line)
+            .collect();
+        let mut episode_lines: Vec<String> = episodes
+            .iter()
+            .take(MEMORY_MAX_EPISODES)
+            .map(format_episode_line)
+            .collect();
+        let mut block = build_memory_block(&lesson_lines, &episode_lines);
+        loop {
+            let Some(b) = block.as_ref() else {
+                return;
+            };
+            if crate::context::ContextBudget::estimate_tokens(b) <= self.budget.remaining() {
+                break;
+            }
+            if !episode_lines.is_empty() {
+                episode_lines.pop();
+            } else if lesson_lines.len() > 1 {
+                lesson_lines.pop();
+            } else {
+                break;
+            }
+            block = build_memory_block(&lesson_lines, &episode_lines);
+        }
+        let Some(final_block) = block else {
+            return;
+        };
+        if crate::context::ContextBudget::estimate_tokens(&final_block) > self.budget.remaining()
+        {
+            return;
+        }
+        self.upsert_memory_block(&final_block).await;
+    }
+
+    /// Reemplazo en sitio del bloque (nunca push nuevo): conserva el prefijo
+    /// líder y sustituye solo el bloque; si no hay bloque previo, lo fusiona
+    /// al líder system existente o inserta el líder en 0. Contabilidad por el
+    /// mismo punto que `push_message` (count + consume).
+    pub(super) async fn upsert_memory_block(&mut self, block: &str) {
+        let tokens = self.count_tokens(block).await;
+        if let Some(idx) = find_memory_block(&self.messages) {
+            let stripped =
+                strip_memory_block(self.messages[idx].content.as_deref().unwrap_or(""));
+            let merged = if stripped.trim().is_empty() {
+                block.to_string()
+            } else {
+                format!("{}\n{}", stripped.trim_end(), block)
+            };
+            self.messages[idx].content = Some(merged);
+            self.messages[idx].role = "system".to_string();
+            self.budget.consume(tokens);
+            dedup_memory_blocks(&mut self.messages, idx);
+        } else if !self.messages.is_empty() && self.messages[0].role == "system" {
+            let merged = format!(
+                "{}\n{}",
+                self.messages[0].content.as_deref().unwrap_or(""),
+                block
+            );
+            self.messages[0].content = Some(merged);
+            self.budget.consume(tokens);
+        } else {
+            self.messages.insert(
+                0,
+                Message {
+                    role: "system".to_string(),
+                    content: Some(block.to_string()),
+                    thinking: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            );
+            self.budget.consume(tokens);
+        }
+    }
+
     /// Inject knowledge at the conversation tail if relevant cards are found.
     pub(super) async fn inject_knowledge(&mut self, user_prompt: &str) {
         if !self.knowledge_base.is_enabled() {
@@ -399,54 +569,6 @@ impl Agent {
             });
             let tokens = self.count_tokens(&injection).await;
             self.budget.consume(tokens);
-        }
-    }
-
-    /// Recall top-3 past episodes by goal similarity and inject at conversation tail.
-    pub(super) async fn recall_episodes(&mut self, goal: &str) {
-        // Fase 3.1: SQLite recall runs on the blocking pool so the async
-        // executor never parks on rusqlite. The store is taken and returned —
-        // the agent owns it exclusively and the task flow is sequential.
-        let recalled = if let Some(store) = self.memory_store.take() {
-            let goal = goal.to_string();
-            let (store, result) = tokio::task::spawn_blocking(move || {
-                let result = store.recall_similar(&goal, 3);
-                (Some(store), result)
-            })
-            .await
-            .unwrap_or((None, Ok(Vec::new())));
-            if let Some(store) = store {
-                self.memory_store = Some(store);
-            }
-            result
-        } else {
-            Ok(Vec::new())
-        };
-        if let Ok(episodes) = recalled {
-            if !episodes.is_empty() {
-                let context = episodes
-                    .iter()
-                    .map(|ep| {
-                        format!(
-                            "- Goal: {}\n  Outcome: {}\n  Files: {:?}",
-                            ep.goal, ep.outcome, ep.files_touched
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let injection = format!("[Past Episodes]\n{}\n[End Past Episodes]\n", context);
-                debug!(count = episodes.len(), "Episodic memory recall");
-                // F2.3: Use push_message for token accounting.
-                self.messages.push(Message {
-                    role: "user".to_string(),
-                    content: Some(injection.clone()),
-                    thinking: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
-                let tokens = self.count_tokens(&injection).await;
-                self.budget.consume(tokens);
-            }
         }
     }
 
@@ -753,6 +875,17 @@ impl Agent {
             return Ok(());
         }
 
+        // Pass 2 Lane B: el bloque [Memory] sobrevive a la compactación —
+        // se extrae ANTES del drain y se reconstruye sobre el nuevo líder
+        // system (F3: GIVEN compaction WHEN memory THEN sobrevive).
+        let preserved_memory: Option<String> =
+            find_memory_block(&self.messages).and_then(|idx| {
+                self.messages[idx]
+                    .content
+                    .as_deref()
+                    .and_then(extract_memory_block)
+            });
+
         // f8 AD6: move the boundary back to the nearest USER turn so tool
         // results are never orphaned and kept turns stay complete.
         let final_split = compaction_split_boundary(&self.messages, naive_split_at);
@@ -890,6 +1023,209 @@ impl Agent {
             },
         );
 
+        // Pass 2 Lane B: reconstruir el bloque sobre el nuevo líder system
+        // (reemplazo en sitio, sin push nuevo; contabilidad explícita).
+        if let Some(block) = preserved_memory {
+            let merged = format!(
+                "{}\n{}",
+                self.messages[0].content.as_deref().unwrap_or(""),
+                block
+            );
+            self.messages[0].content = Some(merged);
+            let tokens = self.count_tokens(&block).await;
+            self.budget.consume(tokens);
+        }
+
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass 2 Lane B — bloque [Memory]: constantes y funciones puras (Oracle).
+// ---------------------------------------------------------------------------
+
+/// Apertura del bloque [Memory] (líder system único).
+pub(crate) const MEMORY_BLOCK_START: &str = "[Memory]";
+/// Cierre del bloque [Memory].
+pub(crate) const MEMORY_BLOCK_END: &str = "[End Memory]";
+/// Sección de lecciones con gate dentro del bloque.
+pub(crate) const MEMORY_LESSONS_HEADER: &str = "## Lessons";
+/// Sección de episodios (recall gated) dentro del bloque.
+pub(crate) const MEMORY_EPISODES_HEADER: &str = "## Episodes";
+/// Tope de lecciones renderizadas en el bloque.
+pub(crate) const MEMORY_MAX_LESSONS: usize = 5;
+/// Tope de episodios renderizados en el bloque.
+pub(crate) const MEMORY_MAX_EPISODES: usize = 3;
+
+/// Epoch-secs actuales (reloj real; el recall gated lo recibe como `now`).
+/// m06: `unwrap_or_default` en vez de `unwrap` (reloj roto ⇒ 0, no panic).
+fn epoch_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Una línea de lección (orden de `LessonStore::recall`, determinista).
+fn format_lesson_line(item: &kitty_memory::MemoryItem) -> String {
+    format!(
+        "- {} :: {} (ref: {})",
+        item.cue, item.lesson, item.evidence_ref
+    )
+}
+
+/// Una línea de episodio (orden de `recall_gated`: score/timestamp/id).
+fn format_episode_line(ep: &kitty_memory::Episode) -> String {
+    let files = if ep.files_touched.is_empty() {
+        "-".to_string()
+    } else {
+        ep.files_touched.join(", ")
+    };
+    format!(
+        "- Goal: {} | Outcome: {} | Files: {}",
+        ep.goal, ep.outcome, files
+    )
+}
+
+/// Construye el bloque. `None` si ambas secciones están vacías
+/// (vacío ⇒ omitir: sin mensaje, sin inyección).
+/// m06: función pura, sin errores (los callers validan presupuesto).
+pub(crate) fn build_memory_block(
+    lesson_lines: &[String],
+    episode_lines: &[String],
+) -> Option<String> {
+    if lesson_lines.is_empty() && episode_lines.is_empty() {
+        return None;
+    }
+    let mut out = String::from(MEMORY_BLOCK_START);
+    out.push('\n');
+    if !lesson_lines.is_empty() {
+        out.push_str(MEMORY_LESSONS_HEADER);
+        out.push('\n');
+        for line in lesson_lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !episode_lines.is_empty() {
+        out.push_str(MEMORY_EPISODES_HEADER);
+        out.push('\n');
+        for line in episode_lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push_str(MEMORY_BLOCK_END);
+    Some(out)
+}
+
+/// Índice del mensaje que porta el bloque (cualquier rol: también caza
+/// bloques legacy `user` para migrarlos al líder system).
+/// m06: pura, sin errores.
+pub(crate) fn find_memory_block(messages: &[kitty_runtime::Message]) -> Option<usize> {
+    messages.iter().position(|m| {
+        m.content
+            .as_deref()
+            .is_some_and(|c| c.contains(MEMORY_BLOCK_START))
+    })
+}
+
+/// Extrae el bloque `[Memory]…[End Memory]` (inclusive) de un contenido.
+/// `None` si no hay bloque completo. m06: pura, sin errores.
+pub(crate) fn extract_memory_block(content: &str) -> Option<String> {
+    let start = content.find(MEMORY_BLOCK_START)?;
+    let end_rel = content[start..].find(MEMORY_BLOCK_END)?;
+    Some(content[start..start + end_rel + MEMORY_BLOCK_END.len()].to_string())
+}
+
+/// Quita el bloque del contenido y devuelve el resto (prefijo líder).
+/// Sin bloque ⇒ contenido intacto. m06: pura, sin errores.
+pub(crate) fn strip_memory_block(content: &str) -> String {
+    let Some(start) = content.find(MEMORY_BLOCK_START) else {
+        return content.to_string();
+    };
+    if let Some(end_rel) = content[start..].find(MEMORY_BLOCK_END) {
+        let end = start + end_rel + MEMORY_BLOCK_END.len();
+        format!("{}{}", &content[..start], &content[end..])
+    } else {
+        content[..start].to_string()
+    }
+}
+
+/// Elimina bloques duplicados posteriores a `keep` (unicidad del líder).
+/// m06: pura sobre el vector, sin errores.
+fn dedup_memory_blocks(messages: &mut Vec<kitty_runtime::Message>, keep: usize) {
+    let mut dupes: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(i, m)| {
+            *i != keep
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains(MEMORY_BLOCK_START))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    dupes.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in dupes {
+        messages.remove(idx);
+    }
+}
+
+#[cfg(test)]
+mod memory_block_unit_tests {
+    use super::*;
+
+    #[test]
+    fn empty_sections_yield_no_block() {
+        assert_eq!(build_memory_block(&[], &[]), None);
+    }
+
+    #[test]
+    fn block_format_sections_and_markers() {
+        let lessons = vec!["- cue :: lesson (ref: ppc:r:x)".to_string()];
+        let episodes = vec!["- Goal: g | Outcome: o | Files: -".to_string()];
+        let block = build_memory_block(&lessons, &episodes).unwrap();
+        assert!(block.starts_with("[Memory]\n"));
+        assert!(block.ends_with("[End Memory]"));
+        assert!(block.contains("## Lessons"));
+        assert!(block.contains("## Episodes"));
+        // Orden: lecciones antes que episodios.
+        assert!(block.find("## Lessons") < block.find("## Episodes"));
+    }
+
+    #[test]
+    fn empty_section_is_omitted_not_empty_header() {
+        let block = build_memory_block(&[], &["- Goal: g | Outcome: o | Files: -".to_string()])
+            .unwrap();
+        assert!(!block.contains("## Lessons"));
+        assert!(block.contains("## Episodes"));
+        let block = build_memory_block(&["- cue :: lesson (ref: r)".to_string()], &[]).unwrap();
+        assert!(block.contains("## Lessons"));
+        assert!(!block.contains("## Episodes"));
+    }
+
+    #[test]
+    fn extract_strip_roundtrip() {
+        let leader = "Workspace: rust.\n[Memory]\n## Episodes\n- x\n[End Memory]";
+        let extracted = extract_memory_block(leader).unwrap();
+        assert!(extracted.starts_with("[Memory]"));
+        assert!(extracted.ends_with("[End Memory]"));
+        let stripped = strip_memory_block(leader);
+        assert!(!stripped.contains("[Memory]"));
+        assert!(stripped.contains("Workspace: rust."));
+        // Sin bloque: intacto.
+        assert_eq!(strip_memory_block("plain"), "plain");
+        assert_eq!(extract_memory_block("plain"), None);
+    }
+
+    #[test]
+    fn find_legacy_user_block_too() {
+        let msgs = vec![kitty_runtime::Message::user(
+            "hello\n[Memory]\n## Episodes\n- x\n[End Memory]",
+        )];
+        assert_eq!(find_memory_block(&msgs), Some(0));
+        let msgs = vec![kitty_runtime::Message::user("hello")];
+        assert_eq!(find_memory_block(&msgs), None);
     }
 }

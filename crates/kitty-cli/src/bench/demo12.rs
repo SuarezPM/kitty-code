@@ -443,6 +443,7 @@ pub(crate) async fn run_demo12_bench(
 
     // Runmark Capa 0 (Lane B): fingerprint de celda + rechazo de rerun ANTES
     // del primer LLM. scored/offline: memory=off, systemone=off, seed fijo.
+    // `rep` = 0 siempre (1 rep/invocación, k=1; hueco k=2 futuro, ppc k=1).
     let runmark = crate::bench::runmark::Runmark {
         model: cfg.model.clone(),
         digest: model_digest(&cfg.model),
@@ -455,16 +456,43 @@ pub(crate) async fn run_demo12_bench(
         dataset_sha: crate::bench::runmark::sha_of_str(EMBEDDED_DEMO12_JSON),
         timeout_cell: DEMO12_TIMEOUT_SECS,
         seed: 42,
+        rep: 0,
         git_head: git_head(),
         dirty: git_dirty(),
         memory: false,
         systemone: crate::bench::common::bench_systemone_label(),
         toolset: crate::bench::common::bench_toolset_label(),
     };
+    // Ledger SQLite (única fuente de verdad): pre-chequeo + `begin` que
+    // reserva la celda ANTES del primer LLM y rechaza el duplicado
+    // (fingerprint,arm,rep) con exit 3.
     if let Err(e) = crate::bench::runmark::check_rerun_rejected(out, &runmark.fingerprint()) {
         eprintln!("integridad: {e:#}");
         std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
     }
+    let ledger_path = crate::bench::ledger::ledger_db_path(out);
+    let ledger = match crate::bench::ledger::Ledger::open(&ledger_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("integridad: no se pudo abrir el ledger {}: {e:#}", ledger_path.display());
+            std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+        }
+    };
+    let run_id = match ledger.begin(&crate::bench::ledger::LedgerStamp {
+        fingerprint: runmark.fingerprint(),
+        suite: "demo-12".to_string(),
+        arm: "default".to_string(),
+        rep: runmark.rep as i64,
+        git_head: runmark.git_head.clone(),
+        dirty: runmark.dirty,
+        started_at: utc_timestamp(),
+    }) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("integridad: {e:#}");
+            std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
+        }
+    };
     // B1: tripwire pre-LLM — si el run ya viene marcado con leak, integridad.
     if kitty_harness::guard::is_run_leaked() {
         eprintln!("integridad: run marcado con leak (tripwire): demo-12 no corre");
@@ -594,13 +622,20 @@ pub(crate) async fn run_demo12_bench(
 
     // B1: tripwire intra-run — deny durante los probes ⇒ integridad (exit 3).
     if kitty_harness::guard::is_run_leaked() {
+        let _ = ledger.mark_leaked(&run_id);
+        let _ = ledger.finish(
+            &run_id,
+            &utc_timestamp(),
+            crate::bench::runmark::EXIT_INTEGRITY,
+        );
         eprintln!("integridad: run marcado con leak durante probes (tripwire): sin resume");
         std::process::exit(crate::bench::runmark::EXIT_INTEGRITY);
     }
     // B2: SIGNAL/NO-SIGNAL también en demo-12 (hoy solo PPC lo llamaba).
     // 1 rep/invocación (k=1) ⇒ siempre NoSignal + exit 2 (inconcluso, nunca
     // publicable): la serie k>=3 decide fuera de este proceso.
-    let ledger_clean = !runmark.dirty;
+    // Ledger limpio = dirty==0 && leaked==0 (único gate publicable).
+    let ledger_clean = ledger.is_clean(&run_id).unwrap_or(false);
     let signal = kitty_harness::comparison::decide_signal(passed, total, passed, total, ledger_clean, 1);
     let exit_code = match &signal {
         kitty_harness::comparison::Signal::Signal => crate::bench::runmark::EXIT_PASS,
@@ -617,6 +652,41 @@ pub(crate) async fn run_demo12_bench(
     if digest == "unknown" {
         warn!("no se pudo pinejar el digest del modelo (ollama show falló)");
     }
+    // Hoisted fuera del `json!` gigante (límite de recursión del macro):
+    // se construyen como `Value` y se inyectan como variables.
+    let by_language_json: std::collections::BTreeMap<String, serde_json::Value> = by_lang
+        .iter()
+        .map(|(lang, t)| {
+            (
+                lang.clone(),
+                serde_json::json!({
+                    "attempted": t.attempted,
+                    "passed": t.passed,
+                    "failed": t.failed,
+                    "errored": t.errored,
+                }),
+            )
+        })
+        .collect();
+    let details_json: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "lang": r.lang,
+                "passed": r.passed,
+                "verdict": r.verdict,
+                "latency_ms": r.latency_ms,
+                "wall_ms": r.latency_ms,
+                "hops": r.hops,
+                "iters": r.iters,
+                "effort_off_in_bench": r.effort_off_in_bench,
+            })
+        })
+        .collect();
+    let ledger_db_str = ledger_path.display().to_string();
+    let fingerprint_str = runmark.fingerprint();
+    let git_head_str = runmark.git_head.clone();
     let output = serde_json::json!({
         "suite": "demo-12",
         "version": suite.version,
@@ -657,9 +727,11 @@ pub(crate) async fn run_demo12_bench(
             "ollama_server_ctx": std::env::var("OLLAMA_CONTEXT_LENGTH").unwrap_or("unset (server default; servicio fija 16384)".to_string()),
             "kitty_num_ctx_env": std::env::var(kitty_runtime::client::ENV_NUM_CTX).unwrap_or("unset (probe nativo con techo 32768)".to_string()),
         },
-        "git_head": runmark.git_head,
+        "git_head": git_head_str,
         "git_dirty": runmark.dirty,
-        "runmark_fingerprint": runmark.fingerprint(),
+        "run_id": run_id,
+        "ledger_db": ledger_db_str,
+        "runmark_fingerprint": fingerprint_str,
         "timestamp_utc": utc_timestamp(),
         "total": total,
         "passed": passed,
@@ -669,28 +741,17 @@ pub(crate) async fn run_demo12_bench(
         "wall_p99_censored": p99_censored,
         "wall_rango_ms": [rango.0, rango.1],
         "memory": false,
-        "by_language": by_lang.iter().map(|(lang, t)| (lang.clone(), serde_json::json!({
-            "attempted": t.attempted,
-            "passed": t.passed,
-            "failed": t.failed,
-            "errored": t.errored,
-        }))).collect::<std::collections::BTreeMap<String, serde_json::Value>>(),
-        "details": results.iter().map(|r| serde_json::json!({
-            "id": r.id,
-            "lang": r.lang,
-            "passed": r.passed,
-            "verdict": r.verdict,
-            "latency_ms": r.latency_ms,
-            "wall_ms": r.latency_ms,
-            "hops": r.hops,
-            "iters": r.iters,
-            "effort_off_in_bench": r.effort_off_in_bench,
-        })).collect::<Vec<_>>(),
+        "by_language": by_language_json,
+        "details": details_json,
     });
     std::fs::write(out, serde_json::to_string_pretty(&output)?)?;
     println!("Results saved to {}", out.display());
-    // Sidecar runmark tmp+fsync+rename (después del manifiesto principal).
+    // Sidecar runmark tmp+fsync+rename (caché legible; la decisión vive en el
+    // ledger). Ledger finish con el exit decidido.
     crate::bench::runmark::write_sidecar_atomic(out, &runmark)?;
+    if let Err(e) = ledger.finish(&run_id, &utc_timestamp(), exit_code) {
+        warn!("ledger finish falló (best-effort): {e:#}");
+    }
     println!(
         "Runmark saved to {} (fingerprint {})",
         crate::bench::runmark::sidecar_path(out).display(),

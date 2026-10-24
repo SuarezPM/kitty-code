@@ -7,6 +7,7 @@ pub mod claweval;
 pub mod common;
 pub mod demo12;
 pub mod gpqa;
+pub mod ledger;
 pub mod polyglot;
 pub mod ppc;
 pub mod run;

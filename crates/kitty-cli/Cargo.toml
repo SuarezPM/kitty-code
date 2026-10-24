@@ -19,6 +19,7 @@ console-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
+rusqlite.workspace = true
 tempfile = "3"
 rand = "0.10"
 # W3 probe params derivan JsonSchema: el derive de rmcp exige `schemars` en

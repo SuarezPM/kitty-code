@@ -35,9 +35,11 @@ pub mod skills;
 pub mod speculative;
 pub mod systemone;
 pub use systemone::{
-    Decision, DecisionRequest, OffSystemOne, ScoredDecision, SystemOne, TfidfSystemOne,
-    systemone_status,
+    Decision, DecisionRequest, LayaSystemOne, OffSystemOne, ScoredDecision, SystemOne,
+    SystemOneKind, TfidfSystemOne, build_systemone, select_kind, systemone_status,
+    systemone_status_for,
 };
+pub mod systemone_fixture;
 pub mod telemetry;
 pub mod tfidf_closer;
 pub mod thinking_budget;

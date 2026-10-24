@@ -377,7 +377,7 @@ pub enum Commands {
         #[arg(long)]
         plan: bool,
     },
-    /// Launch the TUI status display (requires `tui` feature)
+    /// Launch the interactive TUI (default feature `tui`; same as bare `kittycode`)
     #[cfg(feature = "tui")]
     Tui,
 }

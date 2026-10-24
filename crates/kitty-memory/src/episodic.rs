@@ -455,6 +455,207 @@ impl EpisodeStore {
             .query_row("SELECT COUNT(*) FROM episodes", [], |row| row.get(0))?;
         Ok(count as usize)
     }
+
+    /// Gated Jaccard arm (no `fill_recent`, no fallback).
+    ///
+    /// m06: sin `unwrap` en prod — los errores SQLite suben con `?`.
+    fn recall_gated_jaccard(&self, goal: &str, limit: usize) -> Result<Vec<Episode>> {
+        let candidates = self.recall_recent(MAX_RECALL_CANDIDATES)?;
+        if candidates.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let query_tokens = tokenize(goal);
+        if query_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut scored: Vec<(f64, &Episode)> = candidates
+            .iter()
+            .map(|ep| (similarity(&query_tokens, &tokenize(&ep.goal)), ep))
+            .filter(|(score, _)| *score > 0.0)
+            .collect();
+        // Determinista: score desc, timestamp desc, id asc.
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.1.timestamp.cmp(&a.1.timestamp))
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, ep)| ep.clone())
+            .collect())
+    }
+
+    /// Gated hybrid arm (BM25 léxico + coseno denso, fusión RRF).
+    ///
+    /// SIN `fill_recent` ni fallback: vacío si ningún canal puntúa > 0.
+    /// NO delega en `recall_hybrid*` (todos terminan en `fill_recent`).
+    /// m06: sin `unwrap` en prod — `get_embedding` tolera filas sin BLOB.
+    fn recall_gated_hybrid(
+        &self,
+        goal: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+    ) -> Result<Vec<Episode>> {
+        let candidates = self.recall_recent(MAX_RECALL_CANDIDATES)?;
+        if candidates.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Canal léxico: índice BM25 fresco (no la caché: el path gated es
+        // puro y no muta cachés).
+        let mut rankings: Vec<Vec<String>> = Vec::new();
+        let query_tokens = tokenize(goal);
+        if !query_tokens.is_empty() {
+            let doc_tokens: Vec<Vec<String>> =
+                candidates.iter().map(|ep| tokenize(&ep.goal)).collect();
+            let index = Bm25Index::new(&doc_tokens);
+            let mut lex: Vec<(f32, usize)> = candidates
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| (index.score(&query_tokens, idx), idx))
+                .filter(|(s, _)| *s > 0.0)
+                .collect();
+            lex.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(candidates[b.1].timestamp.cmp(&candidates[a.1].timestamp))
+                    .then_with(|| candidates[a.1].id.cmp(&candidates[b.1].id))
+            });
+            if !lex.is_empty() {
+                rankings.push(
+                    lex.into_iter()
+                        .map(|(_, idx)| candidates[idx].id.clone())
+                        .collect(),
+                );
+            }
+        }
+        // Canal denso: solo si hay query embedding y columna disponible.
+        if let Some(qemb) = query_embedding {
+            if !qemb.is_empty() {
+                // `ensure_embedding_column` crea la columna si falta; si
+                // falla, el canal denso se omite (no se aborta el recall).
+                let dense_ok = self.ensure_embedding_column().is_ok();
+                if dense_ok {
+                    let mut dense: Vec<(f32, String)> = Vec::new();
+                    for ep in &candidates {
+                        if let Ok(Some(emb)) = self.get_embedding(&ep.id) {
+                            if emb.len() != qemb.len() || emb.is_empty() {
+                                continue;
+                            }
+                            let s = cosine_similarity(qemb, &emb);
+                            if s.is_finite() && s > 0.0 {
+                                dense.push((s, ep.id.clone()));
+                            }
+                        }
+                    }
+                    dense.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.1.cmp(&b.1))
+                    });
+                    if !dense.is_empty() {
+                        rankings.push(dense.into_iter().map(|(_, id)| id).collect());
+                    }
+                }
+            }
+        }
+        if rankings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let by_id: std::collections::HashMap<&str, &Episode> =
+            candidates.iter().map(|ep| (ep.id.as_str(), ep)).collect();
+        if rankings.len() == 1 {
+            let mut out: Vec<Episode> = Vec::new();
+            for id in rankings[0].iter().take(limit) {
+                if let Some(ep) = by_id.get(id.as_str()) {
+                    out.push((*ep).clone());
+                }
+            }
+            return Ok(out);
+        }
+        let fused = reciprocal_rank_fusion(&rankings, RRF_K);
+        let mut scored: Vec<(&Episode, f32)> = candidates
+            .iter()
+            .filter_map(|ep| fused.get(&ep.id).map(|s| (ep, *s)))
+            .collect();
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.0.timestamp.cmp(&a.0.timestamp))
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(ep, _)| ep.clone())
+            .collect())
+    }
+
+    /// Recall gated: Jaccard o híbrido SIN `fill_recent` ni fallback.
+    ///
+    /// - Vacío si `score <= 0` (o `limit == 0`, o sin candidatos).
+    /// - Orden determinista: score desc, timestamp desc, id asc.
+    /// - `Hybrid` detrás del selector default-off
+    ///   ([`hybrid_recall_enabled`]): sin selector ⇒ degrada a Jaccard.
+    /// - NO llama a `recall_hybrid*` (todos terminan en `fill_recent`).
+    pub fn recall_gated(
+        &self,
+        goal: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+        mode: RecallMode,
+        now: i64,
+    ) -> Result<Vec<Episode>> {
+        // `now` se conserva en la firma Oracle para futuros decaimientos de
+        // recencia; el orden gated ya desempata por timestamp.
+        let _ = now;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let effective = match mode {
+            RecallMode::Jaccard => RecallMode::Jaccard,
+            RecallMode::Hybrid if hybrid_recall_enabled() => RecallMode::Hybrid,
+            RecallMode::Hybrid => RecallMode::Jaccard,
+        };
+        match effective {
+            RecallMode::Jaccard => self.recall_gated_jaccard(goal, limit),
+            RecallMode::Hybrid => self.recall_gated_hybrid(goal, query_embedding, limit),
+        }
+    }
+}
+
+/// Modo de recall gated (firma Oracle exacta).
+///
+/// - `Jaccard`: similitud de tokens, sin fallback.
+/// - `Hybrid`: BM25 + denso con fusión RRF, sin `fill_recent`; detrás del
+///   selector default-off ([`hybrid_recall_enabled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallMode {
+    Jaccard,
+    Hybrid,
+}
+
+/// Selector del brazo híbrido (default-off).
+///
+/// Habilitado si `KITTY_HYBRID_RECALL=1` (o `true`, insensible a mayúsculas)
+/// o si se compila con `--features hybrid-recall`. En cualquier otro caso
+/// el recall gated degrada `Hybrid` ⇒ `Jaccard`.
+pub const ENV_HYBRID_RECALL: &str = "KITTY_HYBRID_RECALL";
+
+/// `true` cuando el brazo híbrido está habilitado (ver [`ENV_HYBRID_RECALL`]).
+pub fn hybrid_recall_enabled() -> bool {
+    if let Ok(v) = std::env::var(ENV_HYBRID_RECALL) {
+        return v == "1" || v.eq_ignore_ascii_case("true");
+    }
+    #[cfg(feature = "hybrid-recall")]
+    {
+        return true;
+    }
+    #[cfg(not(feature = "hybrid-recall"))]
+    {
+        return false;
+    }
 }
 
 pub const RRF_K: f32 = 60.0;
@@ -1769,5 +1970,215 @@ mod tests {
         assert!(!back.is_settled(now + SETTLED_TTL_SECS + 1));
         let plain = all.iter().find(|e| e.goal == "lint").unwrap();
         assert!(!plain.settled);
+    }
+
+    // ── Pass 2 Lane B: recall_gated (firma Oracle) ──────────────────────
+
+    fn gated_store_with(goals: &[(&str, i64)]) -> EpisodeStore {
+        // Test-only: el TempDir se olvida a propósito para que el SQLite
+        // sobreviva al helper (el SO limpia /tmp; producción nunca hace esto).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("gated.db");
+        let path_str = path.to_str().unwrap().to_string();
+        std::mem::forget(dir);
+        let store = EpisodeStore::open(&path_str).unwrap();
+        for (goal, ts) in goals {
+            let mut ep = Episode::new((*goal).into(), vec![], None, "ok".into());
+            ep.timestamp = *ts;
+            ep.id = Episode::compute_id(&ep.goal, ep.timestamp);
+            store.save(&ep).unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn gated_jaccard_sin_fill_devuelve_vacio_sin_overlap() {
+        // Legacy `recall_similar` cae a recent aquí; el gated NO debe.
+        let store = gated_store_with(&[("refactor the rust module", 100)]);
+        let out = store
+            .recall_gated("make me a sandwich", None, 10, RecallMode::Jaccard, 200)
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "gated sin overlap debe ser vacío (sin fill_recent), fue: {out:?}"
+        );
+        // Control: el legacy sí rellena (pin del contraste).
+        let legacy = store.recall_similar("make me a sandwich", 10).unwrap();
+        assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
+    fn gated_50_goals_no_relacionados_cero() {
+        let store = gated_store_with(&[("postgres index bloat autovacuum tuning", 100)]);
+        const GOALS: [&str; 50] = [
+            "bake sourdough bread at home",
+            "grow tomatoes on balcony",
+            "fix bicycle flat tire",
+            "plan weekly meals cheap",
+            "learn basic watercolor washes",
+            "train puppy to sit",
+            "organize garage shelves",
+            "write wedding speech toast",
+            "meditate ten minutes daily",
+            "change car oil safely",
+            "knit wool scarf pattern",
+            "build birdhouse from pine",
+            "study spanish verbs nightly",
+            "clean oven glass door",
+            "photograph moon with phone",
+            "repair drywall small hole",
+            "brew kombucha first batch",
+            "sew button on coat",
+            "prune roses in march",
+            "fold fitted sheet neatly",
+            "grill salmon fillets evenly",
+            "unclog sink drain naturally",
+            "paint bedroom accent wall",
+            "potty train toddler tips",
+            "sharpen kitchen knives whetstone",
+            "make candles with soy wax",
+            "tile backsplash grout lines",
+            "compost kitchen scraps apartment",
+            "draw cartoon faces simple",
+            "jog first five kilometers",
+            "hem curtains without sewing machine",
+            "pickle cucumbers vinegar brine",
+            "mount tv bracket studs",
+            "whiten sneakers baking soda",
+            "arrange flowers vase tall",
+            "defrost freezer quickly safely",
+            "wrap gifts with fabric",
+            "calibrate guitar tuner ear",
+            "remove rust from tools",
+            "freeze herbs olive oil",
+            "patch jeans knee denim",
+            "steam dumplings bamboo basket",
+            "refinish wooden chair sanding",
+            "darn socks heel wool",
+            "cure cast iron skillet",
+            "hang curtains rod level",
+            "mop hardwood floors vinegar",
+            "fold origami crane paper",
+            "descale kettle citric acid",
+            "water orchids ice cubes",
+        ];
+        for g in GOALS {
+            let out = store
+                .recall_gated(g, None, 5, RecallMode::Jaccard, 200)
+                .unwrap();
+            assert!(
+                out.is_empty(),
+                "goal no-relacionado '{g}' debe dar 0, fue: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gated_orden_determinista_score_timestamp_id() {
+        // Dos docs con el mismo score Jaccard: gana el más reciente; a igual
+        // timestamp, gana el id menor (determinista entre runs/máquinas).
+        let store = gated_store_with(&[
+            ("bash script", 100),
+            ("bash script", 200),
+            ("bash script backup rotation", 200),
+        ]);
+        let a = store
+            .recall_gated("bash script", None, 10, RecallMode::Jaccard, 300)
+            .unwrap();
+        let b = store
+            .recall_gated("bash script", None, 10, RecallMode::Jaccard, 300)
+            .unwrap();
+        assert_eq!(a.len(), 3);
+        assert_eq!(
+            a.iter().map(|e| &e.id).collect::<Vec<_>>(),
+            b.iter().map(|e| &e.id).collect::<Vec<_>>(),
+            "el orden debe ser determinista entre llamadas"
+        );
+        // Score 1.0 ("bash script" exacto) antes que 2/3 (backup rotation).
+        assert_eq!(a[0].timestamp, 200);
+        assert_eq!(a[0].goal, "bash script");
+        assert_eq!(a[1].goal, "bash script");
+        assert!(a[0].id < a[1].id, "empate total ⇒ id asc: {:?} vs {:?}", a[0].id, a[1].id);
+        // limit respeta el top sin rellenar.
+        let top1 = store
+            .recall_gated("bash script", None, 1, RecallMode::Jaccard, 300)
+            .unwrap();
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0].id, a[0].id);
+        // limit 0 ⇒ vacío.
+        assert!(store
+            .recall_gated("bash script", None, 0, RecallMode::Jaccard, 300)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Lock serializa los tests que mutan `KITTY_HYBRID_RECALL` (cargo corre
+    /// hilos en paralelo en el mismo binario; sin lock dos `gated_hybrid_*`
+    /// en paralelo se pisan ⇒ flaky). + guard con restore en `Drop`
+    /// (panic-safe: un assert no deja el env sucio).
+    static HYBRID_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock_hybrid_env() -> std::sync::MutexGuard<'static, ()> {
+        HYBRID_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    struct HybridEnvGuard {
+        prev: Option<String>,
+    }
+    impl HybridEnvGuard {
+        fn set(value: &str) -> Self {
+            let prev = std::env::var(ENV_HYBRID_RECALL).ok();
+            // SAFETY: test-only bajo lock.
+            unsafe {
+                std::env::set_var(ENV_HYBRID_RECALL, value);
+            }
+            Self { prev }
+        }
+    }
+    impl Drop for HybridEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: test-only restore.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(ENV_HYBRID_RECALL, v),
+                    None => std::env::remove_var(ENV_HYBRID_RECALL),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gated_hybrid_default_off_degrada_a_jaccard() {
+        // Sin `KITTY_HYBRID_RECALL=1` el modo Hybrid degrada a Jaccard:
+        // sin overlap ⇒ vacío aunque haya candidatos (sin fill).
+        // Hermético: lock + `"0"` explícito (fuerza Jaccard incluso con
+        // feature `hybrid-recall`, donde `remove` seguiría habilitado).
+        let _lock = lock_hybrid_env();
+        let _guard = HybridEnvGuard::set("0");
+        let store = gated_store_with(&[("refactor the rust module", 100)]);
+        assert!(!hybrid_recall_enabled());
+        let out = store
+            .recall_gated("make me a sandwich", None, 5, RecallMode::Hybrid, 200)
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "hybrid default-off debe degradar a jaccard (vacío sin fill)"
+        );
+    }
+
+    #[test]
+    fn gated_hybrid_sin_overlap_vacio_aun_habilitado() {
+        // Aun con el selector ON, el híbrido gated no rellena: sin canal con
+        // score > 0 ⇒ vacío.
+        // Hermético: lock + guard (restore en Drop, panic-safe).
+        let _lock = lock_hybrid_env();
+        let _guard = HybridEnvGuard::set("1");
+        let store = gated_store_with(&[("refactor the rust module", 100)]);
+        assert!(hybrid_recall_enabled());
+        let out = store
+            .recall_gated("xyzzy plugh qwerty asdf", None, 5, RecallMode::Hybrid, 200)
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "híbrido gated sin señal debe ser vacío (sin fill_recent), fue: {out:?}"
+        );
     }
 }

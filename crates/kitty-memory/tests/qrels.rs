@@ -8,8 +8,8 @@
 use std::collections::HashSet;
 
 use kitty_memory::{
-    ndcg_at_k, normalize_embedding, recall_at_k, reciprocal_rank, EpisodeStore, RrfParams,
-    ScoringWeights, MODEL_DIM,
+    ndcg_at_k, normalize_embedding, recall_at_k, reciprocal_rank, EpisodeStore, RecallMode,
+    RrfParams, ScoringWeights, ENV_HYBRID_RECALL, MODEL_DIM,
 };
 
 /// Deterministic PRNG (splitmix64) for synthetic dense vectors — same
@@ -232,6 +232,91 @@ fn qrels_hybrid_meets_baseline() {
     assert!(
         r_b >= 0.78,
         "BM25 recall@10 {r_b:.3} below corpus floor 0.78"
+    );
+}
+
+/// Pass 2 Lane B — brazo Jaccard@3 sobre holdout disjunto.
+///
+/// Partición fija y disjunta del corpus congelado: dev = queries[0..6],
+/// holdout = queries[6..12] (sin solape). Compara el brazo léxico gated
+/// (`RecallMode::Jaccard`, sin `fill_recent`) contra el híbrido gated
+/// (`RecallMode::Hybrid` con selector `KITTY_HYBRID_RECALL=1`) a k=3.
+///
+/// Resultado documentado (2026-10-24, corpus congelado): ambos brazos
+/// resuelven el holdout léxicamente saturado; el gate NO exige que el
+/// híbrido gane — solo que no colapse (piso) y que el Jaccard gated no
+/// rellene con recientes. La discriminación densa sigue pinned por
+/// `qrels_dense_channel_decisive_without_lexical_overlap`.
+#[test]
+fn qrels_jaccard_at3_holdout_disjoint() {
+    let (store, _tmp, ids, now, query_embs) = build_store();
+    const K: usize = 3;
+    // Holdout disjunto: segunda mitad, sin solape con dev [0..6).
+    let holdout: &[&usize] = &[&6, &7, &8, &9, &10, &11];
+    assert!(
+        holdout.iter().all(|&&i| i >= 6),
+        "holdout debe ser disjunto del dev [0..6)"
+    );
+    // Selector default-off: habilitar el híbrido solo dentro del test.
+    let saved = std::env::var(ENV_HYBRID_RECALL).ok();
+    // SAFETY: test-only; ningún otro test de qrels lee esta env.
+    unsafe {
+        std::env::set_var(ENV_HYBRID_RECALL, "1");
+    }
+    let mut sum_j = 0.0_f32;
+    let mut sum_h = 0.0_f32;
+    for &&qi in holdout {
+        let (query, target) = QUERIES[qi];
+        let rel: HashSet<String> = [ids[target].clone()].into_iter().collect();
+        let jaccard: Vec<String> = store
+            .recall_gated(query, None, K, RecallMode::Jaccard, now)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let hybrid: Vec<String> = store
+            .recall_gated(query, Some(&query_embs[target]), K, RecallMode::Hybrid, now)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        let rj = recall_at_k(&jaccard, &rel, K);
+        let rh = recall_at_k(&hybrid, &rel, K);
+        println!("holdout q={query:?} target={} jaccard@3={rj:.3} hybrid@3={rh:.3}", TARGETS[target].0);
+        // Sin fill: el brazo que no puntúa devuelve vacío en vez de
+        // recientes — aquí ambas queries tienen overlap, así que ambos
+        // deben recuperar al relevante dentro del top-3.
+        assert!(
+            jaccard.contains(&ids[target]),
+            "jaccard gated debe hallar el target en holdout q={query:?}"
+        );
+        sum_j += rj;
+        sum_h += rh;
+    }
+    if let Some(v) = saved {
+        // SAFETY: test-only restore.
+        unsafe {
+            std::env::set_var(ENV_HYBRID_RECALL, v);
+        }
+    } else {
+        // SAFETY: test-only restore.
+        unsafe {
+            std::env::remove_var(ENV_HYBRID_RECALL);
+        }
+    }
+    let n = holdout.len() as f32;
+    println!("HOLDOUT recall@3 jaccard={:.3} hybrid={:.3} (n={n})", sum_j / n, sum_h / n);
+    // Piso del holdout (corpus saturado): ambos ≥ 0.5. Sin exigencia de
+    // victoria del híbrido — documentar, no ganar.
+    assert!(
+        sum_j / n >= 0.5,
+        "jaccard@3 holdout bajo el piso: {:.3}",
+        sum_j / n
+    );
+    assert!(
+        sum_h / n >= 0.5,
+        "hybrid@3 holdout bajo el piso: {:.3}",
+        sum_h / n
     );
 }
 

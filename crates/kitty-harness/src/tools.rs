@@ -627,8 +627,12 @@ mod tests {
 
     /// Capa 0 F1 (Lane B): pre-dispatch deniega bench/** en `execute`
     /// (Read/Grep/Glob/Bash incl. `cat`), 0 lecturas, error `BenchDenied`.
+    /// Hermético: cada deny flaggea el tripwire global (`flag_run_leaked`);
+    /// sin lock + reset contaminaría al resto del proceso ⇒ flaky.
     #[tokio::test]
     async fn bench_policy_predispatch_denies_without_io() {
+        let _flag = crate::guard::test_flag_lock();
+        crate::guard::clear_run_leaked_for_tests();
         let mut registry = ToolRegistry::new();
         let cases = vec![
             ("Read", serde_json::json!({"path": "bench/demo-12/demo-12.json"})),
@@ -650,5 +654,6 @@ mod tests {
         // 0 lecturas: ninguna denegación registra el fichero como leído.
         assert!(registry.read_files.is_empty());
         assert_eq!(registry.file_modifications(), 0);
+        crate::guard::clear_run_leaked_for_tests();
     }
 }

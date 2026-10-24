@@ -59,9 +59,9 @@ impl Agent {
         // conversation (recall/knowledge injections below must follow it).
         self.preflight(user_prompt);
 
-        // Episodic memory: recall past episodes for this goal (context, not a
-        // user turn — injected after the system message and budget-tracked).
-        self.recall_episodes(user_prompt).await;
+        // Pass 2 Lane B: bloque [Memory] único (lecciones + episodios gated)
+        // en el líder system — reemplazo en sitio, nunca `role=user`.
+        self.inject_memory_block(user_prompt).await;
 
         // Knowledge injection: inject on first user message if enabled.
         self.inject_knowledge(user_prompt).await;
@@ -1221,6 +1221,345 @@ mod run_effort_tests {
                 iters_used: 6,
                 router_off: true,
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod memory_block_tests {
+    //! Pass 2 Lane B — invariantes Oracle del bloque [Memory].
+    //!
+    //! Sin LLM en vivo: `MockClient` solo aporta el summary de compactación;
+    //! el recall es SQLite local (gated, sin fill).
+
+    use super::super::{dummy_response, Agent, AgentConfig};
+    use kitty_runtime::{Message, MockClient};
+
+    const NOW: i64 = 1_790_000_000;
+
+    fn save_episode_at(
+        store: &kitty_memory::EpisodeStore,
+        goal: &str,
+        outcome: &str,
+        ts: i64,
+    ) {
+        let mut ep =
+            kitty_memory::Episode::new(goal.to_string(), vec![], None, outcome.to_string());
+        ep.timestamp = ts;
+        ep.id = kitty_memory::Episode::compute_id(&ep.goal, ep.timestamp);
+        store.save(&ep).unwrap();
+    }
+
+    fn save_lesson(
+        path: &str,
+        cue: &str,
+        lesson: &str,
+        evidence_ref: &str,
+        run_id: &str,
+    ) {
+        let store = kitty_memory::LessonStore::open(path).unwrap();
+        let prov = kitty_memory::RunProvenance::clean(run_id);
+        let item = kitty_memory::MemoryItem::new(
+            cue.to_string(),
+            lesson.to_string(),
+            "{\"score\": 0.9}".to_string(),
+            "test".to_string(),
+            run_id.to_string(),
+            evidence_ref.to_string(),
+            0.8,
+            NOW,
+        );
+        store.save(item, &prov).unwrap();
+    }
+
+    fn db_with_episodes(goals: &[(&str, i64)]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mem.db");
+        let path_str = path.to_str().unwrap().to_string();
+        let store = kitty_memory::EpisodeStore::open(&path_str).unwrap();
+        for (goal, ts) in goals {
+            save_episode_at(&store, goal, "done", *ts);
+        }
+        (dir, path_str)
+    }
+
+    fn agent_with_db(responses: Vec<kitty_runtime::ChatResponse>, path: &str) -> Agent {
+        Agent::new(
+            MockClient::new(responses),
+            AgentConfig {
+                memory_db_path: Some(path.to_string()),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn memory_indices(agent: &Agent) -> Vec<usize> {
+        agent
+            .messages()
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("[Memory]"))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Bloque único, rol system, sin `role=user`, con sección Episodes.
+    #[tokio::test]
+    async fn block_is_single_system_leader_no_user() {
+        let (_dir, path) = db_with_episodes(&[("fix websocket gateway reconnect loop", 100)]);
+        let mut agent = agent_with_db(vec![], &path);
+        agent
+            .inject_memory_block("websocket gateway drops connection")
+            .await;
+        let idx = memory_indices(&agent);
+        assert_eq!(idx.len(), 1, "un solo bloque [Memory]: {:?}", agent.messages());
+        assert_eq!(agent.messages()[idx[0]].role, "system");
+        assert!(
+            !agent.messages().iter().any(|m| m.role == "user"
+                && m.content.as_deref().is_some_and(|c| c.contains("[Memory]"))),
+            "el bloque nunca es role=user"
+        );
+        let content = agent.messages()[idx[0]].content.as_deref().unwrap();
+        assert!(content.contains("## Episodes"), "sección Episodes: {content}");
+        assert!(!content.contains("[Past Episodes]"), "sin formato legacy: {content}");
+    }
+
+    /// F3: 50 goals no-relacionados ⇒ 0 inyecciones (sin fill).
+    #[tokio::test]
+    async fn block_omitted_for_50_unrelated_goals() {
+        let (_dir, path) =
+            db_with_episodes(&[("postgres index bloat autovacuum tuning", 100)]);
+        let mut agent = agent_with_db(vec![], &path);
+        const GOALS: [&str; 50] = [
+            "bake sourdough bread at home",
+            "grow tomatoes on balcony",
+            "fix bicycle flat tire",
+            "plan weekly meals cheap",
+            "learn basic watercolor washes",
+            "train puppy to sit",
+            "organize garage shelves",
+            "write wedding speech toast",
+            "meditate ten minutes daily",
+            "change car oil safely",
+            "knit wool scarf pattern",
+            "build birdhouse from pine",
+            "study spanish verbs nightly",
+            "clean oven glass door",
+            "photograph moon with phone",
+            "repair drywall small hole",
+            "brew kombucha first batch",
+            "sew button on coat",
+            "prune roses in march",
+            "fold fitted sheet neatly",
+            "grill salmon fillets evenly",
+            "unclog sink drain naturally",
+            "paint bedroom accent wall",
+            "potty train toddler tips",
+            "sharpen kitchen knives whetstone",
+            "make candles with soy wax",
+            "tile backsplash grout lines",
+            "compost kitchen scraps apartment",
+            "draw cartoon faces simple",
+            "jog first five kilometers",
+            "hem curtains without sewing machine",
+            "pickle cucumbers vinegar brine",
+            "mount tv bracket studs",
+            "whiten sneakers baking soda",
+            "arrange flowers vase tall",
+            "defrost freezer quickly safely",
+            "wrap gifts with fabric",
+            "calibrate guitar tuner ear",
+            "remove rust from tools",
+            "freeze herbs olive oil",
+            "patch jeans knee denim",
+            "steam dumplings bamboo basket",
+            "refinish wooden chair sanding",
+            "darn socks heel wool",
+            "cure cast iron skillet",
+            "hang curtains rod level",
+            "mop hardwood floors vinegar",
+            "fold origami crane paper",
+            "descale kettle citric acid",
+            "water orchids ice cubes",
+        ];
+        for g in GOALS {
+            agent.inject_memory_block(g).await;
+        }
+        assert!(
+            memory_indices(&agent).is_empty(),
+            "50 goals no-relacionados ⇒ 0 bloques"
+        );
+        assert!(
+            agent.messages().is_empty(),
+            "vacío ⇒ omitir: sin mensajes"
+        );
+    }
+
+    /// Reemplazo en sitio: segunda inyección no hace push (mismo nº
+    /// mensajes, un solo bloque, contenido nuevo sustituye al viejo).
+    #[tokio::test]
+    async fn block_replaces_in_place_never_pushes() {
+        let (_dir, path) =
+            db_with_episodes(&[("fix websocket gateway reconnect loop", 100)]);
+        let mut agent = agent_with_db(vec![], &path);
+        agent
+            .inject_memory_block("websocket gateway drops connection")
+            .await;
+        assert_eq!(agent.messages().len(), 1);
+        // Nuevo episodio disjunto en el mismo DB.
+        let store = kitty_memory::EpisodeStore::open(&path).unwrap();
+        save_episode_at(&store, "deploy kubernetes cluster production", "done", 200);
+        agent.inject_memory_block("kubernetes production rollout").await;
+        assert_eq!(
+            agent.messages().len(),
+            1,
+            "reemplazo en sitio, nunca push: {:?}",
+            agent.messages()
+        );
+        let idx = memory_indices(&agent);
+        assert_eq!(idx.len(), 1);
+        let content = agent.messages()[idx[0]].content.as_deref().unwrap();
+        assert!(content.contains("kubernetes"), "bloque nuevo: {content}");
+        assert!(!content.contains("websocket"), "bloque viejo sustituido: {content}");
+    }
+
+    /// Orden determinista del bloque (score desc, timestamp desc).
+    #[tokio::test]
+    async fn block_order_is_deterministic() {
+        // Hermético: fija Jaccard explícito (`"0"` fuerza Jaccard incluso con
+        // feature `hybrid-recall` o `KITTY_HYBRID_RECALL=1` en el entorno).
+        // Sin esto el test asumiría Jaccard y sería flaky bajo Hybrid.
+        let _lock = crate::model_profile::test_env_lock();
+        let _hybrid =
+            crate::model_profile::EnvRestoreGuard::set(kitty_memory::ENV_HYBRID_RECALL, "0");
+        let (_dir, path) = db_with_episodes(&[
+            ("bash script", 100),
+            ("bash script", 200),
+            ("bash bash bash script", 50),
+        ]);
+        let mut agent = agent_with_db(vec![], &path);
+        agent.inject_memory_block("bash script").await;
+        let idx = memory_indices(&agent);
+        assert_eq!(idx.len(), 1);
+        let content = agent.messages()[idx[0]].content.as_deref().unwrap();
+        let goals: Vec<&str> = content
+            .lines()
+            .filter(|l| l.starts_with("- Goal:"))
+            .collect();
+        assert_eq!(goals.len(), 3, "tres episodios: {content}");
+        // Jaccard("bash script"): exactos (1.0) antes que 3/4; entre exactos,
+        // el más reciente primero.
+        assert!(goals[0].contains("bash script") && !goals[0].contains("bash bash"));
+        assert!(goals[1].contains("bash script") && !goals[1].contains("bash bash"));
+        assert!(goals[2].contains("bash bash bash script"));
+        // Determinista entre llamadas (mismo agente, re-inyección).
+        let first = content.to_string();
+        agent.inject_memory_block("bash script").await;
+        let idx = memory_indices(&agent);
+        assert_eq!(idx.len(), 1);
+        assert_eq!(agent.messages()[idx[0]].content.as_deref().unwrap(), first);
+    }
+
+    /// Lecciones + episodios conviven en el bloque único.
+    #[tokio::test]
+    async fn block_holds_lessons_and_episodes() {
+        let (_dir, path) =
+            db_with_episodes(&[("postgres pool exhaustion timeout", 100)]);
+        save_lesson(
+            &path,
+            "postgres index bloat autovacuum",
+            "usar iter_cap bajo en triage",
+            "ppc:run-limpio-1:baseline",
+            "run-limpio-1",
+        );
+        let mut agent = agent_with_db(vec![], &path);
+        agent.inject_memory_block("postgres autovacuum tuning").await;
+        let idx = memory_indices(&agent);
+        assert_eq!(idx.len(), 1);
+        let content = agent.messages()[idx[0]].content.as_deref().unwrap();
+        assert!(content.contains("## Lessons"), "lecciones: {content}");
+        assert!(content.contains("## Episodes"), "episodios: {content}");
+        assert!(content.contains("ppc:run-limpio-1:baseline"));
+    }
+
+    /// Presupuesto: con restante casi cero el bloque se omite (a ítems
+    /// completos: nunca media línea).
+    #[tokio::test]
+    async fn block_omitted_when_nothing_fits_budget() {
+        let (_dir, path) = db_with_episodes(&[("fix websocket gateway reconnect loop", 100)]);
+        let mut agent = agent_with_db(vec![], &path);
+        let max = agent.budget().max();
+        agent.budget.consume(max);
+        assert_eq!(agent.budget().remaining(), 0);
+        agent
+            .inject_memory_block("websocket gateway drops connection")
+            .await;
+        assert!(
+            memory_indices(&agent).is_empty(),
+            "sin presupuesto ⇒ omitir, no forzar"
+        );
+    }
+
+    /// Presupuesto: con restante ajustado el bloque trunca a ítems
+    /// completos (menos episodios, líneas intactas).
+    #[tokio::test]
+    async fn block_truncates_whole_items_on_tight_budget() {
+        let long_a = format!("fix websocket gateway reconnect {}", "x".repeat(400));
+        let long_b = format!("fix websocket gateway retry backoff {}", "y".repeat(400));
+        let long_c = format!("fix websocket gateway timeout probe {}", "z".repeat(400));
+        let (_dir, path) = db_with_episodes(&[
+            (long_a.as_str(), 100),
+            (long_b.as_str(), 200),
+            (long_c.as_str(), 300),
+        ]);
+        let mut agent = agent_with_db(vec![], &path);
+        let max = agent.budget().max();
+        // ~150 tokens restantes: cabe 1 ítem (~117) pero no 2 (~226).
+        agent.budget.consume(max - 150);
+        agent
+            .inject_memory_block("fix websocket gateway reconnect retry")
+            .await;
+        let idx = memory_indices(&agent);
+        assert_eq!(idx.len(), 1, "un bloque truncado, no omitido");
+        let content = agent.messages()[idx[0]].content.as_deref().unwrap();
+        let n = content.lines().filter(|l| l.starts_with("- Goal:")).count();
+        assert_eq!(n, 1, "truncado a 1 ítem completo: {content}");
+        assert!(content.ends_with("[End Memory]"), "bloque bien formado: {content}");
+    }
+
+    /// Compactación simulada: el bloque sobrevive sobre el nuevo líder
+    /// system y sigue siendo único.
+    #[tokio::test]
+    async fn block_survives_compaction_as_single_leader() {
+        let (_dir, path) = db_with_episodes(&[("fix websocket gateway reconnect loop", 100)]);
+        let mut agent = agent_with_db(vec![dummy_response("summary text")], &path);
+        agent
+            .inject_memory_block("websocket gateway drops connection")
+            .await;
+        assert_eq!(memory_indices(&agent).len(), 1);
+        // Historial suficiente para compactar (líder + 3 turnos).
+        agent.messages.push(Message::user("goal: fix the login bug"));
+        agent.messages.push(Message::assistant("working"));
+        agent.messages.push(Message::user("keep going"));
+        agent.messages.push(Message::assistant("ack"));
+        agent.messages.push(Message::user("almost"));
+        agent.messages.push(Message::assistant("done-ish"));
+        agent.trigger_compaction().await.unwrap();
+        let idx = memory_indices(&agent);
+        assert_eq!(idx.len(), 1, "bloque único tras compactación");
+        assert_eq!(agent.messages()[0].role, "system");
+        let leader = agent.messages()[0].content.as_deref().unwrap();
+        assert!(leader.contains("[Context Summary]"), "nuevo líder summary: {leader}");
+        assert!(leader.contains("[Memory]"), "memoria reconstruida: {leader}");
+        // Sin fugas a role=user.
+        assert!(
+            !agent.messages().iter().any(|m| m.role == "user"
+                && m.content.as_deref().is_some_and(|c| c.contains("[Memory]"))),
+            "sin role=user tras compactar"
         );
     }
 }

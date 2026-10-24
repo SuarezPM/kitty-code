@@ -16,25 +16,73 @@ pub use shell_parse::{detect_write_targets, is_write_via_redirect};
 
 /// Nombre de env que marca un run con leak (tripwire BenchPolicy).
 /// Lo escribe `bench_policy_check` al denegar (deny ⇒ flag leak) y lo lee
-/// `bench/ppc.rs` (rechazo pre-LLM + `RunProvenance.leaked` real). Nunca se
-/// limpia en el proceso: un deny contamina el run entero (exit 3).
+/// `bench/ppc.rs` (rechazo pre-LLM + `RunProvenance.leaked` real).
+///
+/// El estado canónico vive en un [`AtomicBool`] global
+/// ([`OnceLock`]): el deny ocurre en el hilo del tool y PPC lo lee en el
+/// principal, así que NADA de thread-local. El env solo es override externo
+/// (inyectado desde fuera del proceso): se escribe best-effort al flaggear
+/// para compatibilidad con subprocesos y se lee como OR en
+/// [`is_run_leaked`]. Nunca se limpia en el proceso: un deny contamina el
+/// run entero (exit 3).
 pub const ENV_RUN_LEAKED: &str = "KITTY_RUN_LEAKED";
+
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    OnceLock,
+};
+
+/// Flag global de leak del run (proceso entero, visible entre hilos).
+fn run_leaked_flag() -> &'static AtomicBool {
+    static FLAG: OnceLock<AtomicBool> = OnceLock::new();
+    FLAG.get_or_init(|| AtomicBool::new(false))
+}
 
 /// Marca el run actual como contaminado por leak (best-effort, nunca panica).
 pub fn flag_run_leaked() {
+    run_leaked_flag().store(true, Ordering::SeqCst);
     // `set_var` es `unsafe` en ediciones recientes: el deny nunca debe
     // abortar el run por el flag; si falla, el deny ya bloqueó la IO.
+    // Best-effort para visibilidad externa (subprocesos); el estado
+    // canónico es el AtomicBool de arriba.
     unsafe {
         std::env::set_var(ENV_RUN_LEAKED, "1");
     }
 }
 
 /// ¿El run actual está marcado con leak?
+/// OR entre el flag global (deny intra-proceso) y el env externo
+/// (override inyectado desde fuera, leído al inicio/fin por PPC).
 pub fn is_run_leaked() -> bool {
+    if run_leaked_flag().load(Ordering::SeqCst) {
+        return true;
+    }
     matches!(
         std::env::var(ENV_RUN_LEAKED).as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE")
     )
+}
+
+/// Limpia el tripwire (SOLO tests): resetea el [`AtomicBool`] global y quita
+/// el env. Sin esto, un deny en un test contaminaría el resto del proceso
+/// (el flag global nunca se limpia en producción).
+#[cfg(test)]
+pub(crate) fn clear_run_leaked_for_tests() {
+    run_leaked_flag().store(false, Ordering::SeqCst);
+    unsafe {
+        std::env::remove_var(ENV_RUN_LEAKED);
+    }
+}
+
+/// Lock serializa los tests que tocan el flag global de leak (deny en hilo
+/// del tool, lectura en principal). Compartido entre `guard::tests` y
+/// `tools::tests` (mismo binario): sin lock cruzado,
+/// `bench_policy_predispatch_denies_without_io` y los tests de guard se
+/// pisan entre sí ⇒ flaky.
+#[cfg(test)]
+pub(crate) fn test_flag_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// BenchPolicy (Capa 0, Lane B): deny pre-dispatch sobre `bench/**` y
@@ -623,6 +671,19 @@ impl Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializa los tests que tocan el flag global de leak: el flag es un
+    /// `AtomicBool` de proceso (deny en hilo del tool, lectura en principal),
+    /// así que dos tests en paralelo que deniegan se contaminarían entre sí
+    /// (flaky `bench_policy_cat_does_not_bypass`). Cada test con tripwire
+    /// toma este lock y limpia con `clear_run_leaked_for_tests` al entrar/salir.
+    /// Delega al lock compartido [`super::test_flag_lock`] para excluir
+    /// también a `tools::tests::bench_policy_predispatch_denies_without_io`
+    /// (mismo binario, distinto módulo).
+    #[cfg(test)]
+    fn lock_flag_for_test() -> std::sync::MutexGuard<'static, ()> {
+        super::test_flag_lock()
+    }
 
     #[test]
     fn safe_command_allows() {
@@ -1333,10 +1394,9 @@ mod tests {
 
     #[test]
     fn bench_policy_is_bench_path_components() {
+        let _guard = lock_flag_for_test();
         // Limpia tripwire entre tests (bench_policy_check flaggea leak).
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        clear_run_leaked_for_tests();
         assert!(is_bench_path("bench/demo-12/demo-12.json"));
         assert!(is_bench_path("benches/baseline.json"));
         assert!(is_bench_path("./bench/gpqa.json"));
@@ -1353,16 +1413,13 @@ mod tests {
         assert!(!is_bench_path("src/bench/foo.rs"));
         assert!(!is_bench_path("crates/kitty-cli/src/bench/mod.rs"));
         assert!(!is_bench_path("crates/kitty-cli/src/bench/ppc.rs"));
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        clear_run_leaked_for_tests();
     }
 
     #[test]
     fn bench_policy_cat_does_not_bypass() {
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        let _guard = lock_flag_for_test();
+        clear_run_leaked_for_tests();
         // `cat` está en SAFE_OUTPUT_COMMANDS (Guard Allow), pero BenchPolicy
         // corre antes y debe denegar bench/** igual.
         assert_eq!(
@@ -1380,16 +1437,13 @@ mod tests {
         );
         // deny ⇒ flag leak (tripwire).
         assert!(is_run_leaked(), "deny debe flaggear KITTY_RUN_LEAKED");
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        clear_run_leaked_for_tests();
     }
 
     #[test]
     fn bench_policy_adversary_20_prompts_zero_reads() {
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        let _guard = lock_flag_for_test();
+        clear_run_leaked_for_tests();
         // F1: 20 prompts adversarios (Read/Grep/cat bench) ⇒ 0 lecturas:
         // todos denegados por `bench_policy_check` antes de cualquier IO.
         let cases: Vec<(&str, serde_json::Value)> = vec![
@@ -1424,9 +1478,7 @@ mod tests {
             denied += 1;
         }
         assert_eq!(denied, 20, "0 lecturas: los 20 deben denegarse pre-IO");
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        clear_run_leaked_for_tests();
         // Controles: rutas legitimas NO se deniegan.
         assert!(bench_policy_check("Read", &serde_json::json!({"path": "src/main.rs"})).is_none());
         assert!(bench_policy_check("Bash", &serde_json::json!({"command": "cat src/main.rs"})).is_none());
@@ -1459,18 +1511,15 @@ mod tests {
             .is_none(),
             "cat src/bench fuente no se bloquea"
         );
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        clear_run_leaked_for_tests();
     }
 
     // === B1 leak bypass: Grep sin path + intérpretes ===
 
     #[test]
     fn bench_policy_grep_sin_path_deniega_por_walker() {
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        let _guard = lock_flag_for_test();
+        clear_run_leaked_for_tests();
         // Sin `path` el walker cae a "." y barre bench/** ⇒ deny.
         assert!(
             bench_policy_check("Grep", &serde_json::json!({"pattern": "answer"}))
@@ -1492,16 +1541,13 @@ mod tests {
             bench_policy_check("Grep", &serde_json::json!({"pattern": "x", "path": "src"}))
                 .is_none()
         );
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        clear_run_leaked_for_tests();
     }
 
     #[test]
     fn bench_policy_bash_interpreter_payload_no_bypasea() {
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        let _guard = lock_flag_for_test();
+        clear_run_leaked_for_tests();
         // `bash -c 'cat bench/x'` escapa del scan ingenuo (palabra
         // `"cat bench/x"` con espacio no es path) ⇒ debe denegarse por
         // inspección del payload del intérprete.
@@ -1533,9 +1579,7 @@ mod tests {
                 .is_some(),
             "`grep -r answer .` barre bench/**"
         );
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        clear_run_leaked_for_tests();
         assert!(
             bench_policy_check(
                 "Bash",
@@ -1544,18 +1588,15 @@ mod tests {
             .is_none(),
             "`grep -r answer src/` no pisa bench/**"
         );
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        clear_run_leaked_for_tests();
     }
 
     // === Deepwork Pass 1 fix final: 7 comandos del gate + B1.3 ===
 
     #[test]
     fn bench_policy_gate7_b11_b12_b13() {
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        let _guard = lock_flag_for_test();
+        clear_run_leaked_for_tests();
         // B1.1 Grep root ancestro (normaliza ./.. antes de decidir).
         for args in [
             serde_json::json!({"pattern": "answer", "path": "src/.."}),
@@ -1597,9 +1638,7 @@ mod tests {
             .is_some(),
             "Grep path abs del repo ({repo_abs}) debe denegarse"
         );
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        clear_run_leaked_for_tests();
         // B1.2 Bash recursivo implícito (root implícito `.` ⇒ deny).
         for cmd in [
             "grep -r SECRET",
@@ -1624,9 +1663,7 @@ mod tests {
             .is_none(),
             "`grep -r SECRET src/` no pisa bench/**"
         );
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        clear_run_leaked_for_tests();
         // B1.3 Excepción src/bench con `..` (normaliza antes del early-return).
         assert!(
             is_bench_path("src/bench/../../bench/demo-12.json"),
@@ -1643,8 +1680,6 @@ mod tests {
         // Controles: fuentes src/bench siguen siendo código.
         assert!(!is_bench_path("src/bench/foo.rs"));
         assert!(!is_bench_path("crates/kitty-cli/src/bench/mod.rs"));
-        unsafe {
-            std::env::remove_var(ENV_RUN_LEAKED);
-        }
+        clear_run_leaked_for_tests();
     }
 }

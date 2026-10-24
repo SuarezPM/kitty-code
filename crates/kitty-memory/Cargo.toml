@@ -20,6 +20,9 @@ fastembed = { version = "7", optional = true }
 [features]
 default = []
 embedding = ["dep:fastembed"]
+# Selector alternativo al env KITTY_HYBRID_RECALL=1 para el brazo híbrido
+# gated (default-off en ambos casos; ver `hybrid_recall_enabled`).
+hybrid-recall = []
 
 [dev-dependencies]
 tempfile.workspace = true

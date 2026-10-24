@@ -32,8 +32,8 @@
 //!   gana el mejor `pass-rate`, desempates por timeouts → latencia → nombre.
 //!   **Sin LLM judge** y sin red en el compose.
 //! - `run_id`/`runmark`: los provee Lane B vía (`cli`, `cfg`, `out`); el
-//!   `run_id` es `KITTY_RUN_ID` o el fingerprint corto, y el ledger limpio es
-//!   best-effort (`!git_dirty`) hasta que el ledger de Lane A aterrice.
+//!   `run_id` es UUID opaco del ledger (`bench/ledger.rs`, tabla `runs`) y
+//!   el ledger limpio es `is_clean` (`dirty==0 && leaked==0`).
 //! - `systemone_status()` (Lane C) entra SOLO como campo volcado
 //!   (`systemone_status_dump`): no hay ningún `if` sobre este valor en el
 //!   fichero — verificable por inspección.
@@ -48,8 +48,8 @@ use super::common::{
 };
 use super::run::run_one_bench;
 use super::runmark::{
-    check_rerun_rejected, sha_of_str, write_sidecar_atomic, Runmark, EXIT_GATE_FAIL,
-    EXIT_INCONCLUSIVE, EXIT_INTEGRITY, EXIT_PASS,
+    sha_of_str, write_sidecar_atomic, Runmark, EXIT_GATE_FAIL, EXIT_INCONCLUSIVE, EXIT_INTEGRITY,
+    EXIT_PASS,
 };
 use super::BenchCliCtx;
 use anyhow::{Context, Result};
@@ -216,12 +216,14 @@ pub(crate) fn call_cap(tasks: usize) -> usize {
     PPC_CALL_BUDGET_PER_TASK * tasks + 1
 }
 
-/// Exit unificado (B2/B3, contrato runmark): 0 pass / 1 gate-fail /
-/// 2 inconcluso (k<3 por falta de reps o n<3 tareas o CI solapa con
-/// evidencia insuficiente; nunca publicable) / 3 integridad.
-/// B3: k=1 ⇒ siempre NoSignal + exit 2 aunque n≥3 y el lift sea total
-/// (golden 3/3 vs 0/3 y 0/8 vs 8/8 con k=1 → 2, no 0/1): la razón `k<3`
-/// domina sobre `tasks`.
+/// Exit unificado (B2/B3, contrato runmark): 0 pass (Signal) / 1 gate-fail
+/// (NoSignal por ledger sucio o CI solapa con tareas suficientes) /
+/// 2 inconcluso (NoSignal por k<3 falta de reps o n<3 tareas; nunca
+/// publicable) / 3 integridad.
+/// B3: k=1 ⇒ siempre NoSignal (n tareas ≠ k reps); con ledger limpio la
+/// razón es `k<3` ⇒ exit 2 aunque n≥3 y el lift sea total (golden 3/3 vs
+/// 0/3 y 0/8 vs 8/8 con k=1 → 2, no 0/1); con ledger sucio la razón es
+/// `dirty` ⇒ exit 1 (fiel a decide_exit, sin cambiar su semántica).
 pub(crate) fn decide_exit(signal: &Signal, tasks: usize) -> i32 {
     match signal {
         Signal::Signal => EXIT_PASS,
@@ -301,6 +303,8 @@ async fn run_ppc_inner(cli: &BenchCliCtx, cfg: &BenchConfig, out: &PathBuf) -> R
         dataset_sha,
         timeout_cell: cfg.exercise_timeout_secs,
         seed: 42,
+        // Eje rep (hueco k=2 futuro; ppc sigue k=1: siempre 0).
+        rep: 0,
         git_head: git_head(),
         dirty: git_dirty(),
         memory: false,
@@ -308,19 +312,29 @@ async fn run_ppc_inner(cli: &BenchCliCtx, cfg: &BenchConfig, out: &PathBuf) -> R
         toolset: bench_toolset_label(),
     };
     let fingerprint = runmark.fingerprint();
-    // ANTES del primer LLM: rerun de la misma celda se rechaza aquí.
-    if let Err(e) = check_rerun_rejected(out, &fingerprint) {
+    // Pre-chequeo rerun ANTES del primer LLM (delega al ledger) + `begin`
+    // que reserva la celda atómicamente (UNIQUE fingerprint,arm,rep).
+    if let Err(e) = super::runmark::check_rerun_rejected(out, &fingerprint) {
         return Err(IntegrityFail(e.to_string()).into());
     }
-
-    // run_id best-effort (Lane A aterriza el ledger): explícito o fingerprint.
-    let run_id = std::env::var("KITTY_RUN_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| fingerprint.chars().take(16).collect());
-    // Ledger limpio best-effort: árbol limpio. (Sin ledger de Lane A no hay
-    // run_id blind/arm que comprobar; esto se endurece cuando aterrice.)
-    let ledger_clean = !runmark.dirty;
+    // Ledger SQLite (única fuente de verdad): `begin` reserva la celda
+    // ANTES del primer LLM y rechaza el duplicado (fingerprint,arm,rep).
+    let ledger_path = super::ledger::ledger_db_path(out);
+    let ledger = super::ledger::Ledger::open(&ledger_path)
+        .map_err(|e| IntegrityFail(format!("no se pudo abrir el ledger {}: {e:#}", ledger_path.display())))?;
+    // `run_id` opaco del ledger (UUID); `KITTY_RUN_ID` explícito ya no manda
+    // (el ledger es la identidad: evita colisiones por env heredado).
+    let run_id = ledger
+        .begin(&super::ledger::LedgerStamp {
+            fingerprint: fingerprint.clone(),
+            suite: "ppc".to_string(),
+            arm: "default".to_string(),
+            rep: runmark.rep as i64,
+            git_head: runmark.git_head.clone(),
+            dirty: runmark.dirty,
+            started_at: super::demo12::utc_timestamp(),
+        })
+        .map_err(|e| IntegrityFail(e.to_string()))?;
 
     let candidates = default_candidates(cfg);
     let cap = call_cap(n);
@@ -363,13 +377,18 @@ async fn run_ppc_inner(cli: &BenchCliCtx, cfg: &BenchConfig, out: &PathBuf) -> R
     // (KITTY_RUN_LEAKED=1 vía guard::flag_run_leaked) el run es integridad
     // (exit 3), sin lección ni resume, aunque el pre-check inicial pasara.
     // B3: SIGNAL solo con Wilson separado + ledger limpio + k≥3 reps.
-    // k=1 (PPC_K) ⇒ siempre NoSignal + exit 2 (n tareas ≠ k reps).
+    // k=1 (PPC_K) ⇒ siempre NoSignal (n tareas ≠ k reps); el exit lo
+    // decide decide_exit: k<3/n<3 ⇒ 2, ledger sucio/solapa ⇒ 1.
     if kitty_harness::guard::is_run_leaked() || env_flag("KITTY_RUN_LEAKED") {
+        let _ = ledger.mark_leaked(&run_id);
+        let _ = ledger.finish(&run_id, &super::demo12::utc_timestamp(), EXIT_INTEGRITY);
         return Err(
             IntegrityFail("run marcado con leak durante probes (tripwire): sin lección ni resume".to_string())
                 .into(),
         );
     }
+    // Ledger limpio = dirty==0 && leaked==0 (único gate publicable).
+    let ledger_clean = ledger.is_clean(&run_id).unwrap_or(false);
     let signal = decide_signal(
         baseline_passed,
         n,
@@ -462,6 +481,11 @@ async fn run_ppc_inner(cli: &BenchCliCtx, cfg: &BenchConfig, out: &PathBuf) -> R
     println!("Results saved to {}", out.display());
     println!("PPC {signal} (exit {exit_code})");
     write_sidecar_atomic(out, &runmark)?;
+    // Cierre del ledger con el exit decidido (best-effort: el manifiesto ya
+    // está en disco; un fallo aquí solo se avisa, no cambia el exit).
+    if let Err(e) = ledger.finish(&run_id, &super::demo12::utc_timestamp(), exit_code) {
+        eprintln!("aviso: ledger finish falló (best-effort): {e:#}");
+    }
     Ok(exit_code)
 }
 

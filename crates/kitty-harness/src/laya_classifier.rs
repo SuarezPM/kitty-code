@@ -247,6 +247,14 @@ pub enum LayaDecision {
     Proceed,
 }
 
+/// Lane C gate: solo [`FitOutcome::Fitted`] habilita Laya; cualquier
+/// [`FitOutcome::HeldDatos`] ⇒ Off/Noul (fail-open, decide el SLM).
+/// Puro, sin I/O: no calibra nada, solo clasifica el outcome.
+#[must_use]
+pub fn is_fitted(outcome: &FitOutcome) -> bool {
+    matches!(outcome, FitOutcome::Fitted(_))
+}
+
 /// Fit on own traffic. Usable pairs = finite confidence + any label.
 /// Fewer than [`MIN_FIT_SAMPLES`] (or single-class) → [`FitOutcome::HeldDatos`].
 #[must_use]
