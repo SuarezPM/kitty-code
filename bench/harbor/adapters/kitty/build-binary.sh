@@ -35,7 +35,11 @@ docker run --rm \
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
     . "$HOME/.cargo/env"
     mkdir /build
-    cp -r /src/Cargo.toml /src/Cargo.lock /src/rust-toolchain.toml /src/crates /build/
+    cp -r /src/Cargo.toml /src/Cargo.lock /src/rust-toolchain.toml /src/crates /src/engine /build/
+    # kitty-cli embebe bench/demo-12/demo-12.json vía include_str! con ruta
+    # relativa a la raíz del repo; copiarlo para que el build lo encuentre.
+    mkdir -p /build/bench/demo-12
+    cp /src/bench/demo-12/demo-12.json /build/bench/demo-12/demo-12.json
     cd /build
     cargo build --release -p kitty-cli
     cp target/release/kitty-cli /out/kitty-cli

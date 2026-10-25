@@ -34,6 +34,71 @@ KITTY_BENCH_MODEL=ornith-1.5:9b harbor run ...
 | `KITTY_OLLAMA_URL`  | auto (gateway IP)  | Explicit Ollama URL override               |
 | `KITTY_BENCH_BINARY`| adapter `bin/` dir | Host path of the kitty-cli binary to upload|
 
+## Terminal-Bench 2.0 (protocolo k=3)
+
+Comando exacto para correr 1 tarea de TB2.0 con Kitty (smoke test; la serie
+completa la corre el pilot):
+
+```bash
+# desde la raíz del repo Kitty-Code
+PYTHONPATH="$PWD/bench/harbor" KITTY_BENCH_MODEL=minicpm5:2b harbor run \
+  -d terminal-bench@2.0 \
+  -a adapters.kitty.agent:KittyAgent \
+  -m minicpm5:2b \
+  -l 1 -k 3 \
+  -n 1 \
+  --ae KITTY_BENCH_MODEL=minicpm5:2b \
+  --ae KITTY_SANDBOX=off \
+  --ae KITTY_OLLAMA_TIMEOUT_SECS=900 \
+  --agent-timeout-multiplier 3
+```
+
+Flags:
+
+- `-d terminal-bench@2.0` — dataset TB2.0 del registry de Harbor.
+- `-a adapters.kitty.agent:KittyAgent` — import path del adapter (igual que
+  en la sección Usage).
+- `-m minicpm5:2b` — model name para Harbor; el modelo efectivo lo gobierna
+  `KITTY_BENCH_MODEL` (el adapter lo pasa como `--model` a kitty-cli).
+- `-l 1` — una sola tarea (smoke test). Sin `-l`, corre el dataset completo.
+- `-k 3` — 3 intentos por trial (protocolo TB2.0 k=3).
+- `-n 1` — un trial a la vez (los modelos locales 2B/9B no dan para
+  concurrencia; además evita saturar la GPU del host).
+- `--ae KITTY_BENCH_MODEL=minicpm5:2b` — modelo efectivo dentro del
+  contenedor (requerido; `--ae` aterriza en `_extra_env`, no en
+  `os.environ`). El `KITTY_BENCH_MODEL=` del prefijo es cinturón y
+  tirantes para el mismo valor.
+- Variante Ornith: sustituir `minicpm5:2b` por `ornith-1.5:9b` en `-m`,
+  en el prefijo y en `--ae` (el default del adapter sigue siendo
+  `ornith:9b`).
+
+### Timeouts recomendados
+
+- `--ae KITTY_OLLAMA_TIMEOUT_SECS=900` — techo por petición a Ollama; los
+  modelos pequeños locales (2B) razonan lento en tareas largas de
+  terminal. Sin esto, respuestas truncadas se registran como vacías.
+- `--agent-timeout-multiplier 3` — multiplica el timeout de la fase de
+  agente de Harbor (precedente: `bench/harbor/rerun-v3.sh` usa esta misma
+  combinación para `ornith:9b`).
+- Si el timeout salta en build de imagen o verificación (no en el agente),
+  añadir `--timeout-multiplier 2` (o 3) en lugar de seguir subiendo solo el
+  de agente.
+
+### Requisito de red (resumen)
+
+Imprescindible antes de cualquier corrida TB2.0 — detalle en
+`One-time setup` §2:
+
+1. Ollama escuchando en `0.0.0.0` (`OLLAMA_HOST=0.0.0.0`, no solo
+   `127.0.0.1`) + `OLLAMA_CONTEXT_LENGTH=16384` (kitty-cli nunca envía
+   `num_ctx`; sin esto el servidor trunca el prompt y el modelo devuelve
+   respuestas vacías).
+2. Firewall abierto del bridge Docker hacia el host:
+   `sudo ufw allow from 172.16.0.0/12 to any port 11434 proto tcp`.
+3. El adapter autodetecta el gateway del bridge (`ip route` /
+   `/proc/net/route`) y llama a `http://<gateway>:11434`. Solo para
+   depurar la red, forzar con `--ae KITTY_OLLAMA_URL=http://<ip>:11434`.
+
 ## One-time setup
 
 ### 1. Build the container-compatible binary
