@@ -53,6 +53,13 @@ pub const ENV_MODEL: &str = "KITTY_INFER_MODEL";
 pub const ENV_TOKENIZER_DIR: &str = "KITTY_INFER_TOKENIZER_DIR";
 /// Context length override (default 16384 — full 16K window, F1a).
 pub const ENV_CTX: &str = "KITTY_INFER_CTX";
+/// Max concurrent sequences (default 4 — single-resident `run` needs
+/// prompt+decode overlap, not the engine 32-seq serving default which OOMs
+/// a 9B hybrid on 8GB). Override for tuning without rebuild.
+pub const ENV_MAX_SEQS: &str = "KITTY_INFER_MAX_SEQS";
+/// Prefix-cache sequences (default 1 — engine default 16 holds 16 full
+/// contexts and OOMs 9B on 8GB). `0` disables, else small int.
+pub const ENV_PREFIX: &str = "KITTY_INFER_PREFIX";
 /// Extra comma-separated F32 filename prefixes.
 pub const ENV_F32_PREFIXES: &str = "KITTY_INFER_F32_PREFIXES";
 /// Manual GPU-layer spill knob (PROHIBITED by policy, P0-4).
@@ -862,9 +869,34 @@ impl KittyInferClient {
                     if !engine_logging_off_requested() {
                         builder = builder.with_logging();
                     }
+                    let max_seqs = std::env::var(ENV_MAX_SEQS)
+                        .ok()
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .filter(|v| *v > 0)
+                        .unwrap_or(4);
+                    let prefix_n = match std::env::var(ENV_PREFIX).ok().as_deref() {
+                        None => Some(1),
+                        Some(raw) if raw.trim() == "0" => None,
+                        Some(raw) => raw
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|n| *n > 0)
+                            .or(Some(1)),
+                    };
                     builder = builder
                         .with_max_model_len(ctx)
                         .with_dtype(dtype.clone())
+                        // Single-resident `run`: few concurrent sequences.
+                        // Engine defaults (32 seqs, 16 prefix) size serving +
+                        // prefix + graphs for concurrent serving and OOM a 9B
+                        // hybrid on 8GB (ollama holds the same 9B 100% GPU in
+                        // 5.5GB with ctx 16K). 4/1 still serves prompt+decode
+                        // overlap with minimal slots (1 OOMs with "no recurrent
+                        // state slot" for seq 0/1). Tunable via
+                        // KITTY_INFER_MAX_SEQS / KITTY_INFER_PREFIX without rebuild.
+                        .with_max_num_seqs(max_seqs)
+                        .with_prefix_cache_n(prefix_n)
                         // Paged KV capacity follows the attempt ctx: demand
                         // sizing on the hybrid mask (F1a), Utilization only
                         // when the arch is unrecognized.

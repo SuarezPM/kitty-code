@@ -291,6 +291,44 @@ pub(crate) fn default_scheduler_config(max_num_seqs: usize) -> anyhow::Result<Sc
     })
 }
 
+/// Default device-map sizing for GGUF loads, honoring the requested context
+/// window. `with_max_model_len(ctx)` caps the runtime config, so the estimate
+/// must size the same window — otherwise a demand below 4096 fails the
+/// `assert_cache_covers_context` gate (covers < requested) and a demand above
+/// 4096 is sized against the wrong window. `None` keeps the historical 4096
+/// default. Pure and unit-tested.
+pub(crate) fn gguf_default_device_map(
+    has_mmproj: bool,
+    max_model_len: Option<usize>,
+) -> mistralrs_core::AutoDeviceMapParams {
+    use mistralrs_core::AutoDeviceMapParams;
+    let base = if has_mmproj {
+        AutoDeviceMapParams::default_multimodal()
+    } else {
+        AutoDeviceMapParams::default_text()
+    };
+    let Some(ctx) = max_model_len else {
+        return base;
+    };
+    match base {
+        AutoDeviceMapParams::Text { max_batch_size, .. } => AutoDeviceMapParams::Text {
+            max_seq_len: ctx,
+            max_batch_size,
+        },
+        AutoDeviceMapParams::Multimodal {
+            max_batch_size,
+            max_image_shape,
+            max_num_images,
+            ..
+        } => AutoDeviceMapParams::Multimodal {
+            max_seq_len: ctx,
+            max_batch_size,
+            max_image_shape,
+            max_num_images,
+        },
+    }
+}
+
 fn paged_attn_with_serving_capacity(
     config: Option<PagedAttentionConfig>,
     max_num_seqs: usize,
@@ -727,11 +765,11 @@ pub async fn build_gguf_pipeline(
         &builder.dtype,
         &device,
     )?;
-    let default_device_map = if builder.mmproj_files.is_some() {
-        AutoDeviceMapParams::default_multimodal()
-    } else {
-        AutoDeviceMapParams::default_text()
-    };
+    // Device-map sizing honors the requested ctx (with_max_model_len also caps
+    // the runtime config): previously always 4096, so demands below 4096 failed
+    // the estimate assert and demands above were sized against the wrong window.
+    let default_device_map =
+        gguf_default_device_map(builder.mmproj_files.is_some(), builder.max_model_len);
     let device_map_setting = builder
         .device_mapping
         .clone()
@@ -966,8 +1004,7 @@ pub async fn build_auto_pipeline(
         .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()));
 
     let loader_config = ModelLoaderConfig {
-        model_selected: ModelSelected::Run {
-            model_id: builder.model_id.clone(),
+        model_selected: ModelSelected::Run {            model_id: builder.model_id.clone(),
             tokenizer_json: builder.tokenizer_json.clone(),
             dtype: builder.dtype,
             topology: builder.topology_path.clone(),
@@ -1007,4 +1044,46 @@ pub async fn build_auto_pipeline(
     };
 
     Ok((pipeline, scheduler_config, add_model_config))
+}
+
+#[cfg(test)]
+mod gguf_ctx_tests {
+    use super::gguf_default_device_map;
+    use mistralrs_core::AutoDeviceMapParams;
+
+    #[test]
+    fn gguf_device_map_honors_builder_ctx() {
+        match gguf_default_device_map(false, None) {
+            AutoDeviceMapParams::Text {
+                max_seq_len,
+                max_batch_size,
+            } => {
+                assert_eq!(max_seq_len, AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN);
+                assert_eq!(max_batch_size, AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE);
+            }
+            other => panic!("expected text params, got {other:?}"),
+        }
+        for ctx in [1024, 2048, 4096, 8192, 16384] {
+            match gguf_default_device_map(false, Some(ctx)) {
+                AutoDeviceMapParams::Text {
+                    max_seq_len,
+                    max_batch_size,
+                } => {
+                    assert_eq!(max_seq_len, ctx);
+                    assert_eq!(max_batch_size, AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE);
+                }
+                other => panic!("expected text params for ctx {ctx}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn gguf_device_map_multimodal_honors_ctx() {
+        match gguf_default_device_map(true, Some(2048)) {
+            AutoDeviceMapParams::Multimodal { max_seq_len, .. } => {
+                assert_eq!(max_seq_len, 2048);
+            }
+            other => panic!("expected multimodal params, got {other:?}"),
+        }
+    }
 }

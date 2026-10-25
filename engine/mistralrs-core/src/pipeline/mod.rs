@@ -2405,6 +2405,25 @@ pub trait Pipeline:
                                     input_seqs,
                                 ));
                         if self.cache().is_hybrid() {
+                            // Paged prefill admission: seqs without a slot (fresh
+                            // admit or post-evict readmission) acquire one here,
+                            // mirroring `HybridCacheManager::set_none_cache` for
+                            // the non-paged path (which the paged scheduler
+                            // bypasses: it only allocates KV blocks). Running
+                            // seqs keep theirs so accounting is untouched.
+                            // Zeroed: prefill consumes conv+temporal state in
+                            // this same step.
+                            {
+                                let mut hybrid_cache = self.cache().hybrid();
+                                for seq in input_seqs.iter_mut() {
+                                    if seq.recurrent_state_idx().is_none() {
+                                        let slot_idx = hybrid_cache
+                                            .allocate_seq(*seq.id())
+                                            .map_err(candle_core::Error::msg)?;
+                                        seq.set_recurrent_state_idx(Some(slot_idx));
+                                    }
+                                }
+                            }
                             let mut hybrid_cache = self.cache().hybrid();
                             let sequence_slots = seq_indices
                                 .iter()
