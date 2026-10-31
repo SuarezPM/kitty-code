@@ -4149,7 +4149,7 @@ dependencies = [
  "futures",
  "galil-seiferas",
  "half",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "hf-hub",
  "http",
  "indexmap 2.14.2",
