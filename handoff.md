@@ -83,3 +83,36 @@ Re-auditoría Nº2 **7.9/10** + plan SDD-82-10 PASS + infer-readiness MiniCPM5/K
 ## Pendiente declarado
 
 T-E1.6 lints, mutants ≥80 (57.8% parcial), wire compilable in-tree, HU-8 en tag, E2E-CI, BGE-M3/rerank offline, holdout-runner, nextest-swap. CI: 5 rojos preexistentes documentados (0 delta con este push). Puerta al 10: auditoría externa (humano).
+
+---
+
+# Handoff — 2026-10-25, kitty-infer operativo + F3 adapters (HEAD ec3e3ca, tag v0.2.0, PUSHEADO a origin/main)
+
+## Dónde estamos
+
+Deepwork `kittycode-infer-forge-benchmark`: F1a/F1b/F2a/F2b + fix integración + infer-GPU + tok/s + adapters, todo commiteado y pusheado (d1e9ea2 → 922f4de → 1e092f9 → e157f98 → ec3e3ca; tag `v0.2.0` en remoto). Gates Oracle: SDD corregido (sin FP8 sm_75, máscara híbrida real, E1 enum+finalize), FAIL→CONDITIONAL con fix, serie CONDITIONAL doc-only.
+
+- **kitty-infer OPERATIVO**: Ornith-1.5-9B-Q4 full-GPU 32/0 ctx 16K, KV híbrida 462MB, `ok` en 6s (fix: GGUF ctx + max_seqs 4/prefix 1 + recurrent slots). Tok/s: kitty-infer 32.5 wall-only vs Ollama 52.3 decode (prefill 1020, TTFT 0.7). Ollama gana crudo; ventaja kitty-infer = stateful/prefix/grammar (F2c).
+- **F3 adapters listos**: kitty jammy rebuild 0.2.0 + import OK; little headless smoke OK (exit 0, fichero creado) + adapter nuevo; opencode smoke OK con variantes 64K (`ornith-1.5-9b-64k`, `minicpm5-2b-64k` persisten en Ollama; ornith-64k spillea 35% CPU → asimetría declarada).
+- **Pilots TB2.0**: kitty 1 tarea minicpm5 OK en 74s (grading real, reward 0.0; `jobs/2026-10-25__00-05-30/`). Opencode pilot murió en el apagón (repetir con 64k). Little pilot abortado por usuario (GPU ocupada).
+- **Serie demo-12 Pass 3 intacta**: 35/36 vs 32/36, Δp50 +2.8s (empate técnico), HU-LATENCIA ABIERTA. Manifiesto + prereg + warmup ps archivados.
+
+## Para reanudar (en este orden)
+
+1. GPU libre → verificar `ollama ps` vacío + `nvidia-smi` (<1GB usado).
+2. Little pilot: `PYTHONPATH=$PWD/bench/harbor harbor run -d terminal-bench@2.0 -a adapters.little.agent:LittleAgent -m minicpm5:2b -l 1 -k 1 -n 1 --ae LITTLE_BENCH_MODEL=minicpm5:2b` (ver README del adapter).
+3. Opencode pilot con 64k: `opencode run --model local-ollama/minicpm5-2b-64k` (config en /tmp/opencode-ollama-test/opencode.json; `OPENAI_API_KEY=x`).
+4. Pre-reg F3 (matriz TB2.0 k=3 × {minicpm5, ornith-1.5} × {kitty, little, opencode}) + lanzar brazos detached de noche con watcher (1 trial a la vez, `ollama stop` entre celdas).
+5. Con resultados: manifiesto comparativo + McNemar pareado + anuncio (parity-only salvo superioridad probada).
+
+## Lecciones operativas (no repetir)
+
+- pkill/pgrep -f se automachean con su propio comando (usar bracket `[k]`).
+- `ollama stop` cuelga si un cliente murió con -9 a mitad de inferencia: no forzar, dejar expirar el keep-alive y verificar `ollama ps`.
+- `KITTY_NUM_CTX` no llega al estimate de kitty-infer (manda `KITTY_INFER_CTX`); el default 32768 OOMea: fijar siempre ctx explícito.
+- KITTY_INFER_GPU_LAYERS está prohibido por P0-4 (el auto-map manda).
+- Zip 9 bloqueado por pin git de candle-core 0.11 (RUSTSEC-2026-0367/8/9 abiertos); tokio RUSTSEC-2026-0386 + yoke yanked pendientes.
+
+## Secretos
+
+- Sin secretos nuevos. `OPENAI_API_KEY=x` es dummy (documentado en docs/opencode-ollama.md).
