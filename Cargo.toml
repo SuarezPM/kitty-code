@@ -170,7 +170,7 @@ hf-hub = { version = "0.5.0", default-features = false, features = [
     "tokio",
     "rustls-tls",
 ] }
-itertools = "0.14.0"
+itertools = "0.15.0"
 rand09 = { package = "rand", version = "0.9.3" }
 # DUAL rand con motivo (M2): kitty-cli usa 0.10 (BenchAb shuffle, seed 42);
 # engine usa 0.9 (mistralrs + mistralrs-core, con rand_distr 0.6 / rand_isaac
